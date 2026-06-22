@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +21,8 @@ REQUIRED_FILES = [
     "docs/codex-deepresearch-project-management.html",
     ".agents/plugins/marketplace.json",
     "plugins/codex-deepresearch/.codex-plugin/plugin.json",
+    "plugins/codex-deepresearch/scripts/README.md",
+    "plugins/codex-deepresearch/scripts/codex-deepresearch",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
@@ -59,14 +63,36 @@ def main() -> None:
     if plugin.get("skills") != "./skills/":
         fail("plugin.json must expose ./skills/")
 
+    runner = ROOT / "plugins/codex-deepresearch/scripts/codex-deepresearch"
+    if not os.access(runner, os.X_OK):
+        fail("runner script must be executable: plugins/codex-deepresearch/scripts/codex-deepresearch")
+    help_result = subprocess.run(
+        [str(runner), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if help_result.returncode != 0:
+        fail("runner script --help must exit 0")
+
     marketplace = read_json(".agents/plugins/marketplace.json")
     entries = marketplace.get("plugins", [])
     matching = [entry for entry in entries if entry.get("name") == "codex-deepresearch"]
     if len(matching) != 1:
         fail("marketplace must contain exactly one codex-deepresearch entry")
     source = matching[0].get("source", {})
+    if source.get("source") != "local":
+        fail("marketplace source.source must be local")
     if source.get("path") != "./plugins/codex-deepresearch":
         fail("marketplace source.path must be ./plugins/codex-deepresearch")
+    policy = matching[0].get("policy", {})
+    if policy.get("installation") != "AVAILABLE":
+        fail("marketplace policy.installation must be AVAILABLE")
+    if policy.get("authentication") != "ON_INSTALL":
+        fail("marketplace policy.authentication must be ON_INSTALL")
+    if not matching[0].get("category"):
+        fail("marketplace entry must include category")
 
     skill_text = (ROOT / "plugins/codex-deepresearch/skills/deep-research/SKILL.md").read_text(
         encoding="utf-8"
@@ -75,6 +101,13 @@ def main() -> None:
         fail("deep-research skill frontmatter is missing")
     if "visual_required" not in skill_text:
         fail("deep-research skill must include modality routing guidance")
+
+    scripts_readme = (ROOT / "plugins/codex-deepresearch/scripts/README.md").read_text(
+        encoding="utf-8"
+    )
+    for required_word in ["Install", "Update", "Remove"]:
+        if required_word not in scripts_readme:
+            fail(f"scripts README must document {required_word.lower()} flow")
 
     print("Repository scaffold validation passed.")
 
