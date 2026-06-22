@@ -163,6 +163,7 @@ class _ValidationContext:
         self.image_ids: set[str] = set()
         self.claim_ids: set[str] = set()
         self.angle_routes: dict[str, str] = {}
+        self.search_tasks_provided = False
         self.search_task_ids: set[str] = set()
         self.top_level_verifier_votes_provided = False
         self.verifier_vote_ids: set[str] = set()
@@ -237,6 +238,23 @@ def _validate_evidence(
             modality = _check_enum(route, "modality", SEARCH_ROUTES, route_path, collector)
             if angle_id is not None and modality is not None:
                 context.angle_routes[angle_id] = modality
+
+    search_tasks = _optional_list(evidence, "search_tasks", "$.evidence", collector)
+    if search_tasks is not None:
+        context.search_tasks_provided = True
+        for index, search_task in enumerate(search_tasks):
+            search_task_path = f"$.evidence.search_tasks[{index}]"
+            if not _require_object(search_task, search_task_path, collector):
+                continue
+            _require_fields(search_task, search_task_path, ("id",), collector)
+            search_task_id = _optional_string(search_task, "id", search_task_path, collector)
+            if search_task_id is not None:
+                _add_unique_id(
+                    search_task_id,
+                    context.search_task_ids,
+                    search_task_path,
+                    collector,
+                )
 
     images = _optional_list(evidence, "images", "$.evidence", collector)
     if images is not None:
@@ -498,7 +516,11 @@ def _validate_search_results(
         )
         _optional_string(record, "id", path, collector)
         task_id = _optional_string(record, "task_id", path, collector)
-        if task_id is not None and context.search_task_ids and task_id not in context.search_task_ids:
+        if (
+            task_id is not None
+            and context.search_tasks_provided
+            and task_id not in context.search_task_ids
+        ):
             collector.add(
                 f"{path}.task_id",
                 "dangling_reference",

@@ -24,6 +24,9 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
     def load_valid_evidence(self) -> dict:
         return json.loads(self.fixture("valid_evidence.json").read_text(encoding="utf-8"))
 
+    def load_search_result(self) -> dict:
+        return json.loads(self.fixture("search_results.jsonl").read_text(encoding="utf-8"))
+
     def write_evidence(self, evidence: dict) -> Path:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -148,6 +151,26 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
         payload = json.loads(failing.stdout)
         self.assertFalse(payload["valid"])
         self.assertEqual(payload["errors"][0]["code"], "missing_visual_evidence")
+
+    def test_search_result_task_id_must_reference_evidence_search_task(self) -> None:
+        search_result = self.load_search_result()
+        search_result["task_id"] = "task_missing"
+        search_results_path = self.write_jsonl([search_result])
+
+        standalone = validate_artifacts(search_results_path=search_results_path)
+        self.assertTrue(standalone.valid, [error.to_dict() for error in standalone.errors])
+
+        result = validate_artifacts(
+            evidence_path=self.fixture("valid_evidence.json"),
+            search_results_path=search_results_path,
+        )
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        self.assertIn(
+            "$.search_results[0].task_id",
+            {error.path for error in result.errors},
+        )
 
     def test_top_level_verifier_vote_string_record_fails(self) -> None:
         votes_path = self.write_jsonl(["vote_text_001"])

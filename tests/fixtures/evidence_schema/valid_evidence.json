@@ -16,6 +16,17 @@
       "max_images": 2
     }
   ],
+  "search_tasks": [
+    {
+      "id": "task_search_001",
+      "angle_id": "angle_001",
+      "query": "example visual evidence",
+      "freshness_requirement": "any",
+      "route": "visual_required",
+      "max_results": 5,
+      "source_policy": "allowed"
+    }
+  ],
   "sources": [
     {
       "id": "src_001",
