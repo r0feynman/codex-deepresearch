@@ -17,6 +17,7 @@ PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ConfigResolutionError, resolve_config, validate_artifacts
+from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
 
 PLUGIN_NAME = "codex-deepresearch"
@@ -204,6 +205,33 @@ def run_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_ingest_manual(args: argparse.Namespace) -> int:
+    try:
+        result = ingest_manual_sources(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            question=args.question,
+            urls=args.url,
+            pdfs=args.pdf,
+            image_urls=args.image_url,
+            local_images=args.local_image,
+            labels=args.label,
+            budget_preset=args.budget,
+            vlm_provider=args.vlm_provider,
+        )
+    except (ConfigResolutionError, ManualSourcesError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    validation = result.get("validation")
+    if result["status"] == "failed_validation":
+        return 2
+    if isinstance(validation, dict) and validation.get("valid") is False:
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -344,6 +372,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for run artifacts, relative to the repo root by default.",
     )
     ingest.set_defaults(func=run_ingest)
+
+    ingest_manual = subparsers.add_parser(
+        "ingest-manual",
+        help="Record user-provided URLs and images without external search or fetch.",
+    )
+    ingest_manual.add_argument(
+        "--run",
+        help="Existing run id under --runs-dir, or a direct path to a run directory.",
+    )
+    ingest_manual.add_argument(
+        "--question",
+        help="Research question. Required when --run is omitted.",
+    )
+    ingest_manual.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    ingest_manual.add_argument(
+        "--url",
+        action="append",
+        default=[],
+        help="Manual http(s) page URL to record as a source. Repeatable.",
+    )
+    ingest_manual.add_argument(
+        "--pdf",
+        action="append",
+        default=[],
+        help="Manual PDF URL or existing local PDF file to record as a source. Repeatable.",
+    )
+    ingest_manual.add_argument(
+        "--image-url",
+        action="append",
+        default=[],
+        help="Manual http(s) image URL to record as a source and VisualEvidence. Repeatable.",
+    )
+    ingest_manual.add_argument(
+        "--local-image",
+        action="append",
+        default=[],
+        help="Existing local image file to copy into the run and record as VisualEvidence. Repeatable.",
+    )
+    ingest_manual.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Optional source title override, applied to manual inputs in option-group order. Repeatable.",
+    )
+    ingest_manual.add_argument(
+        "--vlm-provider",
+        help="VLM provider metadata for new manual runs.",
+    )
+    ingest_manual.add_argument(
+        "--budget",
+        "--budget-preset",
+        dest="budget",
+        default="standard",
+        help="Budget preset for new manual runs: quick, standard, deep, or exhaustive.",
+    )
+    ingest_manual.set_defaults(func=run_ingest_manual)
     return parser
 
 

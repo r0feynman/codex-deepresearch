@@ -1,6 +1,6 @@
 # Plugin Scripts
 
-`codex-deepresearch` is the plugin-local developer runner. It validates the plugin scaffold, starts smoke run directories, normalizes execution-mode configuration, and manages Codex-native search handoff artifacts.
+`codex-deepresearch` is the plugin-local developer runner. It validates the plugin scaffold, starts smoke run directories, normalizes execution-mode configuration, and manages Codex-native search handoff and manual-source artifacts.
 
 ## Smoke
 
@@ -39,6 +39,21 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_pa
 ```
 
 `ingest` validates `search_results.jsonl`, normalizes records into `evidence.json.sources`, and writes `fetch_queue.json` for allowed, fetchable `http`/`https` sources. Invalid URLs and blocked/manual-review policy decisions are preserved in evidence with `retrieval_status=failed` and explicit ingest errors, but they are not added to the fetch queue.
+
+## Manual Sources
+
+Use `ingest-manual` when the user provides URLs or images directly, or when Codex-native search handoff is blocked. The command does not call external search, fetch remote bodies, run VLM analysis, or create a fetch queue:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual \
+  --question "What evidence is available?" \
+  --url https://example.com/source \
+  --pdf https://example.com/report.pdf \
+  --image-url https://example.com/image.png \
+  --local-image ./path/to/local-image.png
+```
+
+Without `--run`, `--question` is required and the command creates a `manual-sources` run under `research-runs/`. With `--run`, it appends manual records to an existing `evidence.json`. Page URLs and PDFs create source records; image URLs and local image files create both source records and `VisualEvidence`. Local images are copied into the run directory with deterministic MIME type, SHA-256 hash, and dimensions when common image headers expose them. Remote image URLs are recorded as metadata-only visual evidence with `width=0` and `height=0` because M5 intentionally does not fetch bytes.
 
 ## Install
 

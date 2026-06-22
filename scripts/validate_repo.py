@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -26,6 +27,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/__init__.py",
     "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
+    "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
@@ -36,6 +38,7 @@ REQUIRED_FILES = [
     "tests/fixtures/evidence_schema/verifier_votes.jsonl",
     "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
+    "tests/test_manual_sources.py",
     "tests/test_search_handoff.py",
 ]
 
@@ -138,6 +141,37 @@ def main() -> None:
         fail(f"runner validate-evidence must output valid JSON: {exc}")
     if evidence_validation.get("valid") is not True:
         fail("runner validate-evidence did not report valid fixture artifacts")
+
+    with tempfile.TemporaryDirectory() as manual_runs_dir:
+        manual_result = subprocess.run(
+            [
+                str(runner),
+                "ingest-manual",
+                "--question",
+                "Manual validation",
+                "--runs-dir",
+                manual_runs_dir,
+                "--url",
+                "https://example.com/manual-source",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if manual_result.returncode != 0:
+        fail("runner ingest-manual must accept a manual URL without external search")
+    try:
+        manual_validation = json.loads(manual_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner ingest-manual must output valid JSON: {exc}")
+    if manual_validation.get("status") != "manual_sources_ingested":
+        fail("runner ingest-manual did not report manual_sources_ingested")
+    if manual_validation.get("sources_ingested") != 1:
+        fail("runner ingest-manual did not report one ingested source")
+    validation = manual_validation.get("validation")
+    if not isinstance(validation, dict) or validation.get("valid") is not True:
+        fail("runner ingest-manual did not produce valid evidence")
 
     marketplace = read_json(".agents/plugins/marketplace.json")
     entries = marketplace.get("plugins", [])
