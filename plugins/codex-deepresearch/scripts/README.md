@@ -17,10 +17,10 @@ The command checks the manifest, repo-local marketplace metadata, and Codex CLI 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:
 
 ```bash
-plugins/codex-deepresearch/scripts/codex-deepresearch resolve-config --mode codex-plugin --search-provider codex-native
+plugins/codex-deepresearch/scripts/codex-deepresearch resolve-config --mode codex-plugin --search-provider codex-native --budget-preset standard
 ```
 
-The command prints deterministic JSON on success and exits nonzero with a clear error for invalid mode/provider combinations.
+The command prints deterministic JSON on success, including a normalized `budget_preset` field. `--budget` remains available as a shorter alias for `--budget-preset`. Invalid mode/provider combinations exit nonzero with a clear error.
 
 ## Install
 

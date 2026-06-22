@@ -96,6 +96,19 @@ class ExecutionModeResolverTests(unittest.TestCase):
         self.assertEqual(config.budget_preset, "quick")
         self.assertEqual(config.budget.max_sources, 8)
 
+    def test_budget_preset_cli_alias_is_supported(self) -> None:
+        result = self.run_resolve_config(
+            "--mode",
+            "codex-plugin",
+            "--budget-preset",
+            "quick",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(config["budget_preset"], "quick")
+        self.assertEqual(config["budget"]["max_sources"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()

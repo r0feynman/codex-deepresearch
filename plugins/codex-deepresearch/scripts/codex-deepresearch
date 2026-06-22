@@ -192,6 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resolve.add_argument(
         "--budget",
+        "--budget-preset",
+        dest="budget",
         default="standard",
         help="Budget preset: quick, standard, deep, or exhaustive.",
     )
