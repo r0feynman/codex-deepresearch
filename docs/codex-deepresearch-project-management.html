@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex DeepResearch 개발 관리안</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --text: #18202f;
+      --muted: #657084;
+      --line: #dce1ea;
+      --blue: #2563eb;
+      --green: #14845c;
+      --amber: #b7791f;
+      --red: #c2413a;
+      --violet: #6d4aff;
+      --gray: #eef1f6;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }
+    header {
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 20px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 34px 0 14px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+    h3 {
+      margin: 0 0 10px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { margin: 0 0 12px; }
+    .lead {
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+    .note {
+      border-left: 4px solid var(--blue);
+      background: #eef5ff;
+      padding: 14px 16px;
+      border-radius: 6px;
+      color: #18345f;
+    }
+    .muted { color: var(--muted); }
+    code {
+      background: #edf0f6;
+      border: 1px solid #dde3ee;
+      border-radius: 5px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      margin: 0;
+      background: #151923;
+      color: #f5f7fb;
+      border-radius: 8px;
+      padding: 14px;
+      overflow: auto;
+      font-size: 14px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      align-items: stretch;
+    }
+    .flow .step {
+      position: relative;
+      min-height: 84px;
+      padding: 13px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .flow .step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -11px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      font-weight: 700;
+      z-index: 2;
+    }
+    .step strong { display: block; margin-bottom: 5px; }
+    .step span { color: var(--muted); font-size: 13px; }
+
+    .kanban {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(140px, 1fr));
+      gap: 10px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }
+    .column {
+      min-height: 220px;
+      background: #f1f4f9;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .column h3 {
+      font-size: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 24px;
+      height: 24px;
+      border-radius: 12px;
+      background: #dbe4f0;
+      color: #2b3647;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .card {
+      background: white;
+      border: 1px solid #dfe5ef;
+      border-radius: 7px;
+      padding: 10px;
+      margin-bottom: 8px;
+      box-shadow: 0 1px 2px rgba(20, 28, 40, 0.05);
+      font-size: 13px;
+    }
+    .card .tag {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #eef2ff;
+      color: #3b4ac8;
+      font-size: 12px;
+    }
+
+    .roadmap {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(150px, 1fr));
+      gap: 10px;
+      overflow-x: auto;
+    }
+    .phase {
+      border-top: 5px solid var(--blue);
+      background: var(--panel);
+      border-radius: 8px;
+      border-left: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 13px;
+      min-height: 170px;
+    }
+    .phase:nth-child(2) { border-top-color: var(--green); }
+    .phase:nth-child(3) { border-top-color: var(--amber); }
+    .phase:nth-child(4) { border-top-color: var(--violet); }
+    .phase:nth-child(5) { border-top-color: var(--red); }
+    .phase:nth-child(6) { border-top-color: #4b5563; }
+    .phase .num {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .phase ul {
+      padding-left: 18px;
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .hierarchy {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      gap: 12px;
+      align-items: stretch;
+    }
+    .node {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      position: relative;
+    }
+    .node:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .node .label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .node .title {
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .node .desc {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .views {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .view {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .view .icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 7px;
+      display: grid;
+      place-items: center;
+      color: white;
+      background: var(--blue);
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+    .view:nth-child(2) .icon { background: var(--green); }
+    .view:nth-child(3) .icon { background: var(--amber); }
+    .view:nth-child(4) .icon { background: var(--red); }
+
+    .labels {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+    .pill.feature { border-color: #bcd0ff; background: #edf4ff; }
+    .pill.component { border-color: #cde7d8; background: #edf8f2; }
+    .pill.priority { border-color: #f3d38a; background: #fff6dd; }
+    .pill.state { border-color: #e7c0c0; background: #fff0f0; }
+
+    .routine {
+      counter-reset: routine;
+      display: grid;
+      gap: 10px;
+    }
+    .routine li {
+      list-style: none;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 12px 12px 48px;
+      position: relative;
+    }
+    .routine li::before {
+      counter-increment: routine;
+      content: counter(routine);
+      position: absolute;
+      left: 12px;
+      top: 11px;
+      width: 26px;
+      height: 26px;
+      display: grid;
+      place-items: center;
+      border-radius: 13px;
+      background: var(--blue);
+      color: white;
+      font-weight: 800;
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      .grid.two, .grid.three, .views, .hierarchy { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow .step:not(:last-child)::after,
+      .node:not(:last-child)::after { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <h1>Codex DeepResearch 개발 관리안</h1>
+      <p class="lead">GitHub Issues와 GitHub Projects를 중심으로 PRD, 작업, 진행상태, Codex 구현 루틴을 한곳에서 관리하는 방식입니다.</p>
+    </header>
+
+    <section class="note">
+      <strong>추천 결론:</strong> 지금은 GitHub repo 하나에 PRD, Issues, Project board, PR을 묶어 관리합니다. 핵심은 <code>Now</code>를 작게 유지하고, 모든 작업을 Acceptance Criteria가 있는 issue로 만드는 것입니다.
+    </section>
+
+    <h2>전체 구조</h2>
+    <div class="flow">
+      <div class="step"><strong>PRD</strong><span>왜/무엇을 만들지</span></div>
+      <div class="step"><strong>Milestone</strong><span>Phase 단위 묶음</span></div>
+      <div class="step"><strong>Epic Issue</strong><span>큰 작업 덩어리</span></div>
+      <div class="step"><strong>Task Issue</strong><span>실제 구현 단위</span></div>
+      <div class="step"><strong>Project Board</strong><span>현재/다음/막힘</span></div>
+      <div class="step"><strong>PR</strong><span>구현 결과와 검증</span></div>
+    </div>
+
+    <h2>작업 계층</h2>
+    <div class="hierarchy">
+      <div class="node">
+        <div class="label">Milestone</div>
+        <div class="title">Phase 1 - MVP</div>
+        <div class="desc">출시 또는 개발 단계</div>
+      </div>
+      <div class="node">
+        <div class="label">Epic</div>
+        <div class="title">Basic visual acquisition</div>
+        <div class="desc">이미지 수집과 스크린샷 캡처 묶음</div>
+      </div>
+      <div class="node">
+        <div class="label">Issue</div>
+        <div class="title">First viewport screenshot collector</div>
+        <div class="desc">Codex가 처리할 실제 작업 단위</div>
+      </div>
+      <div class="node">
+        <div class="label">PR</div>
+        <div class="title">Implementation + Tests</div>
+        <div class="desc">구현, 검증, 리뷰 결과</div>
+      </div>
+    </div>
+
+    <h2>Project Board</h2>
+    <div class="kanban">
+      <div class="column">
+        <h3>Inbox <span class="badge">3</span></h3>
+        <div class="card">PDF page rasterization 아이디어 <span class="tag">type:research</span></div>
+        <div class="card">장기 캐시 정책 검토 <span class="tag">needs-decision</span></div>
+      </div>
+      <div class="column">
+        <h3>Ready <span class="badge">4</span></h3>
+        <div class="card">Open Graph image extractor <span class="tag">component:visual-acquisition</span></div>
+        <div class="card">Issue template 추가 <span class="tag">type:docs</span></div>
+      </div>
+      <div class="column">
+        <h3>Now <span class="badge">1</span></h3>
+        <div class="card">First viewport screenshot collector <span class="tag">priority:p0</span></div>
+      </div>
+      <div class="column">
+        <h3>Review <span class="badge">1</span></h3>
+        <div class="card">ModalityRouter schema 검증 <span class="tag">type:test</span></div>
+      </div>
+      <div class="column">
+        <h3>Blocked <span class="badge">1</span></h3>
+        <div class="card">이미지 검색 provider 선택 <span class="tag">blocked</span></div>
+      </div>
+      <div class="column">
+        <h3>Done <span class="badge">2</span></h3>
+        <div class="card">PRD 초안 저장 <span class="tag">type:docs</span></div>
+      </div>
+    </div>
+
+    <h2>Roadmap</h2>
+    <div class="roadmap">
+      <div class="phase">
+        <div class="num">Phase 0</div>
+        <h3>Prototype</h3>
+        <ul>
+          <li>CLI prototype</li>
+          <li>수동 URL 입력</li>
+          <li>기본 evidence</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="num">Phase 1</div>
+        <h3>MVP</h3>
+        <ul>
+          <li>Codex Skill</li>
+          <li>Basic visual acquisition</li>
+          <li>3-vote 검증</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="num">Phase 2</div>
+        <h3>Private Alpha</h3>
+        <ul>
+          <li>Resume/retry</li>
+          <li>Cost estimator</li>
+          <li>Trace 저장</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="num">Phase 3</div>
+        <h3>Public Beta</h3>
+        <ul>
+          <li>Dashboard</li>
+          <li>Evidence browser</li>
+          <li>Human review</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="num">Phase 4</div>
+        <h3>Product v1</h3>
+        <ul>
+          <li>Stable schema</li>
+          <li>Policy guardrails</li>
+          <li>Evaluation suite</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="num">Phase 5</div>
+        <h3>Team/Cloud</h3>
+        <ul>
+          <li>Shared evidence</li>
+          <li>Scheduled runs</li>
+          <li>Team approval</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>Project Views</h2>
+    <div class="views">
+      <div class="view">
+        <div class="icon">B</div>
+        <h3>Board - Current</h3>
+        <p class="muted">매일 보는 화면. 상태별로 이슈를 이동합니다.</p>
+      </div>
+      <div class="view">
+        <div class="icon">N</div>
+        <h3>Next</h3>
+        <p class="muted">다음 작업 1-3개만 남겨 선택 피로를 줄입니다.</p>
+      </div>
+      <div class="view">
+        <div class="icon">R</div>
+        <h3>Roadmap</h3>
+        <p class="muted">Phase별 진행상황을 milestone 기준으로 봅니다.</p>
+      </div>
+      <div class="view">
+        <div class="icon">!</div>
+        <h3>Blocked</h3>
+        <p class="muted">결정이 필요한 작업만 따로 모읍니다.</p>
+      </div>
+    </div>
+
+    <h2>Label 체계</h2>
+    <div class="labels">
+      <span class="pill feature">type:feature</span>
+      <span class="pill feature">type:bug</span>
+      <span class="pill feature">type:research</span>
+      <span class="pill feature">type:docs</span>
+      <span class="pill component">component:search</span>
+      <span class="pill component">component:visual-acquisition</span>
+      <span class="pill component">component:vlm</span>
+      <span class="pill component">component:evidence</span>
+      <span class="pill priority">priority:p0</span>
+      <span class="pill priority">priority:p1</span>
+      <span class="pill priority">priority:p2</span>
+      <span class="pill state">blocked</span>
+      <span class="pill state">needs-decision</span>
+      <span class="pill state">ready-for-codex</span>
+    </div>
+
+    <h2>일일 개발 루틴</h2>
+    <ol class="routine">
+      <li><strong>Ready에서 하나 선택.</strong> 가장 중요한 작업만 고릅니다.</li>
+      <li><strong>Now로 이동.</strong> 혼자 개발이면 Now는 1개만 유지합니다.</li>
+      <li><strong>Codex에게 구현 요청.</strong> Issue scope와 Acceptance Criteria를 기준으로 맡깁니다.</li>
+      <li><strong>검증.</strong> 테스트, 산출물, 체크리스트를 확인합니다.</li>
+      <li><strong>PR 또는 커밋.</strong> 변경 내용을 리뷰 가능한 단위로 묶습니다.</li>
+      <li><strong>Done 또는 Review.</strong> 끝난 일과 검토 중인 일을 분리합니다.</li>
+    </ol>
+
+    <h2>Issue Template</h2>
+    <pre><code>## Goal
+무엇을 만들거나 고칠지
+
+## Scope
+이번 이슈에 포함되는 것
+
+## Out of Scope
+이번 이슈에서 하지 않을 것
+
+## Acceptance Criteria
+- [ ] 조건 1
+- [ ] 조건 2
+- [ ] 테스트/검증 방법
+
+## Notes
+관련 PRD 섹션, 참고 파일, 의사결정 메모</code></pre>
+
+    <h2>최소 시작안</h2>
+    <div class="grid two">
+      <div class="panel">
+        <h3>처음 만들 것</h3>
+        <p>Repo, PRD, 관리 문서, milestone 6개, Project board를 먼저 만듭니다.</p>
+      </div>
+      <div class="panel">
+        <h3>처음 시작할 작업</h3>
+        <p>Phase 1 MVP Epic 5-7개와 실제 작업 issue 15-25개를 만들고, <code>Now</code>에는 하나만 둡니다.</p>
+      </div>
+    </div>
+
+    <h2>참고</h2>
+    <p class="muted">GitHub Issues/Projects, GitLab Issue Boards, Shape Up에서 공통으로 배울 점은 작업을 카드화하고 상태를 눈에 보이게 유지하는 것입니다. 단, 이 프로젝트는 개인 개발과 Codex 연동이 우선이므로 GitHub 안에서 작게 시작하는 편이 가장 적합합니다.</p>
+  </main>
+</body>
+</html>

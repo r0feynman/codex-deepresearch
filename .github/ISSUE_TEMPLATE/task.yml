@@ -1,0 +1,43 @@
+name: Task
+description: Track a concrete implementation, research, or documentation task.
+title: "[Task] "
+labels:
+  - type:task
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should change?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Link the PRD section, epic, source discussion, or related evidence.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Use checkboxes for concrete pass/fail conditions.
+      value: |
+        - [ ] 
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: What commands, manual checks, or screenshots prove this is done?
+  - type: dropdown
+    id: modality
+    attributes:
+      label: Modality
+      options:
+        - text_only
+        - visual_optional
+        - visual_required
+        - not_applicable
+    validations:
+      required: true

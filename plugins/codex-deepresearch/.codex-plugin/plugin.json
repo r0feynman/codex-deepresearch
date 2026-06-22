@@ -1,0 +1,20 @@
+{
+  "name": "codex-deepresearch",
+  "version": "0.1.0",
+  "description": "Deep research workflow for Codex with text, image, screenshot, and VLM evidence handling.",
+  "author": {
+    "name": "r0feynman"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex DeepResearch",
+    "shortDescription": "Run source-backed text and visual research in Codex.",
+    "longDescription": "Codex DeepResearch adds a reusable research workflow for source collection, modality routing, claim verification, and visual evidence analysis.",
+    "developerName": "r0feynman",
+    "category": "Productivity",
+    "capabilities": [
+      "skills"
+    ],
+    "defaultPrompt": "$deep-research: "
+  }
+}

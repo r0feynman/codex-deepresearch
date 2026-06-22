@@ -1,0 +1,20 @@
+{
+  "name": "codex-deepresearch-local",
+  "interface": {
+    "displayName": "Codex DeepResearch Local"
+  },
+  "plugins": [
+    {
+      "name": "codex-deepresearch",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-deepresearch"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

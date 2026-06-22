@@ -1,0 +1,37 @@
+name: Epic
+description: Track a large body of work under a phase milestone.
+title: "[Epic] "
+labels:
+  - type:epic
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome should this epic produce?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is included?
+    validations:
+      required: true
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: What should not be solved here?
+  - type: textarea
+    id: child_issues
+    attributes:
+      label: Child Issues
+      description: Link task issues once they exist.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: What must be true before this epic is done?
+    validations:
+      required: true
