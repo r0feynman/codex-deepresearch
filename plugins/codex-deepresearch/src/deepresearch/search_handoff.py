@@ -18,6 +18,7 @@ from .evidence_schema import (
     validate_artifacts,
 )
 from .execution_mode import BudgetPreset, resolve_config
+from .modality_router import route_angles
 
 
 HANDOFF_SCHEMA_VERSION = "codex-deepresearch.search-handoff.v0"
@@ -38,7 +39,8 @@ def prepare_run(
     vlm_provider: str | None = None,
     budget_preset: str = "standard",
     freshness_requirement: str = "any",
-    route: str = "text_only",
+    route: str | None = None,
+    angles: Sequence[str] | None = None,
     max_results: int = 8,
 ) -> dict[str, Any]:
     """Create a run directory and the Codex search handoff artifacts."""
@@ -51,7 +53,7 @@ def prepare_run(
             "freshness_requirement must be one of: "
             + ", ".join(FRESHNESS_REQUIREMENTS)
         )
-    if route not in SEARCH_ROUTES:
+    if route is not None and route not in SEARCH_ROUTES:
         raise SearchHandoffError("route must be one of: " + ", ".join(SEARCH_ROUTES))
     if max_results < 1:
         raise SearchHandoffError("max_results must be at least 1")
@@ -71,31 +73,24 @@ def prepare_run(
     now = _utc_now()
     run_dir = _create_unique_run_dir(Path(runs_dir), now)
     run_id = run_dir.name
-    routing = [
-        {
-            "id": "angle_001",
-            "angle": "primary source discovery",
-            "modality": route,
-            "reason": "Initial Codex-native search handoff for the research question.",
-            "visual_tasks": [] if route == "text_only" else ["image_claim_alignment"],
-            "max_images": 0 if route == "text_only" else config.budget.max_images,
-        }
-    ]
+    planner_angles = _normalize_planner_angles(angles)
+    decisions = route_angles(
+        question=normalized_question,
+        angles=planner_angles,
+        max_images=config.budget.max_images,
+        route_override=route,
+    )
+    routing = [_routing_record(decision, index) for index, decision in enumerate(decisions, start=1)]
     search_tasks = [
-        {
-            "id": "task_search_001",
-            "angle_id": "angle_001",
-            "angle": routing[0]["angle"],
-            "query": normalized_question,
-            "freshness_requirement": freshness_requirement,
-            "modality": route,
-            "route": route,
-            "max_results": max_results,
-            "source_policy": {
-                "decision": "allowed",
-                "flags": [],
-            },
-        }
+        _search_task(
+            normalized_question,
+            route_record,
+            index,
+            freshness_requirement=freshness_requirement,
+            max_results=max_results,
+            use_angle_in_query=len(routing) > 1,
+        )
+        for index, route_record in enumerate(routing, start=1)
     ]
     budget = _budget_to_evidence(config.budget_preset, config.budget)
     evidence = {
@@ -133,7 +128,11 @@ def prepare_run(
         "schema_version": HANDOFF_SCHEMA_VERSION,
         "run_id": run_id,
         "created_at": now,
-        "tasks": [],
+        "tasks": [
+            _visual_task(route_record, index)
+            for index, route_record in enumerate(routing, start=1)
+            if route_record["modality"] != "text_only"
+        ],
     }
     status = {
         "schema_version": HANDOFF_SCHEMA_VERSION,
@@ -430,6 +429,65 @@ def _base_ingest_status(run_dir: Path, status: str) -> dict[str, Any]:
         "run_dir": str(run_dir),
         "status": status,
         "created_at": _utc_now(),
+    }
+
+
+def _normalize_planner_angles(angles: Sequence[str] | None) -> list[str]:
+    if angles is None:
+        return ["primary source discovery"]
+    normalized = [" ".join(angle.strip().split()) for angle in angles if angle.strip()]
+    if not normalized:
+        raise SearchHandoffError("at least one planner angle is required when angles are provided")
+    return normalized
+
+
+def _routing_record(decision: Any, index: int) -> dict[str, Any]:
+    return {
+        "id": f"angle_{index:03d}",
+        "angle": decision.angle,
+        "modality": decision.modality,
+        "reason": decision.reason,
+        "visual_tasks": list(decision.visual_tasks),
+        "max_images": decision.max_images,
+    }
+
+
+def _search_task(
+    question: str,
+    route_record: Mapping[str, Any],
+    index: int,
+    *,
+    freshness_requirement: str,
+    max_results: int,
+    use_angle_in_query: bool,
+) -> dict[str, Any]:
+    angle = str(route_record["angle"])
+    query = question if not use_angle_in_query else f"{question} {angle}"
+    return {
+        "id": f"task_search_{index:03d}",
+        "angle_id": route_record["id"],
+        "angle": angle,
+        "query": query,
+        "freshness_requirement": freshness_requirement,
+        "modality": route_record["modality"],
+        "route": route_record["modality"],
+        "max_results": max_results,
+        "source_policy": {
+            "decision": "allowed",
+            "flags": [],
+        },
+    }
+
+
+def _visual_task(route_record: Mapping[str, Any], index: int) -> dict[str, Any]:
+    return {
+        "id": f"task_visual_{index:03d}",
+        "angle_id": route_record["id"],
+        "angle": route_record["angle"],
+        "route": route_record["modality"],
+        "visual_tasks": list(route_record["visual_tasks"]),
+        "max_images": route_record["max_images"],
+        "status": "planned",
     }
 
 

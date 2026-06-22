@@ -175,7 +175,8 @@ def run_prepare(args: argparse.Namespace) -> int:
             vlm_provider=args.vlm_provider,
             budget_preset=args.budget,
             freshness_requirement=args.freshness_requirement,
-            route=args.route,
+            route=None if args.route == "auto" else args.route,
+            angles=args.angle,
             max_results=args.max_results,
         )
     except (ConfigResolutionError, SearchHandoffError) as exc:
@@ -346,8 +347,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument(
         "--route",
-        default="text_only",
-        help="Search route: text_only, visual_required, or visual_optional.",
+        default="auto",
+        choices=("auto", "text_only", "visual_required", "visual_optional"),
+        help="Search route override. Use auto to classify each planner angle.",
+    )
+    prepare.add_argument(
+        "--angle",
+        action="append",
+        help="Planner angle to classify and hand off. Repeat for multiple angles.",
     )
     prepare.add_argument(
         "--max-results",

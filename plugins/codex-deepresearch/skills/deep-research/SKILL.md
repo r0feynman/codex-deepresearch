@@ -31,7 +31,7 @@ Use this skill when the user asks for deep research, source-backed investigation
 
 In plugin mode, do not assume a hidden Codex search API is available to the runner. Use explicit handoff artifacts:
 
-1. Run `plugins/codex-deepresearch/scripts/codex-deepresearch prepare "<question>"`.
+1. Run `plugins/codex-deepresearch/scripts/codex-deepresearch prepare "<question>"`, passing repeated `--angle "<planner angle>"` values when planner angles are already known.
 2. Read the generated `search_tasks.json`.
 3. Use the current Codex session's available search capability to perform each task.
 4. Write one `SearchResult` JSON object per line to `search_results.jsonl`, preserving task id, angle id, route, provider, query, URL, title, snippet, result type, rank, freshness, access time, policy decision, policy flags, and raw provider metadata.
