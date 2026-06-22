@@ -31,6 +31,16 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
         path.write_text(json.dumps(evidence), encoding="utf-8")
         return path
 
+    def write_jsonl(self, records: list) -> Path:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "records.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def assert_error_code(self, result, code: str) -> None:
         codes = {error.code for error in result.errors}
         self.assertIn(code, codes, [error.to_dict() for error in result.errors])
@@ -138,6 +148,93 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
         payload = json.loads(failing.stdout)
         self.assertFalse(payload["valid"])
         self.assertEqual(payload["errors"][0]["code"], "missing_visual_evidence")
+
+    def test_top_level_verifier_vote_string_record_fails(self) -> None:
+        votes_path = self.write_jsonl(["vote_text_001"])
+
+        result = validate_artifacts(verifier_votes_path=votes_path)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.errors[0].path, "$.verifier_votes[0]")
+        self.assertEqual(result.errors[0].code, "invalid_type")
+
+        cli = subprocess.run(
+            [str(RUNNER), "validate-evidence", "--verifier-votes", str(votes_path)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(cli.returncode, 2)
+        payload = json.loads(cli.stdout)
+        self.assertFalse(payload["valid"])
+        self.assertEqual(payload["errors"][0]["path"], "$.verifier_votes[0]")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_type")
+
+    def test_evidence_image_source_id_dangles_when_sources_empty(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["sources"] = []
+        evidence["claims"] = []
+
+        result = validate_artifacts(evidence_path=self.write_evidence(evidence))
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        self.assertIn(
+            "$.evidence.images[0].source_id",
+            {error.path for error in result.errors},
+        )
+
+    def test_embedded_vote_string_refs_resolve_against_top_level_votes(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["claims"][0]["votes"] = ["vote_text_001"]
+        evidence["claims"][1]["votes"] = ["vote_visual_001"]
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            verifier_votes_path=self.fixture("verifier_votes.jsonl"),
+        )
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+
+    def test_missing_embedded_vote_string_ref_fails_when_votes_are_provided(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["claims"][0]["votes"] = ["vote_missing"]
+        evidence["claims"][1]["votes"] = ["vote_visual_001"]
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            verifier_votes_path=self.fixture("verifier_votes.jsonl"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        self.assertIn(
+            "$.evidence.claims[0].votes[0]",
+            {error.path for error in result.errors},
+        )
+
+    def test_source_and_image_url_fields_require_strings(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["sources"][0]["url"] = 123
+        evidence["sources"][0]["title"] = ["not", "a", "string"]
+        evidence["images"][0]["page_url"] = 123
+        evidence["images"][0]["image_url"] = ["not", "a", "string"]
+        evidence["claims"] = []
+
+        result = validate_artifacts(evidence_path=self.write_evidence(evidence))
+
+        self.assertFalse(result.valid)
+        invalid_paths = {error.path for error in result.errors if error.code == "invalid_type"}
+        self.assertIn("$.evidence.sources[0].url", invalid_paths)
+        self.assertIn("$.evidence.sources[0].title", invalid_paths)
+        self.assertIn("$.evidence.images[0].page_url", invalid_paths)
+        self.assertIn("$.evidence.images[0].image_url", invalid_paths)
+        self.assertIn(
+            "$.evidence.images[0]",
+            {error.path for error in result.errors if error.code == "missing_required_field"},
+        )
 
 
 if __name__ == "__main__":

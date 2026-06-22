@@ -131,6 +131,10 @@ def validate_artifacts(
     )
 
     context = _ValidationContext()
+    if verifier_votes is not None:
+        context.top_level_verifier_votes_provided = True
+        _collect_top_level_verifier_vote_ids(verifier_votes, context)
+
     if isinstance(evidence, Mapping):
         _validate_evidence(evidence, collector, context)
     elif evidence is not None:
@@ -141,7 +145,13 @@ def validate_artifacts(
     if visual_observations is not None:
         _validate_visual_observations(visual_observations, collector, context)
     if verifier_votes is not None:
-        _validate_verifier_votes(verifier_votes, collector, context, "$.verifier_votes")
+        _validate_verifier_votes(
+            verifier_votes,
+            collector,
+            context,
+            "$.verifier_votes",
+            allow_string_refs=False,
+        )
 
     return _result(collector)
 
@@ -154,6 +164,8 @@ class _ValidationContext:
         self.claim_ids: set[str] = set()
         self.angle_routes: dict[str, str] = {}
         self.search_task_ids: set[str] = set()
+        self.top_level_verifier_votes_provided = False
+        self.verifier_vote_ids: set[str] = set()
 
 
 def _result(collector: _Collector) -> ValidationResult:
@@ -232,7 +244,13 @@ def _validate_evidence(
             image_path = f"$.evidence.images[{index}]"
             if not _require_object(image, image_path, collector):
                 continue
-            image_id = _validate_visual_evidence(image, image_path, collector, context)
+            image_id = _validate_visual_evidence(
+                image,
+                image_path,
+                collector,
+                context,
+                require_source_reference=True,
+            )
             if image_id is not None:
                 _add_unique_id(image_id, context.image_ids, image_path, collector)
 
@@ -274,6 +292,8 @@ def _validate_source(
     )
     source_id = _optional_string(source, "id", path, collector)
     _check_enum(source, "type", SOURCE_TYPES, path, collector)
+    _check_string(source, "url", path, collector)
+    _check_string(source, "title", path, collector)
     _check_string(source, "accessed_at", path, collector)
     _check_enum(source, "quality", SOURCE_QUALITIES, path, collector)
     _check_enum(source, "retrieval_status", SOURCE_RETRIEVAL_STATUSES, path, collector)
@@ -288,6 +308,8 @@ def _validate_visual_evidence(
     path: str,
     collector: _Collector,
     context: _ValidationContext,
+    *,
+    require_source_reference: bool,
 ) -> str | None:
     _require_fields(
         image,
@@ -312,18 +334,24 @@ def _validate_visual_evidence(
     )
     image_id = _optional_string(image, "id", path, collector)
     source_id = _optional_string(image, "source_id", path, collector)
-    if source_id is not None and context.source_ids and source_id not in context.source_ids:
+    if (
+        source_id is not None
+        and (require_source_reference or context.source_ids)
+        and source_id not in context.source_ids
+    ):
         collector.add(
             f"{path}.source_id",
             "dangling_reference",
             f"image source_id '{source_id}' does not reference an existing source",
         )
     _check_enum(image, "origin", VISUAL_ORIGINS, path, collector)
-    if not image.get("page_url") and not image.get("image_url"):
+    page_url = _check_optional_string(image, "page_url", path, collector)
+    image_url = _check_optional_string(image, "image_url", path, collector)
+    if page_url is None and image_url is None:
         collector.add(
             path,
             "missing_required_field",
-            "VisualEvidence requires at least one of page_url or image_url",
+            "VisualEvidence requires at least one valid page_url or image_url",
         )
     _check_string(image, "local_artifact_path", path, collector)
     _check_string(image, "mime_type", path, collector)
@@ -425,7 +453,13 @@ def _validate_claim(
     if not isinstance(votes, list):
         collector.add(f"{path}.votes", "invalid_type", "votes must be a list")
         return
-    _validate_verifier_votes(votes, collector, context, f"{path}.votes")
+    _validate_verifier_votes(
+        votes,
+        collector,
+        context,
+        f"{path}.votes",
+        allow_string_refs=True,
+    )
 
 
 def _validate_search_results(
@@ -524,7 +558,13 @@ def _validate_visual_observations(
         path = f"$.visual_observations[{index}]"
         if not _require_object(record, path, collector):
             continue
-        image_id = _validate_visual_evidence(record, path, collector, context)
+        image_id = _validate_visual_evidence(
+            record,
+            path,
+            collector,
+            context,
+            require_source_reference=False,
+        )
         if image_id is not None and context.image_ids and image_id not in context.image_ids:
             collector.add(
                 f"{path}.id",
@@ -533,15 +573,40 @@ def _validate_visual_observations(
             )
 
 
+def _collect_top_level_verifier_vote_ids(
+    records: Sequence[Any],
+    context: _ValidationContext,
+) -> None:
+    for record in records:
+        if isinstance(record, Mapping):
+            vote_id = record.get("id")
+            if isinstance(vote_id, str) and vote_id:
+                context.verifier_vote_ids.add(vote_id)
+
+
 def _validate_verifier_votes(
     records: Sequence[Any],
     collector: _Collector,
     context: _ValidationContext,
     base_path: str,
+    *,
+    allow_string_refs: bool,
 ) -> None:
     for index, record in enumerate(records):
         path = f"{base_path}[{index}]"
         if isinstance(record, str):
+            if allow_string_refs:
+                if (
+                    context.top_level_verifier_votes_provided
+                    and record not in context.verifier_vote_ids
+                ):
+                    collector.add(
+                        path,
+                        "dangling_reference",
+                        f"vote reference '{record}' does not reference a top-level verifier vote",
+                    )
+            else:
+                collector.add(path, "invalid_type", "top-level verifier vote records must be objects")
             continue
         if not _require_object(record, path, collector):
             continue
@@ -665,6 +730,17 @@ def _optional_string(
     collector: _Collector,
 ) -> str | None:
     if field not in record:
+        return None
+    return _check_string(record, field, path, collector)
+
+
+def _check_optional_string(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> str | None:
+    if field not in record or record[field] is None:
         return None
     return _check_string(record, field, path, collector)
 
