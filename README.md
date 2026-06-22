@@ -41,6 +41,7 @@ Current contents:
 Run:
 
 ```bash
+python3 -m unittest discover -s tests
 python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
 ```

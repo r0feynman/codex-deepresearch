@@ -36,11 +36,12 @@ When the user asks to implement work, the main Codex agent must act as a coordin
 Before publishing or opening a PR, run:
 
 ```bash
+python3 -m unittest discover -s tests
 python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
 ```
 
-When implementation code is added, extend this section with the project test command.
+Keep this section current when new implementation test commands are added.
 
 ## Public Repository Safety
 

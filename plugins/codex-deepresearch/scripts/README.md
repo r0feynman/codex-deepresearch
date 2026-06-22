@@ -1,6 +1,6 @@
 # Plugin Scripts
 
-`codex-deepresearch` is the plugin-local developer runner. For M1 it only validates the plugin scaffold and starts a smoke run directory; later issues add execution modes, evidence schemas, verification, and report generation.
+`codex-deepresearch` is the plugin-local developer runner. It validates the plugin scaffold, starts smoke run directories, and normalizes execution-mode configuration before later pipeline stages are added.
 
 ## Smoke
 
@@ -11,6 +11,16 @@ plugins/codex-deepresearch/scripts/codex-deepresearch smoke --install --invoke '
 ```
 
 The command checks the manifest, repo-local marketplace metadata, and Codex CLI availability when `--install` is passed. It writes a timestamped directory under `research-runs/` with `status.json`.
+
+## Resolve Config
+
+Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch resolve-config --mode codex-plugin --search-provider codex-native
+```
+
+The command prints deterministic JSON on success and exits nonzero with a clear error for invalid mode/provider combinations.
 
 ## Install
 

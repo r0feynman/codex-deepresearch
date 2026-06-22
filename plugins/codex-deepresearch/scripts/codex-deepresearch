@@ -13,6 +13,11 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PLUGIN_ROOT.parents[1]
+PLUGIN_SRC = PLUGIN_ROOT / "src"
+sys.path.insert(0, str(PLUGIN_SRC))
+
+from deepresearch import ConfigResolutionError, resolve_config
+
 PLUGIN_NAME = "codex-deepresearch"
 MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
 
@@ -124,6 +129,22 @@ def run_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_resolve_config(args: argparse.Namespace) -> int:
+    try:
+        config = resolve_config(
+            mode=args.mode,
+            search_provider=args.search_provider,
+            vlm_provider=args.vlm_provider,
+            budget_preset=args.budget,
+        )
+    except ConfigResolutionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(config.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -151,6 +172,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for smoke run artifacts, relative to the repo root by default.",
     )
     smoke.set_defaults(func=run_smoke)
+
+    resolve = subparsers.add_parser(
+        "resolve-config",
+        help="Normalize and validate runner execution mode configuration.",
+    )
+    resolve.add_argument(
+        "--mode",
+        required=True,
+        help="Execution mode: codex-plugin, automated-cli, or manual-sources.",
+    )
+    resolve.add_argument(
+        "--search-provider",
+        help="Search provider override for the selected execution mode.",
+    )
+    resolve.add_argument(
+        "--vlm-provider",
+        help="VLM provider override for the selected execution mode.",
+    )
+    resolve.add_argument(
+        "--budget",
+        default="standard",
+        help="Budget preset: quick, standard, deep, or exhaustive.",
+    )
+    resolve.set_defaults(func=run_resolve_config)
     return parser
 
 

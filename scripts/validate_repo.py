@@ -23,9 +23,12 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/.codex-plugin/plugin.json",
     "plugins/codex-deepresearch/scripts/README.md",
     "plugins/codex-deepresearch/scripts/codex-deepresearch",
+    "plugins/codex-deepresearch/src/deepresearch/__init__.py",
+    "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
+    "tests/test_execution_mode.py",
 ]
 
 
@@ -75,6 +78,31 @@ def main() -> None:
     )
     if help_result.returncode != 0:
         fail("runner script --help must exit 0")
+
+    config_result = subprocess.run(
+        [
+            str(runner),
+            "resolve-config",
+            "--mode",
+            "codex-plugin",
+            "--search-provider",
+            "codex-native",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if config_result.returncode != 0:
+        fail("runner resolve-config must accept codex-plugin + codex-native")
+    try:
+        resolved_config = json.loads(config_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner resolve-config must output valid JSON: {exc}")
+    if resolved_config.get("mode") != "codex-plugin":
+        fail("runner resolve-config did not normalize mode")
+    if resolved_config.get("search_provider") != "codex-native":
+        fail("runner resolve-config did not normalize search provider")
 
     marketplace = read_json(".agents/plugins/marketplace.json")
     entries = marketplace.get("plugins", [])
