@@ -54,6 +54,24 @@ class SearchHandoffTests(unittest.TestCase):
     def load_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def write_json(self, path: Path, payload: dict) -> None:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def manual_source(self) -> dict:
+        return {
+            "id": "src_manual",
+            "type": "web",
+            "url": "https://example.com/manual",
+            "title": "Manual Source",
+            "published_at": None,
+            "accessed_at": "2026-06-22T00:00:00Z",
+            "quality": "unknown",
+            "retrieval_status": "manual",
+            "local_artifact_path": "sources/manual.json",
+            "license_policy": "unknown",
+            "robots_policy": "unknown",
+        }
+
     def test_prepare_creates_valid_handoff_artifacts(self) -> None:
         result = prepare_run(
             question="example search question",
@@ -135,6 +153,61 @@ class SearchHandoffTests(unittest.TestCase):
         fetch_queue = self.load_json(run_dir / "fetch_queue.json")
         self.assertEqual(fetch_queue["entries"], [])
 
+    def test_malformed_urls_are_rejected_without_escaping_ingest(self) -> None:
+        prepared = prepare_run(
+            question="example search question",
+            runs_dir=self.temp_runs_dir(),
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(
+            run_dir,
+            [
+                self.base_search_result(id="sr_bad_bracket", url="https://[::1"),
+                self.base_search_result(id="sr_bad_port", url="https://example.com:bad/path"),
+            ],
+        )
+
+        result = ingest_run(run=run_dir)
+
+        self.assertEqual(result["status"], "ingested_with_rejections")
+        self.assertEqual([error["code"] for error in result["errors"]], ["invalid_url", "invalid_url"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(
+            {source["url"]: source["retrieval_status"] for source in evidence["sources"]},
+            {
+                "https://[::1": "failed",
+                "https://example.com:bad/path": "failed",
+            },
+        )
+        fetch_queue = self.load_json(run_dir / "fetch_queue.json")
+        self.assertEqual(fetch_queue["entries"], [])
+
+    def test_cli_ingest_rejects_malformed_url_without_traceback(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="example search question",
+            runs_dir=runs_dir,
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(
+            run_dir,
+            [self.base_search_result(id="sr_bad_bracket", url="https://[::1")],
+        )
+
+        ingest = subprocess.run(
+            [str(RUNNER), "ingest", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(ingest.returncode, 0, ingest.stderr)
+        self.assertNotIn("Traceback", ingest.stderr)
+        payload = json.loads(ingest.stdout)
+        self.assertEqual(payload["status"], "ingested_with_rejections")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_url")
+
     def test_blocked_policy_decision_and_flags_are_preserved(self) -> None:
         prepared = prepare_run(
             question="example search question",
@@ -164,6 +237,42 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(source["robots_policy"], "disallowed")
         fetch_queue = self.load_json(run_dir / "fetch_queue.json")
         self.assertEqual(fetch_queue["entries"], [])
+
+    def test_reingest_replaces_prior_handoff_sources_and_preserves_manual_sources(self) -> None:
+        prepared = prepare_run(
+            question="example search question",
+            runs_dir=self.temp_runs_dir(),
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(
+            run_dir,
+            [
+                self.base_search_result(id="sr_001", url="https://example.com/one"),
+                self.base_search_result(id="sr_002", url="https://example.com/two"),
+            ],
+        )
+        first = ingest_run(run=run_dir)
+        self.assertEqual(first["fetch_queue_count"], 2)
+
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.load_json(evidence_path)
+        evidence["sources"].append(self.manual_source())
+        self.write_json(evidence_path, evidence)
+
+        self.write_search_results(
+            run_dir,
+            [self.base_search_result(id="sr_001", url="https://example.com/one")],
+        )
+        second = ingest_run(run=run_dir)
+
+        self.assertEqual(second["fetch_queue_count"], 1)
+        self.assertTrue(second["validation"]["valid"], second["validation"]["errors"])
+        evidence = self.load_json(evidence_path)
+        source_ids = {source["id"] for source in evidence["sources"]}
+        self.assertEqual(source_ids, {"src_manual", "src_sr_001"})
+        self.assertNotIn("src_sr_002", source_ids)
+        fetch_queue = self.load_json(run_dir / "fetch_queue.json")
+        self.assertEqual([entry["source_id"] for entry in fetch_queue["entries"]], ["src_sr_001"])
 
     def test_cli_prepare_and_ingest_use_handoff_artifacts(self) -> None:
         runs_dir = self.temp_runs_dir()

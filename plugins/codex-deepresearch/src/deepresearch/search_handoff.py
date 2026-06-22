@@ -213,10 +213,23 @@ def ingest_run(
     sources_dir = run_dir / "sources"
     sources_dir.mkdir(exist_ok=True)
 
+    current_sources = evidence.get("sources", [])
+    if not isinstance(current_sources, list):
+        current_sources = []
+    kept_sources = [
+        source
+        for source in current_sources
+        if not _is_search_handoff_source(source)
+    ]
+    used_source_ids = {
+        source["id"]
+        for source in kept_sources
+        if isinstance(source, Mapping) and isinstance(source.get("id"), str)
+    }
+
     normalized_sources: list[dict[str, Any]] = []
     fetch_entries: list[dict[str, Any]] = []
     ingest_errors: list[dict[str, Any]] = []
-    used_source_ids: set[str] = set()
     for index, record in enumerate(records):
         source, fetchable, error = _source_from_search_result(
             record,
@@ -230,22 +243,6 @@ def ingest_run(
             fetch_entries.append(_fetch_queue_entry(source))
         _write_json(run_dir / source["local_artifact_path"], source)
 
-    current_sources = evidence.get("sources", [])
-    if not isinstance(current_sources, list):
-        current_sources = []
-    result_ids = {record["id"] for record in records}
-    generated_ids = {source["id"] for source in normalized_sources}
-    kept_sources = [
-        source
-        for source in current_sources
-        if not (
-            isinstance(source, Mapping)
-            and (
-                source.get("search_result_id") in result_ids
-                or source.get("id") in generated_ids
-            )
-        )
-    ]
     evidence["sources"] = kept_sources + normalized_sources
     evidence["handoff"] = {
         "schema_version": HANDOFF_SCHEMA_VERSION,
@@ -406,6 +403,10 @@ def _fetch_queue_entry(source: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_search_handoff_source(source: Any) -> bool:
+    return isinstance(source, Mapping) and "search_result_id" in source
+
+
 def _budget_to_evidence(preset: str, budget: BudgetPreset) -> dict[str, Any]:
     data = asdict(budget)
     data["preset"] = preset
@@ -493,8 +494,13 @@ def _robots_policy(policy_decision: str, policy_flags: Sequence[Any]) -> str:
 def _is_fetchable_url(url: str) -> bool:
     if not url or any(character.isspace() for character in url):
         return False
-    parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and bool(hostname)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
