@@ -24,10 +24,16 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/scripts/README.md",
     "plugins/codex-deepresearch/scripts/codex-deepresearch",
     "plugins/codex-deepresearch/src/deepresearch/__init__.py",
+    "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
+    "tests/fixtures/evidence_schema/valid_evidence.json",
+    "tests/fixtures/evidence_schema/search_results.jsonl",
+    "tests/fixtures/evidence_schema/visual_observations.jsonl",
+    "tests/fixtures/evidence_schema/verifier_votes.jsonl",
+    "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
 ]
 
@@ -103,6 +109,33 @@ def main() -> None:
         fail("runner resolve-config did not normalize mode")
     if resolved_config.get("search_provider") != "codex-native":
         fail("runner resolve-config did not normalize search provider")
+
+    evidence_result = subprocess.run(
+        [
+            str(runner),
+            "validate-evidence",
+            "--evidence",
+            "tests/fixtures/evidence_schema/valid_evidence.json",
+            "--search-results",
+            "tests/fixtures/evidence_schema/search_results.jsonl",
+            "--visual-observations",
+            "tests/fixtures/evidence_schema/visual_observations.jsonl",
+            "--verifier-votes",
+            "tests/fixtures/evidence_schema/verifier_votes.jsonl",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if evidence_result.returncode != 0:
+        fail("runner validate-evidence must accept valid fixture artifacts")
+    try:
+        evidence_validation = json.loads(evidence_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner validate-evidence must output valid JSON: {exc}")
+    if evidence_validation.get("valid") is not True:
+        fail("runner validate-evidence did not report valid fixture artifacts")
 
     marketplace = read_json(".agents/plugins/marketplace.json")
     entries = marketplace.get("plugins", [])

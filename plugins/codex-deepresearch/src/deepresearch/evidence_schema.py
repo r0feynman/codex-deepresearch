@@ -1,0 +1,732 @@
+"""Schema-level validation for Codex DeepResearch evidence artifacts."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+
+EVIDENCE_SCHEMA_VERSION = "0.1.0"
+
+MODES = ("codex-plugin", "automated-cli", "manual-sources")
+SEARCH_PROVIDERS = ("codex-native", "openai", "brave", "tavily", "serpapi", "manual")
+VLM_PROVIDERS = (
+    "codex-interactive",
+    "openai-responses-vision",
+    "manual-visual-review",
+)
+SOURCE_TYPES = ("web", "pdf", "image", "screenshot")
+SOURCE_QUALITIES = ("primary", "secondary", "blog", "forum", "unknown")
+SOURCE_RETRIEVAL_STATUSES = ("fetched", "failed", "partial", "manual")
+SOURCE_LICENSE_POLICIES = ("unknown", "allowed", "restricted", "manual_review")
+SOURCE_ROBOTS_POLICIES = ("unknown", "allowed", "disallowed", "manual_review")
+CLAIM_TYPES = ("text", "visual", "mixed")
+VERIFICATION_STATUSES = (
+    "supported",
+    "refuted",
+    "disputed",
+    "insufficient_evidence",
+    "needs_visual_evidence",
+    "budget_pruned",
+    "policy_blocked",
+    "unverified",
+)
+REVIEW_STATUSES = (
+    "not_reviewed",
+    "auto_reviewed",
+    "human_accepted",
+    "human_rejected",
+    "needs_more_evidence",
+)
+PROMOTION_STATUSES = (
+    "not_eligible",
+    "eligible",
+    "promoted_memory",
+    "promoted_playbook",
+    "promoted_skill",
+    "promoted_prd",
+    "promotion_rejected",
+)
+CONFIDENCE_LEVELS = ("high", "medium", "low")
+VISUAL_ORIGINS = ("page_image", "image_search", "screenshot", "user_upload", "manual")
+ANALYSIS_STATUSES = (
+    "analyzed",
+    "failed",
+    "skipped",
+    "needs_manual_review",
+    "policy_blocked",
+)
+SEARCH_ROUTES = ("text_only", "visual_required", "visual_optional")
+SEARCH_RESULT_TYPES = ("web", "pdf", "image", "news", "academic", "manual")
+FRESHNESS_REQUIREMENTS = ("latest", "recent", "historical", "any")
+POLICY_DECISIONS = ("allowed", "blocked", "manual_review")
+VERIFIER_TYPES = ("text", "visual", "policy", "freshness")
+VERIFIER_METHODS = ("codex-subagent", "runner-agent", "model-call", "manual-review")
+VERIFIER_VOTES = ("support", "refute", "uncertain", "blocked")
+
+
+@dataclass(frozen=True)
+class ValidationError:
+    path: str
+    code: str
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    valid: bool
+    errors: tuple[ValidationError, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "errors": [error.to_dict() for error in self.errors],
+        }
+
+
+class _Collector:
+    def __init__(self) -> None:
+        self.errors: list[ValidationError] = []
+
+    def add(self, path: str, code: str, message: str) -> None:
+        self.errors.append(ValidationError(path=path, code=code, message=message))
+
+
+def validate_artifacts(
+    *,
+    evidence_path: str | Path | None = None,
+    search_results_path: str | Path | None = None,
+    visual_observations_path: str | Path | None = None,
+    verifier_votes_path: str | Path | None = None,
+) -> ValidationResult:
+    """Validate one or more evidence-related artifacts."""
+
+    collector = _Collector()
+    if not any(
+        [evidence_path, search_results_path, visual_observations_path, verifier_votes_path]
+    ):
+        collector.add("$", "missing_input", "at least one artifact path is required")
+        return _result(collector)
+
+    evidence = _load_json(Path(evidence_path), "$.evidence", collector) if evidence_path else None
+    search_results = (
+        _load_jsonl(Path(search_results_path), "$.search_results", collector)
+        if search_results_path
+        else None
+    )
+    visual_observations = (
+        _load_jsonl(Path(visual_observations_path), "$.visual_observations", collector)
+        if visual_observations_path
+        else None
+    )
+    verifier_votes = (
+        _load_jsonl(Path(verifier_votes_path), "$.verifier_votes", collector)
+        if verifier_votes_path
+        else None
+    )
+
+    context = _ValidationContext()
+    if isinstance(evidence, Mapping):
+        _validate_evidence(evidence, collector, context)
+    elif evidence is not None:
+        collector.add("$.evidence", "invalid_type", "evidence artifact must be a JSON object")
+
+    if search_results is not None:
+        _validate_search_results(search_results, collector, context)
+    if visual_observations is not None:
+        _validate_visual_observations(visual_observations, collector, context)
+    if verifier_votes is not None:
+        _validate_verifier_votes(verifier_votes, collector, context, "$.verifier_votes")
+
+    return _result(collector)
+
+
+class _ValidationContext:
+    def __init__(self) -> None:
+        self.mode: str | None = None
+        self.source_ids: set[str] = set()
+        self.image_ids: set[str] = set()
+        self.claim_ids: set[str] = set()
+        self.angle_routes: dict[str, str] = {}
+        self.search_task_ids: set[str] = set()
+
+
+def _result(collector: _Collector) -> ValidationResult:
+    return ValidationResult(valid=not collector.errors, errors=tuple(collector.errors))
+
+
+def _load_json(path: Path, json_path: str, collector: _Collector) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        collector.add(json_path, "missing_file", f"file not found: {path}")
+    except json.JSONDecodeError as exc:
+        collector.add(json_path, "invalid_json", f"invalid JSON: {exc}")
+    return None
+
+
+def _load_jsonl(path: Path, json_path: str, collector: _Collector) -> list[Any] | None:
+    records: list[Any] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        collector.add(json_path, "missing_file", f"file not found: {path}")
+        return None
+
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        record_path = f"{json_path}[{index}]"
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            collector.add(record_path, "invalid_jsonl_record", f"invalid JSONL record: {exc}")
+    return records
+
+
+def _validate_evidence(
+    evidence: Mapping[str, Any],
+    collector: _Collector,
+    context: _ValidationContext,
+) -> None:
+    _require_fields(
+        evidence,
+        "$.evidence",
+        ("schema_version", "run_id", "created_at", "mode", "search_provider", "vlm_provider"),
+        collector,
+    )
+    _check_enum(evidence, "schema_version", (EVIDENCE_SCHEMA_VERSION,), "$.evidence", collector)
+    context.mode = _check_enum(evidence, "mode", MODES, "$.evidence", collector)
+    _check_enum(evidence, "search_provider", SEARCH_PROVIDERS, "$.evidence", collector)
+    _check_enum(evidence, "vlm_provider", VLM_PROVIDERS, "$.evidence", collector)
+
+    sources = _optional_list(evidence, "sources", "$.evidence", collector)
+    if sources is not None:
+        for index, source in enumerate(sources):
+            source_path = f"$.evidence.sources[{index}]"
+            if not _require_object(source, source_path, collector):
+                continue
+            source_id = _validate_source(source, source_path, collector)
+            if source_id is not None:
+                _add_unique_id(source_id, context.source_ids, source_path, collector)
+
+    routing = _optional_list(evidence, "routing", "$.evidence", collector)
+    if routing is not None:
+        for index, route in enumerate(routing):
+            route_path = f"$.evidence.routing[{index}]"
+            if not _require_object(route, route_path, collector):
+                continue
+            angle_id = _optional_string(route, "id", route_path, collector)
+            modality = _check_enum(route, "modality", SEARCH_ROUTES, route_path, collector)
+            if angle_id is not None and modality is not None:
+                context.angle_routes[angle_id] = modality
+
+    images = _optional_list(evidence, "images", "$.evidence", collector)
+    if images is not None:
+        for index, image in enumerate(images):
+            image_path = f"$.evidence.images[{index}]"
+            if not _require_object(image, image_path, collector):
+                continue
+            image_id = _validate_visual_evidence(image, image_path, collector, context)
+            if image_id is not None:
+                _add_unique_id(image_id, context.image_ids, image_path, collector)
+
+    claims = _optional_list(evidence, "claims", "$.evidence", collector)
+    if claims is not None:
+        for index, claim in enumerate(claims):
+            claim_path = f"$.evidence.claims[{index}]"
+            if not _require_object(claim, claim_path, collector):
+                continue
+            claim_id = _optional_string(claim, "id", claim_path, collector)
+            if claim_id is not None:
+                _add_unique_id(claim_id, context.claim_ids, claim_path, collector)
+        for index, claim in enumerate(claims):
+            if isinstance(claim, Mapping):
+                _validate_claim(claim, f"$.evidence.claims[{index}]", collector, context)
+
+
+def _validate_source(
+    source: Mapping[str, Any],
+    path: str,
+    collector: _Collector,
+) -> str | None:
+    _require_fields(
+        source,
+        path,
+        (
+            "id",
+            "type",
+            "url",
+            "title",
+            "accessed_at",
+            "quality",
+            "retrieval_status",
+            "local_artifact_path",
+            "license_policy",
+            "robots_policy",
+        ),
+        collector,
+    )
+    source_id = _optional_string(source, "id", path, collector)
+    _check_enum(source, "type", SOURCE_TYPES, path, collector)
+    _check_string(source, "accessed_at", path, collector)
+    _check_enum(source, "quality", SOURCE_QUALITIES, path, collector)
+    _check_enum(source, "retrieval_status", SOURCE_RETRIEVAL_STATUSES, path, collector)
+    _check_string(source, "local_artifact_path", path, collector)
+    _check_enum(source, "license_policy", SOURCE_LICENSE_POLICIES, path, collector)
+    _check_enum(source, "robots_policy", SOURCE_ROBOTS_POLICIES, path, collector)
+    return source_id
+
+
+def _validate_visual_evidence(
+    image: Mapping[str, Any],
+    path: str,
+    collector: _Collector,
+    context: _ValidationContext,
+) -> str | None:
+    _require_fields(
+        image,
+        path,
+        (
+            "id",
+            "source_id",
+            "origin",
+            "local_artifact_path",
+            "mime_type",
+            "width",
+            "height",
+            "observations",
+            "inferences",
+            "visual_tasks",
+            "analysis_provider",
+            "analysis_status",
+            "policy_flags",
+            "caveats",
+        ),
+        collector,
+    )
+    image_id = _optional_string(image, "id", path, collector)
+    source_id = _optional_string(image, "source_id", path, collector)
+    if source_id is not None and context.source_ids and source_id not in context.source_ids:
+        collector.add(
+            f"{path}.source_id",
+            "dangling_reference",
+            f"image source_id '{source_id}' does not reference an existing source",
+        )
+    _check_enum(image, "origin", VISUAL_ORIGINS, path, collector)
+    if not image.get("page_url") and not image.get("image_url"):
+        collector.add(
+            path,
+            "missing_required_field",
+            "VisualEvidence requires at least one of page_url or image_url",
+        )
+    _check_string(image, "local_artifact_path", path, collector)
+    _check_string(image, "mime_type", path, collector)
+    _check_number(image, "width", path, collector)
+    _check_number(image, "height", path, collector)
+    _check_list(image, "observations", path, collector)
+    _check_list(image, "inferences", path, collector)
+    _check_list(image, "visual_tasks", path, collector)
+    _check_enum(image, "analysis_provider", VLM_PROVIDERS, path, collector)
+    _check_enum(image, "analysis_status", ANALYSIS_STATUSES, path, collector)
+    _check_list(image, "policy_flags", path, collector)
+    _check_list(image, "caveats", path, collector)
+    return image_id
+
+
+def _validate_claim(
+    claim: Mapping[str, Any],
+    path: str,
+    collector: _Collector,
+    context: _ValidationContext,
+) -> None:
+    _require_fields(
+        claim,
+        path,
+        (
+            "id",
+            "text",
+            "claim_type",
+            "supporting_sources",
+            "supporting_images",
+            "quote_spans",
+            "verification_status",
+            "review_status",
+            "promotion_status",
+            "confidence",
+            "caveats",
+        ),
+        collector,
+    )
+    _optional_string(claim, "id", path, collector)
+    _check_string(claim, "text", path, collector)
+    claim_type = _check_enum(claim, "claim_type", CLAIM_TYPES, path, collector)
+    _check_enum(claim, "verification_status", VERIFICATION_STATUSES, path, collector)
+    _check_enum(claim, "review_status", REVIEW_STATUSES, path, collector)
+    _check_enum(claim, "promotion_status", PROMOTION_STATUSES, path, collector)
+    confidence = _check_enum(claim, "confidence", CONFIDENCE_LEVELS, path, collector)
+    _check_list(claim, "caveats", path, collector)
+
+    supporting_sources = _check_string_list(claim, "supporting_sources", path, collector)
+    for source_id in supporting_sources:
+        if source_id not in context.source_ids:
+            collector.add(
+                f"{path}.supporting_sources",
+                "dangling_reference",
+                f"claim references unknown source '{source_id}'",
+            )
+
+    supporting_images = _check_string_list(claim, "supporting_images", path, collector)
+    for image_id in supporting_images:
+        if image_id not in context.image_ids:
+            collector.add(
+                f"{path}.supporting_images",
+                "dangling_reference",
+                f"claim references unknown image '{image_id}'",
+            )
+
+    quote_spans = _check_list(claim, "quote_spans", path, collector)
+    for index, quote_span in enumerate(quote_spans):
+        quote_path = f"{path}.quote_spans[{index}]"
+        if not _require_object(quote_span, quote_path, collector):
+            continue
+        _require_fields(quote_span, quote_path, ("source_id", "quote", "location"), collector)
+        source_id = _optional_string(quote_span, "source_id", quote_path, collector)
+        _check_string(quote_span, "quote", quote_path, collector)
+        _check_string(quote_span, "location", quote_path, collector)
+        if source_id is not None and source_id not in context.source_ids:
+            collector.add(
+                f"{quote_path}.source_id",
+                "dangling_reference",
+                f"quote span references unknown source '{source_id}'",
+            )
+
+    if confidence == "high" and claim_type == "text" and not quote_spans:
+        collector.add(
+            f"{path}.quote_spans",
+            "missing_text_evidence",
+            "high-confidence text claims require at least one quote span",
+        )
+    if confidence == "high" and claim_type in {"visual", "mixed"} and not supporting_images:
+        collector.add(
+            f"{path}.supporting_images",
+            "missing_visual_evidence",
+            "high-confidence visual or mixed claims require image evidence",
+        )
+
+    votes = claim.get("votes", [])
+    if votes is None:
+        return
+    if not isinstance(votes, list):
+        collector.add(f"{path}.votes", "invalid_type", "votes must be a list")
+        return
+    _validate_verifier_votes(votes, collector, context, f"{path}.votes")
+
+
+def _validate_search_results(
+    records: Sequence[Any],
+    collector: _Collector,
+    context: _ValidationContext,
+) -> None:
+    for index, record in enumerate(records):
+        path = f"$.search_results[{index}]"
+        if not _require_object(record, path, collector):
+            continue
+        _require_fields(
+            record,
+            path,
+            (
+                "id",
+                "task_id",
+                "angle_id",
+                "route",
+                "provider",
+                "query",
+                "url",
+                "title",
+                "snippet",
+                "result_type",
+                "rank",
+                "freshness_requirement",
+                "accessed_at",
+                "language",
+                "region",
+                "policy_decision",
+                "policy_flags",
+                "raw_provider_metadata",
+            ),
+            collector,
+        )
+        _optional_string(record, "id", path, collector)
+        task_id = _optional_string(record, "task_id", path, collector)
+        if task_id is not None and context.search_task_ids and task_id not in context.search_task_ids:
+            collector.add(
+                f"{path}.task_id",
+                "dangling_reference",
+                f"search result references unknown search task '{task_id}'",
+            )
+        angle_id = _optional_string(record, "angle_id", path, collector)
+        route = _check_enum(record, "route", SEARCH_ROUTES, path, collector)
+        if angle_id is not None and context.angle_routes:
+            expected_route = context.angle_routes.get(angle_id)
+            if expected_route is None:
+                collector.add(
+                    f"{path}.angle_id",
+                    "dangling_reference",
+                    f"search result references unknown routed angle '{angle_id}'",
+                )
+            elif route is not None and expected_route != route:
+                collector.add(
+                    f"{path}.route",
+                    "route_mismatch",
+                    f"route '{route}' does not match angle '{angle_id}' route '{expected_route}'",
+                )
+        provider = _check_enum(record, "provider", SEARCH_PROVIDERS, path, collector)
+        if provider == "codex-native" and context.mode and context.mode != "codex-plugin":
+            collector.add(
+                f"{path}.provider",
+                "invalid_provider_for_mode",
+                "provider 'codex-native' is valid only in codex-plugin mode",
+            )
+        _check_string(record, "query", path, collector)
+        _check_string(record, "url", path, collector)
+        _check_string(record, "title", path, collector)
+        _check_string(record, "snippet", path, collector)
+        _check_enum(record, "result_type", SEARCH_RESULT_TYPES, path, collector)
+        _check_number(record, "rank", path, collector)
+        _check_enum(record, "freshness_requirement", FRESHNESS_REQUIREMENTS, path, collector)
+        _check_string(record, "accessed_at", path, collector)
+        _check_string(record, "language", path, collector)
+        _check_string(record, "region", path, collector)
+        _check_enum(record, "policy_decision", POLICY_DECISIONS, path, collector)
+        _check_list(record, "policy_flags", path, collector)
+        if "raw_provider_metadata" in record and not isinstance(
+            record["raw_provider_metadata"], Mapping
+        ):
+            collector.add(
+                f"{path}.raw_provider_metadata",
+                "invalid_type",
+                "raw_provider_metadata must be an object",
+            )
+
+
+def _validate_visual_observations(
+    records: Sequence[Any],
+    collector: _Collector,
+    context: _ValidationContext,
+) -> None:
+    for index, record in enumerate(records):
+        path = f"$.visual_observations[{index}]"
+        if not _require_object(record, path, collector):
+            continue
+        image_id = _validate_visual_evidence(record, path, collector, context)
+        if image_id is not None and context.image_ids and image_id not in context.image_ids:
+            collector.add(
+                f"{path}.id",
+                "dangling_reference",
+                f"visual observation references unknown image '{image_id}'",
+            )
+
+
+def _validate_verifier_votes(
+    records: Sequence[Any],
+    collector: _Collector,
+    context: _ValidationContext,
+    base_path: str,
+) -> None:
+    for index, record in enumerate(records):
+        path = f"{base_path}[{index}]"
+        if isinstance(record, str):
+            continue
+        if not _require_object(record, path, collector):
+            continue
+        _require_fields(
+            record,
+            path,
+            (
+                "id",
+                "claim_id",
+                "verifier_type",
+                "agent_name",
+                "method",
+                "model_or_tool",
+                "vote",
+                "confidence",
+                "evidence_refs",
+                "rationale",
+                "created_at",
+            ),
+            collector,
+        )
+        _optional_string(record, "id", path, collector)
+        claim_id = _optional_string(record, "claim_id", path, collector)
+        if claim_id is not None and context.claim_ids and claim_id not in context.claim_ids:
+            collector.add(
+                f"{path}.claim_id",
+                "dangling_reference",
+                f"verifier vote references unknown claim '{claim_id}'",
+            )
+        _check_enum(record, "verifier_type", VERIFIER_TYPES, path, collector)
+        _check_string(record, "agent_name", path, collector)
+        _check_enum(record, "method", VERIFIER_METHODS, path, collector)
+        _check_string(record, "model_or_tool", path, collector)
+        _check_enum(record, "vote", VERIFIER_VOTES, path, collector)
+        _check_number(record, "confidence", path, collector)
+        evidence_refs = _check_string_list(record, "evidence_refs", path, collector)
+        known_refs = context.source_ids | context.image_ids
+        for reference in evidence_refs:
+            if known_refs and reference not in known_refs:
+                collector.add(
+                    f"{path}.evidence_refs",
+                    "dangling_reference",
+                    f"verifier vote references unknown evidence '{reference}'",
+                )
+        _check_string(record, "rationale", path, collector)
+        _check_string(record, "created_at", path, collector)
+
+
+def _require_object(value: Any, path: str, collector: _Collector) -> bool:
+    if isinstance(value, Mapping):
+        return True
+    collector.add(path, "invalid_type", "expected an object")
+    return False
+
+
+def _require_fields(
+    record: Mapping[str, Any],
+    path: str,
+    fields: Iterable[str],
+    collector: _Collector,
+) -> None:
+    for field in fields:
+        if field not in record:
+            collector.add(
+                f"{path}.{field}",
+                "missing_required_field",
+                f"missing required field '{field}'",
+            )
+
+
+def _optional_list(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> list[Any] | None:
+    if field not in record:
+        return None
+    return _check_list(record, field, path, collector)
+
+
+def _check_list(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> list[Any]:
+    if field not in record:
+        return []
+    value = record[field]
+    if isinstance(value, list):
+        return value
+    collector.add(f"{path}.{field}", "invalid_type", f"{field} must be a list")
+    return []
+
+
+def _check_string_list(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> list[str]:
+    values = _check_list(record, field, path, collector)
+    strings: list[str] = []
+    for index, value in enumerate(values):
+        if isinstance(value, str) and value:
+            strings.append(value)
+        else:
+            collector.add(
+                f"{path}.{field}[{index}]",
+                "invalid_type",
+                f"{field} entries must be non-empty strings",
+            )
+    return strings
+
+
+def _optional_string(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> str | None:
+    if field not in record:
+        return None
+    return _check_string(record, field, path, collector)
+
+
+def _check_string(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> str | None:
+    if field not in record:
+        return None
+    value = record[field]
+    if isinstance(value, str) and value:
+        return value
+    collector.add(f"{path}.{field}", "invalid_type", f"{field} must be a non-empty string")
+    return None
+
+
+def _check_number(
+    record: Mapping[str, Any],
+    field: str,
+    path: str,
+    collector: _Collector,
+) -> float | int | None:
+    if field not in record:
+        return None
+    value = record[field]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    collector.add(f"{path}.{field}", "invalid_type", f"{field} must be a number")
+    return None
+
+
+def _check_enum(
+    record: Mapping[str, Any],
+    field: str,
+    allowed: tuple[str, ...],
+    path: str,
+    collector: _Collector,
+) -> str | None:
+    if field not in record:
+        return None
+    value = _check_string(record, field, path, collector)
+    if value is None:
+        return None
+    if value in allowed:
+        return value
+    collector.add(
+        f"{path}.{field}",
+        "invalid_enum",
+        f"{field} must be one of: {', '.join(allowed)}",
+    )
+    return None
+
+
+def _add_unique_id(
+    value: str,
+    known_ids: set[str],
+    path: str,
+    collector: _Collector,
+) -> None:
+    if value in known_ids:
+        collector.add(f"{path}.id", "duplicate_id", f"duplicate id '{value}'")
+    known_ids.add(value)

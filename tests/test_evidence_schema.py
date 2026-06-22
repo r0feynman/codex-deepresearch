@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresearch"
+PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
+FIXTURES = ROOT / "tests" / "fixtures" / "evidence_schema"
+sys.path.insert(0, str(PLUGIN_SRC))
+
+from deepresearch import validate_artifacts
+
+
+class EvidenceSchemaValidatorTests(unittest.TestCase):
+    def fixture(self, name: str) -> Path:
+        return FIXTURES / name
+
+    def load_valid_evidence(self) -> dict:
+        return json.loads(self.fixture("valid_evidence.json").read_text(encoding="utf-8"))
+
+    def write_evidence(self, evidence: dict) -> Path:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "evidence.json"
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+        return path
+
+    def assert_error_code(self, result, code: str) -> None:
+        codes = {error.code for error in result.errors}
+        self.assertIn(code, codes, [error.to_dict() for error in result.errors])
+
+    def test_valid_fixture_and_adapter_records_pass(self) -> None:
+        result = validate_artifacts(
+            evidence_path=self.fixture("valid_evidence.json"),
+            search_results_path=self.fixture("search_results.jsonl"),
+            visual_observations_path=self.fixture("visual_observations.jsonl"),
+            verifier_votes_path=self.fixture("verifier_votes.jsonl"),
+        )
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+        self.assertEqual(result.errors, ())
+
+    def test_missing_required_state_fields_fails(self) -> None:
+        evidence = self.load_valid_evidence()
+        claim = evidence["claims"][0]
+        del claim["verification_status"]
+        del claim["review_status"]
+        del claim["promotion_status"]
+
+        result = validate_artifacts(evidence_path=self.write_evidence(evidence))
+
+        self.assertFalse(result.valid)
+        missing_paths = {error.path for error in result.errors}
+        self.assertIn("$.evidence.claims[0].verification_status", missing_paths)
+        self.assertIn("$.evidence.claims[0].review_status", missing_paths)
+        self.assertIn("$.evidence.claims[0].promotion_status", missing_paths)
+
+    def test_dangling_source_and_image_references_fail(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["images"][0]["source_id"] = "src_missing"
+        claim = evidence["claims"][1]
+        claim["supporting_sources"] = ["src_missing"]
+        claim["supporting_images"] = ["img_missing"]
+        claim["quote_spans"] = [
+            {
+                "source_id": "src_missing",
+                "quote": "Missing quote",
+                "location": "paragraph 9",
+            }
+        ]
+        claim["votes"][0]["evidence_refs"] = ["img_missing"]
+
+        result = validate_artifacts(evidence_path=self.write_evidence(evidence))
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        dangling_paths = {error.path for error in result.errors if error.code == "dangling_reference"}
+        self.assertIn("$.evidence.images[0].source_id", dangling_paths)
+        self.assertIn("$.evidence.claims[1].supporting_sources", dangling_paths)
+        self.assertIn("$.evidence.claims[1].supporting_images", dangling_paths)
+        self.assertIn("$.evidence.claims[1].quote_spans[0].source_id", dangling_paths)
+        self.assertIn("$.evidence.claims[1].votes[0].evidence_refs", dangling_paths)
+
+    def test_high_confidence_visual_claim_without_image_evidence_fails(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["claims"][1]["supporting_images"] = []
+
+        result = validate_artifacts(evidence_path=self.write_evidence(evidence))
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "missing_visual_evidence")
+
+    def test_cli_outputs_json_for_pass_and_fail_cases(self) -> None:
+        passing = subprocess.run(
+            [
+                str(RUNNER),
+                "validate-evidence",
+                "--evidence",
+                str(self.fixture("valid_evidence.json")),
+                "--search-results",
+                str(self.fixture("search_results.jsonl")),
+                "--visual-observations",
+                str(self.fixture("visual_observations.jsonl")),
+                "--verifier-votes",
+                str(self.fixture("verifier_votes.jsonl")),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(passing.returncode, 0, passing.stderr)
+        self.assertTrue(json.loads(passing.stdout)["valid"])
+
+        evidence = self.load_valid_evidence()
+        evidence["claims"][1]["supporting_images"] = []
+        failing = subprocess.run(
+            [
+                str(RUNNER),
+                "validate-evidence",
+                "--evidence",
+                str(self.write_evidence(evidence)),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(failing.returncode, 2)
+        payload = json.loads(failing.stdout)
+        self.assertFalse(payload["valid"])
+        self.assertEqual(payload["errors"][0]["code"], "missing_visual_evidence")
+
+
+if __name__ == "__main__":
+    unittest.main()

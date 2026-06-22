@@ -16,7 +16,7 @@ REPO_ROOT = PLUGIN_ROOT.parents[1]
 PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import ConfigResolutionError, resolve_config
+from deepresearch import ConfigResolutionError, resolve_config, validate_artifacts
 
 PLUGIN_NAME = "codex-deepresearch"
 MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
@@ -145,6 +145,17 @@ def run_resolve_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_validate_evidence(args: argparse.Namespace) -> int:
+    result = validate_artifacts(
+        evidence_path=args.evidence,
+        search_results_path=args.search_results,
+        visual_observations_path=args.visual_observations,
+        verifier_votes_path=args.verifier_votes,
+    )
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    return 0 if result.valid else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -198,6 +209,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Budget preset: quick, standard, deep, or exhaustive.",
     )
     resolve.set_defaults(func=run_resolve_config)
+
+    validate = subparsers.add_parser(
+        "validate-evidence",
+        help="Validate evidence and adapter handoff artifacts.",
+    )
+    validate.add_argument(
+        "--evidence",
+        help="Path to evidence.json.",
+    )
+    validate.add_argument(
+        "--search-results",
+        help="Path to search_results.jsonl.",
+    )
+    validate.add_argument(
+        "--visual-observations",
+        help="Path to visual_observations.jsonl.",
+    )
+    validate.add_argument(
+        "--verifier-votes",
+        help="Path to verifier_votes.jsonl.",
+    )
+    validate.set_defaults(func=run_validate_evidence)
     return parser
 
 
