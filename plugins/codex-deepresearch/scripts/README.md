@@ -1,6 +1,6 @@
 # Plugin Scripts
 
-`codex-deepresearch` is the plugin-local developer runner. It validates the plugin scaffold, starts smoke run directories, and normalizes execution-mode configuration before later pipeline stages are added.
+`codex-deepresearch` is the plugin-local developer runner. It validates the plugin scaffold, starts smoke run directories, normalizes execution-mode configuration, and manages Codex-native search handoff artifacts.
 
 ## Smoke
 
@@ -21,6 +21,24 @@ plugins/codex-deepresearch/scripts/codex-deepresearch resolve-config --mode code
 ```
 
 The command prints deterministic JSON on success, including a normalized `budget_preset` field. `--budget` remains available as a shorter alias for `--budget-preset`. Invalid mode/provider combinations exit nonzero with a clear error.
+
+## Search Handoff
+
+Use `prepare` to create a plugin-mode run directory without calling any hidden Codex search API:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch prepare "What evidence is available?"
+```
+
+The command writes `evidence.json`, `search_tasks.json`, an empty `search_results.jsonl`, `visual_tasks.json`, and an empty `visual_observations.jsonl` under `research-runs/<run_id>/`. Codex should perform search in the active session and append one `SearchResult` JSON object per line to `search_results.jsonl`.
+
+Then ingest only the handoff artifact:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>
+```
+
+`ingest` validates `search_results.jsonl`, normalizes records into `evidence.json.sources`, and writes `fetch_queue.json` for allowed, fetchable `http`/`https` sources. Invalid URLs and blocked/manual-review policy decisions are preserved in evidence with `retrieval_status=failed` and explicit ingest errors, but they are not added to the fetch queue.
 
 ## Install
 

@@ -27,6 +27,17 @@ Use this skill when the user asks for deep research, source-backed investigation
    - source list
    - visual appendix when visual evidence was used
 
+## Codex Plugin Handoff
+
+In plugin mode, do not assume a hidden Codex search API is available to the runner. Use explicit handoff artifacts:
+
+1. Run `plugins/codex-deepresearch/scripts/codex-deepresearch prepare "<question>"`.
+2. Read the generated `search_tasks.json`.
+3. Use the current Codex session's available search capability to perform each task.
+4. Write one `SearchResult` JSON object per line to `search_results.jsonl`, preserving task id, angle id, route, provider, query, URL, title, snippet, result type, rank, freshness, access time, policy decision, policy flags, and raw provider metadata.
+5. Run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>`.
+6. Continue only from the normalized `evidence.json` and `fetch_queue.json` artifacts.
+
 ## Evidence Rules
 
 - Prefer primary sources, official documentation, original reports, papers, repositories, or direct screenshots.

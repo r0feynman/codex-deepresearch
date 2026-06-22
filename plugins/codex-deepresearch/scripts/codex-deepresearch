@@ -17,6 +17,7 @@ PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ConfigResolutionError, resolve_config, validate_artifacts
+from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
 
 PLUGIN_NAME = "codex-deepresearch"
 MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
@@ -34,6 +35,13 @@ def read_json(path: Path) -> dict:
         fail(f"missing required file: {path.relative_to(REPO_ROOT)}")
     except json.JSONDecodeError as exc:
         fail(f"invalid JSON in {path.relative_to(REPO_ROOT)}: {exc}")
+
+
+def resolve_repo_path(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
 
 
 def validate_manifest() -> dict:
@@ -156,6 +164,46 @@ def run_validate_evidence(args: argparse.Namespace) -> int:
     return 0 if result.valid else 2
 
 
+def run_prepare(args: argparse.Namespace) -> int:
+    try:
+        result = prepare_run(
+            question=args.question,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            mode=args.mode,
+            search_provider=args.search_provider,
+            vlm_provider=args.vlm_provider,
+            budget_preset=args.budget,
+            freshness_requirement=args.freshness_requirement,
+            route=args.route,
+            max_results=args.max_results,
+        )
+    except (ConfigResolutionError, SearchHandoffError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_ingest(args: argparse.Namespace) -> int:
+    try:
+        result = ingest_run(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+        )
+    except SearchHandoffError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if result["status"] in {"blocked_missing_search_handoff", "failed_validation"}:
+        return 2
+    validation = result.get("validation")
+    if isinstance(validation, dict) and validation.get("valid") is False:
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -231,6 +279,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to verifier_votes.jsonl.",
     )
     validate.set_defaults(func=run_validate_evidence)
+
+    prepare = subparsers.add_parser(
+        "prepare",
+        help="Create a Codex-native search handoff run directory.",
+    )
+    prepare.add_argument("question", help="Research question to hand off to Codex search.")
+    prepare.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    prepare.add_argument(
+        "--mode",
+        default="codex-plugin",
+        help="Execution mode. M4 supports codex-plugin.",
+    )
+    prepare.add_argument(
+        "--search-provider",
+        default="codex-native",
+        help="Search provider. M4 supports codex-native.",
+    )
+    prepare.add_argument(
+        "--vlm-provider",
+        help="VLM provider override for the selected execution mode.",
+    )
+    prepare.add_argument(
+        "--budget",
+        "--budget-preset",
+        dest="budget",
+        default="standard",
+        help="Budget preset: quick, standard, deep, or exhaustive.",
+    )
+    prepare.add_argument(
+        "--freshness-requirement",
+        default="any",
+        help="Search freshness requirement: latest, recent, historical, or any.",
+    )
+    prepare.add_argument(
+        "--route",
+        default="text_only",
+        help="Search route: text_only, visual_required, or visual_optional.",
+    )
+    prepare.add_argument(
+        "--max-results",
+        type=int,
+        default=8,
+        help="Maximum expected SearchResult records for the generated task.",
+    )
+    prepare.set_defaults(func=run_prepare)
+
+    ingest = subparsers.add_parser(
+        "ingest",
+        help="Ingest SearchResult records from a prepared run directory.",
+    )
+    ingest.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    ingest.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    ingest.set_defaults(func=run_ingest)
     return parser
 
 

@@ -26,6 +26,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/__init__.py",
     "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
+    "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
@@ -35,6 +36,7 @@ REQUIRED_FILES = [
     "tests/fixtures/evidence_schema/verifier_votes.jsonl",
     "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
+    "tests/test_search_handoff.py",
 ]
 
 
