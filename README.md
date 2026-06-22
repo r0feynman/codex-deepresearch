@@ -13,6 +13,8 @@ Current contents:
 - Product requirements in `docs/codex-deepresearch-prd.md`
 - Development management plan in `docs/codex-deepresearch-project-management.md`
 - Visual project-management explainer in `docs/codex-deepresearch-project-management.html`
+- Session handoff notes in `docs/session-handoff.md`
+- Repo-local PRD evolution skill in `.agents/skills/prd-evolution-review`
 - Codex plugin scaffold in `plugins/codex-deepresearch`
 - DeepResearch skill scaffold in `plugins/codex-deepresearch/skills/deep-research`
 

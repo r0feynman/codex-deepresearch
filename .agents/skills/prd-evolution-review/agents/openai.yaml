@@ -1,0 +1,4 @@
+interface:
+  display_name: "PRD Evolution Review"
+  short_description: "Iterate PRDs with strict review."
+  default_prompt: "Use $prd-evolution-review to create or improve this PRD through a writer/reviewer evolution loop."
