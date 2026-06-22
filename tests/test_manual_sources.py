@@ -16,7 +16,7 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import ingest_manual_sources, validate_artifacts
+from deepresearch import ingest_manual_sources, prepare_run, validate_artifacts
 
 
 PNG_1X1 = base64.b64decode(
@@ -36,6 +36,11 @@ class ManualSourcesTests(unittest.TestCase):
     def write_png(self, directory: Path, name: str = "manual.png") -> Path:
         path = directory / name
         path.write_bytes(PNG_1X1)
+        return path
+
+    def write_pdf(self, directory: Path, name: str = "manual.pdf") -> Path:
+        path = directory / name
+        path.write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n")
         return path
 
     def test_manual_url_creates_source_without_search_artifacts(self) -> None:
@@ -130,6 +135,69 @@ class ManualSourcesTests(unittest.TestCase):
         self.assertEqual(image["height"], 0)
         self.assertIn("dimensions unavailable", image["caveats"][0])
         self.assertTrue((run_dir / image["local_artifact_path"]).exists())
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
+
+    def test_manual_local_pdf_creates_pdf_source(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        pdf_path = self.write_pdf(runs_dir)
+
+        result = ingest_manual_sources(
+            question="manual PDF question",
+            runs_dir=runs_dir,
+            pdfs=[pdf_path],
+            labels=["Local Report"],
+        )
+
+        self.assertEqual(result["status"], "manual_sources_ingested")
+        run_dir = Path(result["run_dir"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(len(evidence["sources"]), 1)
+        self.assertEqual(evidence["images"], [])
+        source = evidence["sources"][0]
+        self.assertEqual(source["type"], "pdf")
+        self.assertEqual(source["url"], pdf_path.resolve().as_uri())
+        self.assertEqual(source["title"], "Local Report")
+        self.assertEqual(source["manual_input_kind"], "pdf")
+        self.assertEqual(source["retrieval_status"], "manual")
+        self.assertEqual(source["robots_policy"], "unknown")
+        self.assertTrue((run_dir / source["local_artifact_path"]).exists())
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
+
+    def test_append_to_existing_run_preserves_handoff_config_and_validates(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="prepared search question",
+            runs_dir=runs_dir,
+            route="visual_optional",
+        )
+        run_dir = Path(prepared["run_dir"])
+        image_path = self.write_png(runs_dir, "append.png")
+
+        result = ingest_manual_sources(
+            run=run_dir,
+            runs_dir=runs_dir,
+            local_images=[image_path],
+            labels=["Append Image"],
+        )
+
+        self.assertEqual(result["status"], "manual_sources_ingested")
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["mode"], "codex-plugin")
+        self.assertEqual(evidence["search_provider"], "codex-native")
+        self.assertEqual(evidence["vlm_provider"], "codex-interactive")
+        self.assertEqual(evidence["search_tasks"][0]["query"], "prepared search question")
+        self.assertEqual(evidence["search_tasks"][0]["route"], "visual_optional")
+        self.assertEqual(evidence["routing"][0]["modality"], "visual_optional")
+        self.assertEqual(len(evidence["sources"]), 1)
+        self.assertEqual(len(evidence["images"]), 1)
+        source = evidence["sources"][0]
+        image = evidence["images"][0]
+        self.assertEqual(source["type"], "image")
+        self.assertEqual(source["title"], "Append Image")
+        self.assertEqual(image["source_id"], source["id"])
+        self.assertEqual(image["analysis_provider"], "codex-interactive")
+        validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
+        self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
         self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
 
     def test_cli_ingest_manual_creates_valid_run(self) -> None:

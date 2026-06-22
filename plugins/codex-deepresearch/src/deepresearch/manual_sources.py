@@ -38,7 +38,7 @@ def ingest_manual_sources(
     runs_dir: str | Path,
     question: str | None = None,
     urls: Sequence[str] = (),
-    pdfs: Sequence[str] = (),
+    pdfs: Sequence[str | Path] = (),
     image_urls: Sequence[str] = (),
     local_images: Sequence[str | Path] = (),
     labels: Sequence[str] = (),
@@ -168,15 +168,15 @@ def ingest_manual_sources(
 def _build_manual_inputs(
     *,
     urls: Sequence[str],
-    pdfs: Sequence[str],
+    pdfs: Sequence[str | Path],
     image_urls: Sequence[str],
     local_images: Sequence[str | Path],
     labels: Sequence[str],
 ) -> list[_ManualInput]:
     values: list[tuple[str, str]] = []
-    values.extend(("url", value) for value in urls)
-    values.extend(("pdf", value) for value in pdfs)
-    values.extend(("image_url", value) for value in image_urls)
+    values.extend(("url", str(value)) for value in urls)
+    values.extend(("pdf", str(value)) for value in pdfs)
+    values.extend(("image_url", str(value)) for value in image_urls)
     values.extend(("local_image", str(value)) for value in local_images)
     if len(labels) > len(values):
         raise ManualSourcesError("--label was provided more times than manual inputs")

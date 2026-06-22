@@ -46,7 +46,7 @@ When the user provides URLs, PDF URLs, image URLs, or local image files directly
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "<question>" --url <url>
 ```
 
-Use `--pdf` for PDF URLs or local PDF files, `--image-url` for remote images, and `--local-image` for local image files. `ingest-manual` creates or updates `evidence.json` with `search_provider=manual`, source records, and `VisualEvidence` for image inputs. It records metadata only: no remote body fetch, claim extraction, verification, VLM analysis, or report generation happens in this fallback slice.
+Use `--pdf` for PDF URLs or local PDF files, `--image-url` for remote images, and `--local-image` for local image files. For new manual runs, `ingest-manual` creates `evidence.json` with `mode=manual-sources` and `search_provider=manual`. When `--run` points at an existing run, it appends source records and `VisualEvidence` for image inputs while preserving that run's existing mode, providers, routing, and search tasks. It records metadata only: no remote body fetch, claim extraction, verification, VLM analysis, or report generation happens in this fallback slice.
 
 ## Evidence Rules
 
