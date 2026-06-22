@@ -29,6 +29,7 @@ When the user asks to implement work, the main Codex agent must act as a coordin
 - After the PR exists, spawn an adversarial review subagent to review for blockers, bugs, behavioral regressions, missing tests, and acceptance-criteria gaps.
 - If the review subagent reports findings, send the work back through implementation and review until no blockers remain.
 - After blockers are cleared, the main Codex coordinator performs the final review and reports the outcome to the user.
+- When the user asks to merge a PR, complete the post-merge cleanup as part of the same workflow: merge the PR, verify the linked issue closed, update the GitHub Project item to `Done`, fetch/prune remotes, switch back to the target branch, fast-forward it to the remote, delete the merged local branch when safe, and report any remaining unrelated worktree changes.
 
 ## Validation
 
