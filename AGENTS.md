@@ -15,6 +15,21 @@ The product goal is described in `docs/codex-deepresearch-prd.md`. The developme
 - Prefer small issues and small PRs tied to the documented phase roadmap.
 - For research features, preserve evidence metadata: source URL, retrieval time, modality, extracted claims, verifier results, and confidence.
 
+## Implementation Coordination
+
+When the user asks to implement work, the main Codex agent must act as a coordinator rather than the primary implementer.
+
+- Create a dedicated local branch before implementation starts.
+- Push the branch to the remote before implementation work begins.
+- Use the GitHub issue as the implementation source of truth, including its scope, dependencies, and acceptance-test checklist.
+- Update the issue checklist as acceptance-test items are implemented or verified.
+- Keep the GitHub Project UI in sync during the work: move the project item to `In Progress` when implementation starts, to review state when the PR is opened, and to `Done` after the issue is closed or merged.
+- Spawn an implementation subagent to make the scoped code or documentation changes.
+- Have the implementation subagent take the work through PR creation.
+- After the PR exists, spawn an adversarial review subagent to review for blockers, bugs, behavioral regressions, missing tests, and acceptance-criteria gaps.
+- If the review subagent reports findings, send the work back through implementation and review until no blockers remain.
+- After blockers are cleared, the main Codex coordinator performs the final review and reports the outcome to the user.
+
 ## Validation
 
 Before publishing or opening a PR, run:
