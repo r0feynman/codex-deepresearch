@@ -158,10 +158,13 @@ def validate_artifacts(
 
 class _ValidationContext:
     def __init__(self) -> None:
+        self.evidence_provided = False
         self.mode: str | None = None
         self.source_ids: set[str] = set()
         self.image_ids: set[str] = set()
+        self.claims_provided = False
         self.claim_ids: set[str] = set()
+        self.routing_provided = False
         self.angle_routes: dict[str, str] = {}
         self.search_tasks_provided = False
         self.search_task_ids: set[str] = set()
@@ -207,6 +210,7 @@ def _validate_evidence(
     collector: _Collector,
     context: _ValidationContext,
 ) -> None:
+    context.evidence_provided = True
     _require_fields(
         evidence,
         "$.evidence",
@@ -230,6 +234,7 @@ def _validate_evidence(
 
     routing = _optional_list(evidence, "routing", "$.evidence", collector)
     if routing is not None:
+        context.routing_provided = True
         for index, route in enumerate(routing):
             route_path = f"$.evidence.routing[{index}]"
             if not _require_object(route, route_path, collector):
@@ -274,6 +279,7 @@ def _validate_evidence(
 
     claims = _optional_list(evidence, "claims", "$.evidence", collector)
     if claims is not None:
+        context.claims_provided = True
         for index, claim in enumerate(claims):
             claim_path = f"$.evidence.claims[{index}]"
             if not _require_object(claim, claim_path, collector):
@@ -528,7 +534,7 @@ def _validate_search_results(
             )
         angle_id = _optional_string(record, "angle_id", path, collector)
         route = _check_enum(record, "route", SEARCH_ROUTES, path, collector)
-        if angle_id is not None and context.angle_routes:
+        if angle_id is not None and context.routing_provided:
             expected_route = context.angle_routes.get(angle_id)
             if expected_route is None:
                 collector.add(
@@ -652,7 +658,11 @@ def _validate_verifier_votes(
         )
         _optional_string(record, "id", path, collector)
         claim_id = _optional_string(record, "claim_id", path, collector)
-        if claim_id is not None and context.claim_ids and claim_id not in context.claim_ids:
+        if (
+            claim_id is not None
+            and context.claims_provided
+            and claim_id not in context.claim_ids
+        ):
             collector.add(
                 f"{path}.claim_id",
                 "dangling_reference",
@@ -667,7 +677,7 @@ def _validate_verifier_votes(
         evidence_refs = _check_string_list(record, "evidence_refs", path, collector)
         known_refs = context.source_ids | context.image_ids
         for reference in evidence_refs:
-            if known_refs and reference not in known_refs:
+            if context.evidence_provided and reference not in known_refs:
                 collector.add(
                     f"{path}.evidence_refs",
                     "dangling_reference",

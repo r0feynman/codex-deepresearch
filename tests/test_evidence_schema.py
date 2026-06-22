@@ -172,6 +172,22 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
             {error.path for error in result.errors},
         )
 
+    def test_search_result_angle_id_dangles_when_routing_empty(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["routing"] = []
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            search_results_path=self.fixture("search_results.jsonl"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        self.assertIn(
+            "$.search_results[0].angle_id",
+            {error.path for error in result.errors},
+        )
+
     def test_top_level_verifier_vote_string_record_fails(self) -> None:
         votes_path = self.write_jsonl(["vote_text_001"])
 
@@ -194,6 +210,42 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
         self.assertFalse(payload["valid"])
         self.assertEqual(payload["errors"][0]["path"], "$.verifier_votes[0]")
         self.assertEqual(payload["errors"][0]["code"], "invalid_type")
+
+    def test_top_level_verifier_vote_claim_id_dangles_when_claims_empty(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["claims"] = []
+
+        standalone = validate_artifacts(verifier_votes_path=self.fixture("verifier_votes.jsonl"))
+        self.assertTrue(standalone.valid, [error.to_dict() for error in standalone.errors])
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            verifier_votes_path=self.fixture("verifier_votes.jsonl"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        self.assertIn(
+            "$.verifier_votes[0].claim_id",
+            {error.path for error in result.errors},
+        )
+
+    def test_verifier_vote_evidence_refs_dangle_when_evidence_refs_are_empty(self) -> None:
+        evidence = self.load_valid_evidence()
+        evidence["sources"] = []
+        evidence["images"] = []
+        del evidence["claims"]
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            verifier_votes_path=self.fixture("verifier_votes.jsonl"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "dangling_reference")
+        dangling_paths = {error.path for error in result.errors if error.code == "dangling_reference"}
+        self.assertIn("$.verifier_votes[0].evidence_refs", dangling_paths)
+        self.assertIn("$.verifier_votes[1].evidence_refs", dangling_paths)
 
     def test_evidence_image_source_id_dangles_when_sources_empty(self) -> None:
         evidence = self.load_valid_evidence()
