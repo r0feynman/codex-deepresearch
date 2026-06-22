@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Developer runner for the Codex DeepResearch plugin scaffold."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = PLUGIN_ROOT.parents[1]
+PLUGIN_NAME = "codex-deepresearch"
+MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
+
+
+def fail(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        fail(f"missing required file: {path.relative_to(REPO_ROOT)}")
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(REPO_ROOT)}: {exc}")
+
+
+def validate_manifest() -> dict:
+    manifest_path = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
+    manifest = read_json(manifest_path)
+    if manifest.get("name") != PLUGIN_NAME:
+        fail("plugin manifest name must be codex-deepresearch")
+    if manifest.get("skills") != "./skills/":
+        fail("plugin manifest must expose ./skills/")
+    skill_path = PLUGIN_ROOT / "skills" / "deep-research" / "SKILL.md"
+    if not skill_path.exists():
+        fail("missing skills/deep-research/SKILL.md")
+    return manifest
+
+
+def validate_marketplace() -> dict:
+    marketplace = read_json(MARKETPLACE_PATH)
+    entries = marketplace.get("plugins")
+    if not isinstance(entries, list):
+        fail("marketplace plugins must be a list")
+    matches = [entry for entry in entries if entry.get("name") == PLUGIN_NAME]
+    if len(matches) != 1:
+        fail("marketplace must contain exactly one codex-deepresearch entry")
+    entry = matches[0]
+    source = entry.get("source", {})
+    if source.get("source") != "local":
+        fail("marketplace source.source must be local")
+    if source.get("path") != "./plugins/codex-deepresearch":
+        fail("marketplace source.path must be ./plugins/codex-deepresearch")
+    policy = entry.get("policy", {})
+    if policy.get("installation") != "AVAILABLE":
+        fail("marketplace policy.installation must be AVAILABLE")
+    if policy.get("authentication") != "ON_INSTALL":
+        fail("marketplace policy.authentication must be ON_INSTALL")
+    if not entry.get("category"):
+        fail("marketplace entry must include category")
+    return marketplace
+
+
+def create_run_directory(runs_dir: Path, invocation: str, install_preflight: bool) -> Path:
+    now = datetime.now(timezone.utc)
+    run_dir = runs_dir / f"smoke-{now.strftime('%Y%m%dT%H%M%SZ')}"
+    suffix = 1
+    while run_dir.exists():
+        suffix += 1
+        run_dir = runs_dir / f"smoke-{now.strftime('%Y%m%dT%H%M%SZ')}-{suffix}"
+    run_dir.mkdir(parents=True)
+
+    status = {
+        "schema_version": "codex-deepresearch.smoke.v0",
+        "status": "started",
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "plugin": {
+            "name": PLUGIN_NAME,
+            "root": str(PLUGIN_ROOT.relative_to(REPO_ROOT)),
+        },
+        "invocation": invocation,
+        "checks": {
+            "manifest": "passed",
+            "marketplace": "passed",
+            "install_preflight": "passed" if install_preflight else "skipped",
+        },
+        "next_step": "M2+ issues will add execution modes, evidence, verification, and reports.",
+    }
+    (run_dir / "status.json").write_text(
+        json.dumps(status, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def run_smoke(args: argparse.Namespace) -> int:
+    validate_manifest()
+    marketplace = validate_marketplace()
+
+    install_preflight = False
+    if args.install:
+        if shutil.which("codex") is None:
+            fail("--install requires the codex CLI to be available on PATH")
+        install_preflight = True
+
+    runs_dir = Path(args.runs_dir)
+    if not runs_dir.is_absolute():
+        runs_dir = REPO_ROOT / runs_dir
+    run_dir = create_run_directory(runs_dir, args.invoke, install_preflight)
+
+    marketplace_name = marketplace.get("name", "codex-deepresearch-local")
+    print("Codex DeepResearch smoke run started.")
+    print(f"Run directory: {run_dir}")
+    print(f"Invocation: {args.invoke}")
+    if args.install:
+        print(f"Install preflight: codex CLI found; marketplace={marketplace_name}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-deepresearch",
+        description="Developer runner for the Codex DeepResearch plugin.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    smoke = subparsers.add_parser(
+        "smoke",
+        help="Validate the plugin scaffold and start a smoke run directory.",
+    )
+    smoke.add_argument(
+        "--install",
+        action="store_true",
+        help="Also verify that local install/update prerequisites are available.",
+    )
+    smoke.add_argument(
+        "--invoke",
+        default="$deep-research: smoke test",
+        help="Skill invocation text recorded in the smoke run status.",
+    )
+    smoke.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for smoke run artifacts, relative to the repo root by default.",
+    )
+    smoke.set_defaults(func=run_smoke)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
