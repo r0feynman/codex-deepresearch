@@ -83,6 +83,13 @@ def gh_json(args: list[str]) -> Any:
         raise SystemExit(f"Failed to parse gh JSON output: {exc}") from exc
 
 
+def gh_graphql(query: str, fields: dict[str, str]) -> Any:
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for key, value in fields.items():
+        args.extend(["-f", f"{key}={value}"])
+    return gh_json(args)
+
+
 def handle_gh_error(result: subprocess.CompletedProcess[str]) -> None:
     message = result.stderr.strip() or result.stdout.strip()
     if "missing required scopes" in message and "project" in message:
@@ -138,41 +145,54 @@ def ensure_project() -> Project:
                 url=project["url"],
             )
 
-    created = gh_json(
-        [
-            "project",
-            "create",
-            "--owner",
-            OWNER,
-            "--title",
-            PROJECT_TITLE,
-            "--format",
-            "json",
-        ]
+    owner_data = gh_graphql(
+        "query($login: String!) { user(login: $login) { id } }",
+        {"login": OWNER},
     )
-    print(f"created project: {PROJECT_TITLE} -> {created.get('url')}")
-    return Project(number=int(created["number"]), project_id=created["id"], url=created["url"])
+    owner_id = owner_data["data"]["user"]["id"]
+    created = gh_graphql(
+        """
+        mutation($ownerId: ID!, $title: String!) {
+          createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+            projectV2 {
+              id
+              number
+              title
+              url
+            }
+          }
+        }
+        """,
+        {"ownerId": owner_id, "title": PROJECT_TITLE},
+    )
+    project = created["data"]["createProjectV2"]["projectV2"]
+    print(f"created project: {PROJECT_TITLE} -> {project.get('url')}")
+    return Project(number=int(project["number"]), project_id=project["id"], url=project["url"])
 
 
 def configure_project(project: Project) -> None:
-    result = run(
-        [
-            "gh",
-            "project",
-            "edit",
-            str(project.number),
-            "--owner",
-            OWNER,
-            "--description",
-            PROJECT_DESCRIPTION,
-            "--readme",
-            PROJECT_README,
-            "--visibility",
-            "PUBLIC",
-        ]
+    gh_graphql(
+        """
+        mutation($projectId: ID!, $shortDescription: String, $readme: String) {
+          updateProjectV2(input: {
+            projectId: $projectId,
+            shortDescription: $shortDescription,
+            readme: $readme,
+            public: true
+          }) {
+            projectV2 {
+              id
+              url
+            }
+          }
+        }
+        """,
+        {
+            "projectId": project.project_id,
+            "shortDescription": PROJECT_DESCRIPTION,
+            "readme": PROJECT_README,
+        },
     )
-    if result.returncode != 0:
-        handle_gh_error(result)
     print("configured project metadata")
 
     result = run(["gh", "project", "link", str(project.number), "--owner", OWNER, "--repo", REPO])
