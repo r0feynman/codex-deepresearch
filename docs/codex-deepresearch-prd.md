@@ -32,24 +32,35 @@ Codex DeepResearch 확장 구조:
 
 ## 입력 경로
 
-Codex 내장 명령형 사용 목표:
+최종 제품 방향:
 
-- Codex 자체의 built-in slash command를 수정하는 제품이 아니라, 설치형 Codex Plugin + Skill + CLI wrapper로 "내장 명령처럼" 호출되는 사용자 경험을 제공한다.
-- 1차 목표 호출 방식은 `$deep-research` Skill invocation이다.
-- 2차 목표 호출 방식은 `codex-deepresearch` CLI이다.
-- 3차 목표 호출 방식은 플러그인 설치 후 Codex의 `/skills` 선택기에서 `deep-research`를 고르는 방식이다.
+- Codex DeepResearch의 최종 배포 단위는 Codex Plugin이다.
+- Codex 자체의 built-in slash command를 수정하는 제품이 아니라, 설치형 Codex Plugin + Skill + local runner로 "내장 명령처럼" 호출되는 사용자 경험을 제공한다.
+- CLI는 독립 제품이 아니라 plugin 내부 runner이자 개발/테스트/자동화용 보조 진입점이다.
+- 1차 목표 호출 방식은 플러그인 설치 후 Codex에서 `$deep-research` Skill invocation을 사용하는 것이다.
+- 2차 목표 호출 방식은 Codex의 `/skills` 선택기에서 `deep-research`를 고르는 방식이다.
+- 3차 목표 호출 방식은 개발/디버깅용 `codex-deepresearch` CLI이다.
 - `/deep-research`와 완전히 같은 slash command 이름을 Codex core에 추가하는 것은 비목표다. 단, 플러그인/스킬 설명과 CLI alias를 통해 사용자는 사실상 내장 워크플로우처럼 사용할 수 있어야 한다.
 
-개발자 CLI:
+Primary Codex Plugin flow:
 
-```bash
-codex-deepresearch "AI 사진 서비스 품질관리 조사" --visual --max-sources 30
+```text
+Codex에 codex-deepresearch plugin 설치
+-> $deep-research: <질문>
+-> Codex 세션의 search/context/VLM capability와 plugin runner를 조합
+-> report.md + evidence.json 생성
 ```
 
 Codex Skill:
 
 ```text
 $deep-research: <질문>
+```
+
+Local runner / developer CLI:
+
+```bash
+codex-deepresearch "AI 사진 서비스 품질관리 조사" --visual --max-sources 30
 ```
 
 Plugin packaging:
@@ -61,6 +72,16 @@ codex-deepresearch-plugin/
   scripts/codex-deepresearch
   src/deepresearch/
 ```
+
+Execution modes:
+
+| Mode | Primary user | Search path | VLM path | Purpose |
+| --- | --- | --- | --- | --- |
+| `codex-plugin` | Codex 사용자 | Codex-native search | Codex interactive VLM 또는 API adapter | 최종 제품 기본 모드 |
+| `automated-cli` | 개발자/자동화 | OpenAI hosted search 또는 외부 provider | OpenAI Responses Vision API | 재현 가능한 batch run |
+| `manual-sources` | 저비용/검증용 | 사용자가 URL/PDF/image 제공 | API, Codex interactive, 또는 manual | Phase 0와 fallback |
+
+MVP의 제품 판단은 `codex-plugin` mode를 기준으로 한다. `automated-cli`는 같은 engine을 검증하고 자동화하는 보조 표면이다.
 
 비개발자 UI:
 
@@ -141,11 +162,21 @@ codex-deepresearch-plugin/
 
 ## Visual Input and Acquisition Modes
 
-Codex-native VLM capability:
+VLM invocation paths:
+
+| VLM path | 사용 위치 | 동작 | MVP 역할 |
+| --- | --- | --- | --- |
+| `codex-interactive` | Codex plugin/skill 세션 | Codex가 현재 세션의 이미지/스크린샷을 읽고 분석한다. Plugin은 분석 요청, evidence 구조화, 검증 단계를 안내한다. | 개인용 plugin mode의 우선 경로 |
+| `openai-responses-vision` | 자동 CLI, batch, plugin runner의 자동 분석 | 수집 이미지/스크린샷을 OpenAI Responses API vision input으로 보내 분석 결과를 JSON으로 받는다. | 자동 실행이 필요한 경우의 명확한 API 경로 |
+| `manual-visual-review` | API 사용 불가, 비용 제한, 민감 이미지 | 사람이 이미지를 확인하고 observation을 evidence에 입력한다. | fallback 및 high-risk review |
+
+Codex interactive VLM capability:
 
 - Codex는 사용자가 첨부한 이미지 파일과 스크린샷을 읽을 수 있다.
-- 개인용 MVP에서는 이 능력을 우선 사용한다.
-- DeepResearch는 자동 수집한 이미지와 스크린샷을 로컬 run artifact로 저장한 뒤, Codex-native VLM 분석 경로로 `VisionExtractAgent`와 `VisualVerifierAgent`에 투입한다.
+- 개인용 plugin MVP에서는 이 능력을 우선 사용한다.
+- 단, local runner가 Codex interactive VLM을 안정적인 library API처럼 직접 호출할 수 있다고 가정하지 않는다.
+- DeepResearch는 자동 수집한 이미지와 스크린샷을 로컬 run artifact로 저장한 뒤, 선택된 VLM path를 통해 `VisionExtractAgent`와 `VisualVerifierAgent`에 투입한다.
+- 재현 가능한 자동 실행이 필요하면 `openai-responses-vision` adapter를 사용한다.
 - 사용자가 제공한 이미지 파일, 붙여넣은 스크린샷, image URL은 자동 수집 결과를 보강하는 supplemental evidence로 취급한다.
 
 Visual acquisition layers:
@@ -170,11 +201,11 @@ Visual acquisition layers:
 
 Decision:
 
-- MVP는 Codex-native VLM + basic automated visual acquisition을 기본으로 한다.
+- MVP는 plugin-first이며, VLM 기본값은 `codex-plugin` mode에서 `codex-interactive`, `automated-cli` mode에서 `openai-responses-vision`이다.
 - user-provided visual evidence는 supplemental input이다.
 - 자동 이미지 검색과 스크린샷 수집은 MVP에 포함한다.
 - Private Alpha는 더 큰 규모, 더 정교한 중복 제거, resume/cache, 대량 캡처 안정화를 담당한다.
-- `visual_required` 태스크는 자동 수집 이미지 또는 사용자 제공 이미지가 없으면 `needs_visual_evidence` 상태로 남기고 high-confidence 결론을 내지 않는다.
+- `visual_required` 태스크는 자동 수집 이미지 또는 사용자 제공 이미지가 없거나 VLM path가 실행 불가능하면 `needs_visual_evidence` 상태로 남기고 high-confidence 결론을 내지 않는다.
 
 ## Agent Budget
 
@@ -204,12 +235,17 @@ Agent 산정식:
 
 여기서 `N`은 angle 수, `V`는 visual angle 수, `S`는 fetch source 수, `I`는 분석 이미지 수, `C`는 claim 수다. Budget을 넘으면 source quality, relevance, visual necessity 순으로 pruning한다.
 
-## 저장 스키마
+## Evidence Schema v0
 
 ```json
 {
+  "schema_version": "0.1.0",
   "run_id": "dr_20260616_001",
+  "created_at": "2026-06-16T10:00:00Z",
   "question": "...",
+  "mode": "codex-plugin|automated-cli|manual-sources",
+  "search_provider": "codex-native|openai|brave|tavily|serpapi|manual",
+  "vlm_provider": "codex-interactive|openai-responses-vision|manual-visual-review|none",
   "sources": [
     {
       "id": "src_001",
@@ -217,13 +253,19 @@ Agent 산정식:
       "url": "...",
       "title": "...",
       "published_at": "...",
-      "quality": "primary|secondary|blog|forum|unknown"
+      "accessed_at": "2026-06-16T10:03:00Z",
+      "quality": "primary|secondary|blog|forum|unknown",
+      "retrieval_status": "fetched|failed|partial|manual",
+      "local_artifact_path": "sources/src_001.html",
+      "license_policy": "unknown|allowed|restricted|manual_review",
+      "robots_policy": "unknown|allowed|disallowed|manual_review"
     }
   ],
   "routing": [
     {
       "angle": "artifact detection",
       "modality": "visual_required",
+      "reason": "The claim depends on visible hands, teeth, eyes, and image artifacts.",
       "visual_tasks": ["ocr", "artifact_detection", "image_claim_alignment"],
       "max_images": 12
     }
@@ -239,35 +281,67 @@ Agent 산정식:
       "id": "img_001",
       "source_id": "src_001",
       "image_url": "...",
+      "page_url": "...",
+      "local_artifact_path": "images/img_001.png",
+      "mime_type": "image/png",
+      "width": 1280,
+      "height": 720,
       "ocr_text": "...",
-      "vlm_summary": "...",
+      "vlm_observations": ["visible UI contains a pricing table"],
+      "vlm_inferences": ["the screenshot likely came from the pricing page"],
       "visual_claims": ["..."],
-      "phash": "..."
+      "phash": "...",
+      "analysis_status": "analyzed|failed|skipped|needs_manual_review"
     }
   ],
   "claims": [
     {
       "id": "claim_001",
       "text": "...",
+      "claim_type": "text|visual|mixed",
       "supporting_sources": ["src_001"],
       "supporting_images": ["img_001"],
+      "quote_spans": [
+        {
+          "source_id": "src_001",
+          "quote": "...",
+          "location": "paragraph 4"
+        }
+      ],
       "votes": [
         {
           "agent": "text_v1",
+          "model_or_method": "gpt-5.1",
           "refuted": false,
+          "confidence": 0.72,
           "evidence": "..."
         },
         {
           "agent": "visual_v1",
+          "model_or_method": "codex-interactive",
           "refuted": true,
+          "confidence": 0.64,
           "evidence": "..."
         }
       ],
-      "status": "confirmed|refuted|uncertain"
+      "status": "confirmed|refuted|uncertain|needs_visual_evidence|budget_pruned",
+      "confidence": "high|medium|low",
+      "caveats": ["small text OCR may be unreliable"]
     }
   ]
 }
 ```
+
+Schema v0 implementation requirements:
+
+- `schema_version`, `run_id`, `created_at`, `mode`, `search_provider`, `vlm_provider`는 필수다.
+- 모든 source는 `accessed_at`, `retrieval_status`, `quality`, `local_artifact_path`를 가진다.
+- 모든 image/screenshot은 `page_url` 또는 `image_url` 중 하나 이상과 `local_artifact_path`를 가진다.
+- VLM output은 `vlm_observations`와 `vlm_inferences`를 분리한다.
+- 모든 high-confidence text claim은 하나 이상의 `quote_spans`를 가진다.
+- 모든 high-confidence visual/mixed claim은 하나 이상의 `supporting_images`를 가진다.
+- verifier vote는 `agent`, `model_or_method`, `refuted`, `confidence`, `evidence`를 가진다.
+- budget 때문에 검증하지 못한 claim은 `budget_pruned`로 남기고 최종 보고서의 확정 주장으로 쓰지 않는다.
 
 ## 검증 규칙
 
@@ -303,35 +377,40 @@ Codex는 후속 작업에서 `evidence.json`을 먼저 읽고, claim status가 `
 
 ## MVP
 
-1. CLI `codex-deepresearch` 구현.
-2. Codex Skill `$deep-research` 구현.
-3. 개인용 Codex Plugin으로 패키징해 `/skills`에서 선택 가능하게 만든다.
-4. 텍스트 검색 + basic automated visual acquisition + Codex-native VLM 분석을 지원한다.
-5. `ModalityRouterAgent`로 text-only/visual-required/visual-optional 분류를 구현한다.
-6. visual-required angle에서 이미지 검색, 대표 이미지 추출, first viewport screenshot 캡처를 수행한다.
-7. `standard` preset 기준 총 subagent 48개, 동시 8개를 기본값으로 둔다.
-8. 보고서 `report.md`와 `evidence.json` 저장.
-9. claim 3-vote 검증 구현.
+1. 개인용 Codex Plugin으로 패키징해 Codex에서 설치 가능하게 만든다.
+2. Codex Skill `$deep-research`를 plugin의 primary UX로 구현한다.
+3. plugin 내부 runner를 만들고, CLI `codex-deepresearch`는 runner를 직접 실행하는 개발/디버깅용 진입점으로 제공한다.
+4. `codex-plugin` mode는 Codex-native search와 `codex-interactive` VLM path를 기본으로 한다.
+5. `automated-cli` mode는 provider abstraction을 통해 OpenAI hosted search 또는 외부 search provider와 `openai-responses-vision` VLM path를 사용한다.
+6. `manual-sources` mode는 사용자가 제공한 URL/PDF/image만으로 Phase 0와 fallback run을 지원한다.
+7. `ModalityRouterAgent`로 text-only/visual-required/visual-optional 분류를 구현한다.
+8. visual-required angle에서 이미지 검색, 대표 이미지 추출, first viewport screenshot 캡처를 수행한다.
+9. `standard` preset 기준 총 subagent 48개, 동시 8개를 기본값으로 둔다.
+10. 보고서 `report.md`와 schema v0 `evidence.json` 저장.
+11. claim 3-vote 검증 구현.
 
 ## Product Roadmap
 
 ### Phase 0: Prototype
 
-목표: Claude Code deep-research 구조를 clean-room으로 재현할 수 있는지 검증한다.
+목표: 최종 제품을 Codex Plugin으로 만들 수 있도록 plugin-first 구조와 evidence schema v0를 검증한다.
 
 범위:
 
 - 로컬 Python/TypeScript 패키지 스캐폴드.
-- 단일 명령 `codex-deepresearch "<question>"`.
+- Codex Plugin skeleton과 `$deep-research` Skill skeleton.
+- plugin 내부 runner skeleton.
+- 개발/테스트용 단일 명령 `codex-deepresearch "<question>"`.
 - 수동 source URL 입력 지원.
 - 수동 image file, screenshot, image URL 입력 지원.
 - `PlannerAgent`, `ModalityRouterAgent`, `SynthesisAgent` 최소 구현.
-- 출력: `report.md`, `evidence.json`.
+- 출력: `report.md`, schema v0 `evidence.json`.
 
 Exit criteria:
 
 - 텍스트-only 질문 3개, visual-required 질문 3개를 끝까지 처리한다.
 - `ModalityRouterAgent`가 VLM 호출 필요 여부를 evidence에 기록한다.
+- `evidence.json`이 schema v0 validation을 통과한다.
 - 실패해도 부분 evidence를 저장한다.
 
 ### Phase 1: MVP
@@ -342,11 +421,15 @@ Exit criteria:
 
 - `$deep-research` Codex Skill.
 - 개인용 Codex Plugin 패키지.
+- plugin 내부 runner.
+- 개발/디버깅용 CLI wrapper.
 - `quick`, `standard`, `deep` preset.
-- 텍스트 웹검색, fetch, claim extraction.
+- `codex-plugin` mode의 Codex-native search workflow.
+- `automated-cli` mode의 search provider abstraction.
+- fetch, claim extraction.
 - basic automated image collection.
 - high-relevance source page first viewport screenshot capture.
-- Codex-native VLM 기반 image/screenshot 분석.
+- `codex-interactive` 및 `openai-responses-vision` VLM path.
 - user-provided image file, screenshot, image URL 보강 입력.
 - claim당 3-vote 검증.
 - source quote와 image evidence ID가 포함된 Markdown 보고서.
@@ -458,27 +541,34 @@ Exit criteria:
 
 Epics:
 
+- Plugin-first scaffold
 - Core runner
 - Minimal agent loop
-- Evidence artifact
+- Evidence schema v0
 - Smoke evaluation
 
 Tasks:
 
-1. `deepresearch/` 패키지와 단일 entrypoint를 만든다.
-2. `codex-deepresearch "<question>"` 명령을 실행하면 run directory를 생성한다.
-3. `PlannerAgent`가 질문을 3-5개 angle로 분해하게 한다.
-4. `ModalityRouterAgent`가 각 angle을 `text_only`, `visual_required`, `visual_optional`로 분류하게 한다.
-5. 수동 source URL과 image URL을 입력받는 옵션을 만든다.
-6. 텍스트 source에서 title, body excerpt, quote 후보를 추출한다.
-7. image URL을 VLM으로 분석해 OCR, visual summary, visual claims를 저장한다.
-8. `SynthesisAgent`가 최소 보고서를 생성한다.
-9. 실패 시 partial `evidence.json`을 저장한다.
-10. 텍스트-only 3개, visual-required 3개 smoke test fixture를 만든다.
+1. `plugins/codex-deepresearch` plugin scaffold를 최종 제품 루트로 확정한다.
+2. `$deep-research` Skill skeleton과 plugin 내부 runner skeleton을 만든다.
+3. `codex-deepresearch "<question>"` 개발용 CLI를 runner wrapper로 연결한다.
+4. 실행하면 run directory를 생성한다.
+5. schema v0 JSON Schema와 example fixture를 만든다.
+6. `PlannerAgent`가 질문을 3-5개 angle로 분해하게 한다.
+7. `ModalityRouterAgent`가 각 angle을 `text_only`, `visual_required`, `visual_optional`로 분류하게 한다.
+8. 수동 source URL과 image URL을 입력받는 옵션을 만든다.
+9. 텍스트 source에서 title, body excerpt, quote 후보를 추출한다.
+10. image URL을 선택된 VLM path로 분석해 OCR, visual observation, visual claim을 저장한다.
+11. `SynthesisAgent`가 최소 보고서를 생성한다.
+12. 실패 시 partial `evidence.json`을 저장한다.
+13. 텍스트-only 3개, visual-required 3개 smoke test fixture를 만든다.
 
 Deliverables:
 
+- Codex Plugin skeleton
+- `$deep-research` Skill skeleton
 - CLI prototype
+- schema v0 JSON Schema
 - `report.md`
 - `evidence.json`
 - smoke test fixture
@@ -491,7 +581,7 @@ Epics:
 - Personal plugin packaging
 - Search/fetch/extract pipeline
 - Basic visual acquisition
-- Codex-native VLM analysis
+- VLM adapter paths
 - Verification pipeline
 - Budget presets
 
@@ -499,33 +589,36 @@ Tasks:
 
 1. `$deep-research` Skill의 `SKILL.md`를 작성한다.
 2. 개인용 Codex Plugin manifest `.codex-plugin/plugin.json`을 작성한다.
-3. CLI runner를 Skill에서 호출 가능한 script로 감싼다.
-4. `quick`, `standard`, `deep` preset config를 구현한다.
-5. 웹 검색 provider abstraction을 만든다.
-6. HTML/PDF fetcher와 본문 추출기를 구현한다.
-7. high-relevance source page에서 Open Graph image와 본문 image 후보를 추출한다.
-8. visual-required angle에서 image search provider가 가능하면 image search를 수행한다.
-9. high-relevance source page의 first viewport screenshot을 캡처한다.
-10. 수집 이미지와 스크린샷을 `images/`, `screenshots/` run artifact로 저장한다.
-11. 수집 이미지를 MIME, 크기, URL 중복, basic hash로 필터링한다.
-12. `VisionExtractAgent`가 Codex-native VLM으로 이미지와 스크린샷을 분석하게 한다.
-13. `ClaimExtractorAgent`가 quote 포함 claim을 구조화하게 한다.
-14. `VerifierAgent` 2개와 `VisualVerifierAgent` 1개를 claim마다 실행한다.
-15. 반박 2표 이상이면 claim을 `refuted` 처리한다.
-16. Budget 초과 시 source quality, relevance, visual necessity 기준으로 pruning한다.
-17. text-only route에서 이미지 검색, screenshot, VLM 호출이 발생하지 않는 테스트를 만든다.
-18. visual-required route에서 자동 이미지 수집 또는 screenshot 캡처가 실행되는 테스트를 만든다.
-19. visual-required route에서 visual verifier가 반드시 실행되는 테스트를 만든다.
-20. Markdown report와 evidence JSON을 Codex 후속 작업에서 읽기 쉬운 형태로 저장한다.
+3. plugin 내부 runner를 Skill에서 호출 가능한 script로 감싼다.
+4. CLI는 runner를 직접 실행하는 개발/디버깅용 wrapper로 둔다.
+5. `quick`, `standard`, `deep` preset config를 구현한다.
+6. `codex-plugin`, `automated-cli`, `manual-sources` 실행 모드를 구현한다.
+7. Skill mode는 Codex-native search workflow를 사용하고, CLI mode는 provider abstraction을 사용하게 분리한다.
+8. HTML/PDF fetcher와 본문 추출기를 구현한다.
+9. high-relevance source page에서 Open Graph image와 본문 image 후보를 추출한다.
+10. visual-required angle에서 image search provider가 가능하면 image search를 수행한다.
+11. high-relevance source page의 first viewport screenshot을 캡처한다.
+12. 수집 이미지와 스크린샷을 `images/`, `screenshots/` run artifact로 저장한다.
+13. 수집 이미지를 MIME, 크기, URL 중복, basic hash로 필터링한다.
+14. `VisionExtractAgent`가 선택된 VLM path로 이미지와 스크린샷을 분석하게 한다.
+15. `ClaimExtractorAgent`가 quote 포함 claim을 구조화하게 한다.
+16. `VerifierAgent` 2개와 `VisualVerifierAgent` 1개를 claim마다 실행한다.
+17. 반박 2표 이상이면 claim을 `refuted` 처리한다.
+18. Budget 초과 시 source quality, relevance, visual necessity 기준으로 pruning한다.
+19. text-only route에서 이미지 검색, screenshot, VLM 호출이 발생하지 않는 테스트를 만든다.
+20. visual-required route에서 자동 이미지 수집 또는 screenshot 캡처가 실행되는 테스트를 만든다.
+21. visual-required route에서 visual verifier가 반드시 실행되는 테스트를 만든다.
+22. Markdown report와 schema v0 evidence JSON을 Codex 후속 작업에서 읽기 쉬운 형태로 저장한다.
 
 Deliverables:
 
 - Codex Skill
 - personal Codex Plugin
-- CLI runner
+- plugin runner
+- developer CLI wrapper
 - basic image collector
 - first viewport screenshot collector
-- Codex-native VLM analysis path
+- VLM adapter paths
 - budget preset config
 - 3-vote verification engine
 - MVP test suite
@@ -669,25 +762,26 @@ Deliverables:
 
 | Capability | Prototype | MVP | Private Alpha | Public Beta | Product v1 | Team/Cloud |
 | --- | --- | --- | --- | --- | --- | --- |
-| CLI 실행 | Yes | Yes | Yes | Yes | Yes | Yes |
-| Codex Skill | No | Yes | Yes | Yes | Yes | Yes |
-| Codex Plugin | No | Personal | Personal | Marketplace-ready | Stable | Team-managed |
+| Codex Plugin | Skeleton | Personal | Personal | Marketplace-ready | Stable | Team-managed |
+| Codex Skill | Skeleton | Yes | Yes | Yes | Yes | Yes |
+| CLI 실행 | Dev wrapper | Dev wrapper | Yes | Yes | Yes | Yes |
 | 텍스트 검색/fetch | Basic | Yes | Yes | Yes | Yes | Yes |
 | 이미지 URL 분석 | Basic | Yes | Yes | Yes | Yes | Yes |
 | 자동 이미지 검색 | No | Basic | Yes | Yes | Yes | Yes |
 | 스크린샷 수집 | No | Basic | Yes | Yes | Yes | Yes |
 | ModalityRouter | Basic | Yes | Yes | Yes | Yes | Policy-aware |
 | Agent budget | Manual | Presets | Cost estimator | User controls | Policy controls | Team controls |
-| Evidence 저장 | JSON/MD | JSON/MD | Versioned draft | Browsable | Versioned stable | Shared |
+| Evidence 저장 | Schema v0 JSON/MD | Schema v0 JSON/MD | Versioned draft | Browsable | Versioned stable | Shared |
 | Human review | No | File edit | Basic | Review UI | Promotion workflow | Team approval |
 | 재개/resume | No | No | Yes | Yes | Yes | Yes |
 | Observability | Logs | Run stats | Trace | Dashboard | Metrics suite | Org analytics |
 
 ## Product-Level Acceptance Criteria
 
+- 최종 제품은 Codex Plugin으로 설치되고, 사용자는 Codex 안에서 plugin을 통해 DeepResearch를 시작한다.
 - 사용자는 Codex 안에서 `$deep-research`를 호출해 별도 설명 없이 리서치를 시작할 수 있다.
-- 사용자는 CLI에서도 같은 엔진을 실행할 수 있다.
-- 모든 run은 재사용 가능한 `evidence.json`을 남긴다.
+- CLI는 같은 엔진을 실행할 수 있지만, 독립 제품이 아니라 plugin runner의 개발/자동화용 보조 표면이다.
+- 모든 run은 schema v0 이상을 따르는 재사용 가능한 `evidence.json`을 남긴다.
 - text-only 작업은 VLM 비용을 쓰지 않는다.
 - visual-required 작업은 VLM 분석과 visual verifier를 생략하지 않는다.
 - 최종 보고서의 모든 high-confidence claim은 quote 또는 image evidence를 가진다.
@@ -705,21 +799,24 @@ Deliverables:
 
 ## 기술 선택
 
+- Product surface: Codex Plugin + Codex Skill. CLI는 plugin runner의 개발/테스트/자동화용 wrapper다.
 - Orchestration: OpenAI Agents SDK. 공식 문서는 agents, tools, handoffs, guardrails, tracing에 적합하다고 설명한다.
-- Model/API: OpenAI Responses API. 공식 vision 문서는 이미지 입력을 URL, Base64 data URL, file ID로 받을 수 있고 여러 이미지를 한 요청에 넣을 수 있다고 설명한다.
+- Model/API: OpenAI Responses API. `automated-cli` 또는 자동 VLM adapter가 필요할 때 사용한다. 공식 vision 문서는 이미지 입력을 URL, Base64 data URL, file ID로 받을 수 있고 여러 이미지를 한 요청에 넣을 수 있다고 설명한다.
+- VLM adapters: `codex-interactive`, `openai-responses-vision`, `manual-visual-review`.
 - Storage: JSONL + Markdown, 나중에 SQLite로 확장.
 - Image processing: perceptual hash, EXIF 추출, screenshot 캡처, OCR/VLM 결과 병합.
 
-## Search Backend and Cost Model
+## Search Provider Modes and Cost Model
 
-Codex 자체의 web search와 Codex DeepResearch의 search backend는 분리한다.
+Codex Plugin의 search workflow와 자동 CLI의 search provider는 분리한다.
 
-Personal-first decision:
+Product-first decision:
 
-- 당장 목표가 판매용 제품이 아니라 개인이 Codex 안에서 고품질 리서치를 하는 것이라면, MVP의 기본 검색 경로는 Codex 내장 search를 사용하는 `codex-native` mode로 둔다.
-- `codex-native` mode에서는 Codex agent가 현재 세션의 web search 기능을 사용해 텍스트 검색과 출처 확인을 수행하고, DeepResearch runner는 evidence schema, claim verification, VLM routing, 보고서 구조화를 담당한다.
-- 독립 실행형 CLI에서 완전 자동으로 검색까지 수행해야 할 때만 OpenAI hosted web search 또는 외부 search API provider를 사용한다.
-- 즉 개인용 MVP에서는 "검색 API 제품화"보다 "Codex가 찾은 근거를 구조화, 검증, 저장, 재사용하는 것"을 우선한다.
+- 최종 제품은 Codex Plugin이다.
+- MVP의 기본 실행 모드는 `codex-plugin`이고, 기본 검색 경로는 Codex 세션 안의 Codex-native search workflow다.
+- `codex-plugin` mode에서는 Codex agent가 현재 세션의 web search 기능을 사용해 텍스트 검색과 출처 확인을 수행하고, DeepResearch runner는 evidence schema, claim verification, VLM routing, 보고서 구조화를 담당한다.
+- `automated-cli` mode에서 재현 가능한 자동 검색이 필요할 때만 OpenAI hosted web search 또는 외부 search API provider를 사용한다.
+- `manual-sources` mode는 Phase 0, 저비용 검증, 민감 source 검토의 fallback이다.
 
 Codex product behavior:
 
@@ -728,20 +825,28 @@ Codex product behavior:
 - `web_search = "live"` 또는 `--search`는 최신 웹 데이터를 가져오는 live browsing 성격이다.
 - 이 Codex 내장 search tool은 Codex 제품 표면이며, Codex DeepResearch 구현이 안정적으로 의존할 공개 library API로 취급하지 않는다.
 
-Codex DeepResearch provider options:
+Mode-specific provider policy:
+
+| Execution mode | Default search provider | Allowed alternatives | Notes |
+| --- | --- | --- | --- |
+| `codex-plugin` | `codex-native` | `manual` | Plugin MVP 기본값. Codex 세션 품질과 사용자의 승인 흐름을 우선한다. |
+| `automated-cli` | `openai` 또는 `manual` | `brave`, `tavily`, `serpapi` | 재현 가능한 batch run, CI smoke, provider 비교에 사용한다. |
+| `manual-sources` | `manual` | 없음 | 사용자가 제공한 URL/PDF/image만 처리한다. |
+
+Provider options:
 
 0. Codex-native search mode
-   - 개인용 MVP의 기본값.
+   - `codex-plugin` MVP의 기본값.
    - Codex 세션 안에서 Codex의 web search 기능을 사용한다.
    - 비용: 별도 외부 검색 API 비용은 없다. 단, Codex 사용량/모델 토큰/VLM 분석 비용은 사용 환경의 과금 정책을 따른다.
    - 장점: 설정이 거의 없고, Codex의 현재 검색 품질을 그대로 활용할 수 있다.
-   - 단점: 독립 실행형 CLI나 백그라운드 worker에서 같은 검색 결과를 API처럼 재현하기 어렵다.
+   - 단점: `automated-cli`나 백그라운드 worker에서 같은 검색 결과를 API처럼 재현하기 어렵다.
    - 적용: text-only 태스크, 빠른 개인 조사, Codex 대화 안에서 바로 실행하는 리서치.
 
 1. OpenAI hosted web search via Responses API
-   - 제품화 또는 독립 실행형 CLI의 기본 provider 후보.
+   - `automated-cli`의 기본 provider 후보.
    - 장점: Responses API/Agents SDK tool orchestration과 잘 맞고 별도 검색 provider 계정이 필요 없다.
-   - 비용: OpenAI API pricing 기준 web search는 별도 tool call 과금 대상이다. 2026-06-16 확인 기준 가격은 `$10 / 1k calls`이고 search content tokens는 무료다.
+   - 비용: OpenAI API pricing 기준 web search는 별도 tool call 과금 대상이다. 구체 가격은 구현 시점의 provider pricing config에서 계산한다.
    - 별도 과금: 검색 결과를 읽고 판단하는 model input/output token, VLM image input token, verifier/synthesis token은 여전히 과금된다.
 
 2. External search API provider
@@ -778,9 +883,9 @@ Budget controls:
 
 MVP policy:
 
-- 개인용 MVP 기본값은 `codex-native`다.
-- 독립 실행형 CLI나 재현 가능한 batch run에서는 provider abstraction을 통해 `openai`, `brave`, `tavily`, `serpapi`, `manual` 중 선택한다.
-- 비용이 가장 예측 가능한 제품화 기본값은 OpenAI hosted web search 또는 user-provided sources mode다.
+- MVP 기본 제품 모드는 `codex-plugin`이고 기본 검색 경로는 `codex-native`다.
+- CLI나 재현 가능한 batch run에서는 provider abstraction을 통해 `openai`, `brave`, `tavily`, `serpapi`, `manual` 중 선택한다.
+- 비용이 가장 예측 가능한 자동 실행 기본값은 OpenAI hosted web search 또는 user-provided sources mode다.
 - 실행 전 예상 search calls, model calls, image analyses, upper-bound cost를 표시한다.
 - `text_only` route는 이미지 검색과 VLM 비용을 쓰지 않는다.
 - `visual_optional` route는 budget이 부족하면 이미지 검색을 생략한다.
@@ -796,15 +901,17 @@ MVP policy:
 
 ## 구현 순서
 
-1. `deepresearch/` 패키지 스캐폴드.
-2. `Planner -> ModalityRouter -> Search -> Fetch -> Extract -> Verify -> Synthesize` 파이프라인 구현.
-3. Agent budget preset과 pruning 구현.
-4. `VisionExtractAgent` 추가.
-5. evidence schema 저장.
-6. Codex Skill 래퍼 추가.
-7. Codex Plugin 패키징과 개인 marketplace 등록 지원.
-8. 시각 evidence appendix 생성.
-9. 나중에 웹 UI/워크플로우 대시보드 추가.
+1. Codex Plugin 구조와 `$deep-research` Skill UX를 확정한다.
+2. schema v0 JSON Schema, fixture, validation command를 만든다.
+3. plugin 내부 runner와 개발용 CLI wrapper를 만든다.
+4. `Planner -> ModalityRouter -> Search -> Fetch -> Extract -> Verify -> Synthesize` 파이프라인을 runner에 구현한다.
+5. `codex-plugin`, `automated-cli`, `manual-sources` 실행 모드를 분리한다.
+6. search provider mode를 skill용 Codex-native workflow와 CLI용 provider abstraction으로 분리한다.
+7. VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리한다.
+8. Agent budget preset과 pruning을 구현한다.
+9. 시각 evidence appendix를 생성한다.
+10. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
+11. 나중에 웹 UI/워크플로우 대시보드 추가.
 
 ## 참고 근거
 
@@ -815,8 +922,8 @@ MVP policy:
 
 ## 자체 검토
 
-문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. MVP 이후 제품화 단계도 없어 실제 제품 수준으로 언제 무엇을 갖춰야 하는지 판단하기 어려웠고, 각 phase를 바로 구현 티켓으로 전환할 작업분해도 부족했다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다.
+문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다.
 
-수정: CLI, Skill, Plugin 기반 호출 표면을 분리했고, `raw -> extracted -> verified -> accepted -> promoted` 승인 단계를 추가했다. 또한 이미지 evidence를 재사용 가능한 JSON 스키마로 고정했다. `ModalityRouterAgent`와 `Agent Budget` 섹션을 추가해 text-only/visual-required/visual-optional 라우팅과 subagent cap을 명시했다. `Product Roadmap`, `Phase Work Breakdown`, `Release Capability Matrix`, `Product-Level Acceptance Criteria`를 추가해 Prototype, MVP, Private Alpha, Public Beta, Product v1, Team/Cloud 단계를 구분하고 각 단계의 epics, tasks, deliverables를 명시했다. MVP 범위에 basic automated visual acquisition, first viewport screenshot capture, Codex-native VLM image/screenshot analysis를 포함하도록 수정했다.
+수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다.
 
-남은 리스크: 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
+남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
