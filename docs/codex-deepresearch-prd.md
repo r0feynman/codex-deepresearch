@@ -73,6 +73,32 @@ codex-deepresearch-plugin/
   src/deepresearch/
 ```
 
+Fixed plugin paths for this repository:
+
+```text
+Repository root:
+  /home/user/Projects/codex-deepresearch/
+
+Plugin root:
+  plugins/codex-deepresearch/
+
+Required plugin layout:
+  plugins/codex-deepresearch/.codex-plugin/plugin.json
+  plugins/codex-deepresearch/skills/deep-research/SKILL.md
+  plugins/codex-deepresearch/scripts/codex-deepresearch
+  plugins/codex-deepresearch/src/deepresearch/
+  plugins/codex-deepresearch/tests/smoke/
+
+Repo-local marketplace metadata:
+  .agents/plugins/marketplace.json
+```
+
+Install/update smoke command target:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch smoke --install --invoke '$deep-research: Codex DeepResearch smoke test'
+```
+
 Execution modes:
 
 | Mode | Primary user | Search path | VLM path | Purpose |
@@ -83,14 +109,79 @@ Execution modes:
 
 MVP의 제품 판단은 `codex-plugin` mode를 기준으로 한다. `automated-cli`는 같은 engine을 검증하고 자동화하는 보조 표면이다.
 
-비개발자 UI:
+## Terminology and Product Contract
 
-- `question`
-- 조사 깊이
-- 이미지 포함 여부
-- 신뢰도 기준
-- 출력 형식
-- 이미지 업로드 또는 URL 목록
+Codex DeepResearch는 다음 실행 단위를 구분한다.
+
+- `Codex subagent`: Codex 세션 안에서 사용자의 지시를 받아 검색, 파일 확인, 이미지 확인, 판단을 수행하는 Codex-side agent 작업 단위다.
+- `runner agent`: plugin 내부 runner가 실행하는 파이프라인 단계다. 예: planner, router, fetcher, evidence writer, report writer.
+- `model call`: OpenAI Responses API 또는 기타 model API에 대한 단일 호출이다.
+- `verifier invocation`: 하나의 claim에 대해 하나의 verifier가 support/refute/uncertain vote를 산출하는 검증 작업이다. verifier invocation은 Codex subagent, runner agent, model call 중 하나 이상을 사용할 수 있지만 동일 개념이 아니다.
+
+제품 계약:
+
+- 최종 제품은 Codex Plugin이다.
+- `$deep-research` Skill invocation이 primary UX다.
+- `/skills` 선택기를 통한 `deep-research` 선택은 secondary UX다.
+- `codex-deepresearch` CLI는 plugin runner를 실행하는 개발/디버깅/자동화용 wrapper이며 독립 제품이 아니다.
+- Codex core의 built-in slash command를 수정하지 않는다.
+- MVP acceptance는 plugin install, manifest validation, marketplace metadata, `$deep-research` invocation smoke test를 기준으로 판정한다.
+- canonical plugin root는 `plugins/codex-deepresearch/`다.
+- canonical marketplace file은 `.agents/plugins/marketplace.json`이고, entry path는 `./plugins/codex-deepresearch`다.
+- canonical local smoke command는 `python3 scripts/validate_repo.py`와 plugin validator 실행 후 `$deep-research: smoke test`를 수행하는 것이다.
+
+## Codex Plugin Search/VLM Handoff Contract
+
+`codex-plugin` mode는 Codex-native search와 Codex interactive visual analysis를 공개 library API처럼 직접 호출한다고 가정하지 않는다. 대신 Skill과 runner 사이에 명시적 handoff artifact를 둔다.
+
+Search handoff:
+
+- Precondition: 사용자가 Codex 세션에서 `$deep-research: <question>`을 호출한다.
+- Runner responsibility: runner는 `search_tasks.json`을 생성한다. 각 task는 angle, query, freshness requirement, modality, max_results, source policy를 포함한다.
+- Codex-side responsibility: Codex agent는 현재 세션의 search capability를 사용해 search task를 수행하고, 결과를 `search_results.jsonl`에 `SearchResult` schema로 기록한다.
+- Runner ingestion: runner는 `search_results.jsonl`을 validate한다. invalid result는 `retrieval_status=failed` 또는 `policy_blocked`로 evidence에 남긴다.
+- Fallback: `codex-plugin` mode에서 `codex-native` search가 불가능하면 `manual-sources` fallback 또는 `blocked_missing_search_handoff` 상태로 종료한다.
+
+VLM handoff:
+
+- Runner responsibility: runner는 visual-required 또는 visual-optional route에서 분석 대상 이미지를 `visual_tasks.json`과 artifact directory에 기록한다.
+- Codex-side responsibility: Codex agent는 세션의 interactive image-reading capability로 이미지를 확인하고, 관찰 결과를 `visual_observations.jsonl`에 `VisualEvidence` schema로 기록한다.
+- Runner ingestion: runner는 `visual_observations.jsonl`을 validate한다. visual-required claim에 valid visual evidence가 없으면 `verification_status=needs_visual_evidence`로 남기고 high-confidence claim으로 쓰지 않는다.
+- Automated alternative: `automated-cli` mode는 `openai-responses-vision` adapter를 사용해 같은 `VisualEvidence` schema를 생성한다.
+- Manual fallback: `manual-visual-review`는 사람이 같은 schema를 작성하는 fallback이다.
+
+Handoff command protocol:
+
+```text
+codex-deepresearch prepare "<question>"
+-> creates run directory, search_tasks.json, visual_tasks.json placeholder
+
+Codex fills handoff artifacts
+-> search_results.jsonl from Codex-native search
+-> visual_observations.jsonl from Codex interactive VLM when needed
+
+codex-deepresearch ingest --run <run_id>
+-> validates SearchResult and VisualEvidence records
+-> fetches allowed sources
+-> normalizes evidence.json
+
+codex-deepresearch verify --run <run_id>
+-> extracts claims
+-> applies route-specific verifier matrix
+-> writes verifier_votes.jsonl and updates claim state
+
+codex-deepresearch synthesize --run <run_id>
+-> writes report.md and image appendix from supported claims only
+```
+
+The Skill must guide the user and Codex-side agent through this protocol. The runner must never assume it can call Codex-native search or `codex-interactive` VLM as a hidden API.
+
+Non-developer input path:
+
+- MVP에서는 별도 web UI를 제공하지 않는다.
+- Phase 1에서 허용하는 최소 비개발자 경로는 Codex 안의 `$deep-research` Skill prompt와 optional TUI/form prompt다.
+- TUI/form이 구현되는 경우 입력 필드는 `question`, `depth preset`, `visual inclusion`, `source URLs`, `image files`로 제한한다.
+- full web dashboard는 Public Beta 범위다.
 
 ## 주요 요구사항
 
@@ -105,10 +196,10 @@ MVP의 제품 판단은 `codex-plugin` mode를 기준으로 한다. `automated-c
    - 이미지와 본문 claim의 일치 여부
    - 조작/스톡/마케팅 이미지 가능성
    - 같은 이미지의 중복/파생본 탐지
-6. claim마다 최소 3개 verifier를 실행한다.
-   - 텍스트 verifier 2개
-   - visual verifier 1개 이상
-   - 이미지 근거가 있는 claim이면 visual verifier 필수
+6. claim마다 route별 verifier matrix를 실행한다.
+   - text-only claim은 text verifier 2개와 freshness/policy verifier 1개를 실행한다.
+   - visual-required claim은 text verifier 2개, visual verifier 1개 이상, policy verifier 1개를 실행한다.
+   - visual-optional claim은 budget에 따라 visual verifier를 생략할 수 있지만, visual vote 없는 시각 claim은 high-confidence가 될 수 없다.
 7. 반박 2표 이상이면 claim을 폐기한다.
 8. 최종 보고서는 모든 주요 주장에 source URL, quote, image evidence ID를 붙인다.
 9. 실행 전 agent budget을 산정하고 사용자가 선택한 조사 깊이의 hard cap을 넘지 않는다.
@@ -207,18 +298,26 @@ Decision:
 - Private Alpha는 더 큰 규모, 더 정교한 중복 제거, resume/cache, 대량 캡처 안정화를 담당한다.
 - `visual_required` 태스크는 자동 수집 이미지 또는 사용자 제공 이미지가 없거나 VLM path가 실행 불가능하면 `needs_visual_evidence` 상태로 남기고 high-confidence 결론을 내지 않는다.
 
-## Agent Budget
+## Invocation Budget
 
 기본 preset:
 
-| Preset | 최대 동시 subagent | 최대 총 subagent | 최대 source | 최대 image | 용도 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `quick` | 4 | 16 | 8 | 4 | 빠른 사실 확인 |
-| `standard` | 8 | 48 | 20 | 12 | 기본 딥리서치 |
-| `deep` | 12 | 96 | 40 | 30 | 고신뢰 보고서 |
-| `exhaustive` | 16 | 256 | 100 | 80 | 비용 확인 후 실행하는 대형 조사 |
+| Preset | 최대 Codex-side handoff task | 최대 동시 runner agent | verifier invocation | model/API call hard cap | 최대 source | 최대 image | 용도 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `quick` | 16 | 4 | 24 | 32 | 8 | 4 | 빠른 사실 확인 |
+| `standard` | 48 | 8 | 80 | 96 | 20 | 12 | MVP 기본 딥리서치 |
+| `deep` | 96 | 12 | 180 | 220 | 40 | 30 | 고신뢰 보고서 |
+| `exhaustive` | 256 | 16 | 500 | 600 | 100 | 80 | 비용 확인 후 실행하는 대형 조사 |
 
-MVP 기본값은 `standard`다. MVP hard cap은 총 subagent 96개, 동시 subagent 12개다. `exhaustive`는 v2에서 제공하며 실행 전 예상 비용과 시간을 사용자에게 확인받는다.
+MVP 기본값은 `standard`다.
+
+Budget terms:
+
+- 48은 Codex-side handoff task 한도다. Codex-native search/VLM을 수행하는 agent-mediated work item 수를 제한한다.
+- 80은 verifier invocation 한도다. 하나의 claim에 대해 하나의 verifier가 vote를 만드는 작업을 제한한다.
+- 96은 paid or metered model/API call hard cap이다.
+- 동시 runner agent 기본값은 8이고 MVP hard cap은 12다.
+- `exhaustive`는 v2에서 제공하며 실행 전 예상 비용과 시간을 사용자에게 확인받는다.
 
 Agent 산정식:
 
@@ -272,26 +371,33 @@ Agent 산정식:
   ],
   "budget": {
     "preset": "standard",
-    "max_concurrent_agents": 8,
-    "max_total_agents": 48,
-    "agents_used": 37
+    "max_codex_handoff_tasks": 48,
+    "max_concurrent_runner_agents": 8,
+    "max_verifier_invocations": 80,
+    "max_model_api_calls": 96,
+    "verifier_invocations_used": 37
   },
   "images": [
     {
       "id": "img_001",
       "source_id": "src_001",
+      "origin": "screenshot",
       "image_url": "...",
       "page_url": "...",
       "local_artifact_path": "images/img_001.png",
       "mime_type": "image/png",
       "width": 1280,
       "height": 720,
-      "ocr_text": "...",
-      "vlm_observations": ["visible UI contains a pricing table"],
-      "vlm_inferences": ["the screenshot likely came from the pricing page"],
-      "visual_claims": ["..."],
+      "hash": "sha256:...",
       "phash": "...",
-      "analysis_status": "analyzed|failed|skipped|needs_manual_review"
+      "ocr_text": "...",
+      "observations": ["visible UI contains a pricing table"],
+      "inferences": ["the screenshot likely came from the pricing page"],
+      "visual_tasks": ["ocr", "image_claim_alignment"],
+      "analysis_provider": "codex-interactive",
+      "analysis_status": "analyzed|failed|skipped|needs_manual_review|policy_blocked",
+      "policy_flags": [],
+      "caveats": []
     }
   ],
   "claims": [
@@ -310,21 +416,35 @@ Agent 산정식:
       ],
       "votes": [
         {
-          "agent": "text_v1",
-          "model_or_method": "gpt-5.1",
-          "refuted": false,
+          "id": "vote_001",
+          "claim_id": "claim_001",
+          "verifier_type": "text",
+          "agent_name": "text_verifier_1",
+          "method": "model-call",
+          "model_or_tool": "gpt-5.1",
+          "vote": "support",
           "confidence": 0.72,
-          "evidence": "..."
+          "evidence_refs": ["src_001"],
+          "rationale": "...",
+          "created_at": "2026-06-22T00:00:00Z"
         },
         {
-          "agent": "visual_v1",
-          "model_or_method": "codex-interactive",
-          "refuted": true,
+          "id": "vote_002",
+          "claim_id": "claim_001",
+          "verifier_type": "visual",
+          "agent_name": "visual_verifier_1",
+          "method": "codex-subagent",
+          "model_or_tool": "codex-interactive",
+          "vote": "refute",
           "confidence": 0.64,
-          "evidence": "..."
+          "evidence_refs": ["img_001"],
+          "rationale": "...",
+          "created_at": "2026-06-22T00:00:00Z"
         }
       ],
-      "status": "confirmed|refuted|uncertain|needs_visual_evidence|budget_pruned",
+      "verification_status": "supported|refuted|disputed|insufficient_evidence|needs_visual_evidence|budget_pruned|policy_blocked|unverified",
+      "review_status": "not_reviewed|auto_reviewed|human_accepted|human_rejected|needs_more_evidence",
+      "promotion_status": "not_eligible|eligible|promoted_memory|promoted_playbook|promoted_skill|promoted_prd|promotion_rejected",
       "confidence": "high|medium|low",
       "caveats": ["small text OCR may be unreliable"]
     }
@@ -336,29 +456,179 @@ Schema v0 implementation requirements:
 
 - `schema_version`, `run_id`, `created_at`, `mode`, `search_provider`, `vlm_provider`는 필수다.
 - 모든 source는 `accessed_at`, `retrieval_status`, `quality`, `local_artifact_path`를 가진다.
+- 모든 image/screenshot은 `VisualEvidence` schema를 따른다.
 - 모든 image/screenshot은 `page_url` 또는 `image_url` 중 하나 이상과 `local_artifact_path`를 가진다.
-- VLM output은 `vlm_observations`와 `vlm_inferences`를 분리한다.
+- VLM output은 `observations`와 `inferences`를 분리한다.
 - 모든 high-confidence text claim은 하나 이상의 `quote_spans`를 가진다.
 - 모든 high-confidence visual/mixed claim은 하나 이상의 `supporting_images`를 가진다.
-- verifier vote는 `agent`, `model_or_method`, `refuted`, `confidence`, `evidence`를 가진다.
+- `claims[].votes[]`는 `VerifierVote` schema를 그대로 embed하거나 `verifier_votes.jsonl`의 `id`를 참조한다. MVP는 embed를 기본으로 한다.
+- verifier vote는 `id`, `claim_id`, `verifier_type`, `agent_name`, `method`, `model_or_tool`, `vote`, `confidence`, `evidence_refs`, `rationale`, `created_at`을 가진다.
 - budget 때문에 검증하지 못한 claim은 `budget_pruned`로 남기고 최종 보고서의 확정 주장으로 쓰지 않는다.
+
+### Evidence State Model v0
+
+Claim 상태는 하나의 `status` 필드로 합치지 않는다. 검증, 사람 리뷰, 승격 상태를 분리한다.
+
+`verification_status` enum:
+
+- `unverified`: claim이 추출됐지만 verifier가 아직 실행되지 않았다.
+- `supported`: verifier matrix를 통과했고 반박 임계값을 넘지 않았다.
+- `refuted`: 반박 vote가 폐기 기준을 넘었다.
+- `disputed`: support/refute가 충돌해 결론을 낼 수 없다.
+- `insufficient_evidence`: quote, source, image evidence가 부족하다.
+- `needs_visual_evidence`: visual-required claim인데 usable visual evidence가 없다.
+- `budget_pruned`: budget cap 때문에 검증하지 못했다.
+- `policy_blocked`: robots, paywall, copyright, PII, high-risk policy에 의해 사용 제한됐다.
+
+`review_status` enum:
+
+- `not_reviewed`: 사람이 검토하지 않았다.
+- `auto_reviewed`: 자동 규칙으로 보고서 포함 가능 판정을 받았다.
+- `human_accepted`: 사람이 승인했다.
+- `human_rejected`: 사람이 거절했다.
+- `needs_more_evidence`: 사람이 추가 증거 필요로 표시했다.
+
+`promotion_status` enum:
+
+- `not_eligible`: 승격 조건을 만족하지 않는다.
+- `eligible`: 승격 가능하지만 아직 승격되지 않았다.
+- `promoted_memory`: memory로 승격됐다.
+- `promoted_playbook`: playbook으로 승격됐다.
+- `promoted_skill`: skill로 승격됐다.
+- `promoted_prd`: PRD로 승격됐다.
+- `promotion_rejected`: 승격이 명시적으로 거절됐다.
+
+Report inclusion rule:
+
+- 최종 보고서의 확정 claim은 `verification_status=supported`이고 `review_status`가 `auto_reviewed` 또는 `human_accepted`여야 한다.
+- 후속 Codex 작업에 재사용 가능한 claim은 `verification_status=supported`이고 `promotion_status=eligible|promoted_*` 중 하나여야 한다.
+
+### Adapter Interface Schemas v0
+
+All adapters must emit these canonical records before evidence ingestion.
+
+`SearchResult`:
+
+```json
+{
+  "id": "sr_001",
+  "task_id": "task_search_001",
+  "angle_id": "angle_001",
+  "route": "text_only|visual_required|visual_optional",
+  "provider": "codex-native|openai|brave|tavily|serpapi|manual",
+  "query": "...",
+  "url": "...",
+  "title": "...",
+  "snippet": "...",
+  "result_type": "web|pdf|image|news|academic|manual",
+  "rank": 1,
+  "freshness_requirement": "latest|recent|historical|any",
+  "published_at": null,
+  "accessed_at": "2026-06-22T00:00:00Z",
+  "language": "en",
+  "region": "US",
+  "policy_decision": "allowed|blocked|manual_review",
+  "policy_flags": [],
+  "raw_provider_metadata": {}
+}
+```
+
+SearchResult validation rules:
+
+- Every `SearchResult.task_id` must reference an existing search task.
+- Every `SearchResult.angle_id` must reference an existing routed angle.
+- `SearchResult.route` must match the referenced angle route.
+- `policy_decision=blocked` result cannot create high-confidence claims.
+- `provider=codex-native` is valid only in `codex-plugin` mode.
+
+`VisualEvidence`:
+
+```json
+{
+  "id": "img_001",
+  "source_id": "src_001",
+  "origin": "page_image|image_search|screenshot|user_upload|manual",
+  "image_url": null,
+  "page_url": "...",
+  "local_artifact_path": "images/img_001.png",
+  "mime_type": "image/png",
+  "width": 1280,
+  "height": 720,
+  "hash": "sha256:...",
+  "phash": null,
+  "ocr_text": null,
+  "observations": ["Visible text says ..."],
+  "inferences": ["This likely indicates ..."],
+  "visual_tasks": ["ocr", "chart_reading", "image_claim_alignment"],
+  "analysis_provider": "codex-interactive|openai-responses-vision|manual-visual-review",
+  "analysis_status": "analyzed|failed|skipped|needs_manual_review|policy_blocked",
+  "policy_flags": [],
+  "caveats": []
+}
+```
+
+`VerifierVote`:
+
+```json
+{
+  "id": "vote_001",
+  "claim_id": "claim_001",
+  "verifier_type": "text|visual|policy|freshness",
+  "agent_name": "text_verifier_1",
+  "method": "codex-subagent|runner-agent|model-call|manual-review",
+  "model_or_tool": "gpt-5.1|codex-interactive|manual",
+  "vote": "support|refute|uncertain|blocked",
+  "confidence": 0.72,
+  "evidence_refs": ["src_001", "img_001"],
+  "rationale": "...",
+  "created_at": "2026-06-22T00:00:00Z"
+}
+```
+
+## Verifier Matrix and Cost Caps
+
+Verifier policy is route-specific.
+
+| Route | Required verifier invocations | Visual verifier | Default max sources | Default max images | VLM cap | Report rule |
+| --- | ---: | --- | ---: | ---: | --- | --- |
+| `text_only` | 2 text + 1 freshness/policy | Forbidden | 12 | 0 | 0 | quote-backed claims only |
+| `visual_required` | 2 text + 1 visual + 1 policy | Required | 20 | 12 | required, capped | image-backed claims required |
+| `visual_optional` | 2 text + 1 policy, visual if budget allows | Optional | 16 | 6 | best-effort | visual claims cannot be high-confidence without visual vote |
+
+Cost caps by preset:
+
+| Preset | Search calls | Sources fetched | Images analyzed | Verifier invocations | Model calls | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `quick` | 8 | 8 | 4 | 24 | 32 | no optional visual expansion |
+| `standard` | 20 | 20 | 12 | 80 | 96 | MVP default |
+| `deep` | 40 | 40 | 30 | 180 | 220 | requires confirmation |
+| `exhaustive` | 100 | 100 | 80 | 500 | 600 | post-MVP only |
+
+These cost caps must match the `Invocation Budget` table. If implementation changes one table, it must update the other in the same PR.
+
+Rules:
+
+- `text_only` route must not perform image search, screenshot capture, or VLM analysis.
+- `visual_required` route must not produce high-confidence conclusions without at least one valid `VisualEvidence` and one visual `VerifierVote`.
+- `visual_optional` route may skip VLM under budget pressure, but any skipped visual evidence must be recorded as `budget_pruned`.
 
 ## 검증 규칙
 
-- quote 없는 텍스트 claim은 `uncertain`.
-- 이미지 claim은 이미지 원본 URL 또는 캡처된 screenshot 없이는 `uncertain`.
+- quote 없는 텍스트 claim은 `verification_status=insufficient_evidence`.
+- 이미지 claim은 이미지 원본 URL 또는 캡처된 screenshot 없이는 `verification_status=needs_visual_evidence`.
 - VLM이 본문과 다른 내용을 읽으면 visual contradiction으로 기록.
 - 날짜가 중요한 claim은 publish date 또는 access date 필수.
 - medical/legal/financial claim은 primary source 없으면 high confidence 금지.
 - 이미지 내 작은 글씨, 회전, 비라틴 문자 OCR은 별도 caveat 필수.
 
-## 승인 레벨
+## Review and Promotion Rules
 
-- `raw`: 수집만 된 source/image.
-- `extracted`: claim 추출 완료.
-- `verified`: 3-vote 검증 통과.
-- `accepted`: 사람이 승인하거나 정책상 충분한 근거 충족.
-- `promoted`: playbook, memory, skill, PRD, implementation plan으로 승격.
+- raw source/image는 `sources[]`와 `images[]`에만 존재하며 claim으로 승격되지 않는다.
+- extracted claim은 `verification_status=unverified`로 시작한다.
+- verifier matrix를 통과한 claim은 `verification_status=supported`가 될 수 있다.
+- 자동 규칙을 통과한 claim은 `review_status=auto_reviewed`, 사람이 승인한 claim은 `review_status=human_accepted`가 된다.
+- `verification_status=supported`이고 `review_status=auto_reviewed|human_accepted`인 evidence만 `promotion_status=eligible` 또는 `promoted_*` 상태가 될 수 있다.
+- rejected, policy-blocked, budget-pruned evidence는 memory/playbook/skill/PRD로 승격할 수 없다.
 
 ## 에이전트 검색/재사용 경로
 
@@ -373,7 +643,7 @@ Schema v0 implementation requirements:
   claims.jsonl
 ```
 
-Codex는 후속 작업에서 `evidence.json`을 먼저 읽고, claim status가 `verified` 또는 `accepted`인 항목만 재사용한다.
+Codex는 후속 작업에서 `evidence.json`을 먼저 읽고, `verification_status=supported`이며 `promotion_status=eligible|promoted_*`인 claim만 재사용한다.
 
 ## MVP
 
@@ -385,9 +655,28 @@ Codex는 후속 작업에서 `evidence.json`을 먼저 읽고, claim status가 `
 6. `manual-sources` mode는 사용자가 제공한 URL/PDF/image만으로 Phase 0와 fallback run을 지원한다.
 7. `ModalityRouterAgent`로 text-only/visual-required/visual-optional 분류를 구현한다.
 8. visual-required angle에서 이미지 검색, 대표 이미지 추출, first viewport screenshot 캡처를 수행한다.
-9. `standard` preset 기준 총 subagent 48개, 동시 8개를 기본값으로 둔다.
+9. `standard` preset 기준 verifier invocation 80개, 동시 runner agent 8개를 기본값으로 둔다.
 10. 보고서 `report.md`와 schema v0 `evidence.json` 저장.
-11. claim 3-vote 검증 구현.
+11. route-specific verifier matrix 구현.
+
+MVP plugin acceptance:
+
+- `.codex-plugin/plugin.json`이 validation을 통과한다.
+- personal marketplace metadata가 존재하고 install/update/remove 절차가 문서화되어 있다.
+- `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`을 생성한다.
+- `codex-plugin` mode의 search handoff와 VLM handoff artifact가 schema validation을 통과한다.
+- `verification_status`, `review_status`, `promotion_status`가 모든 claim에 존재한다.
+- `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
+- MVP guardrail 위반 evidence는 `review_status=human_accepted` 또는 `promotion_status=promoted_*` 상태가 될 수 없다.
+
+MVP security and policy guardrails:
+
+- robots/paywall/copyright/PII policy flags must be recorded on every source and visual artifact when detected.
+- CAPTCHA, login-gated, or access-controlled content must not be bypassed.
+- private user-provided images are stored locally only by default and are marked `sensitive_possible` unless the user opts into export.
+- medical/legal/financial claims require primary-source evidence or must be downgraded from high confidence.
+- image evidence from unknown or restricted sources cannot be promoted without human review.
+- all generated reports must preserve source URLs and evidence IDs, but must not copy large copyrighted passages.
 
 ## Product Roadmap
 
@@ -431,13 +720,13 @@ Exit criteria:
 - high-relevance source page first viewport screenshot capture.
 - `codex-interactive` 및 `openai-responses-vision` VLM path.
 - user-provided image file, screenshot, image URL 보강 입력.
-- claim당 3-vote 검증.
+- route-specific verifier matrix.
 - source quote와 image evidence ID가 포함된 Markdown 보고서.
 - `~/.codex/deepresearch/runs/<run_id>/` 저장.
 
 Exit criteria:
 
-- `standard` preset에서 총 subagent 48개 이하로 안정 실행.
+- `standard` preset에서 verifier invocation 80개 이하로 안정 실행하고, hard cap 96개를 넘지 않는다.
 - unsupported claim이 최종 보고서에 들어가지 않는다.
 - text-only 태스크에서 VLM 호출이 발생하지 않는다.
 - visual-required 태스크에서 자동 이미지 수집 또는 스크린샷 캡처가 실행된다.
@@ -502,7 +791,7 @@ Exit criteria:
 - evaluation suite: known-answer benchmark, visual QA benchmark, citation correctness benchmark.
 - observability: cost, latency, failure rate, verifier disagreement, VLM usage ratio.
 - cache: fetched pages, image analysis, OCR, embeddings/hash.
-- promotion workflow: accepted evidence -> memory/playbook/skill/PRD.
+- promotion workflow: supported + auto/human accepted evidence -> memory/playbook/skill/PRD.
 - documentation: install, quickstart, config, troubleshooting, examples.
 
 Exit criteria:
@@ -511,7 +800,7 @@ Exit criteria:
 - claim citation correctness benchmark가 설정된 기준을 통과한다.
 - visual-required benchmark에서 visual verifier가 누락되지 않는다.
 - schema migration이 이전 run artifact를 깨뜨리지 않는다.
-- 사용자가 accepted evidence만 후속 Codex 작업에 주입할 수 있다.
+- 사용자가 `verification_status=supported`이고 `review_status=auto_reviewed|human_accepted`인 evidence만 후속 Codex 작업에 주입할 수 있다.
 
 ### Phase 5: Team/Cloud Extension
 
@@ -531,7 +820,7 @@ Exit criteria:
 Exit criteria:
 
 - 팀원이 동일 evidence bundle을 조회하고 승인 상태를 공유한다.
-- 반복 조사에서 기존 accepted evidence를 재검증하거나 stale 처리한다.
+- 반복 조사에서 기존 supported + auto/human accepted evidence를 재검증하거나 stale 처리한다.
 - source policy와 budget policy가 팀 설정으로 강제된다.
 - 민감 이미지와 private source가 export에 포함될지 제어할 수 있다.
 
@@ -602,8 +891,8 @@ Tasks:
 13. 수집 이미지를 MIME, 크기, URL 중복, basic hash로 필터링한다.
 14. `VisionExtractAgent`가 선택된 VLM path로 이미지와 스크린샷을 분석하게 한다.
 15. `ClaimExtractorAgent`가 quote 포함 claim을 구조화하게 한다.
-16. `VerifierAgent` 2개와 `VisualVerifierAgent` 1개를 claim마다 실행한다.
-17. 반박 2표 이상이면 claim을 `refuted` 처리한다.
+16. route-specific verifier matrix에 따라 text, visual, policy/freshness verifier를 실행한다.
+17. 반박 2표 이상이면 `verification_status=refuted` 처리한다.
 18. Budget 초과 시 source quality, relevance, visual necessity 기준으로 pruning한다.
 19. text-only route에서 이미지 검색, screenshot, VLM 호출이 발생하지 않는 테스트를 만든다.
 20. visual-required route에서 자동 이미지 수집 또는 screenshot 캡처가 실행되는 테스트를 만든다.
@@ -620,8 +909,256 @@ Deliverables:
 - first viewport screenshot collector
 - VLM adapter paths
 - budget preset config
-- 3-vote verification engine
+- route-specific verification engine
 - MVP test suite
+
+### Phase 1 MVP Vertical Slice Tickets
+
+These tickets are the canonical MVP issue backlog. Each ticket must be independently testable and must produce or validate concrete artifacts.
+
+#### Ticket M1: Plugin Scaffold and Manifest
+
+Input:
+
+- plugin root path
+- plugin name `codex-deepresearch`
+- Skill name `deep-research`
+
+Output:
+
+- `.codex-plugin/plugin.json`
+- `skills/deep-research/SKILL.md`
+- runner script entrypoint
+
+Acceptance tests:
+
+- plugin manifest validates.
+- plugin appears in local/personal marketplace metadata.
+- install/update/remove docs exist.
+- `$deep-research: smoke test` starts a run directory.
+- plugin root exists at `plugins/codex-deepresearch/`.
+- repo-local marketplace metadata exists at `.agents/plugins/marketplace.json`.
+- install/update smoke command exits 0.
+
+#### Ticket M2: Execution Mode Resolver
+
+Input:
+
+- mode: `codex-plugin|automated-cli|manual-sources`
+- provider flags
+- budget preset
+
+Output:
+
+- normalized run config
+- rejected invalid combinations
+
+Acceptance tests:
+
+- `codex-plugin + codex-native` is valid.
+- `automated-cli + codex-native` is rejected.
+- `manual-sources + external search provider` is rejected.
+- invalid VLM provider for mode returns a clear error.
+
+#### Ticket M3: Evidence Schema Validator
+
+Input:
+
+- `evidence.json`
+- `search_results.jsonl`
+- `visual_observations.jsonl`
+- `verifier_votes.jsonl`
+
+Output:
+
+- validation pass/fail
+- machine-readable validation errors
+
+Acceptance tests:
+
+- valid fixture passes.
+- missing required state fields fails.
+- dangling source/image references fail.
+- high-confidence visual claim without image evidence fails.
+
+#### Ticket M4: Codex Search Handoff Slice
+
+Input:
+
+- question
+- search tasks
+- Codex-native search results recorded as `SearchResult`
+
+Output:
+
+- normalized sources in evidence
+- fetch queue
+
+Acceptance tests:
+
+- `search_results.jsonl` ingests into `sources`.
+- invalid URLs are rejected with status.
+- source policy flags are preserved.
+
+#### Ticket M5: Manual Sources Slice
+
+Input:
+
+- user-provided URL/PDF/image URL/local image
+
+Output:
+
+- source records
+- visual evidence records where applicable
+
+Acceptance tests:
+
+- manual URL creates source.
+- manual image creates `VisualEvidence`.
+- no external search call is made.
+
+#### Ticket M6: Modality Router Slice
+
+Input:
+
+- question
+- planner angles
+
+Output:
+
+- route per angle: `text_only|visual_required|visual_optional`
+- visual task list and caps
+
+Acceptance tests:
+
+- API-doc question routes text-only.
+- UI comparison routes visual-required.
+- market report routes visual-optional.
+- route is recorded in evidence.
+
+#### Ticket M7: Fetch and Claim Extraction Slice
+
+Input:
+
+- normalized sources
+- fetch queue
+- source policy flags
+
+Output:
+
+- fetched source artifacts
+- quote candidates
+- extracted claims
+- source-to-claim links
+
+Acceptance tests:
+
+- allowed HTML source produces title, body excerpt, quote candidates, and local artifact path.
+- allowed PDF source produces text excerpt or `retrieval_status=partial` with caveat.
+- blocked or failed source is preserved with `retrieval_status=failed|policy_blocked` and does not create high-confidence claims.
+- every extracted claim references an existing source id.
+- dangling source references fail schema validation.
+
+#### Ticket M8: VLM Handoff and Vision Adapter Slice
+
+Input:
+
+- visual tasks
+- local image artifacts
+- selected VLM path
+
+Output:
+
+- `VisualEvidence` records
+
+Acceptance tests:
+
+- `codex-interactive` path accepts handoff observations.
+- `openai-responses-vision` path emits same schema.
+- `manual-visual-review` path emits same schema.
+- visual-required with no visual result becomes `needs_visual_evidence`.
+
+#### Ticket M9: Verification Matrix Slice
+
+Input:
+
+- extracted claims
+- route
+- sources/images
+
+Output:
+
+- `VerifierVote` records
+- updated `verification_status`
+
+Acceptance tests:
+
+- text-only claim gets 2 text votes and 1 policy/freshness vote.
+- visual-required claim gets at least 1 visual vote.
+- 2 refute votes set `verification_status=refuted`.
+- budget-pruned claim is excluded from final report.
+
+#### Ticket M10: Report Generation Slice
+
+Input:
+
+- evidence bundle
+- supported claims
+
+Output:
+
+- `report.md`
+- image appendix
+- citation/evidence mapping
+
+Acceptance tests:
+
+- every high-confidence text claim has quote/source.
+- every high-confidence visual claim has image evidence ID.
+- unsupported/refuted/policy-blocked claims are excluded or caveated.
+
+#### Ticket M11: Guardrail Enforcement Slice
+
+Input:
+
+- source and visual fixtures with robots, paywall, copyright, PII, private image, and high-risk domain cases
+
+Output:
+
+- policy flags
+- blocked evidence states
+- report redaction/caveat behavior
+
+Acceptance tests:
+
+- login-gated or CAPTCHA-protected content is not bypassed.
+- robots/paywall/copyright flags are preserved on source records.
+- private user-provided images are marked `sensitive_possible` by default.
+- high-risk medical/legal/financial claim without primary source cannot become high confidence.
+- policy-blocked evidence cannot become `review_status=human_accepted` or `promotion_status=promoted_*`.
+- generated report does not copy large copyrighted passages.
+- unknown-license image cannot become `promotion_status=eligible` without `review_status=human_accepted`.
+
+#### Ticket M12: MVP Smoke Suite
+
+Input:
+
+- 3 text-only fixtures
+- 3 visual-required fixtures
+- 2 visual-optional fixtures
+
+Output:
+
+- automated smoke results
+
+Acceptance tests:
+
+- `$deep-research` invocation completes one text-only run.
+- plugin install/update smoke passes.
+- text-only run performs zero VLM calls.
+- visual-required run performs visual handoff and visual verifier.
+- evidence validates against schema v0.
+- guardrail fixture suite passes.
 
 ### Phase 2 WBS: Private Alpha
 
@@ -709,7 +1246,7 @@ Tasks:
 8. citation correctness benchmark를 만든다.
 9. cost, latency, failure rate, verifier disagreement, VLM usage ratio metric을 수집한다.
 10. fetched pages, OCR, image analysis, embeddings/hash cache를 구현한다.
-11. accepted evidence를 memory/playbook/skill/PRD로 승격하는 workflow를 만든다.
+11. supported + auto/human accepted evidence를 memory/playbook/skill/PRD로 승격하는 workflow를 만든다.
 12. install, quickstart, config, troubleshooting, examples 문서를 완성한다.
 13. plugin release checklist와 changelog 프로세스를 만든다.
 
@@ -782,11 +1319,18 @@ Deliverables:
 - 사용자는 Codex 안에서 `$deep-research`를 호출해 별도 설명 없이 리서치를 시작할 수 있다.
 - CLI는 같은 엔진을 실행할 수 있지만, 독립 제품이 아니라 plugin runner의 개발/자동화용 보조 표면이다.
 - 모든 run은 schema v0 이상을 따르는 재사용 가능한 `evidence.json`을 남긴다.
+- plugin manifest `.codex-plugin/plugin.json`이 validation을 통과한다.
+- personal marketplace metadata가 존재하고 install/update/remove 절차가 문서화되어 있다.
+- `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`을 생성한다.
+- `codex-plugin` mode의 search handoff와 VLM handoff artifact가 schema validation을 통과한다.
+- `verification_status`, `review_status`, `promotion_status`가 모든 claim에 존재한다.
+- `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
 - text-only 작업은 VLM 비용을 쓰지 않는다.
 - visual-required 작업은 VLM 분석과 visual verifier를 생략하지 않는다.
 - 최종 보고서의 모든 high-confidence claim은 quote 또는 image evidence를 가진다.
 - high-risk domain claim은 primary source 또는 caveat 없이는 high confidence가 될 수 없다.
-- 사용자는 accepted evidence만 memory/playbook/skill/PRD로 승격할 수 있다.
+- 사용자는 `verification_status=supported`이고 `review_status=auto_reviewed|human_accepted`인 evidence만 memory/playbook/skill/PRD로 승격할 수 있다.
+- MVP guardrail 위반 evidence는 `review_status=human_accepted` 또는 `promotion_status=promoted_*` 상태가 될 수 없다.
 - 제품은 중단, 실패, 재시도, 부분 결과 저장을 정상적인 상태로 다룬다.
 
 ## 비목표
@@ -890,14 +1434,24 @@ MVP policy:
 - `text_only` route는 이미지 검색과 VLM 비용을 쓰지 않는다.
 - `visual_optional` route는 budget이 부족하면 이미지 검색을 생략한다.
 
-## 성공 지표
+## Success Metrics and Phase Thresholds
 
-- claim당 평균 source 수
-- image-backed claim 비율
-- refuted claim 비율
-- unsupported claim 최종 보고서 유입률 0%
-- report 생성 비용/시간
-- 사람이 검토 후 수정한 claim 비율
+Metric denominators:
+
+- Product-Level Acceptance Criteria는 release gate다. gate 항목은 해당 release에서 100% 통과해야 한다.
+- 아래 phase metric은 `policy_blocked`, `needs_manual_review`, `blocked_missing_search_handoff`로 정상 차단된 run을 제외한 completed non-blocked runs 기준이다.
+- blocked run은 실패가 아니라 별도 `blocked_*` 상태로 집계한다.
+
+| Metric | Prototype | MVP | Private Alpha | Public Beta | Product v1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| completed non-blocked evidence schema validation pass rate | 80% | 95% | 98% | 99% | 99% |
+| unsupported high-confidence claim leakage | 0 | 0 | 0 | 0 | 0 |
+| text-only VLM call count | 0 | 0 | 0 | 0 | 0 |
+| completed non-blocked visual-required visual verifier coverage | 70% | 95% | 98% | 99% | 99% |
+| completed non-blocked report citation/evidence ID coverage | 80% | 95% | 98% | 99% | 99% |
+| plugin install + invocation smoke pass | skeleton | 100% | 100% | 100% | 100% |
+| median standard run completion | n/a | < 20 min | < 15 min | < 12 min | < 10 min |
+| policy-blocked evidence leakage into accepted claims | 0 | 0 | 0 | 0 | 0 |
 
 ## 구현 순서
 
