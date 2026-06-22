@@ -43,6 +43,29 @@ python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
 ```
 
+## GitHub Project Management
+
+Milestones, labels, and starter issues can be seeded with:
+
+```bash
+python3 scripts/bootstrap_github.py
+```
+
+The visual GitHub Projects board needs the GitHub CLI `project` scope once:
+
+```bash
+gh auth refresh -s project
+python3 scripts/bootstrap_project_board.py
+```
+
+The board script creates or reuses the `Codex DeepResearch` project, links it to this repository, adds open issues, and sets these custom fields:
+
+- `Phase`
+- `Work Type`
+- `Component`
+- `Priority`
+- `Workflow Status`
+
 ## Codex Usage During Development
 
 From this repository, Codex can use the repo-local skill mirror:

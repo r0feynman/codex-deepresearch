@@ -20,6 +20,8 @@ REQUIRED_FILES = [
     ".agents/plugins/marketplace.json",
     "plugins/codex-deepresearch/.codex-plugin/plugin.json",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
+    "scripts/bootstrap_github.py",
+    "scripts/bootstrap_project_board.py",
 ]
 
 
