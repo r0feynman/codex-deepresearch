@@ -38,6 +38,16 @@ In plugin mode, do not assume a hidden Codex search API is available to the runn
 5. Run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>`.
 6. Continue only from the normalized `evidence.json` and `fetch_queue.json` artifacts.
 
+## Manual Sources Fallback
+
+When the user provides URLs, PDF URLs, image URLs, or local image files directly, or when Codex-native search handoff is blocked, do not call external search. Use the manual source path:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "<question>" --url <url>
+```
+
+Use `--pdf` for PDF URLs or local PDF files, `--image-url` for remote images, and `--local-image` for local image files. `ingest-manual` creates or updates `evidence.json` with `search_provider=manual`, source records, and `VisualEvidence` for image inputs. It records metadata only: no remote body fetch, claim extraction, verification, VLM analysis, or report generation happens in this fallback slice.
+
 ## Evidence Rules
 
 - Prefer primary sources, official documentation, original reports, papers, repositories, or direct screenshots.
