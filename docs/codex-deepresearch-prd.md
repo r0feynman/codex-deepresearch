@@ -344,7 +344,7 @@ Agent 산정식:
   "question": "...",
   "mode": "codex-plugin|automated-cli|manual-sources",
   "search_provider": "codex-native|openai|brave|tavily|serpapi|manual",
-  "vlm_provider": "codex-interactive|openai-responses-vision|manual-visual-review|none",
+  "vlm_provider": "codex-interactive|openai-responses-vision|manual-visual-review",
   "sources": [
     {
       "id": "src_001",
@@ -455,6 +455,7 @@ Agent 산정식:
 Schema v0 implementation requirements:
 
 - `schema_version`, `run_id`, `created_at`, `mode`, `search_provider`, `vlm_provider`는 필수다.
+- `vlm_provider`는 사용 가능한 시각 분석 경로를 기록한다. `text_only`처럼 VLM이 필요 없는 작업은 provider 값을 `none`으로 바꾸지 않고 route, `visual_tasks`, VLM invocation count, 또는 verifier state로 VLM 미사용을 표현한다.
 - 모든 source는 `accessed_at`, `retrieval_status`, `quality`, `local_artifact_path`를 가진다.
 - 모든 image/screenshot은 `VisualEvidence` schema를 따른다.
 - 모든 image/screenshot은 `page_url` 또는 `image_url` 중 하나 이상과 `local_artifact_path`를 가진다.
