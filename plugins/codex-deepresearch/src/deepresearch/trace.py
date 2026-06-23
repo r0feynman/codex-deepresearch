@@ -428,7 +428,7 @@ def classify_exception(exc: BaseException) -> str:
 
     name = exc.__class__.__name__.lower()
     message = str(exc).lower()
-    if "json" in name:
+    if "json" in name or "invalid json" in message or "invalid jsonl" in message:
         return "invalid_json"
     if "missing" in message or "does not exist" in message:
         return "missing_artifact"

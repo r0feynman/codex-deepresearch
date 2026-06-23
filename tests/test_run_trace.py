@@ -228,6 +228,52 @@ class RunTraceTests(unittest.TestCase):
         self.assertEqual(records[-1]["failure_category"], "missing_artifact")
         self.assertTrue(validate_trace_file(run_dir / "run_trace.jsonl").valid)
 
+    def test_cli_invalid_json_failures_are_classified_as_invalid_json(self) -> None:
+        cases = [
+            (
+                "fetch_claims",
+                "fetch-claims",
+                "fetch_queue.json",
+                ["fetch-claims"],
+            ),
+            (
+                "ingest_vision",
+                "ingest-vision",
+                "visual_observations.jsonl",
+                ["ingest-vision", "--provider", "codex-interactive"],
+            ),
+            (
+                "synthesize",
+                "synthesize",
+                "evidence.json",
+                ["synthesize"],
+            ),
+        ]
+        for stage, question_suffix, corrupt_file, command_args in cases:
+            with self.subTest(stage=stage):
+                prepared = prepare_run(
+                    question=f"invalid JSON trace {question_suffix}",
+                    runs_dir=self.temp_runs_dir(),
+                    route="visual_required" if stage == "ingest_vision" else "text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                (run_dir / corrupt_file).write_text("{not valid json\n", encoding="utf-8")
+
+                command = subprocess.run(
+                    [str(RUNNER), *command_args, "--run", str(run_dir)],
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(command.returncode, 2, command.stderr)
+                records = read_trace_records(run_dir / "run_trace.jsonl")
+                self.assertEqual(records[-1]["stage"], stage)
+                self.assertEqual(records[-1]["status"], "failed")
+                self.assertEqual(records[-1]["failure_category"], "invalid_json")
+                self.assertTrue(validate_trace_file(run_dir / "run_trace.jsonl").valid)
+
     def test_trace_schema_validation_reports_missing_required_fields(self) -> None:
         result = validate_trace_record({"schema_version": "codex-deepresearch.run-trace.v0"})
 
