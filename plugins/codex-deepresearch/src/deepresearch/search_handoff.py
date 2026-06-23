@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .budget_estimator import (
+    BudgetCaps,
+    add_budget_estimate_artifact,
+    estimate_budget,
+    write_budget_estimate,
+)
 from .cache_keys import source_cache_key
 from .evidence_schema import (
     EVIDENCE_SCHEMA_VERSION,
@@ -45,6 +51,13 @@ def prepare_run(
     route: str | None = None,
     angles: Sequence[str] | None = None,
     max_results: int = 8,
+    max_sources: int | None = None,
+    max_images: int | None = None,
+    max_subagents: int | None = None,
+    max_agents: int | None = None,
+    max_cost_usd: float | None = None,
+    codex_runner: str = "codex-exec",
+    confirm_budget: bool = False,
 ) -> dict[str, Any]:
     """Create a run directory and the Codex search handoff artifacts."""
 
@@ -85,18 +98,58 @@ def prepare_run(
         route_override=route,
     )
     routing = [_routing_record(decision, index) for index, decision in enumerate(decisions, start=1)]
+    budget_estimate = estimate_budget(
+        question=normalized_question,
+        config=config,
+        routing=routing,
+        max_results=max_results,
+        codex_runner=codex_runner,
+        caps=BudgetCaps(
+            max_sources=max_sources,
+            max_images=max_images,
+            max_subagents=max_subagents,
+            max_agents=max_agents,
+            max_cost_usd=max_cost_usd,
+        ),
+        confirmation_provided=confirm_budget,
+        generated_at=now,
+    )
+    routing = _apply_budget_image_allocations(
+        routing,
+        budget_estimate["planned_search"]["route_image_allocations"],
+    )
+    effective_max_results = int(budget_estimate["planned_search"]["max_results_per_task"])
     search_tasks = [
         _search_task(
             normalized_question,
             route_record,
             index,
             freshness_requirement=freshness_requirement,
-            max_results=max_results,
+            max_results=effective_max_results,
             use_angle_in_query=len(routing) > 1,
         )
         for index, route_record in enumerate(routing, start=1)
     ]
     budget = _budget_to_evidence(config.budget_preset, config.budget)
+    budget.update(
+        {
+            "max_sources": budget_estimate["effective_caps"]["max_sources"],
+            "max_images": budget_estimate["effective_caps"]["max_images"],
+            "max_verifier_invocations": budget_estimate["effective_caps"][
+                "max_verifier_invocations"
+            ],
+            "max_model_api_calls": budget_estimate["effective_caps"][
+                "max_model_api_calls"
+            ],
+            "max_concurrent_codex_subagents": budget_estimate["effective_caps"][
+                "max_concurrent_codex_subagents"
+            ],
+            "max_concurrent_runner_agents": budget_estimate["effective_caps"][
+                "max_concurrent_runner_agents"
+            ],
+            "max_cost_usd": budget_estimate["effective_caps"]["max_cost_usd"],
+        }
+    )
     evidence = {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
         "run_id": run_id,
@@ -159,13 +212,28 @@ def prepare_run(
             "visual_observations": str(run_dir / "visual_observations.jsonl"),
             "status": str(run_dir / "status.json"),
         },
+        "budget_estimate": {
+            "source_count": budget_estimate["estimates"]["source_count"],
+            "image_count": budget_estimate["estimates"]["image_count"],
+            "verifier_invocation_count": budget_estimate["estimates"][
+                "verifier_invocation_count"
+            ],
+            "codex_subagent_count": budget_estimate["estimates"]["codex_subagent_count"],
+            "runner_stage_count": budget_estimate["estimates"]["runner_stage_count"],
+            "high_water_cost_usd": budget_estimate["high_water_cost_bounds"][
+                "upper_bound_usd"
+            ],
+            "suggestion_count": len(budget_estimate["suggestions"]),
+        },
     }
+    add_budget_estimate_artifact(status, run_dir)
 
     _write_json(run_dir / "evidence.json", evidence)
     _write_json(run_dir / "search_tasks.json", search_tasks_artifact)
     (run_dir / "search_results.jsonl").write_text("", encoding="utf-8")
     _write_json(run_dir / "visual_tasks.json", visual_tasks_artifact)
     (run_dir / "visual_observations.jsonl").write_text("", encoding="utf-8")
+    write_budget_estimate(run_dir, budget_estimate)
 
     validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
     if not validation.valid:
@@ -212,7 +280,9 @@ def prepare_run(
             "status": str(run_dir / "status.json"),
             "run_trace": str(run_dir / "run_trace.jsonl"),
             "run_steps": str(run_dir / "run_steps.json"),
+            "budget_estimate": str(run_dir / "budget_estimate.json"),
         },
+        "budget_estimate": status["budget_estimate"],
     }
 
 
@@ -542,6 +612,24 @@ def _routing_record(decision: Any, index: int) -> dict[str, Any]:
         "visual_tasks": list(decision.visual_tasks),
         "max_images": decision.max_images,
     }
+
+
+def _apply_budget_image_allocations(
+    routing: Sequence[Mapping[str, Any]],
+    allocations: Mapping[str, int],
+) -> list[dict[str, Any]]:
+    capped: list[dict[str, Any]] = []
+    for route in routing:
+        record = dict(route)
+        route_id = str(record["id"])
+        record["max_images"] = min(
+            int(record.get("max_images", 0)),
+            int(allocations.get(route_id, 0)),
+        )
+        if record["max_images"] <= 0:
+            record["visual_tasks"] = []
+        capped.append(record)
+    return capped
 
 
 def _search_task(

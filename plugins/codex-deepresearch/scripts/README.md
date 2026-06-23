@@ -50,6 +50,8 @@ plugins/codex-deepresearch/scripts/codex-deepresearch prepare "What evidence is 
 
 The command writes `evidence.json`, `search_tasks.json`, an empty `search_results.jsonl`, `visual_tasks.json`, and an empty `visual_observations.jsonl` under `research-runs/<run_id>/`. Codex should perform search in the active session and append one `SearchResult` JSON object per line to `search_results.jsonl`.
 
+`prepare` also writes `budget_estimate.json` before any search, fetch, VLM, verifier, or subagent work starts. Use `--max-sources`, `--max-images`, `--max-subagents`, `--max-agents`, `--max-cost-usd`, and `--codex-runner codex-exec|codex-sdk|serial` to request lower caps; the estimate records deterministic reduction suggestions and the generated handoff files use the reduced source/image caps. `deep` and `exhaustive` presets require `--confirm-budget`.
+
 By default, `prepare` classifies each planner angle as `text_only`, `visual_required`, or `visual_optional` and records the route in `evidence.json.routing`. Pass repeated `--angle` values to supply planner angles:
 
 ```bash
