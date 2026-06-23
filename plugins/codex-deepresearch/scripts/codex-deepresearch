@@ -341,10 +341,13 @@ def run_mvp_smoke_command(args: argparse.Namespace) -> int:
             suite_id=args.suite_id,
             invoke=args.invoke,
             clean=args.clean,
-            require_codex_cli=args.require_codex_cli,
+            skip_codex_cli_install_check=args.skip_codex_cli_install_check,
         )
     except (MvpSmokeError, OSError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        results_path = getattr(exc, "results_path", None)
+        if results_path:
+            print(f"Results: {results_path}", file=sys.stderr)
         return 2
 
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -404,9 +407,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove an existing suite directory before writing new artifacts.",
     )
     mvp_smoke.add_argument(
-        "--require-codex-cli",
+        "--skip-codex-cli-install-check",
         action="store_true",
-        help="Fail install/update smoke if the codex CLI is not available on PATH.",
+        help=(
+            "Skip the Codex CLI install/update capability check. The suite records "
+            "the skip and does not mark plugin install/update smoke as passed."
+        ),
     )
     mvp_smoke.set_defaults(func=run_mvp_smoke_command)
 

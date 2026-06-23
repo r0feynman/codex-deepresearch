@@ -49,7 +49,7 @@ plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --eviden
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "Manual validation" --runs-dir /tmp/codex-deepresearch-manual-validation --url https://example.com/manual-source
 ```
 
-`scripts/validate_repo.py` also exercises no-network fetch, guardrail, verification, vision, report-generation, and MVP release-gate smokes against temporary local artifacts. See `AGENTS.md` for the full pre-PR validation command block.
+`scripts/validate_repo.py` also exercises no-network fetch, guardrail, verification, vision, report-generation, and MVP release-gate smokes against temporary local artifacts. The MVP release gate requires the `codex` CLI on `PATH` by default for plugin install/update smoke; environments that skip that check must use `--skip-codex-cli-install-check`, which records a skip and does not mark install/update smoke as passed. See `AGENTS.md` for the full pre-PR validation command block.
 
 ## GitHub Project Management
 

@@ -36,6 +36,26 @@ PNG_1X1 = (
 class MvpSmokeError(ValueError):
     """Raised when an MVP smoke fixture fails."""
 
+    def __init__(self, message: str, *, results_path: Path | None = None) -> None:
+        super().__init__(message)
+        self.results_path = results_path
+
+
+class MvpSmokeStageError(MvpSmokeError):
+    """Raised when a named smoke fixture stage fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fixture_id: str,
+        stage: str,
+        results_path: Path | None = None,
+    ) -> None:
+        super().__init__(message, results_path=results_path)
+        self.fixture_id = fixture_id
+        self.stage = stage
+
 
 def run_mvp_smoke(
     *,
@@ -43,7 +63,7 @@ def run_mvp_smoke(
     suite_id: str = "mvp-smoke",
     invoke: str = DEFAULT_INVOKE,
     clean: bool = False,
-    require_codex_cli: bool = False,
+    skip_codex_cli_install_check: bool = False,
 ) -> dict[str, Any]:
     """Run the local deterministic MVP smoke suite.
 
@@ -59,6 +79,7 @@ def run_mvp_smoke(
             raise MvpSmokeError(f"suite directory already exists: {suite_dir}")
         shutil.rmtree(suite_dir)
     suite_dir.mkdir(parents=True)
+    results_path = suite_dir / "mvp_smoke_results.json"
 
     results: dict[str, Any] = {
         "schema_version": MVP_SMOKE_SCHEMA_VERSION,
@@ -67,7 +88,10 @@ def run_mvp_smoke(
         "suite_id": suite_id,
         "suite_dir": str(suite_dir.resolve()),
         "invocation": invoke,
-        "install_update_smoke": _install_update_smoke(require_codex_cli=require_codex_cli),
+        "invocation_validation": _invocation_validation(invoke),
+        "install_update_smoke": _install_update_smoke(
+            skip_codex_cli_install_check=skip_codex_cli_install_check
+        ),
         "fixtures": {
             "text_only": [],
             "visual_required": [],
@@ -75,64 +99,133 @@ def run_mvp_smoke(
         },
         "guardrail_fixture_suite": {},
         "acceptance": {},
+        "failures": [],
+        "skips": {},
+        "artifacts": {"results": str(results_path.resolve())},
     }
 
-    text_fixtures = [
-        _text_fixture_from_fetch(suite_dir, "text_001_deep_research_invocation", invoke=invoke),
-        _text_fixture_from_claim(suite_dir, "text_002_schema_validation"),
-        _text_fixture_from_claim(suite_dir, "text_003_guardrail_clean"),
-    ]
-    visual_required_fixtures = [
-        _visual_fixture(suite_dir, "visual_required_001_handoff", route="visual_required"),
-        _visual_fixture(suite_dir, "visual_required_002_verifier", route="visual_required"),
-        _visual_fixture(suite_dir, "visual_required_003_schema", route="visual_required"),
-    ]
-    visual_optional_fixtures = [
-        _visual_fixture(suite_dir, "visual_optional_001_visual_used", route="visual_optional"),
-        _visual_optional_budget_pruned_fixture(suite_dir, "visual_optional_002_budget_pruned"),
-    ]
-    guardrail_suite = _run_guardrail_fixture_suite(suite_dir)
+    if results["install_update_smoke"]["status"] == "skipped":
+        results["skips"]["codex_cli_install_check"] = True
+    if not results["invocation_validation"]["invocation_valid"]:
+        _record_failure(
+            results,
+            check="invocation_validation",
+            stage="validate_invocation",
+            detail=results["invocation_validation"]["detail"],
+        )
+        _finalize_results(results)
+        _write_json(results_path, results)
+        raise MvpSmokeError(f"MVP smoke suite failed; see {results_path}", results_path=results_path)
 
-    results["fixtures"]["text_only"] = text_fixtures
-    results["fixtures"]["visual_required"] = visual_required_fixtures
-    results["fixtures"]["visual_optional"] = visual_optional_fixtures
-    results["guardrail_fixture_suite"] = guardrail_suite
-    results["acceptance"] = _acceptance_summary(
-        results["install_update_smoke"],
-        text_fixtures=text_fixtures,
-        visual_required_fixtures=visual_required_fixtures,
-        visual_optional_fixtures=visual_optional_fixtures,
-        guardrail_suite=guardrail_suite,
+    if results["install_update_smoke"]["status"] == "failed":
+        _record_failure(
+            results,
+            check="install_update_smoke",
+            stage="codex_cli_install_check",
+            detail=results["install_update_smoke"]["detail"],
+        )
+
+    _record_fixture(
+        results,
+        "text_only",
+        "text_001_deep_research_invocation",
+        lambda: _text_fixture_from_fetch(
+            suite_dir,
+            "text_001_deep_research_invocation",
+            invoke=invoke,
+        ),
     )
-    results["totals"] = {
-        "text_only": len(text_fixtures),
-        "visual_required": len(visual_required_fixtures),
-        "visual_optional": len(visual_optional_fixtures),
-        "guardrail": guardrail_suite["cases_passed"],
-        "run_artifacts": len(text_fixtures) + len(visual_required_fixtures) + len(visual_optional_fixtures),
-    }
-    results["status"] = (
-        "passed"
-        if all(results["acceptance"].values())
-        and results["install_update_smoke"]["status"] == "passed"
-        and guardrail_suite["status"] == "passed"
-        else "failed"
+    _record_fixture(
+        results,
+        "text_only",
+        "text_002_schema_validation",
+        lambda: _text_fixture_from_claim(suite_dir, "text_002_schema_validation"),
     )
-    results_path = suite_dir / "mvp_smoke_results.json"
-    results["artifacts"] = {"results": str(results_path.resolve())}
+    _record_fixture(
+        results,
+        "text_only",
+        "text_003_guardrail_clean",
+        lambda: _text_fixture_from_claim(suite_dir, "text_003_guardrail_clean"),
+    )
+    for fixture_id in (
+        "visual_required_001_handoff",
+        "visual_required_002_verifier",
+        "visual_required_003_schema",
+    ):
+        _record_fixture(
+            results,
+            "visual_required",
+            fixture_id,
+            lambda fixture_id=fixture_id: _visual_fixture(
+                suite_dir,
+                fixture_id,
+                route="visual_required",
+            ),
+        )
+    _record_fixture(
+        results,
+        "visual_optional",
+        "visual_optional_001_visual_used",
+        lambda: _visual_fixture(
+            suite_dir,
+            "visual_optional_001_visual_used",
+            route="visual_optional",
+        ),
+    )
+    _record_fixture(
+        results,
+        "visual_optional",
+        "visual_optional_002_budget_pruned",
+        lambda: _visual_optional_budget_pruned_fixture(
+            suite_dir,
+            "visual_optional_002_budget_pruned",
+        ),
+    )
+    try:
+        results["guardrail_fixture_suite"] = _run_guardrail_fixture_suite(suite_dir)
+    except Exception as exc:
+        results["guardrail_fixture_suite"] = {
+            "status": "failed",
+            "cases_total": 1,
+            "cases_passed": 0,
+            "failed_stage": getattr(exc, "stage", "guardrail_fixture_suite"),
+            "error": str(exc),
+        }
+        _record_failure(
+            results,
+            check="guardrail_fixture_suite",
+            fixture_id="guardrail_001_policy_block",
+            stage=getattr(exc, "stage", "guardrail_fixture_suite"),
+            detail=str(exc),
+        )
+
+    _finalize_results(results)
     _write_json(results_path, results)
     if results["status"] != "passed":
-        raise MvpSmokeError(f"MVP smoke suite failed; see {results_path}")
+        raise MvpSmokeError(f"MVP smoke suite failed; see {results_path}", results_path=results_path)
     return results
 
 
-def _install_update_smoke(*, require_codex_cli: bool) -> dict[str, Any]:
+def _invocation_validation(invoke: str) -> dict[str, Any]:
+    invocation_valid = invoke.startswith("$deep-research:")
+    return {
+        "status": "passed" if invocation_valid else "failed",
+        "invocation_valid": invocation_valid,
+        "requirement": "invocation must start with '$deep-research:'",
+        "detail": "valid $deep-research invocation"
+        if invocation_valid
+        else "invalid invocation; expected prefix '$deep-research:'",
+    }
+
+
+def _install_update_smoke(*, skip_codex_cli_install_check: bool) -> dict[str, Any]:
     manifest = _read_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
     marketplace = _read_json(MARKETPLACE_PATH)
     skill_path = PLUGIN_ROOT / "skills" / "deep-research" / "SKILL.md"
     scripts_readme = (PLUGIN_ROOT / "scripts" / "README.md").read_text(encoding="utf-8")
     entries = marketplace.get("plugins", [])
     matches = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("name") == PLUGIN_NAME]
+    codex_cli_path = shutil.which("codex")
     checks = {
         "manifest_name": manifest.get("name") == PLUGIN_NAME,
         "manifest_skills": manifest.get("skills") == "./skills/",
@@ -140,6 +233,7 @@ def _install_update_smoke(*, require_codex_cli: bool) -> dict[str, Any]:
         "runner_executable": RUNNER_PATH.is_file() and _is_executable(RUNNER_PATH),
         "marketplace_entry": len(matches) == 1,
         "install_update_docs": "Install" in scripts_readme and "Update" in scripts_readme,
+        "codex_cli_available": bool(codex_cli_path),
     }
     if matches:
         source = matches[0].get("source", {})
@@ -147,11 +241,23 @@ def _install_update_smoke(*, require_codex_cli: bool) -> dict[str, Any]:
         checks["marketplace_source"] = source.get("source") == "local"
         checks["marketplace_path"] = source.get("path") == "./plugins/codex-deepresearch"
         checks["marketplace_installable"] = policy.get("installation") == "AVAILABLE"
-    if require_codex_cli:
-        checks["codex_cli_available"] = shutil.which("codex") is not None
+    if skip_codex_cli_install_check:
+        metadata_checks = {key: value for key, value in checks.items() if key != "codex_cli_available"}
+        status = "skipped" if all(metadata_checks.values()) else "failed"
+        detail = "Codex CLI install/update check skipped by --skip-codex-cli-install-check."
+    else:
+        status = "passed" if all(checks.values()) else "failed"
+        detail = (
+            "Codex CLI install/update capability verified locally."
+            if status == "passed"
+            else "Codex CLI is required for install/update smoke and was not found on PATH."
+        )
     return {
-        "status": "passed" if all(checks.values()) else "failed",
+        "status": status,
         "checks": checks,
+        "codex_cli_path": codex_cli_path,
+        "skipped": skip_codex_cli_install_check,
+        "detail": detail,
         "external_network_call": False,
     }
 
@@ -204,7 +310,11 @@ def _text_fixture_from_fetch(suite_dir: Path, fixture_id: str, *, invoke: str) -
     )
     (run_dir / "visual_observations.jsonl").write_text("", encoding="utf-8")
 
-    fetch_status = fetch_claims(run=run_dir, timeout_seconds=5)
+    fetch_status = _run_stage(
+        fixture_id,
+        "fetch_claims",
+        lambda: fetch_claims(run=run_dir, timeout_seconds=5),
+    )
     _require(fetch_status["status"] == "completed", fixture_id, "fetch_claims")
     return _complete_standard_fixture(run_dir, fixture_id, "text_only")
 
@@ -262,10 +372,14 @@ def _visual_fixture(suite_dir: Path, fixture_id: str, *, route: str) -> dict[str
             }
         ],
     )
-    vision_status = ingest_vision_observations(
-        run=run_dir,
-        provider="codex-interactive",
-        observations=observations_path,
+    vision_status = _run_stage(
+        fixture_id,
+        "ingest_vision",
+        lambda: ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        ),
     )
     _require(vision_status["status"] == "visual_evidence_ingested", fixture_id, "ingest_vision")
     evidence = _read_json(run_dir / "evidence.json")
@@ -311,11 +425,23 @@ def _visual_optional_budget_pruned_fixture(suite_dir: Path, fixture_id: str) -> 
 
 
 def _complete_standard_fixture(run_dir: Path, fixture_id: str, route: str) -> dict[str, Any]:
-    guardrail_status = enforce_guardrails(run=run_dir)
+    guardrail_status = _run_stage(
+        fixture_id,
+        "enforce_guardrails",
+        lambda: enforce_guardrails(run=run_dir),
+    )
     _require(guardrail_status["status"] == "completed", fixture_id, "enforce_guardrails")
-    verify_status = verify_claims(run=run_dir)
+    verify_status = _run_stage(
+        fixture_id,
+        "verify_claims",
+        lambda: verify_claims(run=run_dir),
+    )
     _require(verify_status["status"] == "completed", fixture_id, "verify_claims")
-    report_status = synthesize_report(run=run_dir)
+    report_status = _run_stage(
+        fixture_id,
+        "synthesize",
+        lambda: synthesize_report(run=run_dir),
+    )
     _require(report_status["status"] == "completed", fixture_id, "synthesize")
     validation = _validate_fixture(run_dir)
     evidence = _read_json(run_dir / "evidence.json")
@@ -363,7 +489,11 @@ def _run_guardrail_fixture_suite(suite_dir: Path) -> dict[str, Any]:
         ),
     )
     _write_json(run_dir / source["local_artifact_path"], source)
-    status = enforce_guardrails(run=run_dir)
+    status = _run_stage(
+        "guardrail_001_policy_block",
+        "enforce_guardrails",
+        lambda: enforce_guardrails(run=run_dir),
+    )
     validation = _validate_fixture(run_dir, include_verifier_votes=False, include_visual_observations=False)
     blocked = status.get("claims", [{}])[0].get("verification_status") == "policy_blocked"
     return {
@@ -378,8 +508,129 @@ def _run_guardrail_fixture_suite(suite_dir: Path) -> dict[str, Any]:
     }
 
 
+def _record_fixture(
+    results: dict[str, Any],
+    group: str,
+    fixture_id: str,
+    factory: Any,
+) -> None:
+    try:
+        summary = factory()
+    except MvpSmokeStageError as exc:
+        summary = {
+            "id": fixture_id,
+            "status": "failed",
+            "failed_stage": exc.stage,
+            "error": str(exc),
+            "run_dir": _known_run_dir(results, fixture_id),
+        }
+        _record_failure(
+            results,
+            check="fixture",
+            fixture_id=fixture_id,
+            stage=exc.stage,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        summary = {
+            "id": fixture_id,
+            "status": "failed",
+            "failed_stage": "fixture",
+            "error": str(exc),
+            "run_dir": _known_run_dir(results, fixture_id),
+        }
+        _record_failure(
+            results,
+            check="fixture",
+            fixture_id=fixture_id,
+            stage="fixture",
+            detail=str(exc),
+        )
+    results["fixtures"][group].append(summary)
+
+
+def _run_stage(fixture_id: str, stage: str, callback: Any) -> Any:
+    try:
+        return callback()
+    except MvpSmokeStageError:
+        raise
+    except Exception as exc:
+        raise MvpSmokeStageError(
+            f"{fixture_id} failed stage {stage}: {exc}",
+            fixture_id=fixture_id,
+            stage=stage,
+        ) from exc
+
+
+def _record_failure(
+    results: dict[str, Any],
+    *,
+    check: str,
+    stage: str,
+    detail: str,
+    fixture_id: str | None = None,
+) -> None:
+    failure = {
+        "check": check,
+        "stage": stage,
+        "detail": detail,
+    }
+    if fixture_id is not None:
+        failure["fixture_id"] = fixture_id
+    results.setdefault("failures", []).append(failure)
+
+
+def _known_run_dir(results: Mapping[str, Any], fixture_id: str) -> str | None:
+    suite_dir = results.get("suite_dir")
+    if not isinstance(suite_dir, str):
+        return None
+    run_dir = Path(suite_dir) / "runs" / fixture_id
+    return str(run_dir.resolve()) if run_dir.exists() else None
+
+
+def _finalize_results(results: dict[str, Any]) -> None:
+    text_fixtures = results["fixtures"]["text_only"]
+    visual_required_fixtures = results["fixtures"]["visual_required"]
+    visual_optional_fixtures = results["fixtures"]["visual_optional"]
+    guardrail_suite = results.get("guardrail_fixture_suite", {})
+    results["acceptance"] = _acceptance_summary(
+        results["install_update_smoke"],
+        results["invocation_validation"],
+        text_fixtures=text_fixtures,
+        visual_required_fixtures=visual_required_fixtures,
+        visual_optional_fixtures=visual_optional_fixtures,
+        guardrail_suite=guardrail_suite,
+    )
+    results["totals"] = {
+        "text_only": len(text_fixtures),
+        "visual_required": len(visual_required_fixtures),
+        "visual_optional": len(visual_optional_fixtures),
+        "guardrail": guardrail_suite.get("cases_passed", 0)
+        if isinstance(guardrail_suite, Mapping)
+        else 0,
+        "run_artifacts": len(text_fixtures) + len(visual_required_fixtures) + len(visual_optional_fixtures),
+        "failed_fixtures": len(
+            [
+                fixture
+                for fixture in [*text_fixtures, *visual_required_fixtures, *visual_optional_fixtures]
+                if fixture.get("status") != "passed"
+            ]
+        ),
+    }
+    results["status"] = (
+        "passed"
+        if all(results["acceptance"].values())
+        and results["install_update_smoke"]["status"] == "passed"
+        and isinstance(guardrail_suite, Mapping)
+        and guardrail_suite.get("status") == "passed"
+        and not results.get("failures")
+        else "failed"
+    )
+
+
 def _acceptance_summary(
     install_update_smoke: Mapping[str, Any],
+    invocation_validation: Mapping[str, Any],
     *,
     text_fixtures: Sequence[Mapping[str, Any]],
     visual_required_fixtures: Sequence[Mapping[str, Any]],
@@ -389,7 +640,10 @@ def _acceptance_summary(
     text_invocation = text_fixtures[0] if text_fixtures else {}
     all_fixtures = [*text_fixtures, *visual_required_fixtures, *visual_optional_fixtures]
     return {
+        "deep_research_invocation_valid": invocation_validation.get("invocation_valid") is True,
         "deep_research_invocation_completes_text_only_run": (
+            invocation_validation.get("invocation_valid") is True
+            and
             text_invocation.get("status") == "passed"
             and Path(str(text_invocation.get("artifacts", {}).get("evidence", ""))).is_file()
             and Path(str(text_invocation.get("artifacts", {}).get("report", ""))).is_file()
@@ -609,7 +863,11 @@ def _write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
 
 def _require(condition: bool, fixture_id: str, stage: str) -> None:
     if not condition:
-        raise MvpSmokeError(f"{fixture_id} failed stage: {stage}")
+        raise MvpSmokeStageError(
+            f"{fixture_id} failed stage: {stage}",
+            fixture_id=fixture_id,
+            stage=stage,
+        )
 
 
 def _is_executable(path: Path) -> bool:
