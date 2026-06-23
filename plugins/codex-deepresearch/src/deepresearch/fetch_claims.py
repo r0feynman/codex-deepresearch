@@ -145,7 +145,7 @@ def fetch_claims(
     if not fetch_queue_path.exists():
         status = _base_status(run_dir, "blocked_missing_fetch_queue")
         status["errors"] = [{"code": "missing_fetch_queue", "status": "blocked"}]
-        _write_json(run_dir / "fetch_claims_status.json", status)
+        _write_run_json(run_dir, "fetch_claims_status.json", status)
         return status
 
     evidence = _read_json(evidence_path)
@@ -176,7 +176,7 @@ def fetch_claims(
     quote_candidates: list[dict[str, Any]] = evidence["quote_candidates"]
     claims: list[dict[str, Any]] = evidence["claims"]
 
-    artifacts_dir = run_dir / "sources" / "artifacts"
+    artifacts_dir = _resolve_run_relative_path(run_dir, "sources/artifacts")
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     errors: list[dict[str, Any]] = []
     fetched_count = 0
@@ -228,7 +228,7 @@ def fetch_claims(
 
         source_type = str(source.get("type", "web"))
         raw_path = _artifact_path(source_id, source_type, fetched.mime_type)
-        (run_dir / raw_path).write_bytes(fetched.content)
+        _write_run_bytes(run_dir, raw_path, fetched.content)
         extraction = _extract_text(
             content=fetched.content,
             mime_type=fetched.mime_type,
@@ -252,7 +252,7 @@ def fetch_claims(
 
         if extraction.text:
             text_path = _text_artifact_path(source_id)
-            (run_dir / text_path).write_text(extraction.text + "\n", encoding="utf-8")
+            _write_run_text(run_dir, text_path, extraction.text + "\n")
             source["text_artifact_path"] = text_path
 
         if extraction.quote_candidates:
@@ -321,8 +321,8 @@ def fetch_claims(
         "claims_created": created_claim_count,
         "high_confidence_claims_created": 0,
     }
-    _write_json(evidence_path, evidence)
-    _write_json(fetch_queue_path, fetch_queue)
+    _write_run_json(run_dir, "evidence.json", evidence)
+    _write_run_json(run_dir, "fetch_queue.json", fetch_queue)
 
     validation = validate_artifacts(evidence_path=evidence_path)
     status = _base_status(run_dir, "completed_with_errors" if errors else "completed")
@@ -345,7 +345,7 @@ def fetch_claims(
     )
     if not validation.valid:
         status["status"] = "failed_validation"
-    _write_json(run_dir / "fetch_claims_status.json", status)
+    _write_run_json(run_dir, "fetch_claims_status.json", status)
     return status
 
 
@@ -526,6 +526,30 @@ def _metadata_path(source: Mapping[str, Any]) -> str:
     return f"sources/{_safe_id(str(source.get('id', 'source')))}.json"
 
 
+def _safe_metadata_path(run_dir: Path, source: dict[str, Any]) -> str:
+    candidate = _metadata_path(source)
+    try:
+        _resolve_run_relative_path(run_dir, candidate)
+        source["metadata_artifact_path"] = candidate
+        return candidate
+    except FetchClaimsError:
+        fallback = f"sources/{_safe_id(str(source.get('id', 'source')))}.json"
+        _resolve_run_relative_path(run_dir, fallback)
+        source["metadata_artifact_path"] = fallback
+        local_artifact_path = source.get("local_artifact_path")
+        if not isinstance(local_artifact_path, str) or local_artifact_path.endswith(".json"):
+            source["local_artifact_path"] = fallback
+        source["caveats"] = sorted(
+            set(
+                [
+                    *source.get("caveats", []),
+                    "Unsafe metadata artifact path replaced with run-local fallback.",
+                ]
+            )
+        )
+        return fallback
+
+
 def _quote_id(source_id: str, index: int) -> str:
     return f"quote_{_safe_id(source_id)}_{index:03d}"
 
@@ -567,9 +591,10 @@ def _mark_failed(
 
 
 def _write_source_metadata(run_dir: Path, source: Mapping[str, Any]) -> None:
-    metadata_path = source.get("metadata_artifact_path") or _metadata_path(source)
-    (run_dir / str(metadata_path)).parent.mkdir(parents=True, exist_ok=True)
-    _write_json(run_dir / str(metadata_path), source)
+    if not isinstance(source, dict):
+        raise FetchClaimsError("source metadata must be a JSON object")
+    metadata_path = _safe_metadata_path(run_dir, source)
+    _write_run_json(run_dir, metadata_path, source)
 
 
 def _base_status(run_dir: Path, status: str) -> dict[str, Any]:
@@ -600,7 +625,43 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _resolve_run_relative_path(run_dir: Path, relative_path: str | Path) -> Path:
+    path = Path(relative_path)
+    if path.is_absolute():
+        raise FetchClaimsError(f"artifact path must be run-relative: {relative_path}")
+    if not str(path) or path == Path("."):
+        raise FetchClaimsError("artifact path cannot be empty")
+    if any(part == ".." for part in path.parts):
+        raise FetchClaimsError(f"artifact path cannot traverse outside run directory: {relative_path}")
+    root = run_dir.resolve()
+    target = (root / path).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise FetchClaimsError(
+            f"artifact path resolves outside run directory: {relative_path}"
+        ) from exc
+    return target
+
+
+def _write_run_bytes(run_dir: Path, relative_path: str | Path, content: bytes) -> None:
+    path = _resolve_run_relative_path(run_dir, relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _write_run_text(run_dir: Path, relative_path: str | Path, content: str) -> None:
+    path = _resolve_run_relative_path(run_dir, relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _write_run_json(run_dir: Path, relative_path: str | Path, payload: Mapping[str, Any]) -> None:
+    _write_json(_resolve_run_relative_path(run_dir, relative_path), payload)
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

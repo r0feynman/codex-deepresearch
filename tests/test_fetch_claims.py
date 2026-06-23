@@ -152,6 +152,60 @@ class FetchClaimsTests(unittest.TestCase):
         )
         return run_dir
 
+    def prepare_unsafe_metadata_run(self) -> Path:
+        runs_dir = self.temp_runs_dir()
+        run_dir = runs_dir / "unsafe-run"
+        sources_dir = run_dir / "sources"
+        sources_dir.mkdir(parents=True)
+        source = {
+            "id": "src_escape",
+            "type": "web",
+            "url": "https://example.com/blocked",
+            "title": "Blocked Source",
+            "published_at": None,
+            "accessed_at": "2026-06-22T00:00:00Z",
+            "quality": "unknown",
+            "retrieval_status": "partial",
+            "local_artifact_path": "../outside.json",
+            "license_policy": "restricted",
+            "robots_policy": "disallowed",
+            "policy_decision": "blocked",
+            "policy_flags": ["robots_disallowed"],
+        }
+        evidence = {
+            "schema_version": "0.1.0",
+            "run_id": "unsafe-run",
+            "created_at": "2026-06-22T00:00:00Z",
+            "question": "unsafe metadata path",
+            "mode": "codex-plugin",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+            "routing": [],
+            "search_tasks": [],
+            "sources": [source],
+            "images": [],
+            "claims": [],
+        }
+        fetch_queue = {
+            "schema_version": "codex-deepresearch.fetch-queue.v0",
+            "run_id": "unsafe-run",
+            "created_at": "2026-06-22T00:00:00Z",
+            "entries": [
+                {
+                    "source_id": "src_escape",
+                    "url": "https://example.com/blocked",
+                    "type": "web",
+                    "title": "Blocked Source",
+                    "policy_decision": "blocked",
+                    "policy_flags": ["robots_disallowed"],
+                    "retrieval_status": "queued",
+                }
+            ],
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(run_dir / "fetch_queue.json", fetch_queue)
+        return run_dir
+
     def test_allowed_html_fetches_artifact_quotes_and_low_confidence_claims(self) -> None:
         run_dir = self.prepare_ingested_run([self.base_search_result()])
         html = b"""
@@ -263,6 +317,51 @@ class FetchClaimsTests(unittest.TestCase):
         self.assertIn("fetch_failed", failed_source["retrieval_error"])
         self.assertEqual(failed_evidence["claims"], [])
         self.assertEqual(failed["high_confidence_claims_created"], 0)
+
+    def test_unsafe_existing_metadata_path_falls_back_inside_run_directory(self) -> None:
+        run_dir = self.prepare_unsafe_metadata_run()
+        outside_path = run_dir.parent / "outside.json"
+
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            side_effect=AssertionError("network called"),
+        ):
+            result = fetch_claims(run=run_dir)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(outside_path.exists(), f"unexpected escaped write: {outside_path}")
+        evidence = self.load_json(run_dir / "evidence.json")
+        source = evidence["sources"][0]
+        self.assertEqual(source["retrieval_status"], "failed")
+        self.assertEqual(source["retrieval_error"], "policy_blocked")
+        self.assertEqual(source["metadata_artifact_path"], "sources/src_escape.json")
+        self.assertEqual(source["local_artifact_path"], "sources/src_escape.json")
+        self.assertTrue((run_dir / "sources/src_escape.json").exists())
+        self.assertTrue(
+            any("Unsafe metadata artifact path replaced" in caveat for caveat in source["caveats"]),
+            source["caveats"],
+        )
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
+
+    def test_run_relative_path_resolver_rejects_unsafe_paths(self) -> None:
+        run_dir = self.temp_runs_dir() / "run"
+        run_dir.mkdir()
+
+        with self.assertRaisesRegex(fetch_claims_module.FetchClaimsError, "run-relative"):
+            fetch_claims_module._resolve_run_relative_path(run_dir, "/tmp/outside.json")
+        with self.assertRaisesRegex(fetch_claims_module.FetchClaimsError, "traverse"):
+            fetch_claims_module._resolve_run_relative_path(run_dir, "../outside.json")
+
+        outside_dir = self.temp_runs_dir() / "outside"
+        outside_dir.mkdir()
+        link_path = run_dir / "outside-link"
+        try:
+            link_path.symlink_to(outside_dir, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
+        with self.assertRaisesRegex(fetch_claims_module.FetchClaimsError, "outside run directory"):
+            fetch_claims_module._resolve_run_relative_path(run_dir, "outside-link/escaped.json")
 
     def test_dangling_generated_claim_source_reference_fails_validation(self) -> None:
         run_dir = self.prepare_ingested_run([self.base_search_result()])
