@@ -30,6 +30,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/fetch_claims.py",
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
+    "plugins/codex-deepresearch/src/deepresearch/report_generation.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/src/deepresearch/verification_matrix.py",
     "plugins/codex-deepresearch/src/deepresearch/vision_adapter.py",
@@ -45,6 +46,7 @@ REQUIRED_FILES = [
     "tests/test_fetch_claims.py",
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
+    "tests/test_report_generation.py",
     "tests/test_search_handoff.py",
     "tests/test_verification_matrix.py",
     "tests/test_vision_adapter.py",
@@ -350,6 +352,15 @@ def main() -> None:
             capture_output=True,
             text=True,
         )
+        synthesize_result = subprocess.run(
+            [str(runner), "synthesize", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        synthesize_report_exists = (run_dir / "report.md").exists()
+        synthesize_status_exists = (run_dir / "report_status.json").exists()
     if verify_result.returncode != 0:
         fail("runner verify-claims must apply the verifier matrix to a text claim")
     try:
@@ -363,6 +374,18 @@ def main() -> None:
     validation = verify_validation.get("validation")
     if not isinstance(validation, dict) or validation.get("valid") is not True:
         fail("runner verify-claims did not produce valid evidence and verifier votes")
+    if synthesize_result.returncode != 0:
+        fail("runner synthesize must generate a report from verified claims")
+    try:
+        synthesize_validation = json.loads(synthesize_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner synthesize must output valid JSON: {exc}")
+    if synthesize_validation.get("status") != "completed":
+        fail("runner synthesize did not report completed")
+    if synthesize_validation.get("claims_included") != 1:
+        fail("runner synthesize did not include the verified smoke claim")
+    if not synthesize_report_exists or not synthesize_status_exists:
+        fail("runner synthesize did not write report.md and report_status.json")
 
     with tempfile.TemporaryDirectory() as vision_runs_dir:
         prepare_result = subprocess.run(

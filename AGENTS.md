@@ -83,9 +83,10 @@ evidence["claims"] = [{
 (run_dir / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
 PY
 plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run "$run_dir"
+plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run "$run_dir"
 ```
 
-`python3 scripts/validate_repo.py` also runs a no-network `fetch-claims` smoke against a temporary local HTML source.
+`python3 scripts/validate_repo.py` also runs no-network `fetch-claims` and `synthesize` smokes against temporary local artifacts.
 
 Keep this section current when new implementation test commands are added.
 
