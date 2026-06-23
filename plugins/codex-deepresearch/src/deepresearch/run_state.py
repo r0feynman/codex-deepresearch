@@ -563,6 +563,8 @@ def _should_replay_status_artifact(
     target = stage_status_to_step_status(stage, status_payload)
     if target == "pending":
         return False
+    if _stale_reset_blocks_status_artifact(record, status_payload):
+        return False
     current = _status(record)
     if current == "pending":
         return True
@@ -585,6 +587,56 @@ def _should_replay_status_artifact(
     if isinstance(raw_status, str) and raw_status and record.get("stage_status") != raw_status:
         return True
     return False
+
+
+def _stale_reset_blocks_status_artifact(
+    record: Mapping[str, Any],
+    status_payload: Mapping[str, Any],
+) -> bool:
+    stale_reset = record.get("stale_reset")
+    stale_terminal_status = record.get("stale_terminal_status")
+    if (
+        not isinstance(stale_reset, Mapping)
+        and not isinstance(stale_terminal_status, Mapping)
+    ):
+        return False
+
+    stale_reset_at = None
+    if isinstance(stale_reset, Mapping):
+        stale_reset_at = _string_value(stale_reset.get("at"))
+    if stale_reset_at is None:
+        return True
+
+    payload_timestamp = _payload_timestamp(status_payload)
+    return not _timestamp_is_demonstrably_after_stale_reset(payload_timestamp, stale_reset_at)
+
+
+def _timestamp_is_demonstrably_after_stale_reset(
+    payload_timestamp: str | None,
+    stale_reset_at: str,
+) -> bool:
+    if not payload_timestamp:
+        return False
+    payload_datetime = _parse_timestamp(payload_timestamp)
+    stale_reset_datetime = _parse_timestamp(stale_reset_at)
+    if payload_datetime is not None and stale_reset_datetime is not None:
+        if payload_datetime <= stale_reset_datetime:
+            return False
+        if (
+            not _timestamp_has_subsecond_precision(stale_reset_at)
+            and payload_datetime.replace(microsecond=0)
+            == stale_reset_datetime.replace(microsecond=0)
+        ):
+            return False
+        return True
+    return payload_timestamp > stale_reset_at
+
+
+def _timestamp_has_subsecond_precision(value: str) -> bool:
+    time_part = value.split("T", 1)[-1]
+    for separator in ("Z", "+", "-"):
+        time_part = time_part.split(separator, 1)[0]
+    return "." in time_part
 
 
 def _infer_manual_source_ordered_stage_skips(

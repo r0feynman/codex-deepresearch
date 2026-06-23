@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,16 +19,51 @@ sys.path.insert(0, str(PLUGIN_SRC))
 from deepresearch import (  # noqa: E402
     RunStepStateError,
     begin_stage,
+    enforce_guardrails,
     fetch_claims,
     ingest_manual_sources,
     ingest_run,
+    ingest_vision_observations,
     inspect_run_state,
     prepare_run,
     read_trace_records,
     run_steps_path,
+    synthesize_report,
     transition_stage,
+    verify_claims,
 )
 from deepresearch.trace import record_stage_trace  # noqa: E402
+
+
+fetch_claims_module = importlib.import_module("deepresearch.fetch_claims")
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        content: bytes,
+        *,
+        mime_type: str = "text/html",
+        status: int = 200,
+        url: str = "https://example.com/source",
+    ) -> None:
+        self._content = content
+        self.status = status
+        self.headers = Message()
+        self.headers.set_type(mime_type)
+        self._url = url
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._content
+
+    def geturl(self) -> str:
+        return self._url
 
 
 class RunStateTests(unittest.TestCase):
@@ -65,6 +103,24 @@ class RunStateTests(unittest.TestCase):
     def write_search_results(self, run_dir: Path, records: list[dict]) -> None:
         payload = "\n".join(json.dumps(record) for record in records) + "\n"
         (run_dir / "search_results.jsonl").write_text(payload, encoding="utf-8")
+
+    def run_status_payload(self, runs_dir: Path, run_id: str) -> dict:
+        command = subprocess.run(
+            [
+                str(RUNNER),
+                "run-status",
+                "--run",
+                run_id,
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(command.returncode, 0, command.stderr)
+        return json.loads(command.stdout)
 
     def test_prepare_initializes_run_steps_with_completed_planning(self) -> None:
         prepared = prepare_run(
@@ -396,6 +452,80 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertEqual(
             stages["verify_claims"]["stale_terminal_status"]["status"],
+            "completed",
+        )
+
+    def test_reconstruction_rejects_stale_downstream_status_artifacts(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="state machine stale downstream artifact reconstruction",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+
+        early_verify = verify_claims(run=run_dir)
+        early_report = synthesize_report(run=run_dir)
+        self.assertEqual(early_verify["status"], "completed")
+        self.assertEqual(early_report["status"], "completed")
+        self.assertTrue((run_dir / "verification_matrix_status.json").is_file())
+        self.assertTrue((run_dir / "report_status.json").is_file())
+
+        html = b"""
+        <html>
+          <body>
+            <p>The stale artifact reconstruction test extracts a source linked claim.</p>
+          </body>
+        </html>
+        """
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(html),
+        ):
+            fetch = fetch_claims(run=run_dir)
+        self.assertEqual(fetch["status"], "completed")
+        vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        self.assertEqual(vision["status"], "no_visual_tasks")
+        guardrails = enforce_guardrails(run=run_dir)
+        self.assertEqual(guardrails["status"], "completed")
+
+        live = self.run_status_payload(runs_dir, prepared["run_id"])
+        live_stages = {stage["stage"]: stage for stage in live["stages"]}
+        self.assertEqual(live["next_safe_stage"], "verify_claims")
+        self.assertEqual(live_stages["verify_claims"]["status"], "pending")
+        self.assertEqual(live_stages["synthesize"]["status"], "pending")
+        self.assertEqual(
+            live_stages["verify_claims"]["stale_reset"]["reason"],
+            "stale_reset_after_upstream_completion",
+        )
+
+        run_steps_path(run_dir).unlink()
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        stages = {stage["stage"]: stage for stage in reconstructed["stages"]}
+
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(reconstructed["next_safe_stage"], "verify_claims")
+        self.assertFalse(reconstructed["next_stage_retryable"])
+        self.assertEqual(stages["verify_claims"]["status"], "pending")
+        self.assertEqual(stages["synthesize"]["status"], "pending")
+        self.assertEqual(
+            stages["verify_claims"]["stale_reset"]["upstream_stage"],
+            "fetch_claims",
+        )
+        self.assertEqual(
+            stages["verify_claims"]["stale_terminal_status"]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            stages["synthesize"]["stale_reset"]["upstream_stage"],
+            "fetch_claims",
+        )
+        self.assertEqual(
+            stages["synthesize"]["stale_terminal_status"]["status"],
             "completed",
         )
 
