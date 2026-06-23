@@ -27,6 +27,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/__init__.py",
     "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
+    "plugins/codex-deepresearch/src/deepresearch/fetch_claims.py",
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
@@ -39,6 +40,7 @@ REQUIRED_FILES = [
     "tests/fixtures/evidence_schema/verifier_votes.jsonl",
     "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
+    "tests/test_fetch_claims.py",
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
     "tests/test_search_handoff.py",
@@ -174,6 +176,99 @@ def main() -> None:
     validation = manual_validation.get("validation")
     if not isinstance(validation, dict) or validation.get("valid") is not True:
         fail("runner ingest-manual did not produce valid evidence")
+
+    with tempfile.TemporaryDirectory() as fetch_runs_dir:
+        run_dir = Path(fetch_runs_dir) / "fetch-claims-smoke"
+        sources_dir = run_dir / "sources"
+        run_dir.mkdir()
+        sources_dir.mkdir()
+        source_html = run_dir / "source.html"
+        source_html.write_text(
+            "<html><head><title>Fetch Smoke</title></head><body>"
+            "<p>The fetch claims smoke command extracts a source linked claim.</p>"
+            "</body></html>",
+            encoding="utf-8",
+        )
+        evidence = {
+            "schema_version": "0.1.0",
+            "run_id": "fetch-claims-smoke",
+            "created_at": "2026-06-22T00:00:00Z",
+            "question": "Fetch claims smoke",
+            "mode": "codex-plugin",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+            "routing": [],
+            "search_tasks": [],
+            "sources": [
+                {
+                    "id": "src_fetch_smoke",
+                    "type": "web",
+                    "url": source_html.resolve().as_uri(),
+                    "title": "Fetch Smoke Source",
+                    "published_at": None,
+                    "accessed_at": "2026-06-22T00:00:00Z",
+                    "quality": "unknown",
+                    "retrieval_status": "partial",
+                    "local_artifact_path": "sources/src_fetch_smoke.json",
+                    "license_policy": "allowed",
+                    "robots_policy": "allowed",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                }
+            ],
+            "images": [],
+            "claims": [],
+        }
+        fetch_queue = {
+            "schema_version": "codex-deepresearch.fetch-queue.v0",
+            "run_id": "fetch-claims-smoke",
+            "created_at": "2026-06-22T00:00:00Z",
+            "entries": [
+                {
+                    "source_id": "src_fetch_smoke",
+                    "url": source_html.resolve().as_uri(),
+                    "type": "web",
+                    "title": "Fetch Smoke Source",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "retrieval_status": "queued",
+                }
+            ],
+        }
+        (run_dir / "evidence.json").write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (sources_dir / "src_fetch_smoke.json").write_text(
+            json.dumps(evidence["sources"][0], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (run_dir / "fetch_queue.json").write_text(
+            json.dumps(fetch_queue, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        fetch_result = subprocess.run(
+            [str(runner), "fetch-claims", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if fetch_result.returncode != 0:
+        fail("runner fetch-claims must accept a local queued HTML source")
+    try:
+        fetch_validation = json.loads(fetch_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner fetch-claims must output valid JSON: {exc}")
+    if fetch_validation.get("status") != "completed":
+        fail("runner fetch-claims did not report completed")
+    if fetch_validation.get("sources_fetched") != 1:
+        fail("runner fetch-claims did not report one fetched source")
+    if fetch_validation.get("high_confidence_claims_created") != 0:
+        fail("runner fetch-claims must not create high-confidence claims")
+    validation = fetch_validation.get("validation")
+    if not isinstance(validation, dict) or validation.get("valid") is not True:
+        fail("runner fetch-claims did not produce valid evidence")
 
     marketplace = read_json(".agents/plugins/marketplace.json")
     entries = marketplace.get("plugins", [])

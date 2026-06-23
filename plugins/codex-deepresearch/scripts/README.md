@@ -51,6 +51,16 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_pa
 
 `ingest` validates `search_results.jsonl`, normalizes records into `evidence.json.sources`, and writes `fetch_queue.json` for allowed, fetchable `http`/`https` sources. Invalid URLs and blocked/manual-review policy decisions are preserved in evidence with `retrieval_status=failed` and explicit ingest errors, but they are not added to the fetch queue.
 
+## Fetch Claims
+
+Use `fetch-claims` after `ingest` has produced normalized sources and `fetch_queue.json`:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id_or_path>
+```
+
+The command fetches queued `http`, `https`, `file`, or `data` sources with an explicit timeout, writes fetched artifacts under the run directory, extracts text excerpts and quote candidates, and appends source-linked text claims to `evidence.json`. First-pass claims are intentionally conservative: `confidence=low`, `verification_status=unverified`, `review_status=not_reviewed`, and `promotion_status=not_eligible`. Blocked, manual-review, and failed sources remain preserved with failed retrieval metadata and do not create claims.
+
 ## Manual Sources
 
 Use `ingest-manual` when the user provides URLs or images directly, or when Codex-native search handoff is blocked. The command does not call external search, fetch remote bodies, run VLM analysis, or create a fetch queue:

@@ -17,6 +17,7 @@ PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ConfigResolutionError, resolve_config, validate_artifacts
+from deepresearch.fetch_claims import FetchClaimsError, fetch_claims
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
 
@@ -206,6 +207,26 @@ def run_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_fetch_claims(args: argparse.Namespace) -> int:
+    try:
+        result = fetch_claims(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            timeout_seconds=args.timeout_seconds,
+        )
+    except (FetchClaimsError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if result["status"] in {"blocked_missing_fetch_queue", "failed_validation"}:
+        return 2
+    validation = result.get("validation")
+    if isinstance(validation, dict) and validation.get("valid") is False:
+        return 2
+    return 0
+
+
 def run_ingest_manual(args: argparse.Namespace) -> int:
     try:
         result = ingest_manual_sources(
@@ -379,6 +400,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for run artifacts, relative to the repo root by default.",
     )
     ingest.set_defaults(func=run_ingest)
+
+    fetch_claims_parser = subparsers.add_parser(
+        "fetch-claims",
+        help="Fetch queued source bodies and extract low-confidence source-linked claims.",
+    )
+    fetch_claims_parser.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    fetch_claims_parser.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    fetch_claims_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Per-source fetch timeout for http(s), file, and data URLs.",
+    )
+    fetch_claims_parser.set_defaults(func=run_fetch_claims)
 
     ingest_manual = subparsers.add_parser(
         "ingest-manual",
