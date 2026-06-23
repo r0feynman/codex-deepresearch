@@ -24,6 +24,19 @@ Codex DeepResearch 확장 구조:
 -> 증거 JSON + 인용 포함 보고서 + 이미지 appendix
 ```
 
+목표 경험은 Claude Code식 deep-research의 high fan-out 조사를 Codex Plugin 방식으로 재현하는 것이다.
+
+```text
+질문
+-> Planner가 20-100개 bounded research task로 분해
+-> 다수 Codex subagent가 병렬로 검색, 페이지 읽기, 이미지 확인, visual observation을 수행
+-> 각 subagent가 evidence shard를 생성
+-> runner가 shard merge, dedupe, guardrail, verifier matrix를 적용
+-> SynthesisAgent가 supported evidence만 사용해 최종 보고서를 작성
+```
+
+MVP는 이 목표 경험의 vertical slice이고, Private Alpha/Public Beta에서 실제 병렬 subagent orchestration을 제품 기능으로 완성한다.
+
 ## 사용자
 
 - 개발자: CLI/Skill로 기술 조사, 라이브러리 비교, 장애 원인 분석, 코드/문서/스크린샷 기반 조사.
@@ -113,10 +126,12 @@ MVP의 제품 판단은 `codex-plugin` mode를 기준으로 한다. `automated-c
 
 Codex DeepResearch는 다음 실행 단위를 구분한다.
 
-- `Codex subagent`: Codex 세션 안에서 사용자의 지시를 받아 검색, 파일 확인, 이미지 확인, 판단을 수행하는 Codex-side agent 작업 단위다.
+- `Codex subagent`: Codex 세션 안에서 독립 작업 컨텍스트로 생성되어 검색, 파일 확인, 이미지 확인, 판단을 수행하는 Codex-side 조사 작업 단위다. 하나의 DeepResearch run은 여러 Codex subagent를 병렬로 실행할 수 있다.
 - `runner agent`: plugin 내부 runner가 실행하는 파이프라인 단계다. 예: planner, router, fetcher, evidence writer, report writer.
 - `model call`: OpenAI Responses API 또는 기타 model API에 대한 단일 호출이다.
 - `verifier invocation`: 하나의 claim에 대해 하나의 verifier가 support/refute/uncertain vote를 산출하는 검증 작업이다. verifier invocation은 Codex subagent, runner agent, model call 중 하나 이상을 사용할 수 있지만 동일 개념이 아니다.
+- `research task`: planner가 만든 병렬 조사 작업 단위다. 각 task는 angle, route, query, source/image cap, budget, policy constraints, expected artifact를 가진다.
+- `evidence shard`: 하나의 Codex subagent 또는 runner stage가 만든 부분 evidence bundle이다. shard는 최종 `evidence.json`에 병합되기 전까지 독립적으로 validate되어야 한다.
 
 제품 계약:
 
@@ -176,6 +191,81 @@ codex-deepresearch synthesize --run <run_id>
 
 The Skill must guide the user and Codex-side agent through this protocol. The runner must never assume it can call Codex-native search or `codex-interactive` VLM as a hidden API.
 
+### Parallel Codex Subagent Orchestration Contract
+
+DeepResearch의 목표 조사 모델은 단일 agent가 모든 조사를 순차 처리하는 것이 아니라, planner가 만든 bounded research task를 여러 Codex subagent에 나눠 병렬 처리하는 구조다.
+
+Parallel orchestration flow:
+
+```text
+$deep-research: <question>
+-> runner prepare creates research_tasks.json
+-> orchestrator assigns ready tasks to Codex subagents up to max_concurrent_codex_subagents
+-> each subagent performs search/read/image inspection for one task
+-> each subagent writes evidence_shards/<task_id>/evidence_shard.json and handoff JSONL files
+-> runner validates every shard independently
+-> shard merger deduplicates sources/images/claims and writes merge_status.json
+-> verifier matrix and synthesis run on merged evidence only
+```
+
+Required parallel artifacts:
+
+- `research_tasks.json`: canonical task queue for one run.
+- `subagent_assignments.jsonl`: append-only assignment log.
+- `evidence_shards/<task_id>/evidence_shard.json`: per-task evidence output.
+- `evidence_shards/<task_id>/search_results.jsonl`: per-task search result handoff.
+- `evidence_shards/<task_id>/visual_observations.jsonl`: per-task visual handoff when needed.
+- `merge_status.json`: source/image/claim dedupe decisions, conflicts, rejected shards, and merged artifact paths.
+- `run_trace.jsonl`: task assignment, subagent start/finish/failure, merge, retry, and synthesis events.
+
+`ResearchTask` minimum fields:
+
+```json
+{
+  "id": "task_research_001",
+  "angle_id": "angle_001",
+  "route": "text_only|visual_required|visual_optional",
+  "query": "official release notes for ...",
+  "state": "queued|assigned|running|completed|failed|blocked|retryable|merged|discarded",
+  "assigned_subagent_id": null,
+  "attempt": 0,
+  "max_attempts": 2,
+  "max_sources": 8,
+  "max_images": 0,
+  "source_policy": {"decision": "allowed", "flags": []},
+  "output_shard_path": "evidence_shards/task_research_001/evidence_shard.json",
+  "trace_event_ids": []
+}
+```
+
+Task state rules:
+
+- `queued` tasks may become `assigned`.
+- `assigned` tasks must record `assigned_subagent_id` before becoming `running`.
+- `running` tasks may become `completed`, `failed`, `blocked`, or `retryable`.
+- `completed` tasks may become `merged` only after shard validation passes.
+- `failed` tasks may become `retryable` only when `attempt < max_attempts` and the failure category is retry-safe.
+- `blocked` tasks must keep explicit policy, missing-capability, or missing-input reason and must not be silently retried.
+- `discarded` tasks must record dedupe, budget, or policy reason in `merge_status.json`.
+
+Parallel mode requirements:
+
+- `codex-plugin` mode uses Codex subagents when the current Codex surface can spawn or delegate subagent work. If subagents are unavailable, the runner must degrade to serial handoff execution and record `parallel_degraded=true`.
+- `automated-cli` mode may use OpenAI Agents SDK or an equivalent local worker pool for reproducible parallel task execution.
+- `manual-sources` mode does not spawn subagents by default; it can still merge manually supplied evidence shards.
+- Every subagent output must be treated as untrusted until evidence schema validation, guardrails, and verifier matrix pass.
+- No final report claim may cite a shard that failed validation, was policy-blocked, or was discarded by dedupe.
+- The default `standard` run uses conservative parallelism. The Claude Code-style high fan-out mode is `exhaustive` and requires explicit user confirmation, cost cap, and hard `max_concurrent_codex_subagents <= 100`.
+
+M18 implementation decision:
+
+- The first production implementation of parallel research orchestration uses an automated runner adapter, not an undocumented plugin-internal subagent API.
+- The automated runner adapter invokes Codex through `codex exec --json -c agents.max_threads=N` or through the Codex SDK/MCP server with equivalent config.
+- The adapter must parse JSON events for `spawn_agent`, `wait`, `close_agent`, thread IDs, child status, child messages, and failures.
+- Each child subagent prompt must require a schema-valid evidence shard file path or a strict JSON result. Natural-language summaries alone are insufficient for merge.
+- The adapter must persist the raw Codex event stream or a normalized projection in `run_trace.jsonl`.
+- If `codex exec`, Codex SDK, authentication, sandbox, approval policy, or subagent spawning is unavailable, the run records `parallel_degraded=true` and executes the same `research_tasks.json` queue serially.
+
 Non-developer input path:
 
 - MVP에서는 별도 web UI를 제공하지 않는다.
@@ -204,10 +294,16 @@ Non-developer input path:
 8. 최종 보고서는 모든 주요 주장에 source URL, quote, image evidence ID를 붙인다.
 9. 실행 전 agent budget을 산정하고 사용자가 선택한 조사 깊이의 hard cap을 넘지 않는다.
 10. VLM이 필요 없는 angle에는 이미지 수집과 VLM 호출을 하지 않는다.
+11. Phase 2부터 planner는 angle을 bounded `ResearchTask`로 분해하고, parallel mode에서는 task를 여러 Codex subagent에 배정한다.
+12. 각 Codex subagent는 자기 task 범위 안에서 검색, 페이지 읽기, 이미지 확인, visual observation 기록, evidence shard 생성을 담당한다.
+13. runner는 subagent가 만든 evidence shard를 schema validation, guardrail, dedupe, merge 과정을 거쳐 최종 `evidence.json`으로 병합한다.
+14. 병렬 실행은 `max_concurrent_codex_subagents`, `max_concurrent_runner_agents`, source/image/model-call cap을 모두 준수해야 한다.
+15. subagent 실패는 전체 run 실패로 즉시 승격하지 않고, retry-safe failure는 task 단위로 재시도하며, blocked/policy failure는 명시 상태로 보존한다.
 
 ## 에이전트 구성
 
 - `PlannerAgent`: 질문 분해, 텍스트/이미지 조사 필요성 판단.
+- `OrchestratorAgent`: planner task를 Codex subagent 또는 runner worker에 배정하고 task state, retry, budget cap을 관리.
 - `ModalityRouterAgent`: angle과 claim 후보를 `text_only`, `visual_required`, `visual_optional`로 분류하고 VLM 호출 여부를 결정.
 - `SearchAgent`: 웹 검색 결과 수집.
 - `ImageScoutAgent`: 이미지 검색, 페이지 대표 이미지, 스크린샷 후보 수집.
@@ -216,6 +312,7 @@ Non-developer input path:
 - `ClaimExtractorAgent`: 텍스트 claim 구조화.
 - `VerifierAgent`: claim 반박 검색.
 - `VisualVerifierAgent`: 이미지가 claim을 실제로 뒷받침하는지 검증.
+- `ShardMergeAgent`: subagent evidence shard를 validate, dedupe, conflict-marking한 뒤 canonical `evidence.json`으로 병합.
 - `SynthesisAgent`: 살아남은 claim만 병합해 보고서 작성.
 
 ## ModalityRouter 분류 규칙
@@ -302,22 +399,23 @@ Decision:
 
 기본 preset:
 
-| Preset | 최대 Codex-side handoff task | 최대 동시 runner agent | verifier invocation | model/API call hard cap | 최대 source | 최대 image | 용도 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `quick` | 16 | 4 | 24 | 32 | 8 | 4 | 빠른 사실 확인 |
-| `standard` | 48 | 8 | 80 | 96 | 20 | 12 | MVP 기본 딥리서치 |
-| `deep` | 96 | 12 | 180 | 220 | 40 | 30 | 고신뢰 보고서 |
-| `exhaustive` | 256 | 16 | 500 | 600 | 100 | 80 | 비용 확인 후 실행하는 대형 조사 |
+| Preset | 최대 Codex-side handoff task | 최대 동시 Codex subagent | 최대 동시 runner agent | verifier invocation | model/API call hard cap | 최대 source | 최대 image | 용도 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `quick` | 16 | 4 | 4 | 24 | 32 | 8 | 4 | 빠른 사실 확인 |
+| `standard` | 48 | 8 | 8 | 80 | 96 | 20 | 12 | MVP 기본 딥리서치 |
+| `deep` | 96 | 24 | 12 | 180 | 220 | 40 | 30 | 고신뢰 보고서 |
+| `exhaustive` | 256 | 100 | 16 | 500 | 600 | 100 | 80 | 비용 확인 후 실행하는 대형 조사 |
 
 MVP 기본값은 `standard`다.
 
 Budget terms:
 
 - 48은 Codex-side handoff task 한도다. Codex-native search/VLM을 수행하는 agent-mediated work item 수를 제한한다.
+- 8은 `standard` preset의 최대 동시 Codex subagent 수다. high fan-out 조사는 `deep` 또는 `exhaustive`에서만 허용한다.
 - 80은 verifier invocation 한도다. 하나의 claim에 대해 하나의 verifier가 vote를 만드는 작업을 제한한다.
 - 96은 paid or metered model/API call hard cap이다.
 - 동시 runner agent 기본값은 8이고 MVP hard cap은 12다.
-- `exhaustive`는 v2에서 제공하며 실행 전 예상 비용과 시간을 사용자에게 확인받는다.
+- `exhaustive`는 v2에서 제공하며 실행 전 예상 비용, 시간, `max_concurrent_codex_subagents` 값을 사용자에게 확인받는다.
 
 Agent 산정식:
 
@@ -598,14 +696,14 @@ Verifier policy is route-specific.
 
 Cost caps by preset:
 
-| Preset | Search calls | Sources fetched | Images analyzed | Verifier invocations | Model calls | Notes |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `quick` | 8 | 8 | 4 | 24 | 32 | no optional visual expansion |
-| `standard` | 20 | 20 | 12 | 80 | 96 | MVP default |
-| `deep` | 40 | 40 | 30 | 180 | 220 | requires confirmation |
-| `exhaustive` | 100 | 100 | 80 | 500 | 600 | post-MVP only |
+| Preset | Search calls | Sources fetched | Images analyzed | Concurrent Codex subagents | Verifier invocations | Model calls | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `quick` | 8 | 8 | 4 | 4 | 24 | 32 | no optional visual expansion |
+| `standard` | 20 | 20 | 12 | 8 | 80 | 96 | MVP default |
+| `deep` | 40 | 40 | 30 | 24 | 180 | 220 | requires confirmation |
+| `exhaustive` | 100 | 100 | 80 | 100 | 500 | 600 | high fan-out, explicit confirmation only |
 
-These cost caps must match the `Invocation Budget` table. If implementation changes one table, it must update the other in the same PR.
+Shared preset caps in this table must remain consistent with the `Invocation Budget` table. If implementation changes subagent, source, image, verifier, or model-call caps in one table, it must update the other in the same PR.
 
 Rules:
 
@@ -736,10 +834,11 @@ Exit criteria:
 
 ### Phase 2: Private Alpha
 
-목표: MVP의 basic visual acquisition을 더 안정적이고 대규모로 확장하고, 긴 리서치를 재개 가능하게 만든다.
+목표: MVP의 basic visual acquisition을 더 안정적이고 대규모로 확장하고, 긴 리서치를 재개 가능하게 만들며, 실제 병렬 Codex subagent 조사 구조를 도입한다.
 
 범위:
 
+- parallel Codex subagent orchestration: planner task fan-out, task assignment, evidence shard, merge/dedupe.
 - 이미지 검색 API provider 확대와 품질 튜닝.
 - full-page, scroll, interaction screenshot 캡처.
 - 대표 이미지, Open Graph image, 본문 이미지 추출의 정확도 개선.
@@ -751,6 +850,9 @@ Exit criteria:
 
 Exit criteria:
 
+- `standard` preset에서 최소 8개 Codex subagent 또는 equivalent worker가 병렬 research task를 처리하고 evidence shard를 생성한다.
+- `exhaustive` preset은 explicit confirmation과 cost cap이 있을 때 최대 100개 Codex subagent fan-out을 계획할 수 있다.
+- subagent evidence shard가 schema validation, guardrail, dedupe, merge를 거쳐 canonical `evidence.json`에 반영된다.
 - 이미지가 핵심인 조사에서 자동으로 최소 10개 후보 이미지를 수집한다.
 - 중복 이미지 제거율과 제거 근거가 evidence에 남는다.
 - 중단 후 재개해도 이미 처리한 source/image를 다시 분석하지 않는다.
@@ -758,7 +860,7 @@ Exit criteria:
 
 ### Phase 3: Public Beta
 
-목표: 반복 사용 가능한 제품 경험과 검토 UX를 제공한다.
+목표: 반복 사용 가능한 제품 경험과 검토 UX를 제공하고, 병렬 subagent 조사를 사용자가 관찰하고 제어할 수 있게 한다.
 
 범위:
 
@@ -766,6 +868,7 @@ Exit criteria:
 - `/skills`에서 선택 가능한 안정 skill metadata.
 - TUI 또는 lightweight web dashboard.
 - run list, progress, pause/resume/cancel.
+- parallel subagent monitor: active/queued/failed/merged task count, subagent count, shard merge status.
 - evidence browser: source, image, claim, vote를 탐색.
 - human review: claim을 `accepted`, `rejected`, `needs_more_evidence`로 수동 판정.
 - report templates: technical report, market report, competitor analysis, incident report.
@@ -774,6 +877,8 @@ Exit criteria:
 Exit criteria:
 
 - 사용자가 코드 파일을 직접 열지 않고 run 상태와 evidence를 확인할 수 있다.
+- 사용자가 active subagent count, queued task count, failed task count, merged shard count를 볼 수 있다.
+- 사용자가 `deep` 또는 `exhaustive` 실행 전 `max_concurrent_codex_subagents`와 cost cap을 확인하고 승인할 수 있다.
 - human review 결과가 다음 run과 후속 Codex 작업에 반영된다.
 - plugin 설치/업데이트/제거 절차가 문서화된다.
 - 20개 이상 실제 리서치 태스크에서 실패 유형이 분류되어 있다.
@@ -1166,6 +1271,7 @@ Acceptance tests:
 Epics:
 
 - Advanced visual acquisition
+- Parallel subagent orchestration
 - Resume/retry
 - Cost estimation
 - Traceability
@@ -1184,20 +1290,133 @@ Tasks:
 10. 사용자 budget cap을 넘으면 실행 전 축소안을 제시한다.
 11. agent별 prompt, tool call summary, output preview를 trace로 저장한다.
 12. 실패 유형을 `fetch_failed`, `vision_failed`, `verification_disagreement`, `budget_pruned` 등으로 분류한다.
+13. `research_tasks.json` task queue와 task state transition validation을 구현한다.
+14. Codex subagent assignment log와 `max_concurrent_codex_subagents` scheduler를 구현한다.
+15. subagent별 `evidence_shard.json`, per-task search/visual JSONL, trace event linkage를 구현한다.
+16. shard validation, source/image/claim dedupe, conflict marking, merge status를 구현한다.
+17. failed/retryable/blocked/discarded task를 전체 run 상태와 report caveat에 반영한다.
+18. subagent orchestration이 불가능한 Codex surface에서는 serial handoff로 degrade하고 `parallel_degraded=true`를 기록한다.
 
 Deliverables:
 
 - automated image collection
+- parallel research task queue
+- Codex subagent scheduler
+- evidence shard merger
 - screenshot collector
 - resumable run engine
 - cost estimator
 - run trace JSONL
+
+### Phase 2 Private Alpha Tickets
+
+These tickets extend the completed Phase 1 MVP backlog and are the canonical Private Alpha implementation backlog.
+
+#### Ticket M13: Run Trace JSONL
+
+Status: implemented.
+
+Output:
+
+- `run_trace.jsonl`
+- trace writer/validator
+- stage status links to trace artifacts
+
+Acceptance tests:
+
+- runner stages append public-safe trace records.
+- failed stages record failure category.
+- MVP smoke includes trace artifact paths.
+
+#### Ticket M14: Run Step State Machine
+
+Output:
+
+- run step state artifact
+- valid stage transition rules
+- resume-safe command behavior
+
+Acceptance tests:
+
+- major runner stages record pending/running/completed/failed/skipped state.
+- invalid transitions fail with machine-readable errors.
+- interrupted runs expose the next safe stage by `run_id`.
+
+#### Ticket M15: Cache Keys and Idempotent Resume
+
+Output:
+
+- source/image/claim cache keys
+- idempotent resume behavior
+
+Acceptance tests:
+
+- completed source/image/claim units are not reprocessed unless inputs change.
+- changed URL, content hash, source policy, visual evidence, or claim text invalidates the relevant cache key.
+
+#### Ticket M16: Cost Estimator and Budget Cap Suggestions
+
+Output:
+
+- pre-run cost/work estimate artifact
+- budget cap reduction suggestions
+
+Acceptance tests:
+
+- estimates include source count, image count, verifier invocation count, Codex subagent count, runner stage count, model-call placeholders, and high-water cost bounds.
+- `deep` and `exhaustive` presets require explicit confirmation.
+
+#### Ticket M17: Advanced Visual Acquisition v2
+
+Output:
+
+- expanded image candidate collection
+- screenshot capture interface
+- MIME/size/hash/near-duplicate validation
+
+Acceptance tests:
+
+- visual-required runs collect at least 10 candidate image records from configured local/test providers.
+- text-only routes still perform zero image search, screenshot, or VLM work.
+
+#### Ticket M18: Parallel Codex Subagent Orchestration
+
+Input:
+
+- question, planner angles, route decisions, budget preset
+- `research_tasks.json`
+- `codex exec --json` availability or Codex SDK/MCP server availability
+- Codex auth, sandbox, approval policy, and `agents.max_threads` config
+
+Output:
+
+- bounded research task fan-out
+- `subagent_assignments.jsonl`
+- `evidence_shards/<task_id>/evidence_shard.json`
+- per-task search/visual handoff JSONL
+- normalized Codex subagent event trace from `spawn_agent`, `wait`, and `close_agent`
+- `merge_status.json`
+- merged canonical `evidence.json`
+
+Acceptance tests:
+
+- planner output can be expanded into at least 20 bounded `ResearchTask` records for a broad research question.
+- automated runner can invoke Codex with `codex exec --json -c agents.max_threads=N` or Codex SDK/MCP server equivalent.
+- raw or normalized JSON events record `spawn_agent`, child thread IDs, `wait` completion states, child messages, failures, and `close_agent`.
+- `standard` preset schedules up to 8 concurrent Codex subagents or equivalent worker contexts.
+- `exhaustive` preset can plan up to 100 Codex subagents only after explicit confirmation and cost cap.
+- every completed subagent task writes a schema-valid evidence shard before merge.
+- shard merge deduplicates repeated source URLs, image hashes, and equivalent claim text.
+- failed retry-safe tasks can be retried without re-running completed tasks.
+- blocked or discarded tasks are preserved in `merge_status.json` and excluded from final confident claims.
+- if Codex subagents, `codex exec`, SDK/MCP server, auth, sandbox, or approvals are unavailable, the run records `parallel_degraded=true` and executes the same task queue serially.
 
 ### Phase 3 WBS: Public Beta
 
 Epics:
 
 - Product UX
+- Parallel research UX
 - Evidence review
 - Report templates
 - Install/update flow
@@ -1205,20 +1424,22 @@ Epics:
 Tasks:
 
 1. run list, run detail, claim detail을 볼 수 있는 TUI 또는 lightweight web dashboard를 만든다.
-2. 진행 중 run의 phase, agent count, source count, image count를 표시한다.
+2. 진행 중 run의 phase, active/queued/failed/merged task count, Codex subagent count, source count, image count를 표시한다.
 3. pause/resume/cancel control을 구현한다.
-4. source/image/claim/vote를 연결해서 탐색하는 evidence browser를 만든다.
-5. claim review 상태 `accepted`, `rejected`, `needs_more_evidence`를 저장한다.
-6. review 결과가 후속 synthesis와 Codex reuse에 반영되게 한다.
-7. technical report, market report, competitor analysis, incident report template을 만든다.
-8. Markdown, JSON, CSV, HTML bundle export를 구현한다.
-9. plugin 설치, 업데이트, 제거 절차를 문서화한다.
-10. 실제 리서치 태스크 20개 이상을 실행하고 실패 유형을 수집한다.
-11. onboarding quickstart와 example gallery를 만든다.
+4. `max_concurrent_codex_subagents`, `max-cost-usd`, preset confirmation UI를 구현한다.
+5. source/image/claim/vote를 연결해서 탐색하는 evidence browser를 만든다.
+6. claim review 상태 `accepted`, `rejected`, `needs_more_evidence`를 저장한다.
+7. review 결과가 후속 synthesis와 Codex reuse에 반영되게 한다.
+8. technical report, market report, competitor analysis, incident report template을 만든다.
+9. Markdown, JSON, CSV, HTML bundle export를 구현한다.
+10. plugin 설치, 업데이트, 제거 절차를 문서화한다.
+11. 실제 리서치 태스크 20개 이상을 실행하고 실패 유형을 수집한다.
+12. onboarding quickstart와 example gallery를 만든다.
 
 Deliverables:
 
 - dashboard/TUI
+- parallel subagent progress monitor
 - evidence browser
 - human review workflow
 - report templates
@@ -1345,7 +1566,7 @@ Deliverables:
 ## 기술 선택
 
 - Product surface: Codex Plugin + Codex Skill. CLI는 plugin runner의 개발/테스트/자동화용 wrapper다.
-- Orchestration: OpenAI Agents SDK. 공식 문서는 agents, tools, handoffs, guardrails, tracing에 적합하다고 설명한다.
+- Orchestration: 제품 UX는 Codex Plugin + Skill이다. Phase 2 M18의 첫 병렬 구현은 automated runner adapter를 사용한다. 이 adapter는 `codex exec --json -c agents.max_threads=N` 또는 Codex SDK/MCP server equivalent로 Codex subagent workflow를 실행하고 JSON event stream을 추적한다. 나중에 Codex가 plugin-internal subagent API를 제공하면 별도 adapter로 추가한다.
 - Model/API: OpenAI Responses API. `automated-cli` 또는 자동 VLM adapter가 필요할 때 사용한다. 공식 vision 문서는 이미지 입력을 URL, Base64 data URL, file ID로 받을 수 있고 여러 이미지를 한 요청에 넣을 수 있다고 설명한다.
 - VLM adapters: `codex-interactive`, `openai-responses-vision`, `manual-visual-review`.
 - Storage: JSONL + Markdown, 나중에 SQLite로 확장.
@@ -1411,6 +1632,8 @@ Cost accounting:
 total_cost =
   search_call_cost
 + fetch/compute/runtime_cost
++ codex_subagent_runtime_cost
++ codex_cli_or_sdk_orchestration_overhead
 + text_model_input_output_cost
 + image_input_token_cost
 + verifier_agent_cost
@@ -1422,8 +1645,10 @@ Budget controls:
 - `--max-search-calls`
 - `--max-sources`
 - `--max-images`
+- `--max-subagents`
 - `--max-agents`
 - `--max-cost-usd`
+- `--codex-runner codex-exec|codex-sdk|serial`
 - `--provider codex-native|openai|brave|tavily|serpapi|manual`
 
 MVP policy:
@@ -1451,6 +1676,8 @@ Metric denominators:
 | completed non-blocked visual-required visual verifier coverage | 70% | 95% | 98% | 99% | 99% |
 | completed non-blocked report citation/evidence ID coverage | 80% | 95% | 98% | 99% | 99% |
 | plugin install + invocation smoke pass | skeleton | 100% | 100% | 100% | 100% |
+| parallel task shard merge success rate | n/a | n/a | 95% | 98% | 99% |
+| duplicate source/image/claim merge leakage | n/a | n/a | < 2% | < 1% | < 0.5% |
 | median standard run completion | n/a | < 20 min | < 15 min | < 12 min | < 10 min |
 | policy-blocked evidence leakage into accepted claims | 0 | 0 | 0 | 0 | 0 |
 
@@ -1464,9 +1691,11 @@ Metric denominators:
 6. search provider mode를 skill용 Codex-native workflow와 CLI용 provider abstraction으로 분리한다.
 7. VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리한다.
 8. Agent budget preset과 pruning을 구현한다.
-9. 시각 evidence appendix를 생성한다.
-10. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
-11. 나중에 웹 UI/워크플로우 대시보드 추가.
+9. run trace, run step state machine, cache key를 구현한다.
+10. Automated runner adapter를 통해 `codex exec --json` 또는 Codex SDK/MCP server 기반 Codex subagent 병렬 orchestration, evidence shard, merge/dedupe를 구현한다.
+11. 시각 evidence appendix를 생성한다.
+12. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
+13. 웹 UI/워크플로우 대시보드에서 subagent 진행 상태와 cost cap을 제어한다.
 
 ## 참고 근거
 
@@ -1474,11 +1703,15 @@ Metric denominators:
   https://developers.openai.com/api/docs/guides/images-vision
 - OpenAI Agents SDK: agents, tools, handoffs, guardrails, tracing, sandbox execution.  
   https://developers.openai.com/api/docs/libraries#use-the-agents-sdk
+- Codex Subagents: Codex CLI/App subagent workflow, `agents.max_threads`, `spawn_agent` orchestration behavior.
+  https://developers.openai.com/codex/subagents
+- Codex SDK and MCP server: programmatic Codex thread execution and MCP `codex`/`codex-reply` tools.
+  https://developers.openai.com/codex/guides/agents-sdk
 
 ## 자체 검토
 
-문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다.
+문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다.
 
-수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다.
+수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다.
 
-남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
+남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 병렬 subagent 실행 자체는 Codex CLI smoke test로 확인됐지만, automated runner adapter는 Codex auth, sandbox, approval policy, nested `codex exec`, SDK/MCP server availability, JSON event compatibility, child thread cleanup을 안정적으로 처리해야 한다. Codex subagent를 사용할 수 없는 surface에서는 serial handoff 또는 `automated-cli` worker fallback으로 degrade해야 한다. 100-subagent high fan-out은 비용, rate limit, workspace policy, trace volume을 크게 키우므로 `exhaustive` preset에서만 explicit confirmation과 cost cap으로 제한한다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
