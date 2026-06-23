@@ -31,6 +31,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/guardrails.py",
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
+    "plugins/codex-deepresearch/src/deepresearch/mvp_smoke.py",
     "plugins/codex-deepresearch/src/deepresearch/report_generation.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/src/deepresearch/verification_matrix.py",
@@ -48,6 +49,7 @@ REQUIRED_FILES = [
     "tests/test_guardrails.py",
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
+    "tests/test_mvp_smoke.py",
     "tests/test_report_generation.py",
     "tests/test_search_handoff.py",
     "tests/test_verification_matrix.py",
@@ -467,6 +469,43 @@ def main() -> None:
         fail("runner synthesize did not include the verified smoke claim")
     if not synthesize_report_exists or not synthesize_status_exists:
         fail("runner synthesize did not write report.md and report_status.json")
+
+    with tempfile.TemporaryDirectory() as mvp_smoke_runs_dir:
+        mvp_smoke_result = subprocess.run(
+            [
+                str(runner),
+                "mvp-smoke",
+                "--runs-dir",
+                mvp_smoke_runs_dir,
+                "--suite-id",
+                "validate-repo-suite",
+                "--clean",
+                "--invoke",
+                "$deep-research: validate repo MVP smoke",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if mvp_smoke_result.returncode != 0:
+        fail("runner mvp-smoke must pass the deterministic MVP release gate")
+    try:
+        mvp_smoke_validation = json.loads(mvp_smoke_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner mvp-smoke must output valid JSON: {exc}")
+    if mvp_smoke_validation.get("status") != "passed":
+        fail("runner mvp-smoke did not report passed")
+    totals = mvp_smoke_validation.get("totals", {})
+    if totals.get("text_only") != 3:
+        fail("runner mvp-smoke did not run three text-only fixtures")
+    if totals.get("visual_required") != 3:
+        fail("runner mvp-smoke did not run three visual-required fixtures")
+    if totals.get("visual_optional") != 2:
+        fail("runner mvp-smoke did not run two visual-optional fixtures")
+    acceptance = mvp_smoke_validation.get("acceptance", {})
+    if not isinstance(acceptance, dict) or not all(acceptance.values()):
+        fail("runner mvp-smoke acceptance checks did not all pass")
 
     with tempfile.TemporaryDirectory() as vision_runs_dir:
         prepare_result = subprocess.run(

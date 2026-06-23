@@ -6,6 +6,7 @@ from .fetch_claims import FetchClaimsError, fetch_claims
 from .guardrails import GuardrailsError, enforce_guardrails
 from .manual_sources import ManualSourcesError, ingest_manual_sources
 from .modality_router import ModalityDecision, route_angle, route_angles
+from .mvp_smoke import MvpSmokeError, run_mvp_smoke
 from .report_generation import ReportGenerationError, synthesize_report
 from .search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
 from .verification_matrix import VerificationMatrixError, verify_claims
@@ -17,6 +18,7 @@ __all__ = [
     "GuardrailsError",
     "ManualSourcesError",
     "ModalityDecision",
+    "MvpSmokeError",
     "ReportGenerationError",
     "RunConfig",
     "SearchHandoffError",
@@ -34,6 +36,7 @@ __all__ = [
     "route_angles",
     "resolve_config",
     "resolve_run_dir",
+    "run_mvp_smoke",
     "synthesize_report",
     "validate_artifacts",
     "verify_claims",

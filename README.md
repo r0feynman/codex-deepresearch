@@ -44,11 +44,12 @@ Run:
 python3 -m unittest discover -s tests
 python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
+plugins/codex-deepresearch/scripts/codex-deepresearch mvp-smoke --runs-dir /tmp/codex-deepresearch-mvp-smoke --suite-id mvp-smoke --clean --invoke '$deep-research: MVP smoke text-only fixture'
 plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --evidence tests/fixtures/evidence_schema/valid_evidence.json --search-results tests/fixtures/evidence_schema/search_results.jsonl --visual-observations tests/fixtures/evidence_schema/visual_observations.jsonl --verifier-votes tests/fixtures/evidence_schema/verifier_votes.jsonl
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "Manual validation" --runs-dir /tmp/codex-deepresearch-manual-validation --url https://example.com/manual-source
 ```
 
-`scripts/validate_repo.py` also exercises no-network fetch, guardrail, verification, vision, and report-generation smokes against temporary local artifacts. See `AGENTS.md` for the full pre-PR validation command block.
+`scripts/validate_repo.py` also exercises no-network fetch, guardrail, verification, vision, report-generation, and MVP release-gate smokes against temporary local artifacts. See `AGENTS.md` for the full pre-PR validation command block.
 
 ## GitHub Project Management
 
