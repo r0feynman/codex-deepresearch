@@ -43,6 +43,8 @@ plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --eviden
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "Manual validation" --runs-dir /tmp/codex-deepresearch-manual-validation --url https://example.com/manual-source
 ```
 
+`python3 scripts/validate_repo.py` also runs a no-network `fetch-claims` smoke against a temporary local HTML source.
+
 Keep this section current when new implementation test commands are added.
 
 ## Public Repository Safety

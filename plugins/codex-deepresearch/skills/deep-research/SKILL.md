@@ -36,7 +36,8 @@ In plugin mode, do not assume a hidden Codex search API is available to the runn
 3. Use the current Codex session's available search capability to perform each task.
 4. Write one `SearchResult` JSON object per line to `search_results.jsonl`, preserving task id, angle id, route, provider, query, URL, title, snippet, result type, rank, freshness, access time, policy decision, policy flags, and raw provider metadata.
 5. Run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>`.
-6. Continue only from the normalized `evidence.json` and `fetch_queue.json` artifacts.
+6. Run `plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id_or_path>` to fetch queued sources, preserve source artifacts, extract quote candidates, and append low-confidence unverified claims.
+7. Continue only from the normalized `evidence.json`, `fetch_queue.json`, and fetched source artifacts.
 
 ## Manual Sources Fallback
 
@@ -52,6 +53,7 @@ Use `--pdf` for PDF URLs or local PDF files, `--image-url` for remote images, an
 
 - Prefer primary sources, official documentation, original reports, papers, repositories, or direct screenshots.
 - Do not treat a search result snippet as evidence by itself.
+- Treat first-pass fetched text claims as unverified and low confidence until later verifier stages review them.
 - Track retrieval date for time-sensitive facts.
 - Separate observations from inference.
 - For images, preserve the original page URL when possible, not only the image URL.
