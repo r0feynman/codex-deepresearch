@@ -4,6 +4,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +18,9 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import (  # noqa: E402
     CodexExecAdapter,
+    FixtureAdapter,
+    ParallelOrchestrationError,
+    inspect_run_state,
     merge_evidence_shards,
     plan_research_tasks,
     prepare_run,
@@ -47,10 +52,18 @@ class ParallelOrchestratorTests(unittest.TestCase):
         )
         return Path(prepared["run_dir"])
 
-    def shard(self, run_dir: Path, task: dict, *, duplicate: bool = False) -> dict:
+    def shard(
+        self,
+        run_dir: Path,
+        task: dict,
+        *,
+        duplicate: bool = False,
+        common_ids: bool = False,
+    ) -> dict:
         evidence = self.load_json(run_dir / "evidence.json")
-        source_id = f"src_{task['id']}"
-        image_id = f"img_{task['id']}"
+        source_id = "src_001" if common_ids else f"src_{task['id']}"
+        image_id = "img_001" if common_ids else f"img_{task['id']}"
+        claim_id = "claim_001" if common_ids else f"claim_{task['id']}"
         url = "https://example.com/duplicate" if duplicate else f"https://example.com/{task['id']}"
         claim_text = (
             "The duplicate claim text is equivalent."
@@ -105,7 +118,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
             ],
             "claims": [
                 {
-                    "id": f"claim_{task['id']}",
+                    "id": claim_id,
                     "text": claim_text,
                     "claim_type": "mixed",
                     "supporting_sources": [source_id],
@@ -147,7 +160,9 @@ class ParallelOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(command[:4], ["codex", "exec", "--json", "-c"])
         self.assertEqual(command[4], "agents.max_threads=8")
-        self.assertIn("evidence_shards/task_research_001/evidence_shard.json", command[5])
+        self.assertIn("sandbox_mode=workspace-write", command)
+        self.assertIn("approval_policy=never", command)
+        self.assertIn("evidence_shards/task_research_001/evidence_shard.json", command[-1])
 
     def test_fixture_runner_records_codex_events_and_schema_valid_shards(self) -> None:
         run_dir = self.prepare(route="visual_optional")
@@ -173,6 +188,13 @@ class ParallelOrchestratorTests(unittest.TestCase):
 
         evidence_validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
         self.assertTrue(evidence_validation.valid, evidence_validation.to_dict())
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+        self.assertEqual(stages["parallel_orchestration"]["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "skipped")
+        self.assertEqual(stages["fetch_claims"]["status"], "skipped")
+        self.assertEqual(stages["ingest_vision"]["status"], "skipped")
+        self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
 
     def test_shard_merge_deduplicates_sources_images_and_claim_text(self) -> None:
         run_dir = self.prepare()
@@ -195,6 +217,92 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(merge["image_dedupe"])
         self.assertTrue(merge["claim_dedupe"])
         self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_namespaces_colliding_local_ids_and_remaps_refs(self) -> None:
+        run_dir = self.prepare()
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        for task in tasks_artifact["tasks"]:
+            task["state"] = "completed"
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task, common_ids=True))
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        evidence = self.load_json(run_dir / "evidence.json")
+        source_ids = [source["id"] for source in evidence["sources"]]
+        image_ids = [image["id"] for image in evidence["images"]]
+        claim_ids = [claim["id"] for claim in evidence["claims"]]
+        self.assertEqual(len(source_ids), len(set(source_ids)))
+        self.assertEqual(len(image_ids), len(set(image_ids)))
+        self.assertEqual(len(claim_ids), len(set(claim_ids)))
+        self.assertEqual(len(evidence["sources"]), 2)
+        self.assertEqual(len(evidence["claims"]), 2)
+        for claim in evidence["claims"]:
+            self.assertIn(claim["supporting_sources"][0], source_ids)
+            self.assertEqual(claim["quote_spans"][0]["source_id"], claim["supporting_sources"][0])
+            self.assertIn(claim["supporting_images"][0], image_ids)
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_completed_task_requires_schema_valid_shard(self) -> None:
+        run_dir = self.prepare()
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, {"schema_version": "0.1.0", "sources": []})
+
+        class InvalidShardAdapter:
+            name = "invalid-shard"
+
+            def run_task(self, task, *, run_dir, max_threads):
+                return type("Result", (), {
+                    "task_id": task["id"],
+                    "status": "completed",
+                    "child_thread_id": "invalid-shard-thread",
+                    "events": (),
+                    "shard_path": str(run_dir / task["output_shard_path"]),
+                    "failure_category": None,
+                    "message": None,
+                })()
+
+        with mock.patch("deepresearch.parallel_orchestrator._adapter", return_value=InvalidShardAdapter()):
+            run_parallel_orchestration(run=run_dir, adapter_name="fixture", min_tasks=1)
+
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "retryable")
+        self.assertEqual(task["failure_category"], "invalid_shard")
+
+    def test_fixture_adapter_uses_bounded_parallel_scheduler(self) -> None:
+        run_dir = self.prepare()
+        lock = threading.Lock()
+        in_flight = 0
+        max_seen = 0
+
+        class InstrumentedFixture(FixtureAdapter):
+            name = "instrumented-fixture"
+
+            def run_task(self, task, *, run_dir, max_threads):
+                nonlocal in_flight, max_seen
+                with lock:
+                    in_flight += 1
+                    max_seen = max(max_seen, in_flight)
+                try:
+                    time.sleep(0.03)
+                    return super().run_task(task, run_dir=run_dir, max_threads=max_threads)
+                finally:
+                    with lock:
+                        in_flight -= 1
+
+        with mock.patch("deepresearch.parallel_orchestrator._adapter", return_value=InstrumentedFixture()):
+            result = run_parallel_orchestration(run=run_dir, adapter_name="fixture", min_tasks=6)
+
+        self.assertEqual(result["max_scheduled_concurrency"], 8)
+        self.assertGreater(max_seen, 1)
 
     def test_retry_safe_failed_task_does_not_rerun_completed_tasks(self) -> None:
         run_dir = self.prepare()
@@ -256,10 +364,36 @@ class ParallelOrchestratorTests(unittest.TestCase):
 
         self.assertTrue(result["parallel_degraded"])
         self.assertEqual(result["degraded_reason"], "codex_exec_unavailable")
-        self.assertEqual(result["adapter"], "fixture")
+        self.assertEqual(result["adapter"], "serial-degraded")
         self.assertEqual(result["max_scheduled_concurrency"], 1)
         tasks = self.load_json(run_dir / "research_tasks.json")
         self.assertTrue(tasks["parallel_degraded"])
+        self.assertTrue(all(task["state"] == "blocked" for task in tasks["tasks"]))
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["claims"], [])
+        merge = self.load_json(run_dir / "merge_status.json")
+        self.assertEqual(len(merge["blocked_tasks"]), 2)
+
+    def test_exhaustive_plan_requires_confirmation_and_cost_cap(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["budget"]["preset"] = "exhaustive"
+        evidence["budget"].pop("max_cost_usd", None)
+        self.write_json(run_dir / "evidence.json", evidence)
+        (run_dir / "budget_estimate.json").unlink()
+
+        with self.assertRaises(ParallelOrchestrationError):
+            plan_research_tasks(run=run_dir, min_tasks=100)
+        with self.assertRaises(ParallelOrchestrationError):
+            plan_research_tasks(run=run_dir, min_tasks=100, confirm_exhaustive=True)
+
+        result = plan_research_tasks(
+            run=run_dir,
+            min_tasks=100,
+            confirm_exhaustive=True,
+            max_cost_usd=1.0,
+        )
+        self.assertEqual(result["task_count"], 100)
 
     def test_cli_m18_fixture_smoke(self) -> None:
         runs_dir = self.temp_runs_dir()

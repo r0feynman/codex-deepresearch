@@ -90,9 +90,9 @@ plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel \
   --min-tasks 20
 ```
 
-The `codex-exec` adapter constructs `codex exec --json -c agents.max_threads=N` child runs. If the Codex CLI path is unavailable and degradation is allowed, the runner records `parallel_degraded=true` and executes the same queue serially with the deterministic fixture adapter. Tests and local smokes can select `--adapter fixture` directly; it is no-network/no-auth and writes representative `spawn_agent`, `wait`, `message`, and `close_agent` trace records plus schema-valid shards.
+The `codex-exec` adapter constructs `codex exec --json -c agents.max_threads=N -c sandbox_mode=workspace-write -c approval_policy=never` child runs. It relies on the current Codex CLI authenticated session for auth. If Codex execution is unavailable and degradation is allowed, the runner records `parallel_degraded=true` and executes the same queue serially as blocked/degraded tasks without fabricating confident evidence. Tests and local smokes can select `--adapter fixture` directly; it is no-network/no-auth and writes representative `spawn_agent`, `wait`, `message`, and `close_agent` trace records plus schema-valid shards.
 
-The standard preset uses up to 8 concurrent Codex subagents or equivalent worker contexts. The existing budget gate keeps `exhaustive` behind `--confirm-budget` plus `--max-cost-usd` and caps Codex subagent fan-out at 100.
+The standard preset uses up to 8 concurrent Codex subagents or equivalent worker contexts through a bounded local scheduler. The existing `prepare` budget gate keeps `exhaustive` behind `--confirm-budget` plus `--max-cost-usd`; direct `plan-parallel` and `orchestrate-parallel` calls also require `--confirm-exhaustive` and `--max-cost-usd` unless the prepared run's `budget_estimate.json` already records confirmation and a cost cap.
 
 ## Run Status
 

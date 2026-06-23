@@ -485,6 +485,8 @@ def run_plan_parallel(args: argparse.Namespace) -> int:
             runs_dir=resolve_repo_path(args.runs_dir),
             min_tasks=args.min_tasks,
             max_tasks=args.max_tasks,
+            confirm_exhaustive=args.confirm_exhaustive,
+            max_cost_usd=args.max_cost_usd,
         )
     except (ParallelOrchestrationError, SearchHandoffError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -504,6 +506,8 @@ def run_orchestrate_parallel(args: argparse.Namespace) -> int:
             max_tasks=args.max_tasks,
             retry_failed=args.retry_failed,
             allow_degraded=not args.no_degrade,
+            confirm_exhaustive=args.confirm_exhaustive,
+            max_cost_usd=args.max_cost_usd,
         )
     except (AdapterUnavailable, ParallelOrchestrationError, SearchHandoffError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -687,6 +691,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional task cap below the preset hard cap.",
     )
+    plan_parallel.add_argument(
+        "--confirm-exhaustive",
+        action="store_true",
+        help="Confirm exhaustive parallel planning when no prepared budget confirmation exists.",
+    )
+    plan_parallel.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Explicit exhaustive max-cost cap when no prepared budget cap exists.",
+    )
     plan_parallel.set_defaults(func=run_plan_parallel)
 
     orchestrate_parallel = subparsers.add_parser(
@@ -707,7 +721,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--adapter",
         default="codex-exec",
         choices=("codex-exec", "fixture"),
-        help="Runner adapter. codex-exec degrades to fixture serial execution when unavailable.",
+        help=(
+            "Runner adapter. codex-exec degrades to an honest serial blocked-task "
+            "path when unavailable; fixture is only for deterministic tests/smokes."
+        ),
     )
     orchestrate_parallel.add_argument(
         "--min-tasks",
@@ -724,6 +741,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--retry-failed",
         action="store_true",
         help="Retry failed retry-safe tasks without rerunning completed or merged tasks.",
+    )
+    orchestrate_parallel.add_argument(
+        "--confirm-exhaustive",
+        action="store_true",
+        help="Confirm exhaustive orchestration when no prepared budget confirmation exists.",
+    )
+    orchestrate_parallel.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Explicit exhaustive max-cost cap when no prepared budget cap exists.",
     )
     orchestrate_parallel.add_argument(
         "--no-degrade",

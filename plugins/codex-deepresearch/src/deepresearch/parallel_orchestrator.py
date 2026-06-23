@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .execution_mode import BUDGET_PRESETS
+from .run_state import add_run_steps_artifact, begin_stage, skip_stage, transition_stage
 from .search_handoff import SearchHandoffError, resolve_run_dir
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 
@@ -23,7 +25,12 @@ RESEARCH_TASKS_FILENAME = "research_tasks.json"
 ASSIGNMENTS_FILENAME = "subagent_assignments.jsonl"
 MERGE_STATUS_FILENAME = "merge_status.json"
 EVIDENCE_SHARDS_DIRNAME = "evidence_shards"
-RETRY_SAFE_FAILURES = {"adapter_unavailable", "codex_exec_failed", "missing_shard"}
+RETRY_SAFE_FAILURES = {
+    "adapter_unavailable",
+    "codex_exec_failed",
+    "invalid_shard",
+    "missing_shard",
+}
 TASK_STATES = (
     "queued",
     "assigned",
@@ -92,7 +99,15 @@ class CodexExecAdapter:
     def available(self) -> bool:
         return shutil.which(self.codex_binary) is not None
 
-    def build_command(self, task: Mapping[str, Any], *, max_threads: int, run_dir: Path) -> list[str]:
+    def build_command(
+        self,
+        task: Mapping[str, Any],
+        *,
+        max_threads: int,
+        run_dir: Path,
+        sandbox_mode: str = "workspace-write",
+        approval_policy: str = "never",
+    ) -> list[str]:
         prompt = _child_prompt(task, run_dir=run_dir)
         return [
             self.codex_binary,
@@ -100,6 +115,10 @@ class CodexExecAdapter:
             "--json",
             "-c",
             f"agents.max_threads={max_threads}",
+            "-c",
+            f"sandbox_mode={sandbox_mode}",
+            "-c",
+            f"approval_policy={approval_policy}",
             prompt,
         ]
 
@@ -260,12 +279,62 @@ class FixtureAdapter:
         )
 
 
+class SerialFallbackAdapter:
+    """Honest degraded adapter that records blocked work without fabricating evidence."""
+
+    name = "serial-degraded"
+
+    def run_task(
+        self,
+        task: Mapping[str, Any],
+        *,
+        run_dir: Path,
+        max_threads: int,
+    ) -> RunnerResult:
+        child_thread_id = f"serial-degraded-{task['id']}"
+        events = (
+            _codex_event(
+                "spawn_agent",
+                task,
+                child_thread_id=child_thread_id,
+                child_status="blocked",
+                child_message="parallel execution capability unavailable; serial fallback recorded blocked task",
+                failure_category="adapter_unavailable",
+            ),
+            _codex_event(
+                "wait",
+                task,
+                child_thread_id=child_thread_id,
+                child_status="blocked",
+                child_message="no production Codex subagent evidence was fabricated",
+                failure_category="adapter_unavailable",
+            ),
+            _codex_event(
+                "close_agent",
+                task,
+                child_thread_id=child_thread_id,
+                child_status="blocked",
+                failure_category="adapter_unavailable",
+            ),
+        )
+        return RunnerResult(
+            task_id=str(task["id"]),
+            status="blocked",
+            child_thread_id=child_thread_id,
+            events=events,
+            failure_category="adapter_unavailable",
+            message="codex execution unavailable; task preserved as blocked",
+        )
+
+
 def plan_research_tasks(
     *,
     run: str | Path,
     runs_dir: str | Path | None = None,
     min_tasks: int = 1,
     max_tasks: int | None = None,
+    confirm_exhaustive: bool = False,
+    max_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     """Expand planner search tasks into bounded ResearchTask records."""
 
@@ -274,6 +343,13 @@ def plan_research_tasks(
     budget = evidence.get("budget", {}) if isinstance(evidence.get("budget"), Mapping) else {}
     preset_name = str(budget.get("preset") or "standard")
     preset = BUDGET_PRESETS.get(preset_name, BUDGET_PRESETS["standard"])
+    _enforce_parallel_budget_gate(
+        run_dir=run_dir,
+        preset_name=preset_name,
+        budget=budget,
+        confirm_exhaustive=confirm_exhaustive,
+        max_cost_usd=max_cost_usd,
+    )
     hard_task_cap = min(preset.max_codex_handoff_tasks, 100)
     requested_cap = max_tasks if max_tasks is not None else hard_task_cap
     task_count = min(max(min_tasks, 1), requested_cap, hard_task_cap)
@@ -338,11 +414,85 @@ def run_parallel_orchestration(
     max_tasks: int | None = None,
     retry_failed: bool = False,
     allow_degraded: bool = True,
+    confirm_exhaustive: bool = False,
+    max_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     """Run planned research tasks through a Codex adapter and merge accepted shards."""
 
     run_dir = resolve_run_dir(run, runs_dir=runs_dir)
-    plan_research_tasks(run=run_dir, min_tasks=min_tasks, max_tasks=max_tasks)
+    stage_start = begin_stage(run_dir, "parallel_orchestration")
+    if stage_start.skipped:
+        status = _parallel_status(
+            run_dir,
+            evidence=_read_json(run_dir / "evidence.json"),
+            status="skipped",
+            parallel_degraded=False,
+            degraded_reason=None,
+            adapter_name=adapter_name,
+            planned_task_count=len(_read_research_tasks(run_dir)),
+            runnable_task_count=0,
+            max_scheduled_concurrency=0,
+            merge_status=_read_optional_json(run_dir / MERGE_STATUS_FILENAME),
+            skip_reason=stage_start.skip_reason or "stage_already_completed",
+        )
+        _write_json(run_dir / "parallel_orchestration_status.json", status)
+        return status
+
+    try:
+        result = _run_parallel_orchestration_started(
+            run_dir=run_dir,
+            adapter_name=adapter_name,
+            min_tasks=min_tasks,
+            max_tasks=max_tasks,
+            retry_failed=retry_failed,
+            allow_degraded=allow_degraded,
+            confirm_exhaustive=confirm_exhaustive,
+            max_cost_usd=max_cost_usd,
+        )
+    except Exception as exc:
+        status = _parallel_status(
+            run_dir,
+            evidence=_read_optional_json(run_dir / "evidence.json") or {"run_id": run_dir.name},
+            status="failed",
+            parallel_degraded=False,
+            degraded_reason=None,
+            adapter_name=adapter_name,
+            planned_task_count=0,
+            runnable_task_count=0,
+            max_scheduled_concurrency=0,
+            merge_status=None,
+            errors=[{"code": exc.__class__.__name__, "message": str(exc)[:500]}],
+        )
+        _write_json(run_dir / "parallel_orchestration_status.json", status)
+        transition_stage(
+            run_dir,
+            "parallel_orchestration",
+            "failed",
+            reason="stage_failed",
+            status_payload=status,
+        )
+        raise
+    return result
+
+
+def _run_parallel_orchestration_started(
+    *,
+    run_dir: Path,
+    adapter_name: str,
+    min_tasks: int,
+    max_tasks: int | None,
+    retry_failed: bool,
+    allow_degraded: bool,
+    confirm_exhaustive: bool,
+    max_cost_usd: float | None,
+) -> dict[str, Any]:
+    plan_research_tasks(
+        run=run_dir,
+        min_tasks=min_tasks,
+        max_tasks=max_tasks,
+        confirm_exhaustive=confirm_exhaustive,
+        max_cost_usd=max_cost_usd,
+    )
     tasks_artifact = _read_json(run_dir / RESEARCH_TASKS_FILENAME)
     evidence = _read_json(run_dir / "evidence.json")
     tasks = _task_list(tasks_artifact)
@@ -355,31 +505,17 @@ def run_parallel_orchestration(
             raise AdapterUnavailable("codex exec is not available on PATH")
         parallel_degraded = True
         degraded_reason = "codex_exec_unavailable"
-        adapter = FixtureAdapter()
+        adapter = SerialFallbackAdapter()
         max_concurrent = 1
 
     runnable = _runnable_tasks(tasks, retry_failed=retry_failed)
-    for task in runnable:
-        _assign_task(
-            run_dir,
-            task,
-            adapter_name=adapter.name,
-            max_concurrent=max_concurrent,
-            parallel_degraded=parallel_degraded,
-        )
-        result = adapter.run_task(task, run_dir=run_dir, max_threads=max_concurrent)
-        _record_runner_result(run_dir, task, result)
-        if (
-            isinstance(adapter, CodexExecAdapter)
-            and allow_degraded
-            and result.status == "failed"
-            and _is_missing_capability_failure(result)
-        ):
-            parallel_degraded = True
-            degraded_reason = result.failure_category or "codex_exec_unavailable"
-            adapter = FixtureAdapter()
-            max_concurrent = 1
-            task["state"] = "retryable"
+    worker_count = max(1, min(max_concurrent, len(runnable) or 1))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_task: dict[Any, dict[str, Any]] = {}
+        for task in runnable:
+            if isinstance(adapter, SerialFallbackAdapter):
+                max_concurrent = 1
+                worker_count = 1
             _assign_task(
                 run_dir,
                 task,
@@ -387,8 +523,45 @@ def run_parallel_orchestration(
                 max_concurrent=max_concurrent,
                 parallel_degraded=parallel_degraded,
             )
-            degraded_result = adapter.run_task(task, run_dir=run_dir, max_threads=max_concurrent)
-            _record_runner_result(run_dir, task, degraded_result)
+            future = executor.submit(
+                adapter.run_task,
+                dict(task),
+                run_dir=run_dir,
+                max_threads=max_concurrent,
+            )
+            future_to_task[future] = task
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            result = future.result()
+            _record_runner_result(run_dir, task, result)
+            if (
+                isinstance(adapter, CodexExecAdapter)
+                and allow_degraded
+                and result.status == "failed"
+                and _is_missing_capability_failure(result)
+            ):
+                parallel_degraded = True
+                degraded_reason = result.failure_category or "codex_exec_unavailable"
+                task["state"] = "retryable"
+
+    if parallel_degraded and isinstance(adapter, CodexExecAdapter):
+        adapter = SerialFallbackAdapter()
+        max_concurrent = 1
+        for task in _runnable_tasks(tasks, retry_failed=True):
+            if task.get("failure_category") not in RETRY_SAFE_FAILURES:
+                continue
+            if task.get("state") in {"completed", "merged", "blocked", "discarded"}:
+                continue
+            _assign_task(
+                run_dir,
+                task,
+                adapter_name=adapter.name,
+                max_concurrent=max_concurrent,
+                parallel_degraded=parallel_degraded,
+            )
+            result = adapter.run_task(dict(task), run_dir=run_dir, max_threads=max_concurrent)
+            _record_runner_result(run_dir, task, result)
 
     tasks_artifact["tasks"] = tasks
     tasks_artifact["parallel_degraded"] = parallel_degraded
@@ -396,26 +569,37 @@ def run_parallel_orchestration(
         tasks_artifact["degraded_reason"] = degraded_reason
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     merge_status = merge_evidence_shards(run=run_dir)
-    status = {
-        "schema_version": PARALLEL_SCHEMA_VERSION,
-        "run_id": str(evidence.get("run_id") or run_dir.name),
-        "status": "completed",
-        "parallel_degraded": parallel_degraded,
-        "degraded_reason": degraded_reason,
-        "adapter": adapter.name,
-        "planned_task_count": len(tasks),
-        "runnable_task_count": len(runnable),
-        "max_scheduled_concurrency": max_concurrent,
-        "artifacts": {
-            "research_tasks": str(run_dir / RESEARCH_TASKS_FILENAME),
-            "subagent_assignments": str(run_dir / ASSIGNMENTS_FILENAME),
-            "merge_status": str(run_dir / MERGE_STATUS_FILENAME),
-            "evidence": str(run_dir / "evidence.json"),
-            "run_trace": str(trace_path(run_dir)),
-        },
-        "merge": merge_status,
-    }
+    status_value = "completed" if merge_status.get("status") == "completed" else "failed_validation"
+    status = _parallel_status(
+        run_dir,
+        evidence=evidence,
+        status=status_value,
+        parallel_degraded=parallel_degraded,
+        degraded_reason=degraded_reason,
+        adapter_name=adapter.name,
+        planned_task_count=len(tasks),
+        runnable_task_count=len(runnable),
+        max_scheduled_concurrency=max_concurrent,
+        merge_status=merge_status,
+    )
     _write_json(run_dir / "parallel_orchestration_status.json", status)
+    if status_value == "completed":
+        transition_stage(
+            run_dir,
+            "parallel_orchestration",
+            "completed",
+            reason="stage_completed",
+            status_payload=status,
+        )
+        _skip_serial_handoff_after_parallel(run_dir, status)
+    else:
+        transition_stage(
+            run_dir,
+            "parallel_orchestration",
+            "failed",
+            reason="stage_failed",
+            status_payload=status,
+        )
     return status
 
 
@@ -430,6 +614,9 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     source_by_url: dict[str, str] = {}
     image_by_hash: dict[str, str] = {}
     claim_by_text: dict[str, str] = {}
+    used_source_ids: set[str] = set()
+    used_image_ids: set[str] = set()
+    used_claim_ids: set[str] = set()
     source_dedupe: list[dict[str, Any]] = []
     image_dedupe: list[dict[str, Any]] = []
     claim_dedupe: list[dict[str, Any]] = []
@@ -441,7 +628,15 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     evidence.setdefault("sources", [])
     evidence.setdefault("images", [])
     evidence.setdefault("claims", [])
-    _index_existing_evidence(evidence, source_by_url, image_by_hash, claim_by_text)
+    _index_existing_evidence(
+        evidence,
+        source_by_url,
+        image_by_hash,
+        claim_by_text,
+        used_source_ids,
+        used_image_ids,
+        used_claim_ids,
+    )
 
     for task in tasks:
         state = str(task.get("state"))
@@ -473,36 +668,53 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         new_claims = 0
         for source in _list(shard.get("sources")):
             key = _source_key(source)
+            old_id = str(source.get("id") or "")
             existing_id = source_by_url.get(key)
             if existing_id:
-                id_map[str(source.get("id"))] = existing_id
+                id_map[old_id] = existing_id
                 source_dedupe.append(
                     {"task_id": task["id"], "duplicate_id": source.get("id"), "kept_id": existing_id}
                 )
                 continue
             source_copy = dict(source)
-            source_by_url[key] = str(source_copy.get("id"))
+            new_id = _canonical_artifact_id(
+                old_id,
+                used_source_ids,
+                prefix="src",
+                task_id=str(task["id"]),
+            )
+            source_copy["id"] = new_id
+            source_by_url[key] = new_id
             evidence["sources"].append(source_copy)
-            id_map[str(source_copy.get("id"))] = str(source_copy.get("id"))
+            id_map[old_id] = new_id
 
         for image in _list(shard.get("images")):
             image_copy = dict(image)
+            old_id = str(image_copy.get("id") or "")
             if image_copy.get("source_id") in id_map:
                 image_copy["source_id"] = id_map[str(image_copy["source_id"])]
             key = _image_key(image_copy)
             existing_id = image_by_hash.get(key)
             if existing_id:
-                id_map[str(image.get("id"))] = existing_id
+                id_map[old_id] = existing_id
                 image_dedupe.append(
                     {"task_id": task["id"], "duplicate_id": image.get("id"), "kept_id": existing_id}
                 )
                 continue
-            image_by_hash[key] = str(image_copy.get("id"))
+            new_id = _canonical_artifact_id(
+                old_id,
+                used_image_ids,
+                prefix="img",
+                task_id=str(task["id"]),
+            )
+            image_copy["id"] = new_id
+            image_by_hash[key] = new_id
             evidence["images"].append(image_copy)
-            id_map[str(image_copy.get("id"))] = str(image_copy.get("id"))
+            id_map[old_id] = new_id
 
         for claim in _list(shard.get("claims")):
             claim_copy = _remap_claim_refs(claim, id_map)
+            old_id = str(claim.get("id") or "")
             if not _claim_is_mergeable(claim_copy):
                 claim_dedupe.append(
                     {
@@ -519,7 +731,14 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
                     {"task_id": task["id"], "duplicate_id": claim.get("id"), "kept_id": existing_id}
                 )
                 continue
-            claim_by_text[key] = str(claim_copy.get("id"))
+            new_id = _canonical_artifact_id(
+                old_id,
+                used_claim_ids,
+                prefix="claim",
+                task_id=str(task["id"]),
+            )
+            claim_copy["id"] = new_id
+            claim_by_text[key] = new_id
             evidence["claims"].append(claim_copy)
             new_claims += 1
 
@@ -566,6 +785,8 @@ def _adapter(name: str) -> CodexExecAdapter | FixtureAdapter:
         return CodexExecAdapter()
     if normalized in {"fixture", "fake", "deterministic"}:
         return FixtureAdapter()
+    if normalized in {"serial-degraded", "serial-fallback"}:
+        return SerialFallbackAdapter()
     raise ParallelOrchestrationError("adapter must be codex-exec or fixture")
 
 
@@ -588,6 +809,109 @@ def _tasks_payload(
             "evidence_shards": str(run_dir / EVIDENCE_SHARDS_DIRNAME),
         },
     }
+
+
+def _parallel_status(
+    run_dir: Path,
+    *,
+    evidence: Mapping[str, Any],
+    status: str,
+    parallel_degraded: bool,
+    degraded_reason: str | None,
+    adapter_name: str,
+    planned_task_count: int,
+    runnable_task_count: int,
+    max_scheduled_concurrency: int,
+    merge_status: Mapping[str, Any] | None,
+    skip_reason: str | None = None,
+    errors: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": PARALLEL_SCHEMA_VERSION,
+        "run_id": str(evidence.get("run_id") or run_dir.name),
+        "run_dir": str(run_dir),
+        "status": status,
+        "created_at": _utc_now(),
+        "parallel_degraded": parallel_degraded,
+        "degraded_reason": degraded_reason,
+        "adapter": adapter_name,
+        "planned_task_count": planned_task_count,
+        "runnable_task_count": runnable_task_count,
+        "max_scheduled_concurrency": max_scheduled_concurrency,
+        "artifacts": {
+            "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json"),
+            "research_tasks": str(run_dir / RESEARCH_TASKS_FILENAME),
+            "subagent_assignments": str(run_dir / ASSIGNMENTS_FILENAME),
+            "merge_status": str(run_dir / MERGE_STATUS_FILENAME),
+            "evidence": str(run_dir / "evidence.json"),
+            "run_trace": str(trace_path(run_dir)),
+        },
+    }
+    if merge_status is not None:
+        payload["merge"] = dict(merge_status)
+    if skip_reason:
+        payload["skip_reason"] = skip_reason
+    if errors:
+        payload["errors"] = [dict(error) for error in errors]
+    add_run_steps_artifact(payload, run_dir)
+    return payload
+
+
+def _skip_serial_handoff_after_parallel(
+    run_dir: Path,
+    status_payload: Mapping[str, Any],
+) -> None:
+    for stage in ("ingest", "fetch_claims", "ingest_vision"):
+        try:
+            skip_stage(
+                run_dir,
+                stage,
+                reason="parallel_orchestration_completed",
+            )
+        except Exception:
+            continue
+
+
+def _enforce_parallel_budget_gate(
+    *,
+    run_dir: Path,
+    preset_name: str,
+    budget: Mapping[str, Any],
+    confirm_exhaustive: bool,
+    max_cost_usd: float | None,
+) -> None:
+    if preset_name != "exhaustive":
+        return
+    budget_estimate = _read_optional_json(run_dir / "budget_estimate.json") or {}
+    confirmation_provided = confirm_exhaustive or bool(
+        _nested_get(budget_estimate, ("confirmation", "provided"))
+    )
+    effective_cost_cap = max_cost_usd
+    if effective_cost_cap is None:
+        budget_cost = budget.get("max_cost_usd")
+        if isinstance(budget_cost, (int, float)):
+            effective_cost_cap = float(budget_cost)
+    if effective_cost_cap is None:
+        estimate_cost = _nested_get(budget_estimate, ("effective_caps", "max_cost_usd"))
+        if isinstance(estimate_cost, (int, float)):
+            effective_cost_cap = float(estimate_cost)
+    if not confirmation_provided:
+        raise ParallelOrchestrationError(
+            "exhaustive parallel orchestration requires explicit confirmation"
+        )
+    if effective_cost_cap is None or effective_cost_cap <= 0:
+        raise ParallelOrchestrationError(
+            "exhaustive parallel orchestration requires a positive max_cost_usd cap"
+        )
+
+
+def _nested_get(payload: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
 
 
 def _read_research_tasks(run_dir: Path) -> list[dict[str, Any]]:
@@ -665,8 +989,23 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
         trace_ids.append(trace_record["event_id"])
     task["trace_event_ids"] = trace_ids
     if result.status == "completed" and result.shard_path and Path(result.shard_path).exists():
+        validation = validate_artifacts(evidence_path=result.shard_path)
+        if not validation.valid:
+            task["failure_category"] = "invalid_shard"
+            task["validation"] = validation.to_dict()
+            if int(task.get("attempt") or 0) < int(task.get("max_attempts") or 1):
+                task["state"] = "retryable"
+            else:
+                task["state"] = "failed"
+            return
         task["state"] = "completed"
         task["failure_category"] = None
+        task.pop("validation", None)
+        return
+    if result.status == "blocked":
+        task["state"] = "blocked"
+        task["failure_category"] = result.failure_category or "adapter_unavailable"
+        task["blocked_reason"] = result.message or "parallel execution unavailable"
         return
     failure = result.failure_category or "missing_shard"
     task["failure_category"] = failure
@@ -936,13 +1275,54 @@ def _index_existing_evidence(
     source_by_url: dict[str, str],
     image_by_hash: dict[str, str],
     claim_by_text: dict[str, str],
+    used_source_ids: set[str],
+    used_image_ids: set[str],
+    used_claim_ids: set[str],
 ) -> None:
     for source in _list(evidence.get("sources")):
-        source_by_url[_source_key(source)] = str(source.get("id"))
+        source_id = str(source.get("id") or "")
+        if source_id:
+            source_by_url[_source_key(source)] = source_id
+            used_source_ids.add(source_id)
     for image in _list(evidence.get("images")):
-        image_by_hash[_image_key(image)] = str(image.get("id"))
+        image_id = str(image.get("id") or "")
+        if image_id:
+            image_by_hash[_image_key(image)] = image_id
+            used_image_ids.add(image_id)
     for claim in _list(evidence.get("claims")):
-        claim_by_text[_claim_key(claim)] = str(claim.get("id"))
+        claim_id = str(claim.get("id") or "")
+        if claim_id:
+            claim_by_text[_claim_key(claim)] = claim_id
+            used_claim_ids.add(claim_id)
+
+
+def _canonical_artifact_id(
+    preferred_id: str,
+    used_ids: set[str],
+    *,
+    prefix: str,
+    task_id: str,
+) -> str:
+    preferred = _sanitize_id(preferred_id)
+    if preferred and preferred not in used_ids:
+        used_ids.add(preferred)
+        return preferred
+    task_part = _sanitize_id(task_id) or "task"
+    local_part = preferred or "artifact"
+    base = f"{prefix}_{task_part}_{local_part}"
+    candidate = base
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used_ids.add(candidate)
+    return candidate
+
+
+def _sanitize_id(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized
 
 
 def _source_key(source: Mapping[str, Any]) -> str:
@@ -1011,6 +1391,14 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ParallelOrchestrationError(f"expected JSON object: {path}")
     return payload
+
+
+def _read_optional_json(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
