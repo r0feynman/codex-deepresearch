@@ -76,6 +76,18 @@ plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id
 
 The command fetches queued `http`, `https`, `file`, or `data` sources with an explicit timeout, writes fetched artifacts under the run directory, extracts text excerpts and quote candidates, and appends source-linked text claims to `evidence.json`. First-pass claims are intentionally conservative: `confidence=low`, `verification_status=unverified`, `review_status=not_reviewed`, and `promotion_status=not_eligible`. Blocked, manual-review, and failed sources remain preserved with failed retrieval metadata and do not create claims.
 
+## Verify Claims
+
+Use `verify-claims` after claims and any visual evidence have been normalized:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run <run_id_or_path>
+```
+
+The command applies the PRD verifier matrix without external model, VLM, web, or API calls. It writes deterministic `runner-agent` `VerifierVote` records to `verifier_votes.jsonl`, embeds current votes on each claim, updates `verification_status`, `review_status`, and `promotion_status`, and writes `verification_matrix_status.json`. Route rules are enforced as `text_only` = two text votes plus one policy/freshness vote, `visual_required` = two text votes plus one visual vote plus one policy vote, and `visual_optional` = text and policy votes plus a visual vote only when usable visual evidence is already available.
+
+Budget-pruned claims are not voted again. They keep `verification_status=budget_pruned` and receive `include_in_final_report=false` plus `report_exclusion_reason=budget_pruned` for the M10 report renderer to consume.
+
 ## Manual Sources
 
 Use `ingest-manual` when the user provides URLs or images directly, or when Codex-native search handoff is blocked. The command does not call external search, fetch remote bodies, run VLM analysis, or create a fetch queue:

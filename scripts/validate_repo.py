@@ -31,6 +31,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
+    "plugins/codex-deepresearch/src/deepresearch/verification_matrix.py",
     "plugins/codex-deepresearch/src/deepresearch/vision_adapter.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
@@ -45,6 +46,7 @@ REQUIRED_FILES = [
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
     "tests/test_search_handoff.py",
+    "tests/test_verification_matrix.py",
     "tests/test_vision_adapter.py",
 ]
 
@@ -271,6 +273,96 @@ def main() -> None:
     validation = fetch_validation.get("validation")
     if not isinstance(validation, dict) or validation.get("valid") is not True:
         fail("runner fetch-claims did not produce valid evidence")
+
+    with tempfile.TemporaryDirectory() as verify_runs_dir:
+        run_dir = Path(verify_runs_dir) / "verify-claims-smoke"
+        run_dir.mkdir()
+        evidence = {
+            "schema_version": "0.1.0",
+            "run_id": "verify-claims-smoke",
+            "created_at": "2026-06-22T00:00:00Z",
+            "question": "Verify claims smoke",
+            "mode": "codex-plugin",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+            "routing": [
+                {
+                    "id": "angle_001",
+                    "angle": "primary source check",
+                    "modality": "text_only",
+                    "reason": "smoke route",
+                    "visual_tasks": [],
+                    "max_images": 0,
+                }
+            ],
+            "search_tasks": [],
+            "sources": [
+                {
+                    "id": "src_verify_smoke",
+                    "type": "web",
+                    "url": "https://example.com/verify",
+                    "title": "Verify Smoke Source",
+                    "published_at": None,
+                    "accessed_at": "2026-06-22T00:00:00Z",
+                    "quality": "primary",
+                    "retrieval_status": "fetched",
+                    "local_artifact_path": "sources/src_verify_smoke.html",
+                    "license_policy": "allowed",
+                    "robots_policy": "allowed",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "route": "text_only",
+                    "angle_id": "angle_001",
+                }
+            ],
+            "images": [],
+            "claims": [
+                {
+                    "id": "claim_verify_smoke",
+                    "text": "The smoke source contains verifiable text.",
+                    "claim_type": "text",
+                    "supporting_sources": ["src_verify_smoke"],
+                    "supporting_images": [],
+                    "quote_spans": [
+                        {
+                            "source_id": "src_verify_smoke",
+                            "quote": "The smoke source contains verifiable text.",
+                            "location": "paragraph 1",
+                        }
+                    ],
+                    "votes": [],
+                    "verification_status": "unverified",
+                    "review_status": "not_reviewed",
+                    "promotion_status": "not_eligible",
+                    "confidence": "low",
+                    "caveats": [],
+                }
+            ],
+        }
+        (run_dir / "evidence.json").write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        verify_result = subprocess.run(
+            [str(runner), "verify-claims", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if verify_result.returncode != 0:
+        fail("runner verify-claims must apply the verifier matrix to a text claim")
+    try:
+        verify_validation = json.loads(verify_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner verify-claims must output valid JSON: {exc}")
+    if verify_validation.get("status") != "completed":
+        fail("runner verify-claims did not report completed")
+    if verify_validation.get("votes_written") != 3:
+        fail("runner verify-claims did not write the expected three verifier votes")
+    validation = verify_validation.get("validation")
+    if not isinstance(validation, dict) or validation.get("valid") is not True:
+        fail("runner verify-claims did not produce valid evidence and verifier votes")
 
     with tempfile.TemporaryDirectory() as vision_runs_dir:
         prepare_result = subprocess.run(
