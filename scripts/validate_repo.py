@@ -31,6 +31,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
+    "plugins/codex-deepresearch/src/deepresearch/vision_adapter.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
@@ -44,6 +45,7 @@ REQUIRED_FILES = [
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
     "tests/test_search_handoff.py",
+    "tests/test_vision_adapter.py",
 ]
 
 
@@ -269,6 +271,54 @@ def main() -> None:
     validation = fetch_validation.get("validation")
     if not isinstance(validation, dict) or validation.get("valid") is not True:
         fail("runner fetch-claims did not produce valid evidence")
+
+    with tempfile.TemporaryDirectory() as vision_runs_dir:
+        prepare_result = subprocess.run(
+            [
+                str(runner),
+                "prepare",
+                "Vision adapter validation",
+                "--runs-dir",
+                vision_runs_dir,
+                "--route",
+                "visual_required",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if prepare_result.returncode != 0:
+            fail("runner prepare must create a visual-required run for vision smoke")
+        try:
+            prepared = json.loads(prepare_result.stdout)
+        except json.JSONDecodeError as exc:
+            fail(f"runner prepare must output valid JSON for vision smoke: {exc}")
+        vision_result = subprocess.run(
+            [
+                str(runner),
+                "ingest-vision",
+                "--run",
+                prepared["run_dir"],
+                "--provider",
+                "codex-interactive",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if vision_result.returncode != 0:
+        fail("runner ingest-vision must accept an empty visual handoff artifact")
+    try:
+        vision_validation = json.loads(vision_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner ingest-vision must output valid JSON: {exc}")
+    if vision_validation.get("status") != "needs_visual_evidence":
+        fail("runner ingest-vision did not report needs_visual_evidence for missing visual results")
+    validation = vision_validation.get("validation")
+    if not isinstance(validation, dict) or validation.get("valid") is not True:
+        fail("runner ingest-vision did not produce valid evidence")
 
     marketplace = read_json(".agents/plugins/marketplace.json")
     entries = marketplace.get("plugins", [])

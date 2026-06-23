@@ -20,6 +20,7 @@ from deepresearch import ConfigResolutionError, resolve_config, validate_artifac
 from deepresearch.fetch_claims import FetchClaimsError, fetch_claims
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
+from deepresearch.vision_adapter import VisionAdapterError, ingest_vision_observations
 
 PLUGIN_NAME = "codex-deepresearch"
 MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
@@ -254,6 +255,27 @@ def run_ingest_manual(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_ingest_vision(args: argparse.Namespace) -> int:
+    try:
+        result = ingest_vision_observations(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            provider=args.provider,
+            observations=args.observations,
+        )
+    except (VisionAdapterError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if result["status"] in {"failed_normalization", "failed_validation"}:
+        return 2
+    validation = result.get("validation")
+    if isinstance(validation, dict) and validation.get("valid") is False:
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -482,6 +504,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Budget preset for new manual runs: quick, standard, deep, or exhaustive.",
     )
     ingest_manual.set_defaults(func=run_ingest_manual)
+
+    ingest_vision = subparsers.add_parser(
+        "ingest-vision",
+        help="Normalize visual observations into VisualEvidence records.",
+    )
+    ingest_vision.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    ingest_vision.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    ingest_vision.add_argument(
+        "--provider",
+        required=True,
+        choices=("codex-interactive", "openai-responses-vision", "manual-visual-review"),
+        help="Visual analysis provider that produced the observation artifact.",
+    )
+    ingest_vision.add_argument(
+        "--observations",
+        help=(
+            "JSONL observations artifact. Defaults to visual_observations.jsonl "
+            "inside the run directory; an empty artifact records needs_visual_evidence "
+            "for visual_required routes."
+        ),
+    )
+    ingest_vision.set_defaults(func=run_ingest_vision)
     return parser
 
 

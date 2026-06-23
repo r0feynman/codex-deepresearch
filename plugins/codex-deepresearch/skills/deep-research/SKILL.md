@@ -36,8 +36,9 @@ In plugin mode, do not assume a hidden Codex search API is available to the runn
 3. Use the current Codex session's available search capability to perform each task.
 4. Write one `SearchResult` JSON object per line to `search_results.jsonl`, preserving task id, angle id, route, provider, query, URL, title, snippet, result type, rank, freshness, access time, policy decision, policy flags, and raw provider metadata.
 5. Run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>`.
-6. Run `plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id_or_path>` to fetch queued sources, preserve source artifacts, extract quote candidates, and append low-confidence unverified claims.
-7. Continue only from the normalized `evidence.json`, `fetch_queue.json`, and fetched source artifacts.
+6. For visual tasks, write explicit visual observation JSONL and run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision --run <run_id_or_path> --provider <codex-interactive|openai-responses-vision|manual-visual-review> --observations <jsonl>`. Do not assume the runner can call Codex interactive VLM as a hidden API.
+7. Run `plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id_or_path>` to fetch queued sources, preserve source artifacts, extract quote candidates, and append low-confidence unverified claims.
+8. Continue only from the normalized `evidence.json`, `fetch_queue.json`, `visual_observations.jsonl`, and fetched source artifacts.
 
 ## Manual Sources Fallback
 

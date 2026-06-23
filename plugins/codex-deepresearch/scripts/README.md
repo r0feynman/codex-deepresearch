@@ -51,6 +51,21 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_pa
 
 `ingest` validates `search_results.jsonl`, normalizes records into `evidence.json.sources`, and writes `fetch_queue.json` for allowed, fetchable `http`/`https` sources. Invalid URLs and blocked/manual-review policy decisions are preserved in evidence with `retrieval_status=failed` and explicit ingest errors, but they are not added to the fetch queue.
 
+## Vision Adapter
+
+Use `ingest-vision` after visual tasks have produced a JSONL handoff artifact. The command is a dry adapter: it reads local observation records and normalizes them into `VisualEvidence` without calling Codex interactive VLM, OpenAI, or any external network service.
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision \
+  --run <run_id_or_path> \
+  --provider codex-interactive \
+  --observations ./path/to/visual-observations.jsonl
+```
+
+`--provider` must be one of `codex-interactive`, `openai-responses-vision`, or `manual-visual-review`. `codex-interactive` observations are expected to come from explicit JSONL written by the Codex-side agent. `openai-responses-vision` can ingest a deterministic response fixture or artifact and records `analysis_provider=openai-responses-vision`; it does not perform a real API call. `manual-visual-review` records human-entered observations with `analysis_provider=manual-visual-review`.
+
+When `--observations` is omitted, the command reads `visual_observations.jsonl` inside the run directory. If a `visual_required` route has no visual result, the command appends a low-confidence visual claim with `verification_status=needs_visual_evidence` so the gap remains schema-valid and explicit.
+
 ## Fetch Claims
 
 Use `fetch-claims` after `ingest` has produced normalized sources and `fetch_queue.json`:
