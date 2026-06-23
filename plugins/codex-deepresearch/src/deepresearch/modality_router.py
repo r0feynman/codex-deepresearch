@@ -8,6 +8,9 @@ from typing import Sequence
 
 
 ROUTES = ("text_only", "visual_required", "visual_optional")
+TEXT_ONLY_MAX_IMAGES = 0
+VISUAL_REQUIRED_MAX_IMAGES = 12
+VISUAL_OPTIONAL_MAX_IMAGES = 6
 
 
 @dataclass(frozen=True)
@@ -171,7 +174,7 @@ def _decision_for_route(
             modality=route,
             reason=reason,
             visual_tasks=[],
-            max_images=0,
+            max_images=TEXT_ONLY_MAX_IMAGES,
         )
     if route == "visual_required":
         return ModalityDecision(
@@ -179,14 +182,14 @@ def _decision_for_route(
             modality=route,
             reason=reason,
             visual_tasks=["image_claim_alignment", "ocr", "layout_review"],
-            max_images=max_images,
+            max_images=min(max_images, VISUAL_REQUIRED_MAX_IMAGES),
         )
     return ModalityDecision(
         angle=angle,
         modality=route,
         reason=reason,
         visual_tasks=["image_claim_alignment"],
-        max_images=min(max_images, 4),
+        max_images=min(max_images, VISUAL_OPTIONAL_MAX_IMAGES),
     )
 
 

@@ -45,7 +45,22 @@ class ModalityRouterTests(unittest.TestCase):
 
         self.assertEqual(decision.modality, "visual_optional")
         self.assertEqual(decision.visual_tasks, ["image_claim_alignment"])
-        self.assertEqual(decision.max_images, 4)
+        self.assertEqual(decision.max_images, 6)
+
+    def test_visual_routes_respect_lower_budget_cap(self) -> None:
+        visual_required = route_angle(
+            question="Compare screenshots.",
+            angle="screenshot comparison",
+            max_images=4,
+        )
+        visual_optional = route_angle(
+            question="Create a market report.",
+            angle="market report and competitor trends",
+            max_images=4,
+        )
+
+        self.assertEqual(visual_required.max_images, 4)
+        self.assertEqual(visual_optional.max_images, 4)
 
 
 if __name__ == "__main__":
