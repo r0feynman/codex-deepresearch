@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .cache_keys import source_cache_key
 from .evidence_schema import (
     EVIDENCE_SCHEMA_VERSION,
     FRESHNESS_REQUIREMENTS,
@@ -470,11 +471,12 @@ def _source_from_search_result(
         }
     else:
         source["ingest_status"] = "queued_for_fetch"
+    source["cache_key"] = source_cache_key(source)
     return source, fetchable, error
 
 
 def _fetch_queue_entry(source: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    entry = {
         "source_id": source["id"],
         "search_result_id": source["search_result_id"],
         "url": source["url"],
@@ -488,6 +490,8 @@ def _fetch_queue_entry(source: Mapping[str, Any]) -> dict[str, Any]:
         "policy_flags": list(source["policy_flags"]),
         "retrieval_status": "queued",
     }
+    entry["cache_key"] = source_cache_key(source, entry)
+    return entry
 
 
 def _is_search_handoff_source(source: Any) -> bool:

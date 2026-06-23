@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .cache_keys import claim_cache_key
 from .evidence_schema import SEARCH_ROUTES, validate_artifacts
 from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
@@ -105,6 +106,7 @@ def verify_claims(
     all_votes: list[dict[str, Any]] = []
     claim_statuses: list[dict[str, Any]] = []
     pruned_count = 0
+    reused_count = 0
 
     for claim in claims:
         if not isinstance(claim, dict):
@@ -115,9 +117,34 @@ def verify_claims(
             routing_by_angle=routing_by_angle,
         )
         route_counts[route] += 1
+        current_claim_cache_key = claim_cache_key(
+            claim,
+            sources_by_id=sources_by_id,
+            images_by_id=images_by_id,
+            verification_route=route,
+        )
         preserved_votes = _preserved_votes(claim, existing_top_level_votes)
+        reusable_matrix_votes = _existing_matrix_votes(claim, existing_top_level_votes)
+        if _can_reuse_claim_verification(
+            claim,
+            current_claim_cache_key,
+            reusable_matrix_votes,
+        ):
+            claim["cache_key"] = current_claim_cache_key
+            claim["verification_cache_key"] = current_claim_cache_key
+            claim_votes = preserved_votes + reusable_matrix_votes
+            claim["votes"] = claim_votes
+            claim["verification_route"] = route
+            _update_report_eligibility(claim)
+            all_votes.extend(claim_votes)
+            claim_statuses.append(_claim_status_record(claim, route, 0, cache_hit=True))
+            reused_count += 1
+            continue
+
         if _is_budget_pruned(claim):
             pruned_count += 1
+            claim["cache_key"] = current_claim_cache_key
+            claim["verification_cache_key"] = current_claim_cache_key
             claim["verification_status"] = "budget_pruned"
             claim["review_status"] = "not_reviewed"
             claim["promotion_status"] = "not_eligible"
@@ -139,6 +166,9 @@ def verify_claims(
         claim_votes = preserved_votes + generated_votes
         claim["votes"] = claim_votes
         claim["verification_route"] = route
+        claim["cache_key"] = current_claim_cache_key
+        claim["verification_cache_key"] = current_claim_cache_key
+        claim["verified_at"] = now
         _update_claim_state(claim, route=route, votes=claim_votes, images_by_id=images_by_id)
         all_votes.extend(claim_votes)
         claim_statuses.append(_claim_status_record(claim, route, len(generated_votes)))
@@ -152,6 +182,7 @@ def verify_claims(
         "external_model_call": False,
         "routes": route_counts,
         "claims_processed": len([claim for claim in claims if isinstance(claim, Mapping)]),
+        "claims_reused": reused_count,
         "claims_budget_pruned": pruned_count,
     }
 
@@ -171,6 +202,7 @@ def verify_claims(
         "status": "completed" if validation.valid else "failed_validation",
         "created_at": now,
         "claims_processed": evidence["verification_matrix"]["claims_processed"],
+        "claims_reused": reused_count,
         "claims_budget_pruned": pruned_count,
         "votes_written": len(_dedupe_votes(all_votes)),
         "routes": route_counts,
@@ -189,7 +221,7 @@ def verify_claims(
         agent_role="verification_matrix_agent",
         status_payload=status,
         prompt_summary="Apply the deterministic verifier matrix to extracted claims.",
-        tool_call_summary="Generated local verifier votes by route and wrote verifier_votes.jsonl.",
+        tool_call_summary="Reused unchanged claim verification cache hits, generated local verifier votes for changed claims by route, and wrote verifier_votes.jsonl.",
     )
     _write_json(matrix_status_path, status)
     return status
@@ -468,17 +500,9 @@ def _claim_route(
     sources_by_id: Mapping[str, Mapping[str, Any]],
     routing_by_angle: Mapping[str, str],
 ) -> str:
-    explicit = _first_allowed_route(
-        claim.get("verification_route"),
-        claim.get("route"),
-        claim.get("search_route"),
-    )
+    explicit = _first_allowed_route(claim.get("route"), claim.get("search_route"))
     if explicit is not None:
         return explicit
-
-    angle_id = claim.get("angle_id")
-    if isinstance(angle_id, str) and angle_id in routing_by_angle:
-        return routing_by_angle[angle_id]
 
     source_routes = {
         source.get("route")
@@ -493,6 +517,14 @@ def _claim_route(
     if "visual_optional" in source_routes:
         return "visual_optional"
 
+    angle_id = claim.get("angle_id")
+    if isinstance(angle_id, str) and angle_id in routing_by_angle:
+        return routing_by_angle[angle_id]
+
+    persisted = _first_allowed_route(claim.get("verification_route"))
+    if persisted is not None:
+        return persisted
+
     routing_routes = set(routing_by_angle.values())
     if len(routing_routes) == 1:
         return next(iter(routing_routes))
@@ -502,7 +534,13 @@ def _claim_route(
     return "text_only"
 
 
-def _claim_status_record(claim: Mapping[str, Any], route: str, generated_vote_count: int) -> dict[str, Any]:
+def _claim_status_record(
+    claim: Mapping[str, Any],
+    route: str,
+    generated_vote_count: int,
+    *,
+    cache_hit: bool = False,
+) -> dict[str, Any]:
     return {
         "claim_id": claim.get("id"),
         "route": route,
@@ -512,6 +550,7 @@ def _claim_status_record(claim: Mapping[str, Any], route: str, generated_vote_co
         "confidence": claim.get("confidence"),
         "include_in_final_report": claim.get("include_in_final_report"),
         "generated_vote_count": generated_vote_count,
+        "cache_hit": cache_hit,
     }
 
 
@@ -557,6 +596,36 @@ def _preserved_votes(
             continue
         preserved.append(dict(record))
     return preserved
+
+
+def _existing_matrix_votes(
+    claim: Mapping[str, Any],
+    top_level_votes: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    matrix_votes: dict[str, dict[str, Any]] = {}
+    votes = claim.get("votes", [])
+    if not isinstance(votes, list):
+        return []
+    for vote in votes:
+        record = top_level_votes.get(vote) if isinstance(vote, str) else vote
+        if not isinstance(record, Mapping) or not _is_matrix_vote(record):
+            continue
+        vote_id = record.get("id")
+        if isinstance(vote_id, str) and vote_id:
+            matrix_votes[vote_id] = dict(record)
+    return [matrix_votes[vote_id] for vote_id in sorted(matrix_votes)]
+
+
+def _can_reuse_claim_verification(
+    claim: Mapping[str, Any],
+    current_cache_key: str,
+    matrix_votes: Sequence[Mapping[str, Any]],
+) -> bool:
+    if claim.get("verification_cache_key") != current_cache_key:
+        return False
+    if claim.get("verification_status") in {None, "unverified"}:
+        return False
+    return bool(matrix_votes) or _is_budget_pruned(claim)
 
 
 def _is_matrix_vote(vote: Mapping[str, Any]) -> bool:

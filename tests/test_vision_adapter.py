@@ -117,7 +117,83 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(image["analysis_provider"], "codex-interactive")
         self.assertEqual(image["analysis_status"], "analyzed")
         self.assertEqual(image["observations"], ["The screenshot shows a primary checkout button."])
+        self.assertEqual(image["artifact_size_bytes"], len(PNG_1X1))
+        self.assertEqual(image["source_url"], "https://example.com/checkout")
+        self.assertTrue(image["cache_key"].startswith("image:codex-deepresearch.cache-keys.v0:sha256:"))
         self.assertTrue(image["hash"].startswith("sha256:"))
+
+        first_cache_key = image["cache_key"]
+        first_analyzed_at = image["analyzed_at"]
+        resumed = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+        resumed_evidence = self.assert_valid_run(run_dir)
+        self.assertEqual(resumed["images_reused"], 1)
+        self.assertEqual(resumed_evidence["images"][0]["cache_key"], first_cache_key)
+        self.assertEqual(resumed_evidence["images"][0]["analyzed_at"], first_analyzed_at)
+
+    def test_corrected_observation_rerun_replaces_previous_image_analysis(self) -> None:
+        run_dir = self.prepared_visual_run()
+        observations_path = run_dir / "codex_handoff.jsonl"
+        self.write_jsonl(
+            observations_path,
+            [
+                {
+                    "id": "img_checkout",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "observations": ["Old observation"],
+                    "inferences": ["Old inference"],
+                    "visual_tasks": ["layout_review"],
+                }
+            ],
+        )
+        ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+        evidence = self.assert_valid_run(run_dir)
+        old_image = evidence["images"][0]
+        old_cache_key = old_image["cache_key"]
+        evidence["images"][0].pop("cache_key", None)
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        self.write_jsonl(
+            observations_path,
+            [
+                {
+                    "id": "img_checkout",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "observations": ["Corrected observation"],
+                    "inferences": ["Corrected inference"],
+                    "visual_tasks": ["layout_review"],
+                }
+            ],
+        )
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+
+        evidence = self.assert_valid_run(run_dir)
+        image = evidence["images"][0]
+        self.assertEqual(result["images_reused"], 0)
+        self.assertNotEqual(image["cache_key"], old_cache_key)
+        self.assertEqual(image["observations"], ["Corrected observation"])
+        self.assertEqual(image["inferences"], ["Corrected inference"])
 
     def test_openai_responses_vision_fixture_emits_visual_evidence_schema(self) -> None:
         run_dir = self.prepared_visual_run(provider="openai-responses-vision")
