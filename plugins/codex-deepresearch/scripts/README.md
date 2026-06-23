@@ -32,6 +32,17 @@ plugins/codex-deepresearch/scripts/codex-deepresearch prepare "What evidence is 
 
 The command writes `evidence.json`, `search_tasks.json`, an empty `search_results.jsonl`, `visual_tasks.json`, and an empty `visual_observations.jsonl` under `research-runs/<run_id>/`. Codex should perform search in the active session and append one `SearchResult` JSON object per line to `search_results.jsonl`.
 
+By default, `prepare` classifies each planner angle as `text_only`, `visual_required`, or `visual_optional` and records the route in `evidence.json.routing`. Pass repeated `--angle` values to supply planner angles:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch prepare \
+  "Compare checkout flows for these products" \
+  --angle "official API docs and release notes" \
+  --angle "checkout UI screenshot comparison"
+```
+
+Use `--route text_only`, `--route visual_required`, or `--route visual_optional` only when all generated angles need an explicit override. Text-only routes write no visual tasks and set `max_images` to `0`.
+
 Then ingest only the handoff artifact:
 
 ```bash

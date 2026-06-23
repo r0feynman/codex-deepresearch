@@ -28,6 +28,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
+    "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
     "scripts/bootstrap_github.py",
@@ -39,6 +40,7 @@ REQUIRED_FILES = [
     "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
     "tests/test_manual_sources.py",
+    "tests/test_modality_router.py",
     "tests/test_search_handoff.py",
 ]
 

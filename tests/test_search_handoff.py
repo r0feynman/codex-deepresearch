@@ -93,6 +93,45 @@ class SearchHandoffTests(unittest.TestCase):
         validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
         self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
 
+    def test_prepare_records_modality_routes_for_planner_angles(self) -> None:
+        result = prepare_run(
+            question="Research the product market and compare checkout UI.",
+            runs_dir=self.temp_runs_dir(),
+            angles=[
+                "official API docs and release notes",
+                "checkout UI screenshot comparison",
+                "market report and competitor benchmark posts",
+            ],
+        )
+        run_dir = Path(result["run_dir"])
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(
+            [route["modality"] for route in evidence["routing"]],
+            ["text_only", "visual_required", "visual_optional"],
+        )
+        self.assertEqual(evidence["routing"][0]["max_images"], 0)
+        self.assertEqual(evidence["routing"][0]["visual_tasks"], [])
+        self.assertGreater(evidence["routing"][1]["max_images"], 0)
+        self.assertGreater(evidence["routing"][2]["max_images"], 0)
+        self.assertEqual(
+            [task["route"] for task in evidence["search_tasks"]],
+            ["text_only", "visual_required", "visual_optional"],
+        )
+
+        visual_tasks = self.load_json(run_dir / "visual_tasks.json")
+        self.assertEqual(
+            [task["angle_id"] for task in visual_tasks["tasks"]],
+            ["angle_002", "angle_003"],
+        )
+        self.assertTrue(
+            all(task["max_images"] > 0 for task in visual_tasks["tasks"]),
+            visual_tasks["tasks"],
+        )
+
+        validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
+        self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+
     def test_ingest_search_results_into_sources_and_fetch_queue(self) -> None:
         prepared = prepare_run(
             question="example search question",
