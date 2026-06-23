@@ -92,14 +92,21 @@ class VerificationMatrixTests(unittest.TestCase):
             "route": route,
         }
 
-    def image(self, *, image_id: str = "img_001") -> dict:
+    def image(
+        self,
+        *,
+        image_id: str = "img_001",
+        origin: str = "screenshot",
+        image_url: str | None = None,
+        local_artifact_path: str | None = None,
+    ) -> dict:
         return {
             "id": image_id,
             "source_id": "src_001",
-            "origin": "screenshot",
-            "image_url": None,
+            "origin": origin,
+            "image_url": image_url,
             "page_url": "https://example.com/source",
-            "local_artifact_path": f"images/{image_id}.png",
+            "local_artifact_path": local_artifact_path or f"images/{image_id}.png",
             "mime_type": "image/png",
             "width": 640,
             "height": 480,
@@ -125,6 +132,8 @@ class VerificationMatrixTests(unittest.TestCase):
         quote_spans: list[dict] | None = None,
         votes: list[dict] | None = None,
         verification_status: str = "unverified",
+        review_status: str = "not_reviewed",
+        promotion_status: str = "not_eligible",
     ) -> dict:
         return {
             "id": claim_id,
@@ -143,8 +152,8 @@ class VerificationMatrixTests(unittest.TestCase):
             ],
             "votes": votes if votes is not None else [],
             "verification_status": verification_status,
-            "review_status": "not_reviewed",
-            "promotion_status": "not_eligible",
+            "review_status": review_status,
+            "promotion_status": promotion_status,
             "confidence": "low",
             "caveats": [],
             "angle_id": "angle_001",
@@ -229,6 +238,8 @@ class VerificationMatrixTests(unittest.TestCase):
         claim = evidence["claims"][0]
         self.assertEqual(claim["verification_status"], "refuted")
         self.assertEqual(claim["promotion_status"], "not_eligible")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["report_exclusion_reason"], "refuted")
 
     def test_budget_pruned_claim_is_excluded_from_final_report(self) -> None:
         run_dir = self.temp_run(route="text_only")
@@ -273,6 +284,8 @@ class VerificationMatrixTests(unittest.TestCase):
         visual_votes = [vote for vote in votes if vote["verifier_type"] == "visual"]
         self.assertEqual(claim["verification_status"], "needs_visual_evidence")
         self.assertEqual(claim["confidence"], "low")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["report_exclusion_reason"], "needs_visual_evidence")
         self.assertEqual(len(visual_votes), 1)
         self.assertEqual(visual_votes[0]["vote"], "uncertain")
 
@@ -289,7 +302,99 @@ class VerificationMatrixTests(unittest.TestCase):
         text_votes = [vote for vote in self.votes_for(run_dir, "claim_no_quote") if vote["verifier_type"] == "text"]
         self.assertEqual(claim["verification_status"], "insufficient_evidence")
         self.assertEqual(claim["confidence"], "low")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["report_exclusion_reason"], "insufficient_evidence")
         self.assertTrue(all(vote["vote"] == "uncertain" for vote in text_votes))
+
+    def test_visual_optional_visual_claim_without_image_is_not_supported(self) -> None:
+        run_dir = self.temp_run(route="visual_optional")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_optional_missing_image",
+                claim_type="visual",
+                supporting_images=[],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "needs_visual_evidence")
+        self.assertEqual(claim["promotion_status"], "not_eligible")
+        self.assertFalse(claim["include_in_final_report"])
+
+    def test_page_image_without_image_url_or_screenshot_capture_is_not_usable(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image(origin="page_image", image_url=None)]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_page_image_missing_asset",
+                claim_type="visual",
+                supporting_images=["img_001"],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        visual_votes = [
+            vote
+            for vote in self.votes_for(run_dir, "claim_page_image_missing_asset")
+            if vote["verifier_type"] == "visual"
+        ]
+        self.assertEqual(claim["verification_status"], "needs_visual_evidence")
+        self.assertEqual(claim["promotion_status"], "not_eligible")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(visual_votes[0]["vote"], "uncertain")
+
+    def test_human_or_promotion_rejected_claim_is_not_repromoted(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_rejected",
+                review_status="human_rejected",
+                promotion_status="promotion_rejected",
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "supported")
+        self.assertEqual(claim["review_status"], "human_rejected")
+        self.assertEqual(claim["promotion_status"], "promotion_rejected")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["report_exclusion_reason"], "human_rejected")
+
+    def test_promotion_rejected_claim_without_human_rejection_is_not_auto_reviewed(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_promotion_rejected",
+                promotion_status="promotion_rejected",
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "supported")
+        self.assertEqual(claim["review_status"], "needs_more_evidence")
+        self.assertEqual(claim["promotion_status"], "promotion_rejected")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["report_exclusion_reason"], "promotion_rejected")
 
     def test_verify_claims_is_idempotent_for_matrix_votes(self) -> None:
         run_dir = self.temp_run(route="text_only")

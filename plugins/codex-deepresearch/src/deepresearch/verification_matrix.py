@@ -74,10 +74,9 @@ def verify_claims(
             claim["review_status"] = "not_reviewed"
             claim["promotion_status"] = "not_eligible"
             claim["confidence"] = "low"
-            claim["include_in_final_report"] = False
-            claim["report_exclusion_reason"] = "budget_pruned"
             claim["verification_route"] = route
             claim["votes"] = preserved_votes
+            _update_report_eligibility(claim)
             all_votes.extend(preserved_votes)
             claim_statuses.append(_claim_status_record(claim, route, 0))
             continue
@@ -288,6 +287,8 @@ def _update_claim_state(
     votes: Sequence[Mapping[str, Any]],
     images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> None:
+    incoming_review_status = claim.get("review_status")
+    incoming_promotion_status = claim.get("promotion_status")
     refute_count = sum(1 for vote in votes if vote.get("vote") == "refute")
     support_by_type: dict[str, int] = {}
     blocked_count = 0
@@ -303,7 +304,7 @@ def _update_claim_state(
         review_status = "auto_reviewed"
         promotion_status = "not_eligible"
         confidence = "low"
-    elif route == "visual_required" and not _usable_image_refs(claim, images_by_id=images_by_id):
+    elif _needs_visual_evidence(claim, route=route, images_by_id=images_by_id):
         status = "needs_visual_evidence"
         review_status = "needs_more_evidence"
         promotion_status = "not_eligible"
@@ -329,15 +330,50 @@ def _update_claim_state(
         promotion_status = "not_eligible"
         confidence = "low"
 
+    if incoming_review_status == "human_rejected":
+        review_status = "human_rejected"
+        if incoming_promotion_status == "promotion_rejected":
+            promotion_status = "promotion_rejected"
+        else:
+            promotion_status = "not_eligible"
+    elif incoming_review_status == "human_accepted" and status == "supported":
+        review_status = "human_accepted"
+    elif incoming_promotion_status == "promotion_rejected":
+        review_status = "needs_more_evidence" if review_status == "auto_reviewed" else review_status
+        promotion_status = "promotion_rejected"
+
     claim["verification_status"] = status
     claim["review_status"] = review_status
     claim["promotion_status"] = promotion_status
     claim["confidence"] = confidence
-    claim["include_in_final_report"] = status not in {"budget_pruned", "policy_blocked"}
-    if claim["include_in_final_report"]:
+    _update_report_eligibility(claim)
+
+
+def _update_report_eligibility(claim: dict[str, Any]) -> None:
+    status = claim.get("verification_status")
+    review_status = claim.get("review_status")
+    promotion_status = claim.get("promotion_status")
+    reportable = (
+        status == "supported"
+        and review_status in {"auto_reviewed", "human_accepted"}
+        and promotion_status != "promotion_rejected"
+    )
+    claim["include_in_final_report"] = reportable
+    if reportable:
         claim.pop("report_exclusion_reason", None)
     else:
-        claim["report_exclusion_reason"] = status
+        claim["report_exclusion_reason"] = _report_exclusion_reason(claim)
+
+
+def _report_exclusion_reason(claim: Mapping[str, Any]) -> str:
+    if claim.get("review_status") == "human_rejected":
+        return "human_rejected"
+    if claim.get("promotion_status") == "promotion_rejected":
+        return "promotion_rejected"
+    status = claim.get("verification_status")
+    if isinstance(status, str) and status:
+        return status
+    return "not_report_eligible"
 
 
 def _has_required_support(route: str, support_by_type: Mapping[str, int]) -> bool:
@@ -348,6 +384,19 @@ def _has_required_support(route: str, support_by_type: Mapping[str, int]) -> boo
     if route == "visual_required" and support_by_type.get("visual", 0) < 1:
         return False
     return True
+
+
+def _needs_visual_evidence(
+    claim: Mapping[str, Any],
+    *,
+    route: str,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if route == "visual_required":
+        return not _usable_image_refs(claim, images_by_id=images_by_id)
+    if claim.get("claim_type") in {"visual", "mixed"}:
+        return not _usable_image_refs(claim, images_by_id=images_by_id)
+    return False
 
 
 def _claim_route(
@@ -542,6 +591,8 @@ def _usable_image_refs(
             continue
         if _string_list(image.get("policy_flags")):
             continue
+        if not _has_image_source_or_capture(claim, image):
+            continue
         observations = image.get("observations", [])
         inferences = image.get("inferences", [])
         if isinstance(observations, list) and observations:
@@ -549,6 +600,23 @@ def _usable_image_refs(
         elif isinstance(inferences, list) and inferences:
             usable.append(image_id)
     return usable
+
+
+def _has_image_source_or_capture(
+    claim: Mapping[str, Any],
+    image: Mapping[str, Any],
+) -> bool:
+    if claim.get("claim_type") not in {"visual", "mixed"}:
+        return True
+    if _non_empty_string(image.get("image_url")):
+        return True
+    return image.get("origin") == "screenshot" and _non_empty_string(
+        image.get("local_artifact_path")
+    )
+
+
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _visual_budget_allows(
