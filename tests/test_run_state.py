@@ -75,6 +75,44 @@ class RunStateTests(unittest.TestCase):
     def read_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def write_json(self, path: Path, payload: dict) -> None:
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    def set_status_timestamps(
+        self,
+        path: Path,
+        timestamp: str,
+        *,
+        keys: tuple[str, ...] = ("created_at",),
+    ) -> None:
+        payload = self.read_json(path)
+        for key in keys:
+            payload[key] = timestamp
+        self.write_json(path, payload)
+
+    def rewrite_trace(
+        self,
+        run_dir: Path,
+        *,
+        stage_timestamps: dict[str, str],
+        drop_stages: set[str] | None = None,
+    ) -> None:
+        drop_stages = drop_stages or set()
+        records = []
+        for record in read_trace_records(run_dir / "run_trace.jsonl"):
+            stage = record.get("stage")
+            if stage in drop_stages:
+                continue
+            timestamp = stage_timestamps.get(stage)
+            if timestamp is not None:
+                record["timestamp"] = timestamp
+            records.append(record)
+        payload = "".join(
+            json.dumps(record, sort_keys=True) + "\n"
+            for record in records
+        )
+        (run_dir / "run_trace.jsonl").write_text(payload, encoding="utf-8")
+
     def base_search_result(self, **overrides) -> dict:
         result = {
             "id": "sr_001",
@@ -121,6 +159,84 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertEqual(command.returncode, 0, command.stderr)
         return json.loads(command.stdout)
+
+    def create_stale_downstream_artifact_run(self, runs_dir: Path) -> tuple[dict, Path]:
+        prepared = prepare_run(
+            question="state machine stale downstream artifact reconstruction",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+
+        early_verify = verify_claims(run=run_dir)
+        early_report = synthesize_report(run=run_dir)
+        self.assertEqual(early_verify["status"], "completed")
+        self.assertEqual(early_report["status"], "completed")
+        self.assertTrue((run_dir / "verification_matrix_status.json").is_file())
+        self.assertTrue((run_dir / "report_status.json").is_file())
+
+        html = b"""
+        <html>
+          <body>
+            <p>The stale artifact reconstruction test extracts a source linked claim.</p>
+          </body>
+        </html>
+        """
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(html),
+        ):
+            fetch = fetch_claims(run=run_dir)
+        self.assertEqual(fetch["status"], "completed")
+        vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        self.assertEqual(vision["status"], "no_visual_tasks")
+        guardrails = enforce_guardrails(run=run_dir)
+        self.assertEqual(guardrails["status"], "completed")
+        return prepared, run_dir
+
+    def stamp_stale_downstream_artifacts(self, run_dir: Path) -> None:
+        self.set_status_timestamps(run_dir / "status.json", "2026-06-22T00:00:00Z")
+        self.set_status_timestamps(run_dir / "ingest_status.json", "2026-06-22T00:00:05Z")
+        self.set_status_timestamps(
+            run_dir / "verification_matrix_status.json",
+            "2026-06-22T00:00:10Z",
+        )
+        self.set_status_timestamps(
+            run_dir / "report_status.json",
+            "2026-06-22T00:00:11Z",
+            keys=("created_at", "generated_at"),
+        )
+        self.set_status_timestamps(
+            run_dir / "fetch_claims_status.json",
+            "2026-06-22T00:00:20Z",
+        )
+        self.set_status_timestamps(
+            run_dir / "vision_ingest_status.json",
+            "2026-06-22T00:00:30Z",
+        )
+        self.set_status_timestamps(
+            run_dir / "guardrails_status.json",
+            "2026-06-22T00:00:40Z",
+        )
+
+    def stamp_stale_downstream_trace_without_downstream(self, run_dir: Path) -> None:
+        self.rewrite_trace(
+            run_dir,
+            stage_timestamps={
+                "planning": "2026-06-22T00:00:00Z",
+                "ingest": "2026-06-22T00:00:05Z",
+                "fetch_claims": "2026-06-22T00:00:20Z",
+                "ingest_vision": "2026-06-22T00:00:30Z",
+                "enforce_guardrails": "2026-06-22T00:00:40Z",
+                "verify_claims": "2026-06-22T00:00:10Z",
+                "synthesize": "2026-06-22T00:00:11Z",
+            },
+            drop_stages={"verify_claims", "synthesize"},
+        )
 
     def test_prepare_initializes_run_steps_with_completed_planning(self) -> None:
         prepared = prepare_run(
@@ -215,6 +331,9 @@ class RunStateTests(unittest.TestCase):
 
         records = read_trace_records(run_dir / "run_trace.jsonl")
         self.assertEqual([record["stage"] for record in records], ["planning", "ingest"])
+        self.set_status_timestamps(run_dir / "status.json", "2026-06-22T00:00:01Z")
+        self.set_status_timestamps(run_dir / "ingest_status.json", "2026-06-22T00:00:02Z")
+        records[0]["timestamp"] = "2026-06-22T00:00:01Z"
         (run_dir / "run_trace.jsonl").write_text(
             json.dumps(records[0]) + "\n",
             encoding="utf-8",
@@ -457,41 +576,7 @@ class RunStateTests(unittest.TestCase):
 
     def test_reconstruction_rejects_stale_downstream_status_artifacts(self) -> None:
         runs_dir = self.temp_runs_dir()
-        prepared = prepare_run(
-            question="state machine stale downstream artifact reconstruction",
-            runs_dir=runs_dir,
-            route="text_only",
-        )
-        run_dir = Path(prepared["run_dir"])
-        self.write_search_results(run_dir, [self.base_search_result()])
-        ingest = ingest_run(run=run_dir)
-        self.assertEqual(ingest["status"], "ingested")
-
-        early_verify = verify_claims(run=run_dir)
-        early_report = synthesize_report(run=run_dir)
-        self.assertEqual(early_verify["status"], "completed")
-        self.assertEqual(early_report["status"], "completed")
-        self.assertTrue((run_dir / "verification_matrix_status.json").is_file())
-        self.assertTrue((run_dir / "report_status.json").is_file())
-
-        html = b"""
-        <html>
-          <body>
-            <p>The stale artifact reconstruction test extracts a source linked claim.</p>
-          </body>
-        </html>
-        """
-        with mock.patch.object(
-            fetch_claims_module,
-            "urlopen",
-            return_value=FakeResponse(html),
-        ):
-            fetch = fetch_claims(run=run_dir)
-        self.assertEqual(fetch["status"], "completed")
-        vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
-        self.assertEqual(vision["status"], "no_visual_tasks")
-        guardrails = enforce_guardrails(run=run_dir)
-        self.assertEqual(guardrails["status"], "completed")
+        prepared, run_dir = self.create_stale_downstream_artifact_run(runs_dir)
 
         live = self.run_status_payload(runs_dir, prepared["run_id"])
         live_stages = {stage["stage"]: stage for stage in live["stages"]}
@@ -503,6 +588,8 @@ class RunStateTests(unittest.TestCase):
             "stale_reset_after_upstream_completion",
         )
 
+        self.stamp_stale_downstream_artifacts(run_dir)
+        self.stamp_stale_downstream_trace_without_downstream(run_dir)
         run_steps_path(run_dir).unlink()
         reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
         stages = {stage["stage"]: stage for stage in reconstructed["stages"]}
@@ -514,7 +601,7 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(stages["synthesize"]["status"], "pending")
         self.assertEqual(
             stages["verify_claims"]["stale_reset"]["upstream_stage"],
-            "fetch_claims",
+            "enforce_guardrails",
         )
         self.assertEqual(
             stages["verify_claims"]["stale_terminal_status"]["status"],
@@ -522,7 +609,41 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertEqual(
             stages["synthesize"]["stale_reset"]["upstream_stage"],
-            "fetch_claims",
+            "enforce_guardrails",
+        )
+        self.assertEqual(
+            stages["synthesize"]["stale_terminal_status"]["status"],
+            "completed",
+        )
+
+    def test_reconstruction_rejects_stale_downstream_status_artifacts_without_trace(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared, run_dir = self.create_stale_downstream_artifact_run(runs_dir)
+        self.stamp_stale_downstream_artifacts(run_dir)
+        (run_dir / "run_trace.jsonl").unlink()
+        run_steps_path(run_dir).unlink()
+
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        stages = {stage["stage"]: stage for stage in reconstructed["stages"]}
+
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(reconstructed["next_safe_stage"], "verify_claims")
+        self.assertFalse(reconstructed["next_stage_retryable"])
+        self.assertEqual(stages["fetch_claims"]["status"], "completed")
+        self.assertEqual(stages["enforce_guardrails"]["status"], "completed")
+        self.assertEqual(stages["verify_claims"]["status"], "pending")
+        self.assertEqual(stages["synthesize"]["status"], "pending")
+        self.assertEqual(
+            stages["verify_claims"]["stale_reset"]["upstream_stage"],
+            "enforce_guardrails",
+        )
+        self.assertEqual(
+            stages["verify_claims"]["stale_terminal_status"]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            stages["synthesize"]["stale_reset"]["upstream_stage"],
+            "enforce_guardrails",
         )
         self.assertEqual(
             stages["synthesize"]["stale_terminal_status"]["status"],

@@ -67,6 +67,20 @@ _STAGE_STATUS_ARTIFACTS = (
     ("verify_claims", "verification_matrix_status.json"),
     ("synthesize", "report_status.json"),
 )
+_TIMESTAMP_KEYS = (
+    "updated_at",
+    "finished_at",
+    "completed_at",
+    "created_at",
+    "generated_at",
+    "fetched_at",
+    "ingested_at",
+    "verified_at",
+    "enforced_at",
+    "recorded_at",
+    "started_at",
+    "timestamp",
+)
 
 
 class RunStepStateError(ValueError):
@@ -544,6 +558,21 @@ def _replay_status_artifacts(
             continue
         if not _should_replay_status_artifact(stage, record, status_payload):
             continue
+        stale_upstream = _stale_ordered_status_artifact_upstream(
+            state,
+            stage,
+            record,
+            status_payload,
+        )
+        if stale_upstream is not None:
+            _mark_stale_status_artifact(
+                state,
+                stage=stage,
+                record=record,
+                status_payload=status_payload,
+                upstream=stale_upstream,
+            )
+            continue
         _apply_status_to_state(
             state,
             stage=stage,
@@ -587,6 +616,133 @@ def _should_replay_status_artifact(
     if isinstance(raw_status, str) and raw_status and record.get("stage_status") != raw_status:
         return True
     return False
+
+
+def _stale_ordered_status_artifact_upstream(
+    state: Mapping[str, Any],
+    stage: str,
+    record: Mapping[str, Any],
+    status_payload: Mapping[str, Any],
+) -> dict[str, str] | None:
+    if stage not in RUN_STAGE_ORDER:
+        return None
+    if _status(record) in TERMINAL_STEP_STATUSES:
+        return None
+    target = stage_status_to_step_status(stage, status_payload)
+    if target not in TERMINAL_STEP_STATUSES:
+        return None
+    upstream = _latest_relevant_upstream_ordered_stage(state, stage)
+    if upstream is None:
+        return None
+    payload_timestamp = _payload_timestamp(status_payload)
+    if _timestamp_is_after(payload_timestamp, upstream["timestamp"]):
+        return None
+    return upstream
+
+
+def _latest_relevant_upstream_ordered_stage(
+    state: Mapping[str, Any],
+    stage: str,
+) -> dict[str, str] | None:
+    stages = state.get("stages")
+    if not isinstance(stages, Mapping) or stage not in RUN_STAGE_ORDER:
+        return None
+    latest: dict[str, str] | None = None
+    for upstream_stage in RUN_STAGE_ORDER[: RUN_STAGE_ORDER.index(stage)]:
+        record = stages.get(upstream_stage)
+        if not isinstance(record, Mapping):
+            continue
+        status = _status(record)
+        if status not in TERMINAL_STEP_STATUSES and status not in RETRYABLE_STEP_STATUSES:
+            continue
+        timestamp = _record_timestamp(record)
+        if timestamp is None:
+            continue
+        if latest is None or _timestamp_is_after(timestamp, latest["timestamp"]):
+            latest = {
+                "stage": upstream_stage,
+                "status": status,
+                "timestamp": timestamp,
+            }
+    return latest
+
+
+def _mark_stale_status_artifact(
+    state: dict[str, Any],
+    *,
+    stage: str,
+    record: dict[str, Any],
+    status_payload: Mapping[str, Any],
+    upstream: Mapping[str, str],
+) -> None:
+    current = _status(record)
+    target = stage_status_to_step_status(stage, status_payload)
+    upstream_stage = upstream["stage"]
+    upstream_status = upstream["status"]
+    upstream_timestamp = upstream["timestamp"]
+    reason = _stale_reconstruction_reason(upstream_status)
+    snapshot = _status_payload_terminal_snapshot(record, target, status_payload)
+    record["stale_terminal_status"] = snapshot
+    record["stale_reset"] = {
+        "status": "stale-reset",
+        "at": upstream_timestamp,
+        "reason": reason,
+        "upstream_stage": upstream_stage,
+        "upstream_status": upstream_status,
+        "previous_terminal_status": snapshot,
+    }
+    if current == "pending":
+        record["updated_at"] = upstream_timestamp
+        record["retryable"] = False
+        record["terminal"] = False
+        record["failure"] = None
+        record["skip_reason"] = None
+        record["artifacts"] = {}
+        history = record.setdefault("history", [])
+        if isinstance(history, list):
+            history.append(
+                {
+                    "at": upstream_timestamp,
+                    "from": target,
+                    "to": "pending",
+                    "reason": reason,
+                    "upstream_stage": upstream_stage,
+                }
+            )
+        state["updated_at"] = upstream_timestamp
+
+
+def _stale_reconstruction_reason(upstream_status: str) -> str:
+    if upstream_status in TERMINAL_STEP_STATUSES:
+        return "stale_reset_after_upstream_completion"
+    if upstream_status == "failed":
+        return "stale_reset_after_upstream_failure"
+    return "stale_reset_after_upstream_running"
+
+
+def _status_payload_terminal_snapshot(
+    record: Mapping[str, Any],
+    status: str,
+    status_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "status": status,
+        "attempt": int(record.get("attempt") or 0),
+    }
+    payload_timestamp = _payload_timestamp(status_payload)
+    if payload_timestamp is not None:
+        snapshot["updated_at"] = payload_timestamp
+        snapshot["finished_at"] = payload_timestamp
+    raw_status = status_payload.get("status")
+    if isinstance(raw_status, str) and raw_status:
+        snapshot["stage_status"] = raw_status
+    skip_reason = status_payload.get("skip_reason")
+    if isinstance(skip_reason, str) and skip_reason:
+        snapshot["skip_reason"] = skip_reason
+    artifacts = _string_artifacts(status_payload.get("artifacts"))
+    if artifacts:
+        snapshot["artifacts"] = artifacts
+    return snapshot
 
 
 def _stale_reset_blocks_status_artifact(
@@ -1232,11 +1388,39 @@ def _payload_run_id(status_payload: Mapping[str, Any]) -> str | None:
 
 
 def _payload_timestamp(status_payload: Mapping[str, Any]) -> str | None:
-    for key in ("updated_at", "created_at", "generated_at", "fetched_at", "ingested_at"):
-        value = status_payload.get(key)
+    return _latest_mapping_timestamp(status_payload)
+
+
+def _record_timestamp(record: Mapping[str, Any]) -> str | None:
+    for key in (
+        "updated_at",
+        "finished_at",
+        "completed_at",
+        "started_at",
+        "generated_at",
+        "fetched_at",
+        "ingested_at",
+        "verified_at",
+        "enforced_at",
+        "timestamp",
+        "recorded_at",
+        "created_at",
+    ):
+        value = record.get(key)
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _latest_mapping_timestamp(payload: Mapping[str, Any]) -> str | None:
+    latest: str | None = None
+    for key in _TIMESTAMP_KEYS:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if latest is None or _timestamp_is_after(value, latest):
+            latest = value
+    return latest
 
 
 def _string_value(value: Any) -> str | None:
