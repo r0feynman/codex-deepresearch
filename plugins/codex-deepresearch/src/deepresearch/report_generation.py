@@ -56,6 +56,7 @@ def synthesize_report(
     report_path = run_dir / REPORT_FILENAME
     validation = validate_artifacts(evidence_path=evidence_path)
     if not validation.valid:
+        _remove_report_if_present(report_path)
         status = {
             "schema_version": REPORT_STATUS_SCHEMA_VERSION,
             "run_id": evidence.get("run_id", run_dir.name),
@@ -457,6 +458,13 @@ def _claim_count(claims: Any) -> int:
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _remove_report_if_present(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
 
 
 def _ordered_unique(values: Sequence[str] | Any) -> list[str]:

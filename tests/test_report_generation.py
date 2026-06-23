@@ -273,6 +273,51 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(status["claims_included"], 0)
         self.assertNotIn("report", status["artifacts"])
 
+    def test_failed_validation_rerun_removes_stale_confident_report(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_stale",
+                text="Previously valid high-confidence finding.",
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        valid = subprocess.run(
+            [str(RUNNER), "synthesize", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        report_path = run_dir / "report.md"
+        self.assertIn(
+            "Previously valid high-confidence finding.",
+            report_path.read_text(encoding="utf-8"),
+        )
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"][0]["supporting_sources"] = ["src_missing"]
+        evidence["claims"][0]["quote_spans"][0]["source_id"] = "src_missing"
+        self.write_json(run_dir / "evidence.json", evidence)
+        invalid = subprocess.run(
+            [str(RUNNER), "synthesize", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(invalid.returncode, 0)
+        payload = json.loads(invalid.stdout)
+        self.assertEqual(payload["status"], "failed_validation")
+        self.assertFalse(report_path.exists())
+        status = self.load_json(run_dir / "report_status.json")
+        self.assertEqual(status["status"], "failed_validation")
+        self.assertFalse(status["validation"]["valid"])
+
     def test_cli_synthesize_is_byte_stable_for_unchanged_evidence(self) -> None:
         run_dir = self.temp_run()
         evidence = self.load_json(run_dir / "evidence.json")
