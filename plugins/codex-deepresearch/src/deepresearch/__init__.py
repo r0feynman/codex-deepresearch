@@ -1,5 +1,15 @@
 """Core helpers for the Codex DeepResearch plugin runner."""
 
+from .budget_estimator import (
+    BUDGET_ESTIMATE_FILENAME,
+    BUDGET_ESTIMATE_SCHEMA_VERSION,
+    BudgetCaps,
+    BudgetEstimateError,
+    add_budget_estimate_artifact,
+    budget_estimate_path,
+    estimate_budget,
+    write_budget_estimate,
+)
 from .evidence_schema import ValidationError, ValidationResult, validate_artifacts
 from .execution_mode import ConfigResolutionError, RunConfig, resolve_config
 from .fetch_claims import FetchClaimsError, fetch_claims
@@ -32,6 +42,10 @@ from .verification_matrix import VerificationMatrixError, verify_claims
 from .vision_adapter import VisionAdapterError, ingest_vision_observations
 
 __all__ = [
+    "BUDGET_ESTIMATE_FILENAME",
+    "BUDGET_ESTIMATE_SCHEMA_VERSION",
+    "BudgetCaps",
+    "BudgetEstimateError",
     "ConfigResolutionError",
     "FetchClaimsError",
     "GuardrailsError",
@@ -53,8 +67,11 @@ __all__ = [
     "ValidationResult",
     "VerificationMatrixError",
     "VisionAdapterError",
+    "add_budget_estimate_artifact",
     "begin_stage",
+    "budget_estimate_path",
     "enforce_guardrails",
+    "estimate_budget",
     "fetch_claims",
     "ingest_run",
     "ingest_manual_sources",
@@ -74,4 +91,5 @@ __all__ = [
     "validate_trace_record",
     "read_trace_records",
     "verify_claims",
+    "write_budget_estimate",
 ]

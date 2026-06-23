@@ -46,6 +46,7 @@ DEFAULT_VLM_PROVIDER_BY_MODE: Mapping[str, str] = {
 @dataclass(frozen=True)
 class BudgetPreset:
     max_codex_handoff_tasks: int
+    max_concurrent_codex_subagents: int
     max_concurrent_runner_agents: int
     max_verifier_invocations: int
     max_model_api_calls: int
@@ -56,6 +57,7 @@ class BudgetPreset:
 BUDGET_PRESETS: Mapping[str, BudgetPreset] = {
     "quick": BudgetPreset(
         max_codex_handoff_tasks=16,
+        max_concurrent_codex_subagents=4,
         max_concurrent_runner_agents=4,
         max_verifier_invocations=24,
         max_model_api_calls=32,
@@ -64,6 +66,7 @@ BUDGET_PRESETS: Mapping[str, BudgetPreset] = {
     ),
     "standard": BudgetPreset(
         max_codex_handoff_tasks=48,
+        max_concurrent_codex_subagents=8,
         max_concurrent_runner_agents=8,
         max_verifier_invocations=80,
         max_model_api_calls=96,
@@ -72,6 +75,7 @@ BUDGET_PRESETS: Mapping[str, BudgetPreset] = {
     ),
     "deep": BudgetPreset(
         max_codex_handoff_tasks=96,
+        max_concurrent_codex_subagents=24,
         max_concurrent_runner_agents=12,
         max_verifier_invocations=180,
         max_model_api_calls=220,
@@ -80,6 +84,7 @@ BUDGET_PRESETS: Mapping[str, BudgetPreset] = {
     ),
     "exhaustive": BudgetPreset(
         max_codex_handoff_tasks=256,
+        max_concurrent_codex_subagents=100,
         max_concurrent_runner_agents=16,
         max_verifier_invocations=500,
         max_model_api_calls=600,

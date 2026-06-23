@@ -16,7 +16,7 @@ REPO_ROOT = PLUGIN_ROOT.parents[1]
 PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import ConfigResolutionError, resolve_config, validate_artifacts
+from deepresearch import BudgetEstimateError, ConfigResolutionError, resolve_config, validate_artifacts
 from deepresearch.fetch_claims import FetchClaimsError, fetch_claims
 from deepresearch.guardrails import GuardrailsError, enforce_guardrails
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
@@ -234,7 +234,17 @@ def run_prepare(args: argparse.Namespace) -> int:
             route=None if args.route == "auto" else args.route,
             angles=args.angle,
             max_results=args.max_results,
+            max_sources=args.max_sources,
+            max_images=args.max_images,
+            max_subagents=args.max_subagents,
+            max_agents=args.max_agents,
+            max_cost_usd=args.max_cost_usd,
+            codex_runner=args.codex_runner,
+            confirm_budget=args.confirm_budget,
         )
+    except BudgetEstimateError as exc:
+        print(json.dumps(exc.to_dict(), sort_keys=True, allow_nan=False), file=sys.stderr)
+        return 2
     except (ConfigResolutionError, SearchHandoffError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -639,6 +649,42 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="Maximum expected SearchResult records for the generated task.",
+    )
+    prepare.add_argument(
+        "--max-sources",
+        type=int,
+        help="Optional source cap to apply before search and fetch work starts.",
+    )
+    prepare.add_argument(
+        "--max-images",
+        type=int,
+        help="Optional image cap to apply before visual acquisition and VLM work starts.",
+    )
+    prepare.add_argument(
+        "--max-subagents",
+        type=int,
+        help="Optional concurrent Codex subagent cap for the planned run.",
+    )
+    prepare.add_argument(
+        "--max-agents",
+        type=int,
+        help="Optional concurrent runner-agent cap for the planned run.",
+    )
+    prepare.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Optional deterministic high-water cost cap in USD placeholder units.",
+    )
+    prepare.add_argument(
+        "--codex-runner",
+        default="codex-exec",
+        choices=("codex-exec", "codex-sdk", "serial"),
+        help="Automated runner mode used for orchestration overhead estimation.",
+    )
+    prepare.add_argument(
+        "--confirm-budget",
+        action="store_true",
+        help="Confirm execution for deep and exhaustive budget presets.",
     )
     prepare.set_defaults(func=run_prepare)
 
