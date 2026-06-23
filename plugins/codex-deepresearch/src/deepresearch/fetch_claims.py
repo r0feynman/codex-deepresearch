@@ -721,6 +721,10 @@ def _can_reuse_completed_source(
         return False
     if isinstance(previous_cache_key, str) and previous_cache_key != current_cache_key:
         return False
+    if not isinstance(previous_cache_key, str) and not _completed_source_hash_matches_current(
+        source
+    ):
+        return False
     if source.get("retrieval_status") not in {"fetched", "partial"}:
         return False
     local_artifact_path = source.get("local_artifact_path")
@@ -732,6 +736,16 @@ def _can_reuse_completed_source(
         return _resolve_run_relative_path(run_dir, local_artifact_path).is_file()
     except FetchClaimsError:
         return False
+
+
+def _completed_source_hash_matches_current(source: Mapping[str, Any]) -> bool:
+    current_hash = source.get("current_content_sha256")
+    if not isinstance(current_hash, str) or not current_hash.strip():
+        return False
+    persisted_hash = source.get("content_sha256") or source.get("artifact_sha256")
+    if not isinstance(persisted_hash, str) or not persisted_hash.strip():
+        return False
+    return _normalize_sha256(persisted_hash) == _normalize_sha256(current_hash)
 
 
 def _refresh_fetch_claim_cache_keys(

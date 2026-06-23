@@ -159,7 +159,11 @@ class VisionAdapterTests(unittest.TestCase):
             provider="codex-interactive",
             observations=observations_path,
         )
-        old_image = self.assert_valid_run(run_dir)["images"][0]
+        evidence = self.assert_valid_run(run_dir)
+        old_image = evidence["images"][0]
+        old_cache_key = old_image["cache_key"]
+        evidence["images"][0].pop("cache_key", None)
+        self.write_json(run_dir / "evidence.json", evidence)
 
         self.write_jsonl(
             observations_path,
@@ -187,7 +191,7 @@ class VisionAdapterTests(unittest.TestCase):
         evidence = self.assert_valid_run(run_dir)
         image = evidence["images"][0]
         self.assertEqual(result["images_reused"], 0)
-        self.assertNotEqual(image["cache_key"], old_image["cache_key"])
+        self.assertNotEqual(image["cache_key"], old_cache_key)
         self.assertEqual(image["observations"], ["Corrected observation"])
         self.assertEqual(image["inferences"], ["Corrected inference"])
 

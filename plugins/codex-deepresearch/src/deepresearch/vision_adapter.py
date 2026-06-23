@@ -655,7 +655,7 @@ def _reuse_completed_images(
             existing = by_id.get(image_id)
         if existing is None and isinstance(current_key, str):
             existing = by_cache_key.get(current_key)
-        if _can_reuse_image(existing, current_key):
+        if _can_reuse_image(existing, image):
             reused = dict(existing)
             reused["cache_key"] = current_key
             if image.get("artifact_size_bytes") is not None:
@@ -669,11 +669,15 @@ def _reuse_completed_images(
     return result, reused_count
 
 
-def _can_reuse_image(existing: Mapping[str, Any] | None, current_key: Any) -> bool:
+def _can_reuse_image(existing: Mapping[str, Any] | None, image: Mapping[str, Any]) -> bool:
+    current_key = image.get("cache_key")
     if not isinstance(existing, Mapping) or not isinstance(current_key, str):
         return False
     previous_key = existing.get("cache_key")
-    if isinstance(previous_key, str) and previous_key != current_key:
+    if isinstance(previous_key, str):
+        if previous_key != current_key:
+            return False
+    elif image_cache_key(existing) != current_key:
         return False
     return existing.get("analysis_status") in {
         "analyzed",

@@ -534,6 +534,38 @@ class FetchClaimsTests(unittest.TestCase):
         self.assertNotEqual(evidence["claims"][0]["text"], first_claim_text)
         self.assertIn("edited file source", evidence["claims"][0]["text"])
 
+    def test_missing_prior_source_cache_key_does_not_reuse_changed_file_content(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        page = runs_dir / "source.html"
+        page.write_text(
+            "<html><body><p>The legacy file source creates a source linked claim.</p></body></html>",
+            encoding="utf-8",
+        )
+        run_dir = self.prepare_queued_file_run(page.resolve().as_uri())
+        fetch_claims(run=run_dir)
+
+        evidence_path = run_dir / "evidence.json"
+        queue_path = run_dir / "fetch_queue.json"
+        evidence = self.load_json(evidence_path)
+        fetch_queue = self.load_json(queue_path)
+        legacy_claim_text = evidence["claims"][0]["text"]
+        evidence["sources"][0].pop("cache_key", None)
+        fetch_queue["entries"][0].pop("cache_key", None)
+        self.write_json(evidence_path, evidence)
+        self.write_json(queue_path, fetch_queue)
+
+        page.write_text(
+            "<html><body><p>The changed legacy file source creates a replacement claim.</p></body></html>",
+            encoding="utf-8",
+        )
+        result = fetch_claims(run=run_dir)
+
+        self.assertEqual(result["sources_reused"], 0)
+        self.assertEqual(result["sources_fetched"], 1)
+        evidence = self.load_json(evidence_path)
+        self.assertNotEqual(evidence["claims"][0]["text"], legacy_claim_text)
+        self.assertIn("changed legacy file source", evidence["claims"][0]["text"])
+
     def test_http_source_without_current_content_hash_refetches_on_retry(self) -> None:
         run_dir = self.prepare_ingested_run([self.base_search_result()])
         first_html = b"""
