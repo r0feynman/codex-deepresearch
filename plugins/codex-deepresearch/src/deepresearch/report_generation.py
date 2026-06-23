@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -52,6 +51,36 @@ def synthesize_report(
         raise ReportGenerationError(f"missing evidence.json in run directory: {run_dir}")
 
     evidence = _read_json(evidence_path)
+    generated_at = _deterministic_generated_at(evidence)
+    status_path = run_dir / REPORT_STATUS_FILENAME
+    report_path = run_dir / REPORT_FILENAME
+    validation = validate_artifacts(evidence_path=evidence_path)
+    if not validation.valid:
+        status = {
+            "schema_version": REPORT_STATUS_SCHEMA_VERSION,
+            "run_id": evidence.get("run_id", run_dir.name),
+            "run_dir": str(run_dir),
+            "status": "failed_validation",
+            "created_at": generated_at,
+            "generated_at": generated_at,
+            "report_status_path": str(status_path),
+            "claims_seen": _claim_count(evidence.get("claims", [])),
+            "claims_included": 0,
+            "claims_excluded": 0,
+            "used_sources": [],
+            "used_images": [],
+            "included_claims": [],
+            "excluded_claims": [],
+            "validation": validation.to_dict(),
+            "artifacts": {
+                "evidence": str(evidence_path),
+                "report_status": str(status_path),
+            },
+            "external_model_call": False,
+        }
+        _write_json(status_path, status)
+        return status
+
     claims = evidence.get("claims", [])
     if not isinstance(claims, list):
         raise ReportGenerationError("evidence.claims must be a list")
@@ -84,29 +113,25 @@ def synthesize_report(
         for item in included
         for image_id in item["image_ids"]
     )
-    now = _utc_now()
     report_markdown = _render_report(
         evidence,
         included,
         excluded,
         sources_by_id=sources_by_id,
         images_by_id=images_by_id,
-        generated_at=now,
+        generated_at=generated_at,
     )
-    report_path = run_dir / REPORT_FILENAME
-    status_path = run_dir / REPORT_STATUS_FILENAME
     report_path.write_text(report_markdown, encoding="utf-8")
-
-    validation = validate_artifacts(evidence_path=evidence_path)
     status = {
         "schema_version": REPORT_STATUS_SCHEMA_VERSION,
         "run_id": evidence.get("run_id", run_dir.name),
         "run_dir": str(run_dir),
         "status": "completed",
-        "created_at": now,
+        "created_at": generated_at,
+        "generated_at": generated_at,
         "report_path": str(report_path),
         "report_status_path": str(status_path),
-        "claims_seen": len([claim for claim in claims if isinstance(claim, Mapping)]),
+        "claims_seen": _claim_count(claims),
         "claims_included": len(included),
         "claims_excluded": len(excluded),
         "used_sources": used_source_ids,
@@ -411,6 +436,24 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _deterministic_generated_at(evidence: Mapping[str, Any]) -> str:
+    report_generation = evidence.get("report_generation")
+    if isinstance(report_generation, Mapping):
+        generated_at = report_generation.get("generated_at")
+        if isinstance(generated_at, str) and generated_at.strip():
+            return generated_at
+    created_at = evidence.get("created_at")
+    if isinstance(created_at, str) and created_at.strip():
+        return created_at
+    return "1970-01-01T00:00:00Z"
+
+
+def _claim_count(claims: Any) -> int:
+    if not isinstance(claims, list):
+        return 0
+    return len([claim for claim in claims if isinstance(claim, Mapping)])
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -445,7 +488,3 @@ def _truncate(value: str, max_length: int) -> str:
     if len(value) <= max_length:
         return value
     return value[: max_length - 3].rstrip() + "..."
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

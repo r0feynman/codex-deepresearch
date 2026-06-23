@@ -242,6 +242,68 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertTrue((run_dir / "report.md").exists())
         self.assertTrue((run_dir / "report_status.json").exists())
 
+    def test_invalid_evidence_cli_fails_without_confident_report(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["sources"][0].pop("url")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_invalid_supported",
+                text="Invalid evidence must not become report prose.",
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        command = subprocess.run(
+            [str(RUNNER), "synthesize", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(command.returncode, 0)
+        payload = json.loads(command.stdout)
+        self.assertEqual(payload["status"], "failed_validation")
+        self.assertFalse((run_dir / "report.md").exists())
+        status = self.load_json(run_dir / "report_status.json")
+        self.assertEqual(status["status"], "failed_validation")
+        self.assertFalse(status["validation"]["valid"])
+        self.assertGreater(len(status["validation"]["errors"]), 0)
+        self.assertEqual(status["claims_included"], 0)
+        self.assertNotIn("report", status["artifacts"])
+
+    def test_cli_synthesize_is_byte_stable_for_unchanged_evidence(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [self.claim(claim_id="claim_stable")]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        first = subprocess.run(
+            [str(RUNNER), "synthesize", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        first_report = (run_dir / "report.md").read_bytes()
+        first_status = (run_dir / "report_status.json").read_bytes()
+        second = subprocess.run(
+            [str(RUNNER), "synthesize", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        second_report = (run_dir / "report.md").read_bytes()
+        second_status = (run_dir / "report_status.json").read_bytes()
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first_report, second_report)
+        self.assertEqual(first_status, second_status)
+        self.assertIn("2026-06-22T00:00:00Z", first_report.decode("utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
