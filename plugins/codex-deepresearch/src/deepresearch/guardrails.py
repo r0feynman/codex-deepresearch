@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .evidence_schema import validate_artifacts
 from .search_handoff import SearchHandoffError, resolve_run_dir
+from .trace import record_stage_trace
 
 
 GUARDRAILS_SCHEMA_VERSION = "codex-deepresearch.guardrails.v0"
@@ -138,6 +139,14 @@ def enforce_guardrails(
         "external_model_call": False,
         "external_network_call": False,
     }
+    record_stage_trace(
+        run_dir,
+        stage="enforce_guardrails",
+        agent_role="guardrails_agent",
+        status_payload=status,
+        prompt_summary="Apply deterministic source, image, claim, privacy, and risk-domain guardrails.",
+        tool_call_summary="Read evidence.json, applied local policy rules, and rewrote guarded evidence/status artifacts.",
+    )
     _write_json(status_path, status)
     return status
 

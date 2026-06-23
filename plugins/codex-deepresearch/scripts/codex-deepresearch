@@ -23,6 +23,7 @@ from deepresearch.manual_sources import ManualSourcesError, ingest_manual_source
 from deepresearch.mvp_smoke import DEFAULT_INVOKE, MvpSmokeError, run_mvp_smoke
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
+from deepresearch.trace import record_exception_trace
 from deepresearch.verification_matrix import VerificationMatrixError, verify_claims
 from deepresearch.vision_adapter import VisionAdapterError, ingest_vision_observations
 
@@ -49,6 +50,54 @@ def resolve_repo_path(path_value: str) -> Path:
     if path.is_absolute():
         return path
     return REPO_ROOT / path
+
+
+def trace_cli_failure(
+    args: argparse.Namespace,
+    *,
+    stage: str,
+    agent_role: str,
+    exc: BaseException,
+) -> None:
+    run = getattr(args, "run", None)
+    if not run:
+        return
+    run_dir = resolve_existing_run_dir_for_trace(
+        run,
+        getattr(args, "runs_dir", None),
+    )
+    if run_dir is None:
+        return
+    try:
+        record_exception_trace(
+            run_dir,
+            stage=stage,
+            agent_role=agent_role,
+            exc=exc,
+            prompt_summary=f"Run the {stage} stage from the developer CLI.",
+            tool_call_summary=(
+                "The stage raised before writing its normal status payload; "
+                "the trace stores only the exception class and public-safe category."
+            ),
+        )
+    except Exception:
+        return
+
+
+def resolve_existing_run_dir_for_trace(
+    run: str,
+    runs_dir: str | None,
+) -> Path | None:
+    run_path = Path(run)
+    if run_path.exists() and run_path.is_dir():
+        return run_path.resolve()
+    if run_path.is_absolute():
+        return None
+    if runs_dir:
+        candidate = resolve_repo_path(runs_dir) / run_path
+        if candidate.exists() and candidate.is_dir():
+            return candidate.resolve()
+    return None
 
 
 def validate_manifest() -> dict:
@@ -200,6 +249,12 @@ def run_ingest(args: argparse.Namespace) -> int:
             runs_dir=resolve_repo_path(args.runs_dir),
         )
     except SearchHandoffError as exc:
+        trace_cli_failure(
+            args,
+            stage="ingest",
+            agent_role="search_ingest_agent",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -220,6 +275,12 @@ def run_fetch_claims(args: argparse.Namespace) -> int:
             timeout_seconds=args.timeout_seconds,
         )
     except (FetchClaimsError, SearchHandoffError, OSError) as exc:
+        trace_cli_failure(
+            args,
+            stage="fetch_claims",
+            agent_role="fetch_claims_agent",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -247,6 +308,12 @@ def run_ingest_manual(args: argparse.Namespace) -> int:
             vlm_provider=args.vlm_provider,
         )
     except (ConfigResolutionError, ManualSourcesError, OSError) as exc:
+        trace_cli_failure(
+            args,
+            stage="ingest_manual",
+            agent_role="manual_source_ingest_agent",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -268,6 +335,12 @@ def run_ingest_vision(args: argparse.Namespace) -> int:
             observations=args.observations,
         )
     except (VisionAdapterError, SearchHandoffError, OSError) as exc:
+        trace_cli_failure(
+            args,
+            stage="ingest_vision",
+            agent_role="vision_adapter",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -287,6 +360,12 @@ def run_verify_claims(args: argparse.Namespace) -> int:
             runs_dir=resolve_repo_path(args.runs_dir),
         )
     except (VerificationMatrixError, SearchHandoffError, OSError) as exc:
+        trace_cli_failure(
+            args,
+            stage="verify_claims",
+            agent_role="verification_matrix_agent",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -306,6 +385,12 @@ def run_enforce_guardrails(args: argparse.Namespace) -> int:
             runs_dir=resolve_repo_path(args.runs_dir),
         )
     except (GuardrailsError, SearchHandoffError, OSError) as exc:
+        trace_cli_failure(
+            args,
+            stage="enforce_guardrails",
+            agent_role="guardrails_agent",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -325,6 +410,12 @@ def run_synthesize(args: argparse.Namespace) -> int:
             runs_dir=resolve_repo_path(args.runs_dir),
         )
     except (ReportGenerationError, SearchHandoffError, OSError) as exc:
+        trace_cli_failure(
+            args,
+            stage="synthesize",
+            agent_role="report_synthesis_agent",
+            exc=exc,
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

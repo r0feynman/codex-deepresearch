@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from .evidence_schema import validate_artifacts
 from .search_handoff import SearchHandoffError, resolve_run_dir
+from .trace import record_stage_trace
 
 
 REPORT_STATUS_SCHEMA_VERSION = "codex-deepresearch.report-generation.v0"
@@ -105,6 +106,14 @@ def synthesize_report(
             },
             "external_model_call": False,
         }
+        record_stage_trace(
+            run_dir,
+            stage="synthesize",
+            agent_role="report_synthesis_agent",
+            status_payload=status,
+            prompt_summary="Synthesize a Markdown report from validated evidence.",
+            tool_call_summary="Validated evidence before report generation and removed stale report output on failure.",
+        )
         _write_json(status_path, status)
         return status
 
@@ -177,6 +186,14 @@ def synthesize_report(
         },
         "external_model_call": False,
     }
+    record_stage_trace(
+        run_dir,
+        stage="synthesize",
+        agent_role="report_synthesis_agent",
+        status_payload=status,
+        prompt_summary="Synthesize a Markdown report from validated evidence.",
+        tool_call_summary="Rendered report.md from verified local evidence and wrote report_status.json.",
+    )
     _write_json(status_path, status)
     return status
 

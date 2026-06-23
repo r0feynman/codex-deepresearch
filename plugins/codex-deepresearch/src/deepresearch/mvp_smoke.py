@@ -11,6 +11,7 @@ from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .fetch_claims import fetch_claims
 from .guardrails import enforce_guardrails
 from .report_generation import synthesize_report
+from .trace import trace_path
 from .verification_matrix import verify_claims
 from .vision_adapter import ingest_vision_observations
 
@@ -466,6 +467,7 @@ def _complete_standard_fixture(run_dir: Path, fixture_id: str, route: str) -> di
             "evidence": str((run_dir / "evidence.json").resolve()),
             "report": str((run_dir / "report.md").resolve()),
             "results": str((run_dir / "report_status.json").resolve()),
+            "run_trace": str(trace_path(run_dir).resolve()),
         },
     }
 
@@ -505,6 +507,11 @@ def _run_guardrail_fixture_suite(suite_dir: Path) -> dict[str, Any]:
         "policy_blocked_claim": blocked,
         "external_model_call": False,
         "external_network_call": False,
+        "artifacts": {
+            "evidence": str((run_dir / "evidence.json").resolve()),
+            "guardrails_status": str((run_dir / "guardrails_status.json").resolve()),
+            "run_trace": str(trace_path(run_dir).resolve()),
+        },
     }
 
 

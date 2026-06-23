@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlparse
 
 from .evidence_schema import VLM_PROVIDERS, validate_artifacts
 from .search_handoff import resolve_run_dir
+from .trace import record_stage_trace
 
 
 VISION_ADAPTER_SCHEMA_VERSION = "codex-deepresearch.vision-adapter.v0"
@@ -91,6 +92,19 @@ def ingest_vision_observations(
     if errors:
         status = _base_status(run_dir, evidence, "failed_normalization")
         status["errors"] = errors
+        status["artifacts"] = {
+            "evidence": str(evidence_path),
+            "visual_observations": str(run_dir / "visual_observations.jsonl"),
+            "vision_ingest_status": str(run_dir / "vision_ingest_status.json"),
+        }
+        record_stage_trace(
+            run_dir,
+            stage="ingest_vision",
+            agent_role="vision_adapter",
+            status_payload=status,
+            prompt_summary="Normalize visual handoff records into VisualEvidence.",
+            tool_call_summary="Read visual observation records and validated run-local image/source references.",
+        )
         _write_json(run_dir / "vision_ingest_status.json", status)
         return status
 
@@ -176,6 +190,14 @@ def ingest_vision_observations(
             },
             "external_vlm_call": False,
         }
+    )
+    record_stage_trace(
+        run_dir,
+        stage="ingest_vision",
+        agent_role="vision_adapter",
+        status_payload=status,
+        prompt_summary="Normalize visual handoff records into VisualEvidence.",
+        tool_call_summary="Read visual observations, normalized image evidence, and updated evidence.json without VLM calls.",
     )
     _write_json(run_dir / "vision_ingest_status.json", status)
     return status
