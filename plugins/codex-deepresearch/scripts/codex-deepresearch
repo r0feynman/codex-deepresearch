@@ -20,6 +20,7 @@ from deepresearch import ConfigResolutionError, resolve_config, validate_artifac
 from deepresearch.fetch_claims import FetchClaimsError, fetch_claims
 from deepresearch.guardrails import GuardrailsError, enforce_guardrails
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
+from deepresearch.mvp_smoke import DEFAULT_INVOKE, MvpSmokeError, run_mvp_smoke
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
 from deepresearch.verification_matrix import VerificationMatrixError, verify_claims
@@ -333,6 +334,26 @@ def run_synthesize(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_mvp_smoke_command(args: argparse.Namespace) -> int:
+    try:
+        result = run_mvp_smoke(
+            runs_dir=resolve_repo_path(args.runs_dir),
+            suite_id=args.suite_id,
+            invoke=args.invoke,
+            clean=args.clean,
+            skip_codex_cli_install_check=args.skip_codex_cli_install_check,
+        )
+    except (MvpSmokeError, OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        results_path = getattr(exc, "results_path", None)
+        if results_path:
+            print(f"Results: {results_path}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["status"] == "passed" else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -360,6 +381,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for smoke run artifacts, relative to the repo root by default.",
     )
     smoke.set_defaults(func=run_smoke)
+
+    mvp_smoke = subparsers.add_parser(
+        "mvp-smoke",
+        help="Run the deterministic no-network MVP release-gate smoke suite.",
+    )
+    mvp_smoke.add_argument(
+        "--invoke",
+        default=DEFAULT_INVOKE,
+        help="Skill invocation text recorded for the text-only invocation smoke.",
+    )
+    mvp_smoke.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for MVP smoke artifacts, relative to the repo root by default.",
+    )
+    mvp_smoke.add_argument(
+        "--suite-id",
+        default="mvp-smoke",
+        help="Subdirectory name under --runs-dir for this smoke suite.",
+    )
+    mvp_smoke.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove an existing suite directory before writing new artifacts.",
+    )
+    mvp_smoke.add_argument(
+        "--skip-codex-cli-install-check",
+        action="store_true",
+        help=(
+            "Skip the Codex CLI install/update capability check. The suite records "
+            "the skip and does not mark plugin install/update smoke as passed."
+        ),
+    )
+    mvp_smoke.set_defaults(func=run_mvp_smoke_command)
 
     resolve = subparsers.add_parser(
         "resolve-config",

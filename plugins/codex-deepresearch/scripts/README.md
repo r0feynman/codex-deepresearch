@@ -12,6 +12,24 @@ plugins/codex-deepresearch/scripts/codex-deepresearch smoke --install --invoke '
 
 The command checks the manifest, repo-local marketplace metadata, and Codex CLI availability when `--install` is passed. It writes a timestamped directory under `research-runs/` with `status.json`.
 
+## MVP Smoke
+
+`mvp-smoke` is the M12 release-gate suite. It is deterministic and no-network: fixtures use local HTML, local PNG bytes, fixture claims, and existing runner stages without live web, model, API, or VLM calls.
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch mvp-smoke \
+  --runs-dir /tmp/codex-deepresearch-mvp-smoke \
+  --suite-id mvp-smoke \
+  --clean \
+  --invoke '$deep-research: MVP smoke text-only fixture'
+```
+
+The suite writes `mvp_smoke_results.json` and per-fixture run directories containing `evidence.json`, `report.md`, verifier votes, and stage status files. It covers 3 text-only fixtures, 3 visual-required fixtures, 2 visual-optional fixtures, local plugin install/update checks, schema-v0 evidence validation, and the guardrail fixture suite.
+
+By default, `mvp-smoke` requires the `codex` CLI on `PATH` so the plugin install/update capability is actually available. If an environment cannot provide Codex CLI, pass `--skip-codex-cli-install-check`; the results file will record `install_update_smoke.status=skipped`, `skips.codex_cli_install_check=true`, and `acceptance.plugin_install_update_smoke_passes=false` instead of claiming that the install/update smoke passed.
+
+The invocation smoke also validates that `--invoke` starts with `$deep-research:`. Invalid invocations fail the suite and still write `mvp_smoke_results.json` with failed check details.
+
 ## Resolve Config
 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:
@@ -145,6 +163,7 @@ After changing plugin files, rerun validation and the smoke command:
 ```bash
 python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
+plugins/codex-deepresearch/scripts/codex-deepresearch mvp-smoke --runs-dir /tmp/codex-deepresearch-mvp-smoke --suite-id mvp-smoke --clean --invoke '$deep-research: MVP smoke text-only fixture'
 plugins/codex-deepresearch/scripts/codex-deepresearch smoke --install --invoke '$deep-research: Codex DeepResearch smoke test'
 codex plugin add codex-deepresearch@codex-deepresearch-local
 ```
