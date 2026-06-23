@@ -164,6 +164,16 @@ def estimate_budget(
             value=config.budget_preset,
             details={"required_flag": "--confirm-budget"},
         )
+    if config.budget_preset == "exhaustive" and user_caps.max_cost_usd is None:
+        raise BudgetEstimateError(
+            code="budget_cost_cap_required",
+            message="budget preset 'exhaustive' requires max_cost_usd before execution",
+            field="max_cost_usd",
+            details={
+                "required_flag": "--max-cost-usd",
+                "budget_preset": "exhaustive",
+            },
+        )
 
     route_records = [_normalized_route(route, index) for index, route in enumerate(routing, start=1)]
     preset = config.budget

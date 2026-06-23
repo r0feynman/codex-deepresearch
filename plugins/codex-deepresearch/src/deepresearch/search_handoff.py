@@ -86,10 +86,6 @@ def prepare_run(
             "with codex-native search"
         )
 
-    now = _utc_now()
-    run_dir = _create_unique_run_dir(Path(runs_dir), now)
-    run_id = run_dir.name
-    begin_stage(run_dir, "planning", run_id=run_id, started_at=now)
     planner_angles = _normalize_planner_angles(angles)
     decisions = route_angles(
         question=normalized_question,
@@ -98,6 +94,7 @@ def prepare_run(
         route_override=route,
     )
     routing = [_routing_record(decision, index) for index, decision in enumerate(decisions, start=1)]
+    now = _utc_now()
     budget_estimate = estimate_budget(
         question=normalized_question,
         config=config,
@@ -114,6 +111,9 @@ def prepare_run(
         confirmation_provided=confirm_budget,
         generated_at=now,
     )
+    run_dir = _create_unique_run_dir(Path(runs_dir), now)
+    run_id = run_dir.name
+    begin_stage(run_dir, "planning", run_id=run_id, started_at=now)
     routing = _apply_budget_image_allocations(
         routing,
         budget_estimate["planned_search"]["route_image_allocations"],
@@ -212,19 +212,7 @@ def prepare_run(
             "visual_observations": str(run_dir / "visual_observations.jsonl"),
             "status": str(run_dir / "status.json"),
         },
-        "budget_estimate": {
-            "source_count": budget_estimate["estimates"]["source_count"],
-            "image_count": budget_estimate["estimates"]["image_count"],
-            "verifier_invocation_count": budget_estimate["estimates"][
-                "verifier_invocation_count"
-            ],
-            "codex_subagent_count": budget_estimate["estimates"]["codex_subagent_count"],
-            "runner_stage_count": budget_estimate["estimates"]["runner_stage_count"],
-            "high_water_cost_usd": budget_estimate["high_water_cost_bounds"][
-                "upper_bound_usd"
-            ],
-            "suggestion_count": len(budget_estimate["suggestions"]),
-        },
+        "budget_estimate": _budget_estimate_summary(budget_estimate),
     }
     add_budget_estimate_artifact(status, run_dir)
 
@@ -630,6 +618,35 @@ def _apply_budget_image_allocations(
             record["visual_tasks"] = []
         capped.append(record)
     return capped
+
+
+def _budget_estimate_summary(estimate: Mapping[str, Any]) -> dict[str, Any]:
+    estimates = estimate["estimates"]
+    model_calls = estimates["model_call_placeholders"]
+    tokens = estimates["token_placeholders"]
+    return {
+        "source_count": estimates["source_count"],
+        "image_count": estimates["image_count"],
+        "verifier_invocation_count": estimates["verifier_invocation_count"],
+        "codex_subagent_count": estimates["codex_subagent_count"],
+        "runner_stage_count": estimates["runner_stage_count"],
+        "model_call_placeholders": {
+            "total_model_api_calls": model_calls["total_model_api_calls"],
+            "total_model_api_calls_uncapped": model_calls[
+                "total_model_api_calls_uncapped"
+            ],
+        },
+        "token_placeholders": {
+            "total_input_tokens_placeholder": tokens[
+                "total_input_tokens_placeholder"
+            ],
+            "total_output_tokens_placeholder": tokens[
+                "total_output_tokens_placeholder"
+            ],
+        },
+        "high_water_cost_usd": estimate["high_water_cost_bounds"]["upper_bound_usd"],
+        "suggestion_count": len(estimate["suggestions"]),
+    }
 
 
 def _search_task(

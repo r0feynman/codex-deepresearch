@@ -90,6 +90,7 @@ class BudgetEstimatorTests(unittest.TestCase):
                     config=config,
                     routing=routing,
                     max_results=200,
+                    caps=BudgetCaps(max_cost_usd=999.0) if preset == "exhaustive" else None,
                     confirmation_provided=True,
                 )
 
@@ -223,13 +224,14 @@ class BudgetEstimatorTests(unittest.TestCase):
         json.loads(str(impossible.exception))
 
     def test_prepare_requires_confirmation_for_deep_budget(self) -> None:
+        runs_dir = self.temp_runs_dir()
         result = subprocess.run(
             [
                 str(RUNNER),
                 "prepare",
                 "Deep budget confirmation",
                 "--runs-dir",
-                str(self.temp_runs_dir()),
+                str(runs_dir),
                 "--budget",
                 "deep",
             ],
@@ -243,6 +245,79 @@ class BudgetEstimatorTests(unittest.TestCase):
         payload = json.loads(result.stderr)
         self.assertEqual(payload["code"], "budget_confirmation_required")
         self.assertEqual(payload["details"]["required_flag"], "--confirm-budget")
+        self.assertEqual(list(runs_dir.iterdir()), [])
+
+    def test_prepare_rejects_impossible_visual_cap_without_partial_run(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        result = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "Impossible visual cap",
+                "--runs-dir",
+                str(runs_dir),
+                "--route",
+                "visual_required",
+                "--max-images",
+                "0",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["code"], "impossible_image_cap")
+        self.assertEqual(payload["field"], "max_images")
+        self.assertEqual(list(runs_dir.iterdir()), [])
+
+    def test_exhaustive_requires_cost_cap_even_with_confirmation(self) -> None:
+        config, routing = self.routing(
+            question="Broad exhaustive research",
+            budget_preset="exhaustive",
+            route="text_only",
+        )
+
+        with self.assertRaises(BudgetEstimateError) as raised:
+            estimate_budget(
+                question="Broad exhaustive research",
+                config=config,
+                routing=routing,
+                max_results=200,
+                confirmation_provided=True,
+            )
+        payload = raised.exception.to_dict()
+        self.assertEqual(payload["code"], "budget_cost_cap_required")
+        self.assertEqual(payload["field"], "max_cost_usd")
+        self.assertEqual(payload["details"]["required_flag"], "--max-cost-usd")
+
+        runs_dir = self.temp_runs_dir()
+        result = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "Exhaustive without cost cap",
+                "--runs-dir",
+                str(runs_dir),
+                "--budget",
+                "exhaustive",
+                "--confirm-budget",
+                "--max-results",
+                "200",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["code"], "budget_cost_cap_required")
+        self.assertEqual(payload["field"], "max_cost_usd")
+        self.assertEqual(list(runs_dir.iterdir()), [])
 
     def test_prepare_writes_and_links_budget_estimate_artifact(self) -> None:
         prepared = prepare_run(
@@ -269,7 +344,25 @@ class BudgetEstimatorTests(unittest.TestCase):
         self.assertEqual(estimate["estimates"]["source_count"], 4)
         self.assertEqual(estimate["estimates"]["image_count"], 2)
         self.assertEqual(prepared["budget_estimate"]["source_count"], 4)
+        self.assertIn("model_call_placeholders", prepared["budget_estimate"])
+        self.assertIn("token_placeholders", prepared["budget_estimate"])
+        self.assertEqual(
+            prepared["budget_estimate"]["model_call_placeholders"][
+                "total_model_api_calls"
+            ],
+            estimate["estimates"]["model_call_placeholders"]["total_model_api_calls"],
+        )
+        self.assertEqual(
+            prepared["budget_estimate"]["token_placeholders"][
+                "total_input_tokens_placeholder"
+            ],
+            estimate["estimates"]["token_placeholders"][
+                "total_input_tokens_placeholder"
+            ],
+        )
         self.assertEqual(status["artifacts"]["budget_estimate"], str(run_dir / "budget_estimate.json"))
+        self.assertIn("model_call_placeholders", status["budget_estimate"])
+        self.assertIn("token_placeholders", status["budget_estimate"])
         self.assertEqual(trace["artifacts"]["budget_estimate"], str(run_dir / "budget_estimate.json"))
         self.assertEqual(evidence["budget"]["max_sources"], 4)
         self.assertEqual(evidence["budget"]["max_images"], 2)
