@@ -22,6 +22,19 @@ from .search_handoff import SearchHandoffError, resolve_run_dir
 FETCH_CLAIMS_SCHEMA_VERSION = "codex-deepresearch.fetch-claims.v0"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_QUOTE_CANDIDATES_PER_SOURCE = 3
+SOURCE_FETCH_BLOCKING_POLICY_FLAGS = {
+    "access_controlled",
+    "captcha_protected",
+    "copyright_restricted",
+    "login_gated",
+    "paywall",
+    "pii_detected",
+    "robots_disallowed",
+}
+SOURCE_FETCH_MANUAL_REVIEW_POLICY_FLAGS = {
+    "copyright_manual_review",
+    "robots_manual_review",
+}
 
 
 class FetchClaimsError(ValueError):
@@ -564,13 +577,35 @@ def _safe_id(value: str) -> str:
 
 
 def _policy_decision(source: Mapping[str, Any], entry: Mapping[str, Any]) -> str:
-    decision = entry.get("policy_decision", source.get("policy_decision", "allowed"))
-    return str(decision)
+    source_decision = str(source.get("policy_decision", "allowed"))
+    if source_decision in {"blocked", "manual_review"}:
+        return source_decision
+
+    flags = set(_string_list(source.get("policy_flags")))
+    if flags.intersection(SOURCE_FETCH_BLOCKING_POLICY_FLAGS):
+        return "blocked"
+    if flags.intersection(SOURCE_FETCH_MANUAL_REVIEW_POLICY_FLAGS):
+        return "manual_review"
+    if source.get("robots_policy") == "disallowed":
+        return "blocked"
+    if source.get("robots_policy") == "manual_review":
+        return "manual_review"
+    if source.get("license_policy") == "restricted":
+        return "blocked"
+    if source.get("license_policy") == "manual_review":
+        return "manual_review"
+    if source.get("retrieval_status") == "failed" and str(
+        source.get("retrieval_error", "")
+    ).startswith(("guardrail_", "policy_")):
+        return "blocked"
+
+    entry_decision = entry.get("policy_decision", source_decision)
+    return str(entry_decision)
 
 
 def _mark_policy_blocked(source: dict[str, Any], entry: dict[str, Any], fetched_at: str) -> None:
     source["retrieval_status"] = "failed"
-    source["retrieval_error"] = "policy_blocked"
+    source.setdefault("retrieval_error", "policy_blocked")
     source["fetched_at"] = fetched_at
     source["caveats"] = sorted(set([*source.get("caveats", []), "Source policy blocked fetch."]))
     entry["retrieval_status"] = "failed"
@@ -595,6 +630,12 @@ def _write_source_metadata(run_dir: Path, source: Mapping[str, Any]) -> None:
         raise FetchClaimsError("source metadata must be a JSON object")
     metadata_path = _safe_metadata_path(run_dir, source)
     _write_run_json(run_dir, metadata_path, source)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
 
 
 def _base_status(run_dir: Path, status: str) -> dict[str, Any]:

@@ -16,6 +16,31 @@ MATRIX_METHOD = "runner-agent"
 MATRIX_TOOL = "codex-deepresearch"
 MATRIX_AGENT_PREFIX = "matrix_"
 MATRIX_VOTE_PREFIX = "vote_matrix_"
+SOURCE_BLOCKING_POLICY_FLAGS = {
+    "access_controlled",
+    "captcha_protected",
+    "copyright_restricted",
+    "login_gated",
+    "paywall",
+    "pii_detected",
+    "robots_disallowed",
+}
+SOURCE_MANUAL_REVIEW_POLICY_FLAGS = {
+    "copyright_manual_review",
+    "robots_manual_review",
+}
+IMAGE_BLOCKING_POLICY_FLAGS = {
+    "copyright_restricted",
+    "pii_detected",
+    "private_image",
+}
+IMAGE_REVIEW_GATE_POLICY_FLAGS = {
+    "sensitive_possible",
+    "unknown_license_image",
+}
+CLAIM_BLOCKING_POLICY_FLAGS = SOURCE_BLOCKING_POLICY_FLAGS | IMAGE_BLOCKING_POLICY_FLAGS | {
+    "no_primary_source",
+}
 
 
 class VerificationMatrixError(ValueError):
@@ -227,7 +252,11 @@ def _policy_vote(
     source_refs = _string_list(claim.get("supporting_sources"))
     image_refs = _string_list(claim.get("supporting_images"))
     refs = source_refs + image_refs
-    blocked = _has_policy_block(source_refs, sources_by_id) or _has_policy_image(image_refs, images_by_id)
+    blocked = (
+        _has_policy_block(source_refs, sources_by_id)
+        or _has_policy_image(image_refs, images_by_id, claim=claim)
+        or _has_claim_policy_block(claim)
+    )
     if blocked:
         vote = "blocked"
         confidence = 0.9
@@ -560,7 +589,8 @@ def _has_policy_block(
             return True
         if source.get("robots_policy") in {"disallowed", "manual_review"}:
             return True
-        if _string_list(source.get("policy_flags")):
+        flags = set(_string_list(source.get("policy_flags")))
+        if flags.intersection(SOURCE_BLOCKING_POLICY_FLAGS | SOURCE_MANUAL_REVIEW_POLICY_FLAGS):
             return True
     return False
 
@@ -568,16 +598,20 @@ def _has_policy_block(
 def _has_policy_image(
     image_refs: Sequence[str],
     images_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    claim: Mapping[str, Any],
 ) -> bool:
     for image_id in image_refs:
         image = images_by_id.get(image_id)
         if not isinstance(image, Mapping):
             continue
-        if image.get("analysis_status") == "policy_blocked":
-            return True
-        if _string_list(image.get("policy_flags")):
+        if _image_policy_blocks(image, claim=claim):
             return True
     return False
+
+
+def _has_claim_policy_block(claim: Mapping[str, Any]) -> bool:
+    return bool(set(_string_list(claim.get("policy_flags"))).intersection(CLAIM_BLOCKING_POLICY_FLAGS))
 
 
 def _usable_image_refs(
@@ -592,7 +626,7 @@ def _usable_image_refs(
             continue
         if image.get("analysis_status") != "analyzed":
             continue
-        if _string_list(image.get("policy_flags")):
+        if _image_policy_blocks(image, claim=claim):
             continue
         if not _has_image_source_or_capture(claim, image):
             continue
@@ -603,6 +637,19 @@ def _usable_image_refs(
         elif isinstance(inferences, list) and inferences:
             usable.append(image_id)
     return usable
+
+
+def _image_policy_blocks(image: Mapping[str, Any], *, claim: Mapping[str, Any]) -> bool:
+    if image.get("analysis_status") == "policy_blocked":
+        return True
+    flags = set(_string_list(image.get("policy_flags")))
+    if flags.intersection(IMAGE_BLOCKING_POLICY_FLAGS):
+        return True
+    if image.get("analysis_status") == "needs_manual_review":
+        return claim.get("review_status") != "human_accepted"
+    if flags.intersection(IMAGE_REVIEW_GATE_POLICY_FLAGS):
+        return claim.get("review_status") != "human_accepted"
+    return False
 
 
 def _has_image_source_or_capture(

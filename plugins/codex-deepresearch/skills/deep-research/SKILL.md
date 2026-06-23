@@ -38,9 +38,10 @@ In plugin mode, do not assume a hidden Codex search API is available to the runn
 5. Run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>`.
 6. For visual tasks, write explicit visual observation JSONL and run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision --run <run_id_or_path> --provider <codex-interactive|openai-responses-vision|manual-visual-review> --observations <jsonl>`. Do not assume the runner can call Codex interactive VLM as a hidden API.
 7. Run `plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id_or_path>` to fetch queued sources, preserve source artifacts, extract quote candidates, and append low-confidence unverified claims.
-8. Run `plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run <run_id_or_path>` to apply the deterministic verifier matrix, write `verifier_votes.jsonl`, and update claim verification state. This runner stage uses only normalized local evidence; it does not call external models, VLMs, web search, or APIs.
-9. Run `plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run <run_id_or_path>` to write `report.md` and `report_status.json` from supported, reviewed claims only. This runner stage uses only local evidence and must not call external models, VLMs, web search, or APIs.
-10. Continue only from the normalized `evidence.json`, `fetch_queue.json`, `visual_observations.jsonl`, `verifier_votes.jsonl`, fetched source artifacts, `report.md`, and `report_status.json`.
+8. Run `plugins/codex-deepresearch/scripts/codex-deepresearch enforce-guardrails --run <run_id_or_path>` to apply local policy, privacy, copyright, image-license, and high-risk-domain gates before verification or promotion. This stage uses only local evidence metadata and existing artifacts; it does not call external models, VLMs, web search, or APIs.
+9. Run `plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run <run_id_or_path>` to apply the deterministic verifier matrix, write `verifier_votes.jsonl`, and update claim verification state. This runner stage uses only normalized local evidence; it does not call external models, VLMs, web search, or APIs.
+10. Run `plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run <run_id_or_path>` to write `report.md` and `report_status.json` from supported, reviewed claims only. This runner stage uses only local evidence and must not call external models, VLMs, web search, or APIs.
+11. Continue only from the normalized `evidence.json`, `fetch_queue.json`, `visual_observations.jsonl`, `guardrails_status.json`, `verifier_votes.jsonl`, fetched source artifacts, `report.md`, and `report_status.json`.
 
 ## Manual Sources Fallback
 
@@ -58,6 +59,7 @@ Use `--pdf` for PDF URLs or local PDF files, `--image-url` for remote images, an
 - Do not treat a search result snippet as evidence by itself.
 - Treat first-pass fetched text claims as unverified and low confidence until later verifier stages review them.
 - Apply route-specific verifier rules before promotion or report drafting: `text_only` claims require two text votes and one policy/freshness vote, `visual_required` claims require two text votes, one visual vote, and one policy vote, and `visual_optional` claims use visual votes only when usable visual evidence is already available.
+- Run guardrails before verification and reporting. Login-gated, CAPTCHA-protected, access-controlled, robots-disallowed, paywalled, copyright-restricted, PII-bearing, private image, unknown image-license, and high-risk medical/legal/financial cases must remain explicit policy flags/caveats and must not be promoted without the required review/source support.
 - Keep `budget_pruned` claims out of final reporting by honoring `include_in_final_report=false`.
 - Report only claims with `verification_status=supported` and `review_status=auto_reviewed` or `human_accepted`; treat `include_in_final_report=false` as an additional exclusion guard.
 - High-confidence text report claims must preserve quote spans with source IDs, and visual or mixed report claims must preserve supporting image evidence IDs.

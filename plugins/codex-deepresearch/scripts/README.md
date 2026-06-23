@@ -76,6 +76,18 @@ plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id
 
 The command fetches queued `http`, `https`, `file`, or `data` sources with an explicit timeout, writes fetched artifacts under the run directory, extracts text excerpts and quote candidates, and appends source-linked text claims to `evidence.json`. First-pass claims are intentionally conservative: `confidence=low`, `verification_status=unverified`, `review_status=not_reviewed`, and `promotion_status=not_eligible`. Blocked, manual-review, and failed sources remain preserved with failed retrieval metadata and do not create claims.
 
+## Enforce Guardrails
+
+Use `enforce-guardrails` after evidence, claims, and any visual records have been normalized and before verification or promotion:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch enforce-guardrails --run <run_id_or_path>
+```
+
+The command is fully local and deterministic. It reads `evidence.json`, preserves existing policy flags, adds guardrail flags for login/CAPTCHA/access-controlled sources, robots, paywall, copyright, PII, private user-provided images, unknown image licenses, and high-risk medical/legal/financial claims without primary-source support, then writes updated `evidence.json` and `guardrails_status.json`.
+
+Guardrail-blocked evidence cannot remain `review_status=human_accepted` or `promotion_status=promoted_*`. Unknown-license images require human acceptance before eligibility, high-risk claims without primary-source support cannot remain high confidence, and policy-blocked claims receive `include_in_final_report=false`.
+
 ## Verify Claims
 
 Use `verify-claims` after claims and any visual evidence have been normalized:

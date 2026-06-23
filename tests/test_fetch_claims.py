@@ -16,7 +16,7 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import fetch_claims, ingest_run, prepare_run, validate_artifacts
+from deepresearch import enforce_guardrails, fetch_claims, ingest_run, prepare_run, validate_artifacts
 
 
 fetch_claims_module = importlib.import_module("deepresearch.fetch_claims")
@@ -317,6 +317,91 @@ class FetchClaimsTests(unittest.TestCase):
         self.assertIn("fetch_failed", failed_source["retrieval_error"])
         self.assertEqual(failed_evidence["claims"], [])
         self.assertEqual(failed["high_confidence_claims_created"], 0)
+
+    def test_guardrail_blocked_source_overrides_stale_allowed_fetch_queue(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        page = runs_dir / "source.html"
+        page.write_text(
+            "<html><body><p>Stale queue entries must not fetch access controlled content.</p></body></html>",
+            encoding="utf-8",
+        )
+        run_dir = self.prepare_queued_file_run(page.resolve().as_uri())
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.load_json(evidence_path)
+        evidence["sources"][0]["login_required"] = True
+        self.write_json(evidence_path, evidence)
+
+        guardrails = enforce_guardrails(run=run_dir)
+        self.assertEqual(guardrails["status"], "completed")
+        guarded = self.load_json(evidence_path)
+        self.assertEqual(guarded["sources"][0]["policy_decision"], "blocked")
+        self.assertEqual(guarded["sources"][0]["retrieval_status"], "failed")
+        self.assertIn("login_gated", guarded["sources"][0]["policy_flags"])
+
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            side_effect=AssertionError("stale allowed queue entry fetched a blocked source"),
+        ):
+            result = fetch_claims(run=run_dir)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["sources_fetched"], 0)
+        self.assertEqual(result["sources_failed"], 1)
+        self.assertEqual(result["claims_created"], 0)
+        self.assertEqual(result["quote_candidates_created"], 0)
+        evidence = self.load_json(evidence_path)
+        source = evidence["sources"][0]
+        self.assertEqual(source["policy_decision"], "blocked")
+        self.assertEqual(source["retrieval_status"], "failed")
+        self.assertEqual(source["retrieval_error"], "guardrail_blocked_access_controlled")
+        self.assertIn("login_gated", source["policy_flags"])
+        self.assertEqual(evidence["claims"], [])
+        fetch_queue = self.load_json(run_dir / "fetch_queue.json")
+        self.assertEqual(fetch_queue["entries"][0]["retrieval_status"], "failed")
+        self.assertEqual(fetch_queue["entries"][0]["retrieval_error"], "policy_blocked")
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
+
+    def test_source_level_hard_policy_flags_override_stale_allowed_fetch_queue(self) -> None:
+        stale_allowed_cases = [
+            ("captcha_protected", {}),
+            ("access_controlled", {}),
+            ("robots_disallowed", {"robots_policy": "allowed"}),
+            ("copyright_restricted", {"license_policy": "allowed"}),
+            ("paywall", {}),
+        ]
+        for flag, source_overrides in stale_allowed_cases:
+            with self.subTest(flag=flag):
+                runs_dir = self.temp_runs_dir()
+                page = runs_dir / f"{flag}.html"
+                page.write_text(
+                    "<html><body><p>Blocked source should not be fetched from a stale queue.</p></body></html>",
+                    encoding="utf-8",
+                )
+                run_dir = self.prepare_queued_file_run(page.resolve().as_uri())
+                evidence_path = run_dir / "evidence.json"
+                evidence = self.load_json(evidence_path)
+                source = evidence["sources"][0]
+                source.update(source_overrides)
+                source["policy_flags"] = [flag]
+                source["retrieval_status"] = "failed"
+                source["retrieval_error"] = f"guardrail_blocked_{flag}"
+                self.write_json(evidence_path, evidence)
+
+                with mock.patch.object(
+                    fetch_claims_module,
+                    "urlopen",
+                    side_effect=AssertionError(f"stale queue fetched {flag} source"),
+                ):
+                    result = fetch_claims(run=run_dir)
+
+                evidence = self.load_json(evidence_path)
+                self.assertEqual(result["sources_fetched"], 0)
+                self.assertEqual(result["sources_failed"], 1)
+                self.assertEqual(result["claims_created"], 0)
+                self.assertEqual(evidence["claims"], [])
+                self.assertEqual(evidence["sources"][0]["retrieval_status"], "failed")
+                self.assertEqual(evidence["sources"][0]["retrieval_error"], f"guardrail_blocked_{flag}")
 
     def test_unsafe_existing_metadata_path_falls_back_inside_run_directory(self) -> None:
         run_dir = self.prepare_unsafe_metadata_run()

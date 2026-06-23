@@ -23,6 +23,32 @@ EXCLUDED_STATUSES = {
     "policy_blocked",
     "unverified",
 }
+COPYRIGHT_POLICY_FLAGS = {
+    "copyright_manual_review",
+    "copyright_restricted",
+}
+SOURCE_BLOCKING_POLICY_FLAGS = {
+    "access_controlled",
+    "captcha_protected",
+    "copyright_restricted",
+    "login_gated",
+    "paywall",
+    "pii_detected",
+    "robots_disallowed",
+}
+SOURCE_MANUAL_REVIEW_POLICY_FLAGS = {
+    "copyright_manual_review",
+    "robots_manual_review",
+}
+IMAGE_BLOCKING_POLICY_FLAGS = {
+    "copyright_restricted",
+    "pii_detected",
+    "private_image",
+}
+IMAGE_REVIEW_GATE_POLICY_FLAGS = {
+    "sensitive_possible",
+    "unknown_license_image",
+}
 
 
 class ReportGenerationError(ValueError):
@@ -171,6 +197,8 @@ def _evaluate_claim(
         source_ids=source_ids,
         quote_spans=quote_spans,
         image_ids=image_ids,
+        sources_by_id=sources_by_id,
+        images_by_id=images_by_id,
     )
     return {
         "included": not reasons,
@@ -190,6 +218,8 @@ def _exclusion_reasons(
     source_ids: Sequence[str],
     quote_spans: Sequence[Mapping[str, Any]],
     image_ids: Sequence[str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+    images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
     reasons: list[str] = []
     if claim.get("verification_status") != "supported":
@@ -213,6 +243,14 @@ def _exclusion_reasons(
         reasons.append("high_confidence_visual_missing_image_evidence")
     if not source_ids and not image_ids:
         reasons.append("missing_resolved_evidence")
+    if _has_policy_blocked_source(source_ids, sources_by_id=sources_by_id):
+        reasons.append("policy_blocked_source")
+    if _has_policy_blocked_image(
+        _string_list(claim.get("supporting_images")),
+        images_by_id=images_by_id,
+        claim=claim,
+    ):
+        reasons.append("policy_blocked_image")
 
     return _ordered_unique(reasons)
 
@@ -249,13 +287,21 @@ def _render_report(
             image_refs = _image_refs(item["image_ids"])
             evidence_refs = ", ".join(citation_refs + image_refs)
             confidence = _string_value(claim.get("confidence"), "unknown")
+            claim_text = _claim_text_for_report(
+                claim,
+                item["source_ids"],
+                sources_by_id=sources_by_id,
+            )
             lines.append(
-                f"{index}. {str(claim.get('text', '')).strip()} "
+                f"{index}. {claim_text} "
                 f"({confidence} confidence; claim `{item['claim_id']}`; evidence {evidence_refs})."
             )
             for quote in item["quote_spans"]:
-                quote_text = _truncate(str(quote.get("quote", "")).strip(), 180)
                 source_id = _string_value(quote.get("source_id"), "unknown")
+                quote_text = _quote_text_for_report(
+                    quote,
+                    sources_by_id=sources_by_id,
+                )
                 location = _string_value(quote.get("location"), "unspecified location")
                 lines.append(f"   - Quote [{source_id}]: \"{quote_text}\" ({location})")
             caveats = _string_list(claim.get("caveats"))
@@ -322,7 +368,11 @@ def _render_report(
         for item in excluded_records:
             claim = item["claim"]
             reasons = ", ".join(item["exclusion_reasons"]) or "not_report_eligible"
-            text = _truncate(str(claim.get("text", "")).strip(), 180)
+            text = _claim_text_for_report(
+                claim,
+                item["source_ids"],
+                sources_by_id=sources_by_id,
+            )
             lines.append(f"- Claim `{item['claim_id']}` excluded: {reasons}. {text}")
     else:
         lines.append("- No excluded claims recorded.")
@@ -394,7 +444,7 @@ def _resolved_image_ids(
             continue
         if image.get("analysis_status") == "policy_blocked":
             continue
-        if _string_list(image.get("policy_flags")):
+        if _image_policy_blocks(image, claim=claim):
             continue
         ids.append(image_id)
     return _ordered_unique(ids)
@@ -405,6 +455,101 @@ def _quote_spans(claim: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if not isinstance(spans, list):
         return []
     return [span for span in spans if isinstance(span, Mapping)]
+
+
+def _claim_text_for_report(
+    claim: Mapping[str, Any],
+    source_ids: Sequence[str],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> str:
+    text = str(claim.get("text", "")).strip()
+    if _has_copyright_restricted_source(source_ids, sources_by_id=sources_by_id):
+        return _truncate(text, 80) + " [copyright-truncated]"
+    return _truncate(text, 180)
+
+
+def _quote_text_for_report(
+    quote: Mapping[str, Any],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> str:
+    source_id = quote.get("source_id")
+    quote_text = str(quote.get("quote", "")).strip()
+    if isinstance(source_id, str) and _has_copyright_restricted_source(
+        [source_id],
+        sources_by_id=sources_by_id,
+    ):
+        return _truncate(quote_text, 80) + " [copyright-truncated]"
+    return _truncate(quote_text, 180)
+
+
+def _has_copyright_restricted_source(
+    source_ids: Sequence[str],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    for source_id in source_ids:
+        source = sources_by_id.get(source_id)
+        if not isinstance(source, Mapping):
+            continue
+        if source.get("license_policy") in {"restricted", "manual_review"}:
+            return True
+        if set(_string_list(source.get("policy_flags"))).intersection(COPYRIGHT_POLICY_FLAGS):
+            return True
+    return False
+
+
+def _has_policy_blocked_source(
+    source_ids: Sequence[str],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    for source_id in source_ids:
+        source = sources_by_id.get(source_id)
+        if not isinstance(source, Mapping):
+            continue
+        if source.get("policy_decision") in {"blocked", "manual_review"}:
+            return True
+        if source.get("robots_policy") in {"disallowed", "manual_review"}:
+            return True
+        if source.get("license_policy") in {"restricted", "manual_review"}:
+            return True
+        retrieval_error = _string_value(source.get("retrieval_error"), "")
+        if source.get("retrieval_status") == "failed" and retrieval_error.startswith(
+            ("guardrail_", "policy_")
+        ):
+            return True
+        flags = set(_string_list(source.get("policy_flags")))
+        if flags.intersection(SOURCE_BLOCKING_POLICY_FLAGS | SOURCE_MANUAL_REVIEW_POLICY_FLAGS):
+            return True
+    return False
+
+
+def _has_policy_blocked_image(
+    image_ids: Sequence[str],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+    claim: Mapping[str, Any],
+) -> bool:
+    for image_id in image_ids:
+        image = images_by_id.get(image_id)
+        if isinstance(image, Mapping) and _image_policy_blocks(image, claim=claim):
+            return True
+    return False
+
+
+def _image_policy_blocks(image: Mapping[str, Any], *, claim: Mapping[str, Any]) -> bool:
+    if image.get("analysis_status") == "policy_blocked":
+        return True
+    flags = set(_string_list(image.get("policy_flags")))
+    if flags.intersection(IMAGE_BLOCKING_POLICY_FLAGS):
+        return True
+    if image.get("analysis_status") == "needs_manual_review":
+        return claim.get("review_status") != "human_accepted"
+    if flags.intersection(IMAGE_REVIEW_GATE_POLICY_FLAGS):
+        return claim.get("review_status") != "human_accepted"
+    return False
 
 
 def _citation_refs(source_ids: Sequence[str]) -> list[str]:
