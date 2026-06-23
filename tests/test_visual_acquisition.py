@@ -98,6 +98,7 @@ class VisualAcquisitionTests(unittest.TestCase):
         result = acquire_visual_candidates(run=run_dir)
 
         self.assertEqual(result["status"], "visual_candidates_collected")
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
         self.assertGreaterEqual(result["candidate_records"], 10)
         provider_names = {provider["provider"] for provider in result["providers"]}
         self.assertEqual(
@@ -117,6 +118,7 @@ class VisualAcquisitionTests(unittest.TestCase):
             "tracking_pixel",
             "low_value_preview",
             "duplicate_image_url",
+            "duplicate_content_hash",
             "near_duplicate",
         ):
             self.assertGreaterEqual(removal_counts.get(reason, 0), 1, reason)
@@ -142,6 +144,17 @@ class VisualAcquisitionTests(unittest.TestCase):
             {record["candidate_class"] for record in observations},
             {"open_graph_image", "body_image", "image_search", "screenshot"},
         )
+        duplicate_hash_candidates = [
+            candidate
+            for candidate in candidates
+            if "duplicate_content_hash" in candidate.get("removal_reasons", [])
+        ]
+        self.assertEqual(len(duplicate_hash_candidates), 1)
+        duplicate_hash_check = duplicate_hash_candidates[0]["validation_checks"]["content_hash"]
+        self.assertEqual(duplicate_hash_check["status"], "failed")
+        self.assertTrue(duplicate_hash_check["duplicate"])
+        self.assertEqual(duplicate_hash_check["reason"], "duplicate_content_hash")
+        self.assertTrue(duplicate_hash_check["duplicate_of"].startswith("cand_"))
 
         ingest = ingest_vision_observations(
             run=run_dir,
@@ -162,7 +175,13 @@ class VisualAcquisitionTests(unittest.TestCase):
         checks = first["visual_validation"]
         self.assertEqual(checks["mime_type"]["status"], "passed")
         self.assertEqual(checks["size_limit"]["status"], "passed")
+        self.assertEqual(checks["content_hash"]["status"], "passed")
+        self.assertIn("candidate_id", first)
+        self.assertIn("visual_provider", first)
         self.assertTrue(first["hash"].startswith("sha256:"))
+        screenshot_images = [image for image in evidence["images"] if image["origin"] == "screenshot"]
+        self.assertEqual({image["screenshot"]["mode"] for image in screenshot_images}, {"first_viewport", "full_page"})
+        self.assertEqual({image["visual_provider"] for image in screenshot_images}, {"local-screenshot-fixture"})
 
         ocr_images = [image for image in evidence["images"] if image.get("ocr_text")]
         self.assertEqual(len(ocr_images), 1)
@@ -187,6 +206,7 @@ class VisualAcquisitionTests(unittest.TestCase):
         result = acquire_visual_candidates(run=run_dir)
 
         self.assertEqual(result["status"], "no_visual_tasks")
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
         self.assertEqual(result["candidate_records"], 0)
         self.assertEqual(result["selected_observations"], 0)
         self.assertEqual(result["image_search_invocations"], 0)

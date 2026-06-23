@@ -178,7 +178,10 @@ def acquire_visual_candidates(
         budget["images_selected"] = len(selected)
     _write_json(evidence_path, evidence)
 
-    validation = validate_artifacts(visual_observations_path=visual_observations_path)
+    validation = validate_artifacts(
+        evidence_path=evidence_path,
+        visual_observations_path=visual_observations_path,
+    )
     status = _base_status(run_dir, evidence, "visual_candidates_collected", now)
     status.update(
         {
@@ -311,7 +314,7 @@ class _LocalImageFixtureProvider:
                     height=450 + index,
                     alt_text=f"Fixture image search result {index}",
                     local_artifact_path=f"images/fixture_search_{index:02d}.png",
-                    content_seed=f"fixture-search:{index}",
+                    content_seed="fixture-search:8" if index == 10 else f"fixture-search:{index}",
                     phash="fixture-near-duplicate" if index in {6, 7} else f"fixture-search-{index}",
                     ocr_text="Fixture OCR text from search result 3" if index == 3 else None,
                     vlm_visual_summary=f"Fixture visual summary for search result {index}",
@@ -563,6 +566,9 @@ def _validate_and_select_candidates(
             "content_hash": {
                 "status": "passed" if image_hash else "failed",
                 "hash": image_hash,
+                "duplicate": False,
+                "duplicate_of": None,
+                "reason": None if image_hash else "missing_content_hash",
             },
             "url_duplicate": {
                 "status": "passed",
@@ -596,6 +602,10 @@ def _validate_and_select_candidates(
 
         previous_hash = seen_hashes.get(image_hash)
         if previous_hash is not None:
+            validation_checks["content_hash"]["status"] = "failed"
+            validation_checks["content_hash"]["duplicate"] = True
+            validation_checks["content_hash"]["duplicate_of"] = previous_hash
+            validation_checks["content_hash"]["reason"] = "duplicate_content_hash"
             record["duplicate_of"] = previous_hash
             removal_reasons.append("duplicate_content_hash")
         elif image_hash:
@@ -827,6 +837,10 @@ def _write_text_only_skip(
         handoff["visual_candidates_path"] = "visual_candidates.jsonl"
         handoff["visual_status"] = "no_visual_tasks"
     _write_json(evidence_path, evidence)
+    validation = validate_artifacts(
+        evidence_path=evidence_path,
+        visual_observations_path=visual_observations_path,
+    )
     status = _base_status(run_dir, evidence, "no_visual_tasks", created_at)
     status.update(
         {
@@ -843,6 +857,7 @@ def _write_text_only_skip(
             "external_network_call": False,
             "external_ocr_call": False,
             "external_vlm_call": False,
+            "validation": validation.to_dict(),
             "artifacts": {
                 "evidence": str(evidence_path),
                 "visual_candidates": str(visual_candidates_path),
