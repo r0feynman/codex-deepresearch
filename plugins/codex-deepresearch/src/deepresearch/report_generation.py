@@ -27,6 +27,19 @@ COPYRIGHT_POLICY_FLAGS = {
     "copyright_manual_review",
     "copyright_restricted",
 }
+SOURCE_BLOCKING_POLICY_FLAGS = {
+    "access_controlled",
+    "captcha_protected",
+    "copyright_restricted",
+    "login_gated",
+    "paywall",
+    "pii_detected",
+    "robots_disallowed",
+}
+SOURCE_MANUAL_REVIEW_POLICY_FLAGS = {
+    "copyright_manual_review",
+    "robots_manual_review",
+}
 IMAGE_BLOCKING_POLICY_FLAGS = {
     "copyright_restricted",
     "pii_detected",
@@ -184,6 +197,8 @@ def _evaluate_claim(
         source_ids=source_ids,
         quote_spans=quote_spans,
         image_ids=image_ids,
+        sources_by_id=sources_by_id,
+        images_by_id=images_by_id,
     )
     return {
         "included": not reasons,
@@ -203,6 +218,8 @@ def _exclusion_reasons(
     source_ids: Sequence[str],
     quote_spans: Sequence[Mapping[str, Any]],
     image_ids: Sequence[str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+    images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
     reasons: list[str] = []
     if claim.get("verification_status") != "supported":
@@ -226,6 +243,14 @@ def _exclusion_reasons(
         reasons.append("high_confidence_visual_missing_image_evidence")
     if not source_ids and not image_ids:
         reasons.append("missing_resolved_evidence")
+    if _has_policy_blocked_source(source_ids, sources_by_id=sources_by_id):
+        reasons.append("policy_blocked_source")
+    if _has_policy_blocked_image(
+        _string_list(claim.get("supporting_images")),
+        images_by_id=images_by_id,
+        claim=claim,
+    ):
+        reasons.append("policy_blocked_image")
 
     return _ordered_unique(reasons)
 
@@ -471,6 +496,45 @@ def _has_copyright_restricted_source(
         if source.get("license_policy") in {"restricted", "manual_review"}:
             return True
         if set(_string_list(source.get("policy_flags"))).intersection(COPYRIGHT_POLICY_FLAGS):
+            return True
+    return False
+
+
+def _has_policy_blocked_source(
+    source_ids: Sequence[str],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    for source_id in source_ids:
+        source = sources_by_id.get(source_id)
+        if not isinstance(source, Mapping):
+            continue
+        if source.get("policy_decision") in {"blocked", "manual_review"}:
+            return True
+        if source.get("robots_policy") in {"disallowed", "manual_review"}:
+            return True
+        if source.get("license_policy") in {"restricted", "manual_review"}:
+            return True
+        retrieval_error = _string_value(source.get("retrieval_error"), "")
+        if source.get("retrieval_status") == "failed" and retrieval_error.startswith(
+            ("guardrail_", "policy_")
+        ):
+            return True
+        flags = set(_string_list(source.get("policy_flags")))
+        if flags.intersection(SOURCE_BLOCKING_POLICY_FLAGS | SOURCE_MANUAL_REVIEW_POLICY_FLAGS):
+            return True
+    return False
+
+
+def _has_policy_blocked_image(
+    image_ids: Sequence[str],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+    claim: Mapping[str, Any],
+) -> bool:
+    for image_id in image_ids:
+        image = images_by_id.get(image_id)
+        if isinstance(image, Mapping) and _image_policy_blocks(image, claim=claim):
             return True
     return False
 
