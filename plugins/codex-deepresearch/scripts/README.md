@@ -73,13 +73,30 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_pa
 
 ## Run Status
 
-Every runner stage writes `run_steps.json` with `pending`, `running`, `completed`, `failed`, or `skipped` state. Use `run-status` to inspect an interrupted run and identify the next safe stage:
+Every state-managed pipeline stage writes `run_steps.json` with `pending`, `running`, `completed`, `failed`, or `skipped` state. Use `run-status` to inspect an interrupted run and identify the next safe stage:
 
 ```bash
 plugins/codex-deepresearch/scripts/codex-deepresearch run-status --run <run_id_or_path>
 ```
 
 Most completed stages rerun and revalidate their inputs until M15 cache keys exist. Stages that explicitly skip a completed rerun keep the primary stage state as `completed` and record the skipped rerun in `run_steps.json` history plus `run_trace.jsonl`.
+
+## Visual Acquisition
+
+Use `acquire-visual` on `visual_required` or `visual_optional` runs to create deterministic local/test image candidates before `ingest-vision`:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch acquire-visual \
+  --run <run_id_or_path> \
+  --provider local-page \
+  --provider local-image-fixture \
+  --provider local-screenshot-fixture \
+  --screenshot-mode all
+```
+
+The command writes all candidates to `visual_candidates.jsonl` and selected handoff records to `visual_observations.jsonl`. It preserves candidate classes for Open Graph images, body images, image search results, and screenshots; records MIME, size, URL duplicate, content hash, and near-duplicate checks; stores OCR/text-in-image fields separately from visual summary/description fields; and marks favicon, logo, thumbnail, tracking pixel, low-value preview, duplicate, and budget-pruned candidates with removal reasons. The local screenshot fixture represents first viewport, full-page, scroll, and interaction capture modes and records unsupported capabilities explicitly.
+
+`text_only` routes are an explicit no-op: the command writes empty visual candidate/observation artifacts and records zero image search, screenshot, OCR, and VLM work.
 
 ## Vision Adapter
 
