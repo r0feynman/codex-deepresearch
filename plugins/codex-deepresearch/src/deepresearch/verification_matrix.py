@@ -336,11 +336,14 @@ def _update_claim_state(
             promotion_status = "promotion_rejected"
         else:
             promotion_status = "not_eligible"
+    elif incoming_promotion_status == "promotion_rejected":
+        if incoming_review_status == "human_accepted" and status == "supported":
+            review_status = "human_accepted"
+        elif review_status == "auto_reviewed":
+            review_status = "needs_more_evidence"
+        promotion_status = "promotion_rejected"
     elif incoming_review_status == "human_accepted" and status == "supported":
         review_status = "human_accepted"
-    elif incoming_promotion_status == "promotion_rejected":
-        review_status = "needs_more_evidence" if review_status == "auto_reviewed" else review_status
-        promotion_status = "promotion_rejected"
 
     claim["verification_status"] = status
     claim["review_status"] = review_status

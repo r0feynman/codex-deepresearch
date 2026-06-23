@@ -396,6 +396,28 @@ class VerificationMatrixTests(unittest.TestCase):
         self.assertFalse(claim["include_in_final_report"])
         self.assertEqual(claim["report_exclusion_reason"], "promotion_rejected")
 
+    def test_human_accepted_promotion_rejected_claim_preserves_promotion_rejection(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_human_accepted_promotion_rejected",
+                review_status="human_accepted",
+                promotion_status="promotion_rejected",
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "supported")
+        self.assertEqual(claim["review_status"], "human_accepted")
+        self.assertEqual(claim["promotion_status"], "promotion_rejected")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["report_exclusion_reason"], "promotion_rejected")
+
     def test_verify_claims_is_idempotent_for_matrix_votes(self) -> None:
         run_dir = self.temp_run(route="text_only")
         evidence = self.load_json(run_dir / "evidence.json")
