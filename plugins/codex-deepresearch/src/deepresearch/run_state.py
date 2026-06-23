@@ -39,7 +39,7 @@ RUN_STEP_TRANSITIONS = {
     "pending": ("running", "skipped"),
     "running": ("running", "completed", "failed", "skipped"),
     "failed": ("running", "skipped"),
-    "completed": ("completed", "failed", "skipped"),
+    "completed": ("running", "completed", "failed", "skipped"),
     "skipped": ("skipped",),
 }
 _COMPLETED_STAGE_STATUSES = {
@@ -171,7 +171,15 @@ def begin_stage(
     current = _status(record)
     if current in TERMINAL_STEP_STATUSES:
         if current == "completed" and completed_behavior == "rerun":
-            return StageStart(stage=stage, status=current, skipped=False)
+            transition_stage(
+                run_dir,
+                stage,
+                "running",
+                reason="rerun_completed_stage",
+                timestamp=started_at,
+                run_id=run_id,
+            )
+            return StageStart(stage=stage, status="running", skipped=False)
         reason = "stage_already_completed" if current == "completed" else "stage_already_skipped"
         return StageStart(stage=stage, status=current, skipped=True, skip_reason=reason)
 
@@ -229,9 +237,20 @@ def transition_stage(
     record["retryable"] = to_status in RETRYABLE_STEP_STATUSES
     record["terminal"] = to_status in TERMINAL_STEP_STATUSES
     if to_status == "running":
+        if from_status in TERMINAL_STEP_STATUSES:
+            snapshot = _terminal_snapshot(record, from_status)
+            record["previous_terminal_status"] = snapshot
+            terminal_history = record.setdefault("terminal_history", [])
+            if isinstance(terminal_history, list):
+                terminal_history.append({**snapshot, "rerun_started_at": now})
+            record["last_rerun_status"] = "running"
+            record["last_rerun_at"] = now
         record["attempt"] = int(record.get("attempt") or 0) + 1
         record["started_at"] = now
         record.pop("finished_at", None)
+    elif from_status == "running" and record.get("previous_terminal_status"):
+        record["last_rerun_status"] = to_status
+        record["last_rerun_at"] = now
     if to_status in TERMINAL_STEP_STATUSES or to_status == "failed":
         record["finished_at"] = now
     if to_status == "failed" and status_payload is not None:
@@ -282,7 +301,8 @@ def record_trace_state(
 
     target = stage_status_to_step_status(stage, status_payload)
     state = initialize_run_steps(run_dir, run_id=_payload_run_id(status_payload), created_at=timestamp)
-    current = _status(_stage_record(state, stage))
+    record = _stage_record(state, stage)
+    current = _status(record)
     if current == "completed" and target == "skipped":
         return _record_completed_stage_skip(
             run_dir,
@@ -290,6 +310,19 @@ def record_trace_state(
             status_payload=status_payload,
             trace_event_id=trace_event_id,
             timestamp=timestamp,
+        )
+    if (
+        current == "running"
+        and target == "skipped"
+        and _previous_terminal_status(record) == "completed"
+    ):
+        return _record_completed_stage_skip(
+            run_dir,
+            stage=stage,
+            status_payload=status_payload,
+            trace_event_id=trace_event_id,
+            timestamp=timestamp,
+            from_status="running",
         )
     if current == "pending" and target != "running":
         transition_stage(
@@ -320,6 +353,7 @@ def _record_completed_stage_skip(
     status_payload: Mapping[str, Any],
     trace_event_id: str,
     timestamp: str | None,
+    from_status: str = "completed",
 ) -> dict[str, Any]:
     """Record a skipped rerun without erasing the completed primary state."""
 
@@ -328,13 +362,21 @@ def _record_completed_stage_skip(
     state = initialize_run_steps(run_dir, run_id=_payload_run_id(status_payload), created_at=timestamp)
     record = _stage_record(state, stage)
     now = timestamp or _utc_now()
+    snapshot = _previous_terminal_snapshot(record) if from_status == "running" else None
+    if snapshot is None:
+        snapshot = _terminal_snapshot(record, "completed")
     record["status"] = "completed"
     record["updated_at"] = now
     record["retryable"] = False
     record["terminal"] = True
     record["skip_reason"] = _transition_reason("skipped", status_payload)
+    record["previous_terminal_status"] = snapshot
     record["last_rerun_status"] = "skipped"
     record["last_rerun_at"] = now
+    for key in ("started_at", "finished_at"):
+        value = snapshot.get(key)
+        if value is not None:
+            record[key] = value
     artifacts = _string_artifacts(status_payload.get("artifacts"))
     if artifacts:
         record["artifacts"] = artifacts
@@ -349,13 +391,16 @@ def _record_completed_stage_skip(
         history.append(
             {
                 "at": now,
-                "from": "completed",
+                "from": from_status,
                 "to": "completed",
                 "reason": record["skip_reason"],
                 "rerun_status": "skipped",
                 "trace_event_id": trace_event_id,
             }
         )
+    terminal_history = record.setdefault("terminal_history", [])
+    if isinstance(terminal_history, list):
+        terminal_history.append({**snapshot, "rerun_status": "skipped", "rerun_at": now})
     state["updated_at"] = now
     _write_state(path, _with_resume_summary(state))
     return _with_resume_summary(state)
@@ -653,6 +698,38 @@ def _failure_summary(status_payload: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(validation, Mapping) and validation.get("valid") is False:
         summary["validation_valid"] = False
     return summary
+
+
+def _terminal_snapshot(record: Mapping[str, Any], status: str) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "status": status,
+        "attempt": int(record.get("attempt") or 0),
+    }
+    for key in ("stage_status", "started_at", "finished_at", "updated_at", "skip_reason"):
+        value = record.get(key)
+        if value is not None:
+            snapshot[key] = value
+    failure = record.get("failure")
+    if isinstance(failure, Mapping):
+        snapshot["failure"] = dict(failure)
+    artifacts = _string_artifacts(record.get("artifacts"))
+    if artifacts:
+        snapshot["artifacts"] = artifacts
+    trace_ids = record.get("trace_event_ids")
+    if isinstance(trace_ids, list):
+        snapshot["trace_event_ids"] = [str(trace_id) for trace_id in trace_ids if trace_id]
+    return snapshot
+
+
+def _previous_terminal_snapshot(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    previous = record.get("previous_terminal_status")
+    return dict(previous) if isinstance(previous, Mapping) else None
+
+
+def _previous_terminal_status(record: Mapping[str, Any]) -> str | None:
+    previous = _previous_terminal_snapshot(record)
+    status = previous.get("status") if previous is not None else None
+    return status if isinstance(status, str) else None
 
 
 def _string_artifacts(value: Any) -> dict[str, str]:

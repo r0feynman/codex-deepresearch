@@ -15,6 +15,7 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import (  # noqa: E402
     RunStepStateError,
+    begin_stage,
     ingest_manual_sources,
     ingest_run,
     inspect_run_state,
@@ -23,6 +24,7 @@ from deepresearch import (  # noqa: E402
     run_steps_path,
     transition_stage,
 )
+from deepresearch.trace import record_stage_trace  # noqa: E402
 
 
 class RunStateTests(unittest.TestCase):
@@ -83,7 +85,7 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(stages["fetch_claims"]["status"], "pending")
         self.assertEqual(
             self.read_json(run_dir / "run_steps.json")["transition_rules"]["completed"],
-            ["completed", "failed", "skipped"],
+            ["running", "completed", "failed", "skipped"],
         )
         trace = read_trace_records(run_dir / "run_trace.jsonl")
         self.assertIn("run_steps", trace[0]["artifacts"])
@@ -146,8 +148,86 @@ class RunStateTests(unittest.TestCase):
             len(second_ingest["trace_event_ids"]),
             len(first_ingest["trace_event_ids"]),
         )
-        self.assertEqual(second_ingest["history"][-1]["from"], "completed")
+        self.assertEqual(second_ingest["history"][-2]["from"], "completed")
+        self.assertEqual(second_ingest["history"][-2]["to"], "running")
+        self.assertEqual(second_ingest["history"][-2]["reason"], "rerun_completed_stage")
+        self.assertEqual(second_ingest["history"][-1]["from"], "running")
         self.assertEqual(second_ingest["history"][-1]["to"], "completed")
+        self.assertEqual(second_ingest["last_rerun_status"], "completed")
+        self.assertEqual(second_ingest["previous_terminal_status"]["status"], "completed")
+        self.assertEqual(second_ingest["previous_terminal_status"]["attempt"], first_ingest["attempt"])
+
+    def test_completed_stage_rerun_is_retryable_before_trace_completion(self) -> None:
+        prepared = prepare_run(
+            question="state machine interrupted completed rerun",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        first = ingest_run(run=run_dir)
+        completed_state = inspect_run_state(run_dir)
+        completed_ingest = {
+            stage["stage"]: stage for stage in completed_state["stages"]
+        }["ingest"]
+
+        started = begin_stage(run_dir, "ingest")
+        interrupted_state = inspect_run_state(run_dir)
+        interrupted_ingest = {
+            stage["stage"]: stage for stage in interrupted_state["stages"]
+        }["ingest"]
+
+        self.assertEqual(first["status"], "ingested")
+        self.assertEqual(started.status, "running")
+        self.assertFalse(started.skipped)
+        self.assertEqual(interrupted_state["next_safe_stage"], "ingest")
+        self.assertTrue(interrupted_state["next_stage_retryable"])
+        self.assertEqual(interrupted_ingest["status"], "running")
+        self.assertTrue(interrupted_ingest["retryable"])
+        self.assertEqual(interrupted_ingest["attempt"], completed_ingest["attempt"] + 1)
+        self.assertEqual(interrupted_ingest["previous_terminal_status"]["status"], "completed")
+        self.assertEqual(
+            interrupted_ingest["previous_terminal_status"]["attempt"],
+            completed_ingest["attempt"],
+        )
+        self.assertEqual(interrupted_ingest["last_rerun_status"], "running")
+        self.assertEqual(interrupted_ingest["history"][-1]["from"], "completed")
+        self.assertEqual(interrupted_ingest["history"][-1]["to"], "running")
+
+    def test_completed_stage_rerun_skip_keeps_completed_primary_state(self) -> None:
+        prepared = prepare_run(
+            question="state machine completed rerun skip",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+
+        started = begin_stage(run_dir, "planning")
+        record_stage_trace(
+            run_dir,
+            stage="planning",
+            agent_role="test_agent",
+            status_payload={
+                "run_id": prepared["run_id"],
+                "status": "skipped",
+                "skip_reason": "test_rerun_no_work",
+                "artifacts": {},
+            },
+            prompt_summary="Exercise skipped status after completed-stage rerun start.",
+            tool_call_summary="Recorded skipped rerun status without mutating domain artifacts.",
+        )
+        state = inspect_run_state(run_dir)
+        planning = {stage["stage"]: stage for stage in state["stages"]}["planning"]
+
+        self.assertEqual(started.status, "running")
+        self.assertEqual(planning["status"], "completed")
+        self.assertFalse(planning["retryable"])
+        self.assertEqual(planning["skip_reason"], "test_rerun_no_work")
+        self.assertEqual(planning["last_rerun_status"], "skipped")
+        self.assertEqual(planning["previous_terminal_status"]["status"], "completed")
+        self.assertEqual(planning["history"][-1]["from"], "running")
+        self.assertEqual(planning["history"][-1]["to"], "completed")
+        self.assertEqual(planning["history"][-1]["rerun_status"], "skipped")
 
     def test_invalid_transition_reports_machine_readable_error(self) -> None:
         prepared = prepare_run(
@@ -160,7 +240,7 @@ class RunStateTests(unittest.TestCase):
             transition_stage(
                 run_dir,
                 "planning",
-                "running",
+                "pending",
                 reason="test_invalid_transition",
             )
 
@@ -168,7 +248,7 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(payload["code"], "invalid_state_transition")
         self.assertEqual(payload["stage"], "planning")
         self.assertEqual(payload["from_status"], "completed")
-        self.assertEqual(payload["to_status"], "running")
+        self.assertEqual(payload["to_status"], "pending")
 
     def test_failed_stage_is_retryable_and_can_complete_after_retry(self) -> None:
         prepared = prepare_run(
