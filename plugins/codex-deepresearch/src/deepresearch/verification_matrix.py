@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 
 from .evidence_schema import SEARCH_ROUTES, validate_artifacts
 from .search_handoff import SearchHandoffError, resolve_run_dir
+from .trace import record_stage_trace
 
 
 VERIFICATION_MATRIX_SCHEMA_VERSION = "codex-deepresearch.verification-matrix.v0"
@@ -160,6 +161,14 @@ def verify_claims(
         },
         "external_model_call": False,
     }
+    record_stage_trace(
+        run_dir,
+        stage="verify_claims",
+        agent_role="verification_matrix_agent",
+        status_payload=status,
+        prompt_summary="Apply the deterministic verifier matrix to extracted claims.",
+        tool_call_summary="Generated local verifier votes by route and wrote verifier_votes.jsonl.",
+    )
     _write_json(matrix_status_path, status)
     return status
 

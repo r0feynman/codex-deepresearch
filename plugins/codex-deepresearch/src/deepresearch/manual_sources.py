@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .execution_mode import BudgetPreset, resolve_config
 from .search_handoff import resolve_run_dir
+from .trace import record_stage_trace
 
 
 MANUAL_INGEST_SCHEMA_VERSION = "codex-deepresearch.manual-ingest.v0"
@@ -161,6 +162,14 @@ def ingest_manual_sources(
             "manual_ingest_status": str(run_dir / "manual_ingest_status.json"),
         },
     }
+    record_stage_trace(
+        run_dir,
+        stage="ingest_manual",
+        agent_role="manual_source_ingest_agent",
+        status_payload=status,
+        prompt_summary="Record user-provided source and image metadata without external fetches.",
+        tool_call_summary="Copied or referenced manual inputs, updated evidence.json, and wrote manual_ingest_status.json.",
+    )
     _write_json(run_dir / "manual_ingest_status.json", status)
     return status
 

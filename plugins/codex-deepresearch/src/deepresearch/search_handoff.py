@@ -19,6 +19,7 @@ from .evidence_schema import (
 )
 from .execution_mode import BudgetPreset, resolve_config
 from .modality_router import route_angles
+from .trace import record_stage_trace
 
 
 HANDOFF_SCHEMA_VERSION = "codex-deepresearch.search-handoff.v0"
@@ -147,6 +148,14 @@ def prepare_run(
             "Fill search_results.jsonl with SearchResult records, then run "
             "codex-deepresearch ingest --run <run_id_or_path>."
         ),
+        "artifacts": {
+            "evidence": str(run_dir / "evidence.json"),
+            "search_tasks": str(run_dir / "search_tasks.json"),
+            "search_results": str(run_dir / "search_results.jsonl"),
+            "visual_tasks": str(run_dir / "visual_tasks.json"),
+            "visual_observations": str(run_dir / "visual_observations.jsonl"),
+            "status": str(run_dir / "status.json"),
+        },
     }
 
     _write_json(run_dir / "evidence.json", evidence)
@@ -154,14 +163,37 @@ def prepare_run(
     (run_dir / "search_results.jsonl").write_text("", encoding="utf-8")
     _write_json(run_dir / "visual_tasks.json", visual_tasks_artifact)
     (run_dir / "visual_observations.jsonl").write_text("", encoding="utf-8")
-    _write_json(run_dir / "status.json", status)
 
     validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
     if not validation.valid:
+        status["status"] = "failed_validation"
+        status["validation"] = validation.to_dict()
+        record_stage_trace(
+            run_dir,
+            stage="planning",
+            agent_role="planner",
+            status_payload=status,
+            prompt_summary="Create a Codex-native search handoff plan for the research question.",
+            tool_call_summary="Resolved local execution config, routed planner angles, and wrote run handoff artifacts.",
+            event_type="run_start",
+            timestamp=now,
+        )
+        _write_json(run_dir / "status.json", status)
         raise SearchHandoffError(
             "prepared evidence.json failed validation: "
             + json.dumps(validation.to_dict(), sort_keys=True)
         )
+    record_stage_trace(
+        run_dir,
+        stage="planning",
+        agent_role="planner",
+        status_payload=status,
+        prompt_summary="Create a Codex-native search handoff plan for the research question.",
+        tool_call_summary="Resolved local execution config, routed planner angles, and wrote run handoff artifacts.",
+        event_type="run_start",
+        timestamp=now,
+    )
+    _write_json(run_dir / "status.json", status)
 
     return {
         "schema_version": HANDOFF_SCHEMA_VERSION,
@@ -175,6 +207,7 @@ def prepare_run(
             "visual_tasks": str(run_dir / "visual_tasks.json"),
             "visual_observations": str(run_dir / "visual_observations.jsonl"),
             "status": str(run_dir / "status.json"),
+            "run_trace": str(run_dir / "run_trace.jsonl"),
         },
     }
 
@@ -203,6 +236,19 @@ def ingest_run(
     if not validation.valid:
         status = _base_ingest_status(run_dir, "failed_validation")
         status["validation"] = validation.to_dict()
+        status["artifacts"] = {
+            "evidence": str(evidence_path),
+            "search_results": str(search_results_path),
+            "ingest_status": str(run_dir / "ingest_status.json"),
+        }
+        record_stage_trace(
+            run_dir,
+            stage="ingest",
+            agent_role="search_ingest_agent",
+            status_payload=status,
+            prompt_summary="Ingest SearchResult records from the prepared handoff artifact.",
+            tool_call_summary="Validated evidence and search_results JSONL before normalizing sources.",
+        )
         _write_json(run_dir / "ingest_status.json", status)
         return status
 
@@ -287,6 +333,14 @@ def ingest_run(
             },
         }
     )
+    record_stage_trace(
+        run_dir,
+        stage="ingest",
+        agent_role="search_ingest_agent",
+        status_payload=status,
+        prompt_summary="Ingest SearchResult records from the prepared handoff artifact.",
+        tool_call_summary="Read search_results.jsonl, normalized source metadata, and wrote fetch_queue.json.",
+    )
     _write_json(run_dir / "ingest_status.json", status)
     return status
 
@@ -314,6 +368,17 @@ def resolve_run_dir(run: str | Path, *, runs_dir: str | Path | None = None) -> P
 def _write_blocked_status(run_dir: Path, reason: str) -> dict[str, Any]:
     status = _base_ingest_status(run_dir, "blocked_missing_search_handoff")
     status["errors"] = [{"code": reason, "status": "blocked_missing_search_handoff"}]
+    status["artifacts"] = {
+        "ingest_status": str(run_dir / "ingest_status.json"),
+    }
+    record_stage_trace(
+        run_dir,
+        stage="ingest",
+        agent_role="search_ingest_agent",
+        status_payload=status,
+        prompt_summary="Ingest SearchResult records from the prepared handoff artifact.",
+        tool_call_summary="Checked required search handoff artifacts before ingestion.",
+    )
     _write_json(run_dir / "ingest_status.json", status)
     return status
 

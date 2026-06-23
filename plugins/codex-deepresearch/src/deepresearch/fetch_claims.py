@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from .evidence_schema import validate_artifacts
 from .search_handoff import SearchHandoffError, resolve_run_dir
+from .trace import record_stage_trace
 
 
 FETCH_CLAIMS_SCHEMA_VERSION = "codex-deepresearch.fetch-claims.v0"
@@ -158,6 +159,18 @@ def fetch_claims(
     if not fetch_queue_path.exists():
         status = _base_status(run_dir, "blocked_missing_fetch_queue")
         status["errors"] = [{"code": "missing_fetch_queue", "status": "blocked"}]
+        status["artifacts"] = {
+            "evidence": str(evidence_path),
+            "fetch_claims_status": str(run_dir / "fetch_claims_status.json"),
+        }
+        record_stage_trace(
+            run_dir,
+            stage="fetch_claims",
+            agent_role="fetch_claims_agent",
+            status_payload=status,
+            prompt_summary="Fetch queued sources and extract low-confidence source-linked claims.",
+            tool_call_summary="Checked for fetch_queue.json before fetching source bodies.",
+        )
         _write_run_json(run_dir, "fetch_claims_status.json", status)
         return status
 
@@ -358,6 +371,14 @@ def fetch_claims(
     )
     if not validation.valid:
         status["status"] = "failed_validation"
+    record_stage_trace(
+        run_dir,
+        stage="fetch_claims",
+        agent_role="fetch_claims_agent",
+        status_payload=status,
+        prompt_summary="Fetch queued sources and extract low-confidence source-linked claims.",
+        tool_call_summary="Fetched allowed source bodies, preserved local artifacts, and extracted quote candidates.",
+    )
     _write_run_json(run_dir, "fetch_claims_status.json", status)
     return status
 

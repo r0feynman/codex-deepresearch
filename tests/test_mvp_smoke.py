@@ -89,6 +89,20 @@ class MvpSmokeTests(unittest.TestCase):
         self.assertEqual(optional_evidence["claims"][0]["verification_status"], "budget_pruned")
         self.assertEqual(self.read_jsonl(optional_run / "verifier_votes.jsonl"), [])
 
+        all_fixture_summaries = [
+            *result["fixtures"]["text_only"],
+            *result["fixtures"]["visual_required"],
+            *result["fixtures"]["visual_optional"],
+        ]
+        for fixture in all_fixture_summaries:
+            trace_path = Path(fixture["artifacts"]["run_trace"])
+            self.assertTrue(trace_path.is_file(), fixture["id"])
+            self.assertGreaterEqual(len(self.read_jsonl(trace_path)), 1)
+
+        guardrail_trace = Path(result["guardrail_fixture_suite"]["artifacts"]["run_trace"])
+        self.assertTrue(guardrail_trace.is_file())
+        self.assertGreaterEqual(len(self.read_jsonl(guardrail_trace)), 1)
+
     def test_cli_mvp_smoke_outputs_machine_readable_results(self) -> None:
         runs_dir = self.temp_runs_dir()
         fake_bin = self.fake_codex_bin(runs_dir)
