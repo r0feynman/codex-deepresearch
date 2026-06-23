@@ -39,6 +39,7 @@ from .trace import (
     validate_trace_record,
 )
 from .verification_matrix import VerificationMatrixError, verify_claims
+from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
 from .vision_adapter import VisionAdapterError, ingest_vision_observations
 
 __all__ = [
@@ -65,9 +66,11 @@ __all__ = [
     "TraceValidationResult",
     "ValidationError",
     "ValidationResult",
+    "VisualAcquisitionError",
     "VerificationMatrixError",
     "VisionAdapterError",
     "add_budget_estimate_artifact",
+    "acquire_visual_candidates",
     "begin_stage",
     "budget_estimate_path",
     "enforce_guardrails",

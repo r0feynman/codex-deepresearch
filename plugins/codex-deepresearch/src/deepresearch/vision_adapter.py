@@ -323,9 +323,23 @@ def _normalize_visual_record(
     elif isinstance(response, str) and response.strip():
         observations.append(response.strip())
 
-    ocr_text = _first_optional_string(record, "ocr_text") or _first_optional_string(image, "ocr_text")
-    if ocr_text:
-        observations.append(ocr_text)
+    ocr_text = (
+        _first_optional_string(record, "ocr_text", "text_in_image")
+        or _first_optional_string(image, "ocr_text", "text_in_image")
+    )
+    ocr_outputs = _ocr_outputs(record, image, ocr_text=ocr_text)
+    visual_summary = (
+        _first_optional_string(record, "vlm_visual_summary", "visual_summary")
+        or _first_optional_string(image, "vlm_visual_summary", "visual_summary")
+    )
+    visual_description = (
+        _first_optional_string(record, "vlm_visual_description", "visual_description")
+        or _first_optional_string(image, "vlm_visual_description", "visual_description")
+    )
+    if visual_summary:
+        observations.append(visual_summary)
+    if visual_description and visual_description != visual_summary:
+        observations.append(visual_description)
 
     observations = _dedupe(observations)
     inferences = _dedupe(inferences)
@@ -349,8 +363,11 @@ def _normalize_visual_record(
         "hash": _hash(record, image, artifact_file),
         "phash": _first_optional_string(record, "phash") or _first_optional_string(image, "phash"),
         "ocr_text": ocr_text,
+        "ocr_outputs": ocr_outputs,
         "observations": observations,
         "inferences": inferences,
+        "vlm_visual_summary": visual_summary,
+        "vlm_visual_description": visual_description,
         "visual_tasks": _dedupe(_string_list(record, "visual_tasks", "tasks")),
         "analysis_provider": provider,
         "analysis_status": _analysis_status(record, observations, inferences),
@@ -365,6 +382,7 @@ def _normalize_visual_record(
         visual["raw_provider_metadata"] = dict(raw_provider_metadata)
     elif isinstance(response, Mapping):
         visual["raw_provider_metadata"] = {"response": dict(response)}
+    _copy_optional_visual_metadata(record, image, visual)
     visual["cache_key"] = image_cache_key(visual, source=source)
     return visual
 
@@ -541,6 +559,65 @@ def _artifact_size_bytes(
                 except ValueError:
                     continue
     return None
+
+
+def _ocr_outputs(
+    record: Mapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    ocr_text: str | None,
+) -> list[dict[str, Any]]:
+    outputs: list[dict[str, Any]] = []
+    for container in (record, image):
+        raw = container.get("ocr_outputs")
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            for item in raw:
+                if isinstance(item, Mapping):
+                    text = _first_optional_string(item, "text", "ocr_text", "text_in_image")
+                    if text:
+                        entry = dict(item)
+                        entry["text"] = text
+                        outputs.append(entry)
+                else:
+                    text = str(item).strip()
+                    if text:
+                        outputs.append({"text": text})
+    if ocr_text and not any(output.get("text") == ocr_text for output in outputs):
+        outputs.append({"text": ocr_text})
+    return outputs
+
+
+def _copy_optional_visual_metadata(
+    record: Mapping[str, Any],
+    image: Mapping[str, Any],
+    visual: dict[str, Any],
+) -> None:
+    scalar_keys = (
+        "candidate_id",
+        "candidate_class",
+        "visual_provider",
+        "visual_acquisition_provider",
+        "duplicate_of",
+        "near_duplicate_group_id",
+        "near_duplicate_of",
+        "removal_reason",
+    )
+    list_keys = ("removal_reasons",)
+    mapping_keys = ("visual_validation", "validation_checks", "screenshot")
+    for key in scalar_keys:
+        value = _first_optional_string(record, key) or _first_optional_string(image, key)
+        if value:
+            visual[key] = value
+    for key in list_keys:
+        values = _dedupe(_string_list(record, key) + _string_list(image, key))
+        if values:
+            visual[key] = values
+    for key in mapping_keys:
+        value = record.get(key)
+        if not isinstance(value, Mapping):
+            value = image.get(key)
+        if isinstance(value, Mapping):
+            visual[key] = dict(value)
 
 
 def _number(record: Mapping[str, Any], image: Mapping[str, Any], key: str) -> int | float:

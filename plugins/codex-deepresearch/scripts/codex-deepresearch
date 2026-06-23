@@ -26,6 +26,7 @@ from deepresearch.run_state import RunStepStateError, inspect_run_state
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
 from deepresearch.trace import record_exception_trace
 from deepresearch.verification_matrix import VerificationMatrixError, verify_claims
+from deepresearch.visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
 from deepresearch.vision_adapter import VisionAdapterError, ingest_vision_observations
 
 PLUGIN_NAME = "codex-deepresearch"
@@ -358,6 +359,26 @@ def run_ingest_vision(args: argparse.Namespace) -> int:
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["status"] in {"failed_normalization", "failed_validation"}:
         return 2
+    validation = result.get("validation")
+    if isinstance(validation, dict) and validation.get("valid") is False:
+        return 2
+    return 0
+
+
+def run_acquire_visual(args: argparse.Namespace) -> int:
+    try:
+        result = acquire_visual_candidates(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            providers=args.provider,
+            screenshot_modes=args.screenshot_mode,
+            max_image_bytes=args.max_image_bytes,
+        )
+    except (VisualAcquisitionError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
     validation = result.get("validation")
     if isinstance(validation, dict) and validation.get("valid") is False:
         return 2
@@ -815,6 +836,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ingest_vision.set_defaults(func=run_ingest_vision)
+
+    acquire_visual = subparsers.add_parser(
+        "acquire-visual",
+        help="Collect deterministic local/test visual candidates for visual routes.",
+    )
+    acquire_visual.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    acquire_visual.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    acquire_visual.add_argument(
+        "--provider",
+        action="append",
+        help=(
+            "Local/test visual provider. Repeatable or comma-separated. "
+            "Defaults to local-page, local-image-fixture, local-screenshot-fixture."
+        ),
+    )
+    acquire_visual.add_argument(
+        "--screenshot-mode",
+        action="append",
+        help=(
+            "Screenshot mode to represent: all, first_viewport, full_page, scroll, "
+            "or interaction. Repeatable or comma-separated. Defaults to all."
+        ),
+    )
+    acquire_visual.add_argument(
+        "--max-image-bytes",
+        type=int,
+        default=1_000_000,
+        help="Maximum allowed image artifact size in bytes before candidate removal.",
+    )
+    acquire_visual.set_defaults(func=run_acquire_visual)
 
     verify_claims_parser = subparsers.add_parser(
         "verify-claims",
