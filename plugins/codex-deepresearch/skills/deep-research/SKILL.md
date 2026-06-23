@@ -38,7 +38,8 @@ In plugin mode, do not assume a hidden Codex search API is available to the runn
 5. Run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_path>`.
 6. For visual tasks, write explicit visual observation JSONL and run `plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision --run <run_id_or_path> --provider <codex-interactive|openai-responses-vision|manual-visual-review> --observations <jsonl>`. Do not assume the runner can call Codex interactive VLM as a hidden API.
 7. Run `plugins/codex-deepresearch/scripts/codex-deepresearch fetch-claims --run <run_id_or_path>` to fetch queued sources, preserve source artifacts, extract quote candidates, and append low-confidence unverified claims.
-8. Continue only from the normalized `evidence.json`, `fetch_queue.json`, `visual_observations.jsonl`, and fetched source artifacts.
+8. Run `plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run <run_id_or_path>` to apply the deterministic verifier matrix, write `verifier_votes.jsonl`, and update claim verification state. This runner stage uses only normalized local evidence; it does not call external models, VLMs, web search, or APIs.
+9. Continue only from the normalized `evidence.json`, `fetch_queue.json`, `visual_observations.jsonl`, `verifier_votes.jsonl`, and fetched source artifacts.
 
 ## Manual Sources Fallback
 
@@ -55,6 +56,8 @@ Use `--pdf` for PDF URLs or local PDF files, `--image-url` for remote images, an
 - Prefer primary sources, official documentation, original reports, papers, repositories, or direct screenshots.
 - Do not treat a search result snippet as evidence by itself.
 - Treat first-pass fetched text claims as unverified and low confidence until later verifier stages review them.
+- Apply route-specific verifier rules before promotion or report drafting: `text_only` claims require two text votes and one policy/freshness vote, `visual_required` claims require two text votes, one visual vote, and one policy vote, and `visual_optional` claims use visual votes only when usable visual evidence is already available.
+- Keep `budget_pruned` claims out of final reporting by honoring `include_in_final_report=false`.
 - Track retrieval date for time-sensitive facts.
 - Separate observations from inference.
 - For images, preserve the original page URL when possible, not only the image URL.

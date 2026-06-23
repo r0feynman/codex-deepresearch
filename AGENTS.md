@@ -42,6 +42,47 @@ python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.
 plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --evidence tests/fixtures/evidence_schema/valid_evidence.json --search-results tests/fixtures/evidence_schema/search_results.jsonl --visual-observations tests/fixtures/evidence_schema/visual_observations.jsonl --verifier-votes tests/fixtures/evidence_schema/verifier_votes.jsonl
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "Manual validation" --runs-dir /tmp/codex-deepresearch-manual-validation --url https://example.com/manual-source
 tmpdir=/tmp/codex-deepresearch-vision-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Vision adapter validation" --runs-dir "$tmpdir" --route visual_required | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision --run "$run_dir" --provider codex-interactive
+tmpdir=/tmp/codex-deepresearch-verify-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Verification matrix validation" --runs-dir "$tmpdir" --route text_only | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); page="$run_dir/source.html"; printf '<html><body><p>The verification matrix validation command extracts a source linked claim.</p></body></html>' > "$page"; python3 - "$run_dir" "$page" <<'PY'
+import json, sys
+from pathlib import Path
+run_dir = Path(sys.argv[1])
+page = Path(sys.argv[2])
+evidence = json.loads((run_dir / "evidence.json").read_text())
+source = {
+    "id": "src_verify_validation",
+    "type": "web",
+    "url": page.resolve().as_uri(),
+    "title": "Verification Validation Source",
+    "published_at": None,
+    "accessed_at": "2026-06-22T00:00:00Z",
+    "quality": "primary",
+    "retrieval_status": "fetched",
+    "local_artifact_path": "sources/src_verify_validation.html",
+    "license_policy": "allowed",
+    "robots_policy": "allowed",
+    "policy_decision": "allowed",
+    "policy_flags": [],
+    "route": "text_only",
+    "angle_id": "angle_001",
+}
+evidence["sources"] = [source]
+evidence["claims"] = [{
+    "id": "claim_verify_validation",
+    "text": "The verification matrix validation command extracts a source linked claim.",
+    "claim_type": "text",
+    "supporting_sources": ["src_verify_validation"],
+    "supporting_images": [],
+    "quote_spans": [{"source_id": "src_verify_validation", "quote": "The verification matrix validation command extracts a source linked claim.", "location": "paragraph 1"}],
+    "votes": [],
+    "verification_status": "unverified",
+    "review_status": "not_reviewed",
+    "promotion_status": "not_eligible",
+    "confidence": "low",
+    "caveats": [],
+}]
+(run_dir / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+PY
+plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run "$run_dir"
 ```
 
 `python3 scripts/validate_repo.py` also runs a no-network `fetch-claims` smoke against a temporary local HTML source.

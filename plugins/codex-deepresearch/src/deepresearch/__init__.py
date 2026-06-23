@@ -6,6 +6,7 @@ from .fetch_claims import FetchClaimsError, fetch_claims
 from .manual_sources import ManualSourcesError, ingest_manual_sources
 from .modality_router import ModalityDecision, route_angle, route_angles
 from .search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
+from .verification_matrix import VerificationMatrixError, verify_claims
 from .vision_adapter import VisionAdapterError, ingest_vision_observations
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "SearchHandoffError",
     "ValidationError",
     "ValidationResult",
+    "VerificationMatrixError",
     "VisionAdapterError",
     "fetch_claims",
     "ingest_run",
@@ -28,4 +30,5 @@ __all__ = [
     "resolve_config",
     "resolve_run_dir",
     "validate_artifacts",
+    "verify_claims",
 ]
