@@ -24,6 +24,24 @@ def source_cache_key(
         "schema_version": CACHE_KEY_SCHEMA_VERSION,
         "type": _normalize_scalar(_first_string(entry, "type") or _first_string(source, "type")),
         "url": normalize_url(_first_string(entry, "url") or _first_string(source, "url") or ""),
+        "content_hash": _normalize_hash(
+            _first_string(
+                entry,
+                "current_content_sha256",
+                "input_content_sha256",
+                "content_sha256",
+                "source_content_sha256",
+            )
+            or _first_string(
+                source,
+                "current_content_sha256",
+                "input_content_sha256",
+                "content_sha256",
+                "source_content_sha256",
+                "artifact_sha256",
+            )
+            or ""
+        ),
         "policy_context": {
             "license_policy": _normalize_scalar(
                 _first_string(source, "license_policy")
@@ -75,6 +93,19 @@ def image_cache_key(
             "source_url": normalize_url(source_url or ""),
             "page_url": normalize_url(_first_string(image, "page_url") or ""),
             "image_url": normalize_url(_first_string(image, "image_url") or ""),
+            "local_artifact_path": _compact_whitespace(
+                _first_string(image, "local_artifact_path") or ""
+            ),
+        },
+        "verification_inputs": {
+            "origin": _normalize_scalar(_first_string(image, "origin") or ""),
+            "analysis_status": _normalize_scalar(
+                _first_string(image, "analysis_status") or ""
+            ),
+            "policy_flags": _normalized_string_set(_string_list(image.get("policy_flags"))),
+            "observations": _normalized_text_list(image.get("observations")),
+            "inferences": _normalized_text_list(image.get("inferences")),
+            "ocr_text": normalize_text(_first_string(image, "ocr_text") or ""),
         },
     }
     return _digest("image", payload)
@@ -85,6 +116,7 @@ def claim_cache_key(
     *,
     sources_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     images_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    verification_route: str | None = None,
 ) -> str:
     """Return the stable cache key for a claim verification decision."""
 
@@ -96,6 +128,7 @@ def claim_cache_key(
         "kind": "claim",
         "schema_version": CACHE_KEY_SCHEMA_VERSION,
         "claim_type": _normalize_scalar(_first_string(claim, "claim_type") or "text"),
+        "verification_route": _normalize_scalar(verification_route or ""),
         "text": normalize_text(_first_string(claim, "text") or ""),
         "supporting_sources": [
             {
@@ -240,6 +273,10 @@ def _string_list(value: Any) -> list[str]:
 
 def _normalized_string_set(values: Sequence[str]) -> list[str]:
     return sorted({_normalize_scalar(value) for value in values if value.strip()})
+
+
+def _normalized_text_list(value: Any) -> list[str]:
+    return sorted({normalize_text(item) for item in _string_list(value) if item.strip()})
 
 
 def _normalize_scalar(value: str | None) -> str:

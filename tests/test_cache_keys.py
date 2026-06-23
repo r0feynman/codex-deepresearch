@@ -28,9 +28,11 @@ class CacheKeyTests(unittest.TestCase):
             "policy_flags": ["robots_allowed"],
         }
         changed_policy = {**same, "robots_policy": "disallowed"}
+        changed_content = {**same, "current_content_sha256": "sha256:changed"}
 
         self.assertEqual(source_cache_key(source), source_cache_key(same))
         self.assertNotEqual(source_cache_key(source), source_cache_key(changed_policy))
+        self.assertNotEqual(source_cache_key(source), source_cache_key(changed_content))
 
     def test_image_key_uses_mime_size_hash_and_source_url_metadata(self) -> None:
         source = {"id": "src_001", "url": "https://example.com/source"}
@@ -40,6 +42,10 @@ class CacheKeyTests(unittest.TestCase):
             "hash": "sha256:abc",
             "page_url": "https://example.com/source#ignored",
             "image_url": "https://cdn.example.com/image.png",
+            "analysis_status": "analyzed",
+            "policy_flags": [],
+            "observations": ["The button is visible."],
+            "inferences": ["The image supports the claim."],
         }
 
         baseline = image_cache_key(image, source=source)
@@ -52,6 +58,14 @@ class CacheKeyTests(unittest.TestCase):
         self.assertNotEqual(
             baseline,
             image_cache_key(image, source={**source, "url": "https://example.com/changed"}),
+        )
+        self.assertNotEqual(
+            baseline,
+            image_cache_key({**image, "policy_flags": ["private_image"]}, source=source),
+        )
+        self.assertNotEqual(
+            baseline,
+            image_cache_key({**image, "observations": ["The button is corrected."]}, source=source),
         )
 
     def test_claim_key_uses_normalized_text_and_supporting_refs(self) -> None:
@@ -92,6 +106,20 @@ class CacheKeyTests(unittest.TestCase):
         self.assertNotEqual(
             claim_cache_key(claim, sources_by_id=sources, images_by_id=images),
             claim_cache_key(changed_ref, sources_by_id=sources, images_by_id=images),
+        )
+        self.assertNotEqual(
+            claim_cache_key(
+                claim,
+                sources_by_id=sources,
+                images_by_id=images,
+                verification_route="text_only",
+            ),
+            claim_cache_key(
+                claim,
+                sources_by_id=sources,
+                images_by_id=images,
+                verification_route="visual_required",
+            ),
         )
 
 

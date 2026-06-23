@@ -12,7 +12,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from .cache_keys import claim_cache_key, source_cache_key
@@ -248,6 +248,7 @@ def fetch_claims(
             entry["retrieval_status"] = "failed"
             continue
 
+        content_hash_proven_current = _attach_current_source_content_metadata(source, entry)
         previous_source_cache_key = source.get("cache_key")
         current_source_cache_key = source_cache_key(source, entry)
         source["cache_key"] = current_source_cache_key
@@ -257,6 +258,7 @@ def fetch_claims(
             source,
             current_source_cache_key,
             previous_cache_key=previous_source_cache_key,
+            content_hash_proven_current=content_hash_proven_current,
         ):
             _refresh_fetch_claim_cache_keys(
                 evidence,
@@ -312,6 +314,11 @@ def fetch_claims(
         source["local_artifact_path"] = raw_path
         source["artifact_mime_type"] = fetched.mime_type
         source["artifact_sha256"] = "sha256:" + hashlib.sha256(fetched.content).hexdigest()
+        source["content_sha256"] = source["artifact_sha256"]
+        entry["content_sha256"] = source["artifact_sha256"]
+        current_source_cache_key = source_cache_key(source, entry)
+        source["cache_key"] = current_source_cache_key
+        entry["cache_key"] = current_source_cache_key
         source["fetched_at"] = now
         source["accessed_at"] = now
         source["final_url"] = fetched.final_url
@@ -652,13 +659,66 @@ def _safe_id(value: str) -> str:
     return safe or "source"
 
 
+def _attach_current_source_content_metadata(
+    source: dict[str, Any],
+    entry: dict[str, Any],
+) -> bool:
+    url = str(entry.get("url") or source.get("url") or "")
+    parsed = urlparse(url)
+    if parsed.scheme == "file":
+        try:
+            file_path = _file_uri_path(parsed)
+            digest = "sha256:" + hashlib.sha256(file_path.read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            source.pop("current_content_sha256", None)
+            entry.pop("current_content_sha256", None)
+            return False
+        source["current_content_sha256"] = digest
+        entry["current_content_sha256"] = digest
+        return True
+
+    explicit_hash = _first_current_content_hash(entry) or _first_current_content_hash(source)
+    if explicit_hash:
+        normalized_hash = _normalize_sha256(explicit_hash)
+        entry["current_content_sha256"] = normalized_hash
+        source["current_content_sha256"] = normalized_hash
+        return True
+    source.pop("current_content_sha256", None)
+    entry.pop("current_content_sha256", None)
+    return False
+
+
+def _first_current_content_hash(record: Mapping[str, Any]) -> str | None:
+    for key in ("input_content_sha256", "source_content_sha256"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _normalize_sha256(value: str) -> str:
+    value = value.strip().lower()
+    return value if value.startswith("sha256:") else f"sha256:{value}"
+
+
+def _file_uri_path(parsed: Any) -> Path:
+    if parsed.scheme != "file":
+        raise ValueError("not a file URI")
+    if parsed.netloc not in {"", "localhost"}:
+        raise ValueError(f"unsupported file URI host: {parsed.netloc}")
+    return Path(unquote(parsed.path))
+
+
 def _can_reuse_completed_source(
     run_dir: Path,
     source: Mapping[str, Any],
     current_cache_key: str,
     *,
     previous_cache_key: Any,
+    content_hash_proven_current: bool,
 ) -> bool:
+    if not content_hash_proven_current:
+        return False
     if isinstance(previous_cache_key, str) and previous_cache_key != current_cache_key:
         return False
     if source.get("retrieval_status") not in {"fetched", "partial"}:

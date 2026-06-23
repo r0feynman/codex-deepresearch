@@ -471,18 +471,18 @@ class FetchClaimsTests(unittest.TestCase):
         self.assertIn("$.evidence.claims[0].quote_spans[0].source_id", dangling_paths)
 
     def test_completed_source_cache_hit_skips_refetch_on_resume(self) -> None:
-        run_dir = self.prepare_ingested_run([self.base_search_result()])
-        html = b"""
+        runs_dir = self.temp_runs_dir()
+        page = runs_dir / "source.html"
+        page.write_text(
+            """
         <html><body>
           <p>The source cache hit test extracts a reusable source linked claim.</p>
         </body></html>
-        """
-        with mock.patch.object(
-            fetch_claims_module,
-            "urlopen",
-            return_value=FakeResponse(html, mime_type="text/html"),
-        ):
-            first = fetch_claims(run=run_dir)
+        """,
+            encoding="utf-8",
+        )
+        run_dir = self.prepare_queued_file_run(page.resolve().as_uri())
+        first = fetch_claims(run=run_dir)
 
         self.assertEqual(first["sources_fetched"], 1)
         first_evidence = self.load_json(run_dir / "evidence.json")
@@ -504,6 +504,64 @@ class FetchClaimsTests(unittest.TestCase):
         second_evidence = self.load_json(run_dir / "evidence.json")
         self.assertEqual(second_evidence["sources"][0]["cache_key"], first_source_key)
         self.assertEqual(second_evidence["claims"], first_claims)
+
+    def test_changed_file_source_content_invalidates_same_url_cache(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        page = runs_dir / "source.html"
+        page.write_text(
+            "<html><body><p>The original file source creates a source linked claim.</p></body></html>",
+            encoding="utf-8",
+        )
+        run_dir = self.prepare_queued_file_run(page.resolve().as_uri())
+        fetch_claims(run=run_dir)
+
+        evidence_path = run_dir / "evidence.json"
+        first_evidence = self.load_json(evidence_path)
+        first_source_key = first_evidence["sources"][0]["cache_key"]
+        first_claim_text = first_evidence["claims"][0]["text"]
+
+        page.write_text(
+            "<html><body><p>The edited file source creates a replacement source linked claim.</p></body></html>",
+            encoding="utf-8",
+        )
+        result = fetch_claims(run=run_dir)
+
+        self.assertEqual(result["sources_reused"], 0)
+        self.assertEqual(result["sources_fetched"], 1)
+        evidence = self.load_json(evidence_path)
+        self.assertNotEqual(evidence["sources"][0]["cache_key"], first_source_key)
+        self.assertEqual(len(evidence["claims"]), 1)
+        self.assertNotEqual(evidence["claims"][0]["text"], first_claim_text)
+        self.assertIn("edited file source", evidence["claims"][0]["text"])
+
+    def test_http_source_without_current_content_hash_refetches_on_retry(self) -> None:
+        run_dir = self.prepare_ingested_run([self.base_search_result()])
+        first_html = b"""
+        <html><body><p>The remote source first fetch creates a source linked claim.</p></body></html>
+        """
+        second_html = b"""
+        <html><body><p>The remote source retry refetch creates a replacement claim.</p></body></html>
+        """
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(first_html, mime_type="text/html"),
+        ):
+            first = fetch_claims(run=run_dir)
+
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(second_html, mime_type="text/html"),
+        ):
+            second = fetch_claims(run=run_dir)
+
+        self.assertEqual(first["sources_fetched"], 1)
+        self.assertEqual(second["sources_reused"], 0)
+        self.assertEqual(second["sources_fetched"], 1)
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(len(evidence["claims"]), 1)
+        self.assertIn("remote source retry refetch", evidence["claims"][0]["text"])
 
     def test_changed_source_url_invalidates_cache_and_replaces_generated_claims(self) -> None:
         run_dir = self.prepare_ingested_run([self.base_search_result()])

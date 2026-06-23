@@ -134,6 +134,63 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(resumed_evidence["images"][0]["cache_key"], first_cache_key)
         self.assertEqual(resumed_evidence["images"][0]["analyzed_at"], first_analyzed_at)
 
+    def test_corrected_observation_rerun_replaces_previous_image_analysis(self) -> None:
+        run_dir = self.prepared_visual_run()
+        observations_path = run_dir / "codex_handoff.jsonl"
+        self.write_jsonl(
+            observations_path,
+            [
+                {
+                    "id": "img_checkout",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "observations": ["Old observation"],
+                    "inferences": ["Old inference"],
+                    "visual_tasks": ["layout_review"],
+                }
+            ],
+        )
+        ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+        old_image = self.assert_valid_run(run_dir)["images"][0]
+
+        self.write_jsonl(
+            observations_path,
+            [
+                {
+                    "id": "img_checkout",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "observations": ["Corrected observation"],
+                    "inferences": ["Corrected inference"],
+                    "visual_tasks": ["layout_review"],
+                }
+            ],
+        )
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+
+        evidence = self.assert_valid_run(run_dir)
+        image = evidence["images"][0]
+        self.assertEqual(result["images_reused"], 0)
+        self.assertNotEqual(image["cache_key"], old_image["cache_key"])
+        self.assertEqual(image["observations"], ["Corrected observation"])
+        self.assertEqual(image["inferences"], ["Corrected inference"])
+
     def test_openai_responses_vision_fixture_emits_visual_evidence_schema(self) -> None:
         run_dir = self.prepared_visual_run(provider="openai-responses-vision")
         observations_path = run_dir / "openai_adapter_response.jsonl"

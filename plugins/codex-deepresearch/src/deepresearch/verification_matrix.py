@@ -121,6 +121,7 @@ def verify_claims(
             claim,
             sources_by_id=sources_by_id,
             images_by_id=images_by_id,
+            verification_route=route,
         )
         preserved_votes = _preserved_votes(claim, existing_top_level_votes)
         reusable_matrix_votes = _existing_matrix_votes(claim, existing_top_level_votes)
@@ -499,17 +500,9 @@ def _claim_route(
     sources_by_id: Mapping[str, Mapping[str, Any]],
     routing_by_angle: Mapping[str, str],
 ) -> str:
-    explicit = _first_allowed_route(
-        claim.get("verification_route"),
-        claim.get("route"),
-        claim.get("search_route"),
-    )
+    explicit = _first_allowed_route(claim.get("route"), claim.get("search_route"))
     if explicit is not None:
         return explicit
-
-    angle_id = claim.get("angle_id")
-    if isinstance(angle_id, str) and angle_id in routing_by_angle:
-        return routing_by_angle[angle_id]
 
     source_routes = {
         source.get("route")
@@ -523,6 +516,14 @@ def _claim_route(
         return "visual_required"
     if "visual_optional" in source_routes:
         return "visual_optional"
+
+    angle_id = claim.get("angle_id")
+    if isinstance(angle_id, str) and angle_id in routing_by_angle:
+        return routing_by_angle[angle_id]
+
+    persisted = _first_allowed_route(claim.get("verification_route"))
+    if persisted is not None:
+        return persisted
 
     routing_routes = set(routing_by_angle.values())
     if len(routing_routes) == 1:

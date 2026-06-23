@@ -565,6 +565,93 @@ class VerificationMatrixTests(unittest.TestCase):
             {"2026-06-22T00:20:00Z"},
         )
 
+    def test_changed_route_ignores_stale_verification_route_and_regenerates(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [self.claim(claim_id="claim_changed_route")]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["claims"][0]["verification_route"], "text_only")
+        old_cache_key = evidence["claims"][0]["verification_cache_key"]
+        evidence["routing"][0]["modality"] = "visual_required"
+        evidence["sources"][0]["route"] = "visual_required"
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:25:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_route"], "visual_required")
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertEqual(result["claim_statuses"][0]["route"], "visual_required")
+        visual_votes = [
+            vote for vote in self.votes_for(run_dir, "claim_changed_route")
+            if vote["verifier_type"] == "visual"
+        ]
+        self.assertEqual(len(visual_votes), 1)
+        self.assertEqual(visual_votes[0]["created_at"], "2026-06-22T00:25:00Z")
+
+    def test_changed_image_policy_flag_invalidates_verification_cache(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_changed_image_policy",
+                claim_type="visual",
+                supporting_images=["img_001"],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        old_cache_key = evidence["claims"][0]["verification_cache_key"]
+        evidence["images"][0]["policy_flags"] = ["private_image"]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:30:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertEqual(
+            {vote["created_at"] for vote in self.votes_for(run_dir, "claim_changed_image_policy")},
+            {"2026-06-22T00:30:00Z"},
+        )
+        self.assertTrue(
+            any(
+                vote["verifier_type"] == "policy" and vote["vote"] == "blocked"
+                for vote in self.votes_for(run_dir, "claim_changed_image_policy")
+            )
+        )
+
     def test_cli_verify_claims_outputs_status_json(self) -> None:
         run_dir = self.temp_run(route="text_only")
         evidence = self.load_json(run_dir / "evidence.json")
