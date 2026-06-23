@@ -198,6 +198,63 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(guardrails["status"], "completed")
         return prepared, run_dir
 
+    def create_completed_status_artifact_run(self, runs_dir: Path) -> tuple[dict, Path]:
+        prepared = prepare_run(
+            question="state machine completed status artifact reconstruction",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        page = runs_dir / "completed-source.html"
+        page.write_text(
+            (
+                "<html><body><p>The completed reconstruction test extracts a "
+                "source linked claim.</p></body></html>"
+            ),
+            encoding="utf-8",
+        )
+        self.write_search_results(
+            run_dir,
+            [self.base_search_result(title="Completed Source")],
+        )
+
+        ingest = ingest_run(run=run_dir)
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["url"] = page.resolve().as_uri()
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        fetch_queue_path = run_dir / "fetch_queue.json"
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["url"] = page.resolve().as_uri()
+        fetch_queue_path.write_text(json.dumps(fetch_queue), encoding="utf-8")
+
+        fetch = fetch_claims(run=run_dir)
+        vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        guardrails = enforce_guardrails(run=run_dir)
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(ingest["status"], "ingested")
+        self.assertEqual(fetch["status"], "completed")
+        self.assertEqual(vision["status"], "no_visual_tasks")
+        self.assertEqual(guardrails["status"], "completed")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        return prepared, run_dir
+
+    def stamp_completed_status_artifacts(self, run_dir: Path, timestamp: str) -> None:
+        self.set_status_timestamps(run_dir / "status.json", timestamp)
+        self.set_status_timestamps(run_dir / "ingest_status.json", timestamp)
+        self.set_status_timestamps(run_dir / "fetch_claims_status.json", timestamp)
+        self.set_status_timestamps(run_dir / "vision_ingest_status.json", timestamp)
+        self.set_status_timestamps(run_dir / "guardrails_status.json", timestamp)
+        self.set_status_timestamps(run_dir / "verification_matrix_status.json", timestamp)
+        self.set_status_timestamps(
+            run_dir / "report_status.json",
+            timestamp,
+            keys=("created_at", "generated_at"),
+        )
+
     def stamp_stale_downstream_artifacts(self, run_dir: Path) -> None:
         self.set_status_timestamps(run_dir / "status.json", "2026-06-22T00:00:00Z")
         self.set_status_timestamps(run_dir / "ingest_status.json", "2026-06-22T00:00:05Z")
@@ -317,7 +374,7 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(stages["planning"]["status"], "completed")
         self.assertEqual(stages["ingest"]["status"], "pending")
 
-    def test_reconstruction_merges_status_artifacts_after_partial_trace(self) -> None:
+    def test_reconstruction_merges_same_second_status_artifacts_after_partial_trace(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(
             question="state machine partial trace reconstruction",
@@ -331,9 +388,10 @@ class RunStateTests(unittest.TestCase):
 
         records = read_trace_records(run_dir / "run_trace.jsonl")
         self.assertEqual([record["stage"] for record in records], ["planning", "ingest"])
-        self.set_status_timestamps(run_dir / "status.json", "2026-06-22T00:00:01Z")
-        self.set_status_timestamps(run_dir / "ingest_status.json", "2026-06-22T00:00:02Z")
-        records[0]["timestamp"] = "2026-06-22T00:00:01Z"
+        same_second = "2026-06-22T00:00:01Z"
+        self.set_status_timestamps(run_dir / "status.json", same_second)
+        self.set_status_timestamps(run_dir / "ingest_status.json", same_second)
+        records[0]["timestamp"] = same_second
         (run_dir / "run_trace.jsonl").write_text(
             json.dumps(records[0]) + "\n",
             encoding="utf-8",
@@ -348,10 +406,37 @@ class RunStateTests(unittest.TestCase):
         self.assertFalse(state["next_stage_retryable"])
         self.assertEqual(stages["planning"]["status"], "completed")
         self.assertEqual(stages["ingest"]["status"], "completed")
+        self.assertNotIn("stale_reset", stages["ingest"])
         self.assertEqual(
             stages["ingest"]["artifacts"]["ingest_status"],
             str(run_dir / "ingest_status.json"),
         )
+
+    def test_reconstruction_from_completed_status_artifacts_without_trace_allows_same_second_timestamps(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared, run_dir = self.create_completed_status_artifact_run(runs_dir)
+        self.stamp_completed_status_artifacts(run_dir, "2026-06-22T00:00:01Z")
+        (run_dir / "run_trace.jsonl").unlink()
+        run_steps_path(run_dir).unlink()
+
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        stages = {stage["stage"]: stage for stage in reconstructed["stages"]}
+
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(reconstructed["status"], "completed")
+        self.assertIsNone(reconstructed["next_safe_stage"])
+        self.assertFalse(reconstructed["next_stage_retryable"])
+        for stage in (
+            "planning",
+            "ingest",
+            "fetch_claims",
+            "ingest_vision",
+            "enforce_guardrails",
+            "verify_claims",
+            "synthesize",
+        ):
+            self.assertIn(stages[stage]["status"], {"completed", "skipped"})
+            self.assertNotIn("stale_reset", stages[stage])
 
     def test_manual_source_reconstruction_restores_ordered_skips(self) -> None:
         runs_dir = self.temp_runs_dir()

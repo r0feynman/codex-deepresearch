@@ -635,9 +635,9 @@ def _stale_ordered_status_artifact_upstream(
     if upstream is None:
         return None
     payload_timestamp = _payload_timestamp(status_payload)
-    if _timestamp_is_after(payload_timestamp, upstream["timestamp"]):
-        return None
-    return upstream
+    if _timestamp_is_demonstrably_after(upstream["timestamp"], payload_timestamp):
+        return upstream
+    return None
 
 
 def _latest_relevant_upstream_ordered_stage(
@@ -771,21 +771,28 @@ def _timestamp_is_demonstrably_after_stale_reset(
     payload_timestamp: str | None,
     stale_reset_at: str,
 ) -> bool:
-    if not payload_timestamp:
+    return _timestamp_is_demonstrably_after(payload_timestamp, stale_reset_at)
+
+
+def _timestamp_is_demonstrably_after(left: str | None, right: str | None) -> bool:
+    if not left or not right:
         return False
-    payload_datetime = _parse_timestamp(payload_timestamp)
-    stale_reset_datetime = _parse_timestamp(stale_reset_at)
-    if payload_datetime is not None and stale_reset_datetime is not None:
-        if payload_datetime <= stale_reset_datetime:
+    left_datetime = _parse_timestamp(left)
+    right_datetime = _parse_timestamp(right)
+    if left_datetime is not None and right_datetime is not None:
+        if left_datetime <= right_datetime:
             return False
-        if (
-            not _timestamp_has_subsecond_precision(stale_reset_at)
-            and payload_datetime.replace(microsecond=0)
-            == stale_reset_datetime.replace(microsecond=0)
+        same_whole_second = (
+            left_datetime.replace(microsecond=0)
+            == right_datetime.replace(microsecond=0)
+        )
+        if same_whole_second and (
+            not _timestamp_has_subsecond_precision(left)
+            or not _timestamp_has_subsecond_precision(right)
         ):
             return False
         return True
-    return payload_timestamp > stale_reset_at
+    return left > right
 
 
 def _timestamp_has_subsecond_precision(value: str) -> bool:
