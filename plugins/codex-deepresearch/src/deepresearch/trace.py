@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .run_state import add_run_steps_artifact, record_trace_state
+
 
 TRACE_SCHEMA_VERSION = "codex-deepresearch.run-trace.v0"
 TRACE_FILENAME = "run_trace.jsonl"
@@ -130,6 +132,7 @@ def record_stage_trace(
 
     run_dir = Path(run_dir)
     add_trace_artifact(status_payload, run_dir)
+    add_run_steps_artifact(status_payload, run_dir)
     record = {
         "schema_version": TRACE_SCHEMA_VERSION,
         "run_id": _run_id(run_dir, status_payload),
@@ -154,6 +157,13 @@ def record_stage_trace(
     if not validation.valid:
         raise TraceError(json.dumps(validation.to_dict(), sort_keys=True))
     append_trace_record(run_dir, record)
+    record_trace_state(
+        run_dir,
+        stage=stage,
+        status_payload=status_payload,
+        trace_event_id=record["event_id"],
+        timestamp=record["timestamp"],
+    )
     return record
 
 

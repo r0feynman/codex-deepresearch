@@ -69,6 +69,16 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_pa
 
 `ingest` validates `search_results.jsonl`, normalizes records into `evidence.json.sources`, and writes `fetch_queue.json` for allowed, fetchable `http`/`https` sources. Invalid URLs and blocked/manual-review policy decisions are preserved in evidence with `retrieval_status=failed` and explicit ingest errors, but they are not added to the fetch queue.
 
+## Run Status
+
+Every runner stage writes `run_steps.json` with `pending`, `running`, `completed`, `failed`, or `skipped` state. Use `run-status` to inspect an interrupted run and identify the next safe stage:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch run-status --run <run_id_or_path>
+```
+
+Most completed stages rerun and revalidate their inputs until M15 cache keys exist. Stages that explicitly skip a completed rerun keep the primary stage state as `completed` and record the skipped rerun in `run_steps.json` history plus `run_trace.jsonl`.
+
 ## Vision Adapter
 
 Use `ingest-vision` after visual tasks have produced a JSONL handoff artifact. The command is a dry adapter: it reads local observation records and normalizes them into `VisualEvidence` without calling Codex interactive VLM, OpenAI, or any external network service.

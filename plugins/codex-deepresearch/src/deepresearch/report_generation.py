@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .evidence_schema import validate_artifacts
+from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
 from .trace import record_stage_trace
 
@@ -72,6 +73,31 @@ def synthesize_report(
         run_dir = resolve_run_dir(run, runs_dir=runs_dir)
     except SearchHandoffError as exc:
         raise ReportGenerationError(str(exc)) from exc
+
+    start = begin_stage(run_dir, "synthesize")
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="synthesize",
+            schema_version=REPORT_STATUS_SCHEMA_VERSION,
+            status_artifact_key="report_status",
+            status_filename=REPORT_STATUS_FILENAME,
+            reason=start.skip_reason or "stage_already_completed",
+        )
+        report_path = run_dir / REPORT_FILENAME
+        if report_path.exists():
+            status["report_path"] = str(report_path)
+            status["artifacts"]["report"] = str(report_path)
+        record_stage_trace(
+            run_dir,
+            stage="synthesize",
+            agent_role="report_synthesis_agent",
+            status_payload=status,
+            prompt_summary="Synthesize a Markdown report from validated evidence.",
+            tool_call_summary="Skipped report synthesis because run_steps.json marks the stage terminal.",
+        )
+        _write_json(run_dir / REPORT_STATUS_FILENAME, status)
+        return status
 
     evidence_path = run_dir / "evidence.json"
     if not evidence_path.exists():

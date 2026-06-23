@@ -22,7 +22,8 @@ from deepresearch.guardrails import GuardrailsError, enforce_guardrails
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
 from deepresearch.mvp_smoke import DEFAULT_INVOKE, MvpSmokeError, run_mvp_smoke
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
-from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run
+from deepresearch.run_state import RunStepStateError, inspect_run_state
+from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
 from deepresearch.trace import record_exception_trace
 from deepresearch.verification_matrix import VerificationMatrixError, verify_claims
 from deepresearch.vision_adapter import VisionAdapterError, ingest_vision_observations
@@ -420,8 +421,23 @@ def run_synthesize(args: argparse.Namespace) -> int:
         return 2
 
     print(json.dumps(result, indent=2, sort_keys=True))
-    if result["status"] != "completed":
+    if result["status"] not in {"completed", "skipped"}:
         return 2
+    return 0
+
+
+def run_run_status(args: argparse.Namespace) -> int:
+    try:
+        run_dir = resolve_run_dir(args.run, runs_dir=resolve_repo_path(args.runs_dir))
+        result = inspect_run_state(run_dir)
+    except RunStepStateError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except SearchHandoffError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
@@ -554,6 +570,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to verifier_votes.jsonl.",
     )
     validate.set_defaults(func=run_validate_evidence)
+
+    run_status = subparsers.add_parser(
+        "run-status",
+        help="Inspect run_steps.json and report the next safe stage for a run.",
+    )
+    run_status.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    run_status.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    run_status.set_defaults(func=run_run_status)
 
     prepare = subparsers.add_parser(
         "prepare",
@@ -791,7 +823,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except RunStepStateError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .execution_mode import BudgetPreset, resolve_config
+from .run_state import begin_stage, skip_stage, skipped_stage_status
 from .search_handoff import resolve_run_dir
 from .trace import record_stage_trace
 
@@ -72,6 +73,14 @@ def ingest_manual_sources(
             vlm_provider=vlm_provider,
             created_at=now,
         )
+        for skipped_stage in ("planning", "ingest", "fetch_claims", "ingest_vision"):
+            skip_stage(
+                run_dir,
+                skipped_stage,
+                reason="manual_sources_run",
+                timestamp=now,
+                run_id=evidence.get("run_id", run_dir.name),
+            )
     else:
         run_dir = resolve_run_dir(run, runs_dir=runs_dir)
         evidence_path = run_dir / "evidence.json"
@@ -82,6 +91,34 @@ def ingest_manual_sources(
             normalized_question = question.strip()
             if normalized_question:
                 evidence["question"] = normalized_question
+
+    start = begin_stage(
+        run_dir,
+        "ingest_manual",
+        run_id=str(evidence.get("run_id", run_dir.name)),
+        started_at=now,
+        completed_behavior="skip",
+    )
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="ingest_manual",
+            schema_version=MANUAL_INGEST_SCHEMA_VERSION,
+            status_artifact_key="manual_ingest_status",
+            status_filename="manual_ingest_status.json",
+            reason=start.skip_reason or "stage_already_completed",
+            run_id=str(evidence.get("run_id", run_dir.name)),
+        )
+        record_stage_trace(
+            run_dir,
+            stage="ingest_manual",
+            agent_role="manual_source_ingest_agent",
+            status_payload=status,
+            prompt_summary="Record user-provided source and image metadata without external fetches.",
+            tool_call_summary="Skipped manual ingestion because run_steps.json marks the stage terminal.",
+        )
+        _write_json(run_dir / "manual_ingest_status.json", status)
+        return status
 
     sources = evidence.setdefault("sources", [])
     images = evidence.setdefault("images", [])
