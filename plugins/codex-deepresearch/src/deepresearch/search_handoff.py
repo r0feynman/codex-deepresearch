@@ -19,6 +19,7 @@ from .evidence_schema import (
 )
 from .execution_mode import BudgetPreset, resolve_config
 from .modality_router import route_angles
+from .run_state import begin_stage, skipped_stage_status
 from .trace import record_stage_trace
 
 
@@ -74,6 +75,7 @@ def prepare_run(
     now = _utc_now()
     run_dir = _create_unique_run_dir(Path(runs_dir), now)
     run_id = run_dir.name
+    begin_stage(run_dir, "planning", run_id=run_id, started_at=now)
     planner_angles = _normalize_planner_angles(angles)
     decisions = route_angles(
         question=normalized_question,
@@ -208,6 +210,7 @@ def prepare_run(
             "visual_observations": str(run_dir / "visual_observations.jsonl"),
             "status": str(run_dir / "status.json"),
             "run_trace": str(run_dir / "run_trace.jsonl"),
+            "run_steps": str(run_dir / "run_steps.json"),
         },
     }
 
@@ -220,6 +223,26 @@ def ingest_run(
     """Validate and ingest Codex-native SearchResult records for one run."""
 
     run_dir = resolve_run_dir(run, runs_dir=runs_dir)
+    start = begin_stage(run_dir, "ingest")
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="ingest",
+            schema_version=INGEST_STATUS_SCHEMA_VERSION,
+            status_artifact_key="ingest_status",
+            status_filename="ingest_status.json",
+            reason=start.skip_reason or "stage_already_completed",
+        )
+        record_stage_trace(
+            run_dir,
+            stage="ingest",
+            agent_role="search_ingest_agent",
+            status_payload=status,
+            prompt_summary="Ingest SearchResult records from the prepared handoff artifact.",
+            tool_call_summary="Skipped ingestion because run_steps.json marks the stage terminal.",
+        )
+        _write_json(run_dir / "ingest_status.json", status)
+        return status
     evidence_path = run_dir / "evidence.json"
     search_results_path = run_dir / "search_results.jsonl"
     if not evidence_path.exists():

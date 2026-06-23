@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .evidence_schema import validate_artifacts
+from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
 from .trace import record_stage_trace
 
@@ -74,6 +75,27 @@ def enforce_guardrails(
         run_dir = resolve_run_dir(run, runs_dir=runs_dir)
     except SearchHandoffError as exc:
         raise GuardrailsError(str(exc)) from exc
+
+    start = begin_stage(run_dir, "enforce_guardrails")
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="enforce_guardrails",
+            schema_version=GUARDRAILS_SCHEMA_VERSION,
+            status_artifact_key="guardrails_status",
+            status_filename=GUARDRAILS_STATUS_FILENAME,
+            reason=start.skip_reason or "stage_already_completed",
+        )
+        record_stage_trace(
+            run_dir,
+            stage="enforce_guardrails",
+            agent_role="guardrails_agent",
+            status_payload=status,
+            prompt_summary="Apply deterministic source, image, claim, privacy, and risk-domain guardrails.",
+            tool_call_summary="Skipped guardrail enforcement because run_steps.json marks the stage terminal.",
+        )
+        _write_json(run_dir / GUARDRAILS_STATUS_FILENAME, status)
+        return status
 
     evidence_path = run_dir / "evidence.json"
     if not evidence_path.exists():

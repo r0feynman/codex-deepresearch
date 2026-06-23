@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .evidence_schema import validate_artifacts
+from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
 from .trace import record_stage_trace
 
@@ -152,6 +153,26 @@ def fetch_claims(
         raise FetchClaimsError("timeout_seconds must be positive")
 
     run_dir = resolve_run_dir(run, runs_dir=runs_dir)
+    start = begin_stage(run_dir, "fetch_claims")
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="fetch_claims",
+            schema_version=FETCH_CLAIMS_SCHEMA_VERSION,
+            status_artifact_key="fetch_claims_status",
+            status_filename="fetch_claims_status.json",
+            reason=start.skip_reason or "stage_already_completed",
+        )
+        record_stage_trace(
+            run_dir,
+            stage="fetch_claims",
+            agent_role="fetch_claims_agent",
+            status_payload=status,
+            prompt_summary="Fetch queued sources and extract low-confidence source-linked claims.",
+            tool_call_summary="Skipped fetch and claim extraction because run_steps.json marks the stage terminal.",
+        )
+        _write_run_json(run_dir, "fetch_claims_status.json", status)
+        return status
     evidence_path = run_dir / "evidence.json"
     fetch_queue_path = run_dir / "fetch_queue.json"
     if not evidence_path.exists():

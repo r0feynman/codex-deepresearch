@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .evidence_schema import SEARCH_ROUTES, validate_artifacts
+from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
 from .trace import record_stage_trace
 
@@ -64,6 +65,27 @@ def verify_claims(
         run_dir = resolve_run_dir(run, runs_dir=runs_dir)
     except SearchHandoffError as exc:
         raise VerificationMatrixError(str(exc)) from exc
+
+    start = begin_stage(run_dir, "verify_claims")
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="verify_claims",
+            schema_version=VERIFICATION_MATRIX_SCHEMA_VERSION,
+            status_artifact_key="verification_matrix_status",
+            status_filename="verification_matrix_status.json",
+            reason=start.skip_reason or "stage_already_completed",
+        )
+        record_stage_trace(
+            run_dir,
+            stage="verify_claims",
+            agent_role="verification_matrix_agent",
+            status_payload=status,
+            prompt_summary="Apply the deterministic verifier matrix to extracted claims.",
+            tool_call_summary="Skipped claim verification because run_steps.json marks the stage terminal.",
+        )
+        _write_json(run_dir / "verification_matrix_status.json", status)
+        return status
 
     evidence_path = run_dir / "evidence.json"
     if not evidence_path.exists():

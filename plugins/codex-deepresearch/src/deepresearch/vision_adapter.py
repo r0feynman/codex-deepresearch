@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from .evidence_schema import VLM_PROVIDERS, validate_artifacts
+from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import resolve_run_dir
 from .trace import record_stage_trace
 
@@ -40,6 +41,27 @@ def ingest_vision_observations(
 
     normalized_provider = _normalize_provider(provider)
     run_dir = resolve_run_dir(run, runs_dir=runs_dir)
+    start = begin_stage(run_dir, "ingest_vision")
+    if start.skipped:
+        status = skipped_stage_status(
+            run_dir,
+            stage="ingest_vision",
+            schema_version=VISION_ADAPTER_SCHEMA_VERSION,
+            status_artifact_key="vision_ingest_status",
+            status_filename="vision_ingest_status.json",
+            reason=start.skip_reason or "stage_already_completed",
+        )
+        status["provider"] = normalized_provider
+        record_stage_trace(
+            run_dir,
+            stage="ingest_vision",
+            agent_role="vision_adapter",
+            status_payload=status,
+            prompt_summary="Normalize visual handoff records into VisualEvidence.",
+            tool_call_summary="Skipped visual ingestion because run_steps.json marks the stage terminal.",
+        )
+        _write_json(run_dir / "vision_ingest_status.json", status)
+        return status
     evidence_path = run_dir / "evidence.json"
     if not evidence_path.exists():
         raise VisionAdapterError(f"missing evidence.json in run directory: {run_dir}")
