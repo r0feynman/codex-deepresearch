@@ -71,6 +71,29 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest --run <run_id_or_pa
 
 `ingest` validates `search_results.jsonl`, normalizes records into `evidence.json.sources`, and writes `fetch_queue.json` for allowed, fetchable `http`/`https` sources. Invalid URLs and blocked/manual-review policy decisions are preserved in evidence with `retrieval_status=failed` and explicit ingest errors, but they are not added to the fetch queue.
 
+## Parallel Orchestration
+
+Use `plan-parallel` to expand prepared planner output into the canonical M18 `research_tasks.json` queue:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch plan-parallel \
+  --run <run_id_or_path> \
+  --min-tasks 20
+```
+
+Use `orchestrate-parallel` to assign bounded tasks, collect per-task evidence shards, record normalized Codex subagent events, and merge schema-valid shards back into canonical `evidence.json`:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel \
+  --run <run_id_or_path> \
+  --adapter codex-exec \
+  --min-tasks 20
+```
+
+The `codex-exec` adapter constructs `codex exec --json -c agents.max_threads=N` child runs. If the Codex CLI path is unavailable and degradation is allowed, the runner records `parallel_degraded=true` and executes the same queue serially with the deterministic fixture adapter. Tests and local smokes can select `--adapter fixture` directly; it is no-network/no-auth and writes representative `spawn_agent`, `wait`, `message`, and `close_agent` trace records plus schema-valid shards.
+
+The standard preset uses up to 8 concurrent Codex subagents or equivalent worker contexts. The existing budget gate keeps `exhaustive` behind `--confirm-budget` plus `--max-cost-usd` and caps Codex subagent fan-out at 100.
+
 ## Run Status
 
 Every state-managed pipeline stage writes `run_steps.json` with `pending`, `running`, `completed`, `failed`, or `skipped` state. Use `run-status` to inspect an interrupted run and identify the next safe stage:
@@ -193,6 +216,7 @@ After changing plugin files, rerun validation and the smoke command:
 python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
 plugins/codex-deepresearch/scripts/codex-deepresearch mvp-smoke --runs-dir /tmp/codex-deepresearch-mvp-smoke --suite-id mvp-smoke --clean --invoke '$deep-research: MVP smoke text-only fixture'
+tmpdir=/tmp/codex-deepresearch-parallel-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Parallel orchestration validation" --runs-dir "$tmpdir" --route text_only | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel --run "$run_dir" --adapter fixture --min-tasks 3
 plugins/codex-deepresearch/scripts/codex-deepresearch smoke --install --invoke '$deep-research: Codex DeepResearch smoke test'
 codex plugin add codex-deepresearch@codex-deepresearch-local
 ```
