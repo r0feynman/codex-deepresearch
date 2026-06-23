@@ -88,6 +88,18 @@ The command applies the PRD verifier matrix without external model, VLM, web, or
 
 Budget-pruned claims are not voted again. They keep `verification_status=budget_pruned` and receive `include_in_final_report=false` plus `report_exclusion_reason=budget_pruned` for the M10 report renderer to consume.
 
+## Synthesize Report
+
+Use `synthesize` after claims have been verified:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run <run_id_or_path>
+```
+
+The command reads only the local `evidence.json` artifact and writes `report.md` plus `report_status.json`. It does not call external web, model, VLM, or API services. Confirmed report findings must have `verification_status=supported` and `review_status=auto_reviewed` or `human_accepted`; `include_in_final_report=false` is honored as an additional exclusion guard.
+
+High-confidence text findings require a source-linked quote span. Visual and mixed findings require supporting image evidence IDs that resolve to non-policy-blocked `VisualEvidence`. Unsupported, refuted, policy-blocked, budget-pruned, unverified, and otherwise under-evidenced claims are kept out of the confident findings and recorded in the status manifest and the report's excluded evidence section.
+
 ## Manual Sources
 
 Use `ingest-manual` when the user provides URLs or images directly, or when Codex-native search handoff is blocked. The command does not call external search, fetch remote bodies, run VLM analysis, or create a fetch queue:
