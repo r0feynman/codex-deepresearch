@@ -495,12 +495,12 @@ def _reconstruct_state_from_artifacts(
     trace_applied = _replay_trace_artifact(state, run_dir, timestamp=timestamp)
     if trace_applied:
         sources.append(_RUN_TRACE_FILENAME)
-    else:
-        sources.extend(_replay_status_artifacts(state, run_dir, timestamp=timestamp))
+    sources.extend(_replay_status_artifacts(state, run_dir, timestamp=timestamp))
+    sources.extend(_infer_manual_source_ordered_stage_skips(state, run_dir, timestamp=timestamp))
     if sources:
         state["reconstructed_from_artifacts"] = {
             "at": timestamp,
-            "sources": sources,
+            "sources": _unique_strings(sources),
         }
 
 
@@ -539,10 +539,10 @@ def _replay_status_artifacts(
     applied: list[str] = []
     for stage, filename in _STAGE_STATUS_ARTIFACTS:
         record = _stage_record(state, stage)
-        if _status(record) != "pending":
-            continue
         status_payload = _read_json_artifact(run_dir / filename)
         if status_payload is None:
+            continue
+        if not _should_replay_status_artifact(stage, record, status_payload):
             continue
         _apply_status_to_state(
             state,
@@ -553,6 +553,104 @@ def _replay_status_artifacts(
         )
         applied.append(filename)
     return applied
+
+
+def _should_replay_status_artifact(
+    stage: str,
+    record: Mapping[str, Any],
+    status_payload: Mapping[str, Any],
+) -> bool:
+    target = stage_status_to_step_status(stage, status_payload)
+    if target == "pending":
+        return False
+    current = _status(record)
+    if current == "pending":
+        return True
+    if current in RETRYABLE_STEP_STATUSES and target in TERMINAL_STEP_STATUSES:
+        return True
+
+    payload_timestamp = _payload_timestamp(status_payload)
+    record_timestamp = _string_value(record.get("updated_at"))
+    if _timestamp_is_after(payload_timestamp, record_timestamp):
+        return True
+
+    payload_artifacts = _string_artifacts(status_payload.get("artifacts"))
+    record_artifacts = _string_artifacts(record.get("artifacts"))
+    if payload_artifacts and any(
+        record_artifacts.get(key) != value for key, value in payload_artifacts.items()
+    ):
+        return True
+
+    raw_status = status_payload.get("status")
+    if isinstance(raw_status, str) and raw_status and record.get("stage_status") != raw_status:
+        return True
+    return False
+
+
+def _infer_manual_source_ordered_stage_skips(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> list[str]:
+    if not _manual_sources_ingested(state, run_dir):
+        return []
+
+    skipped: list[str] = []
+    artifacts: dict[str, str] = {}
+    evidence_path = run_dir / "evidence.json"
+    if evidence_path.exists():
+        artifacts["evidence"] = str(evidence_path)
+    manual_status_path = run_dir / "manual_ingest_status.json"
+    if manual_status_path.exists():
+        artifacts["manual_ingest_status"] = str(manual_status_path)
+    artifacts["run_steps"] = str(run_steps_path(run_dir))
+
+    for stage in ("planning", "ingest", "fetch_claims", "ingest_vision"):
+        record = _stage_record(state, stage)
+        if _status(record) != "pending":
+            continue
+        _apply_stage_transition(
+            state,
+            stage,
+            "skipped",
+            reason="manual_sources_run",
+            timestamp=timestamp,
+        )
+        record["artifacts"] = dict(artifacts)
+        record["stage_status"] = "skipped"
+        record["reconstructed_skip"] = {
+            "status": "skipped",
+            "reason": "manual_sources_run",
+            "at": timestamp,
+            "source": "manual_source_ingest",
+        }
+        skipped.append(stage)
+
+    if not skipped:
+        return []
+    return ["manual_source_skip_inference"]
+
+
+def _manual_sources_ingested(state: Mapping[str, Any], run_dir: Path) -> bool:
+    manual_record = _stage_record(state, "ingest_manual")
+    if _status(manual_record) == "completed":
+        stage_status = manual_record.get("stage_status")
+        if stage_status in {"manual_sources_ingested", "completed"}:
+            return True
+
+    manual_status = _read_json_artifact(run_dir / "manual_ingest_status.json")
+    if manual_status is not None and manual_status.get("status") == "manual_sources_ingested":
+        return True
+
+    evidence = _read_json_artifact(run_dir / "evidence.json")
+    if evidence is None:
+        return False
+    manual_ingest = evidence.get("manual_ingest")
+    return (
+        isinstance(manual_ingest, Mapping)
+        and manual_ingest.get("status") == "manual_sources_ingested"
+    )
 
 
 def _apply_status_to_state(
@@ -704,6 +802,15 @@ def _apply_stage_transition(
             upstream_stage=stage,
             timestamp=now,
             trace_event_id=trace_event_id,
+            reason="stale_reset_after_upstream_rerun",
+        )
+    elif from_status == "running" and to_status in TERMINAL_STEP_STATUSES:
+        _reset_downstream_ordered_terminal_stages(
+            state,
+            upstream_stage=stage,
+            timestamp=now,
+            trace_event_id=trace_event_id,
+            reason="stale_reset_after_upstream_completion",
         )
     state["updated_at"] = now
 
@@ -767,6 +874,7 @@ def _reset_downstream_ordered_terminal_stages(
     upstream_stage: str,
     timestamp: str,
     trace_event_id: str | None,
+    reason: str,
 ) -> None:
     if upstream_stage not in RUN_STAGE_ORDER:
         return
@@ -788,7 +896,7 @@ def _reset_downstream_ordered_terminal_stages(
         record["stale_reset"] = {
             "status": "stale-reset",
             "at": timestamp,
-            "reason": "stale_reset_after_upstream_rerun",
+            "reason": reason,
             "upstream_stage": upstream_stage,
             "previous_terminal_status": snapshot,
             **({"trace_event_id": trace_event_id} if trace_event_id else {}),
@@ -809,7 +917,7 @@ def _reset_downstream_ordered_terminal_stages(
                     "at": timestamp,
                     "from": from_status,
                     "to": "pending",
-                    "reason": "stale_reset_after_upstream_rerun",
+                    "reason": reason,
                     "upstream_stage": upstream_stage,
                     **({"trace_event_id": trace_event_id} if trace_event_id else {}),
                 }
@@ -820,7 +928,7 @@ def _reset_downstream_ordered_terminal_stages(
                 {
                     **snapshot,
                     "stale_reset_at": timestamp,
-                    "stale_reset_reason": "stale_reset_after_upstream_rerun",
+                    "stale_reset_reason": reason,
                     "upstream_stage": upstream_stage,
                 }
             )
@@ -955,6 +1063,38 @@ def _string_artifacts(value: Any) -> dict[str, str]:
         for key, item in value.items()
         if isinstance(key, str) and key and item is not None and str(item)
     }
+
+
+def _timestamp_is_after(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    left_datetime = _parse_timestamp(left)
+    right_datetime = _parse_timestamp(right)
+    if left_datetime is not None and right_datetime is not None:
+        return left_datetime > right_datetime
+    return left > right
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def _read_state(path: Path) -> dict[str, Any]:

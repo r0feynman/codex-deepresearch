@@ -16,6 +16,7 @@ sys.path.insert(0, str(PLUGIN_SRC))
 from deepresearch import (  # noqa: E402
     RunStepStateError,
     begin_stage,
+    fetch_claims,
     ingest_manual_sources,
     ingest_run,
     inspect_run_state,
@@ -144,6 +145,66 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(stages["planning"]["status"], "completed")
         self.assertEqual(stages["ingest"]["status"], "pending")
 
+    def test_reconstruction_merges_status_artifacts_after_partial_trace(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="state machine partial trace reconstruction",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+
+        records = read_trace_records(run_dir / "run_trace.jsonl")
+        self.assertEqual([record["stage"] for record in records], ["planning", "ingest"])
+        (run_dir / "run_trace.jsonl").write_text(
+            json.dumps(records[0]) + "\n",
+            encoding="utf-8",
+        )
+        run_steps_path(run_dir).unlink()
+
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(state["next_safe_stage"], "fetch_claims")
+        self.assertFalse(state["next_stage_retryable"])
+        self.assertEqual(stages["planning"]["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "completed")
+        self.assertEqual(
+            stages["ingest"]["artifacts"]["ingest_status"],
+            str(run_dir / "ingest_status.json"),
+        )
+
+    def test_manual_source_reconstruction_restores_ordered_skips(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        result = ingest_manual_sources(
+            question="state machine manual reconstruction",
+            runs_dir=runs_dir,
+            urls=["https://example.com/manual-source"],
+        )
+        run_dir = Path(result["run_dir"])
+        before = inspect_run_state(run_dir)
+        self.assertEqual(before["next_safe_stage"], "enforce_guardrails")
+        run_steps_path(run_dir).unlink()
+
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
+        self.assertFalse(state["next_stage_retryable"])
+        for stage in ("planning", "ingest", "fetch_claims", "ingest_vision"):
+            self.assertEqual(stages[stage]["status"], "skipped")
+            self.assertEqual(stages[stage]["skip_reason"], "manual_sources_run")
+            self.assertEqual(
+                stages[stage]["reconstructed_skip"]["source"],
+                "manual_source_ingest",
+            )
+        self.assertEqual(stages["ingest_manual"]["status"], "completed")
+
     def test_completed_stage_rerun_is_explicitly_skipped(self) -> None:
         first = ingest_manual_sources(
             question="state machine manual rerun",
@@ -260,6 +321,82 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(
             stages["enforce_guardrails"]["history"][-1]["reason"],
             "stale_reset_after_upstream_rerun",
+        )
+
+    def test_first_time_upstream_completion_resets_early_downstream_terminal_stages(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="state machine first completion stale downstream reset",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        page = runs_dir / "source.html"
+        page.write_text(
+            (
+                "<html><body><p>The first completion reset test extracts a "
+                "source linked claim.</p></body></html>"
+            ),
+            encoding="utf-8",
+        )
+        self.write_search_results(run_dir, [self.base_search_result(title="Local Source")])
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["url"] = page.resolve().as_uri()
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        fetch_queue_path = run_dir / "fetch_queue.json"
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["url"] = page.resolve().as_uri()
+        fetch_queue_path.write_text(json.dumps(fetch_queue), encoding="utf-8")
+
+        for stage in ("verify_claims", "synthesize"):
+            transition_stage(run_dir, stage, "running", reason="test_early_stage_started")
+            transition_stage(run_dir, stage, "completed", reason="test_early_stage_completed")
+
+        fetch = fetch_claims(run=run_dir)
+        self.assertEqual(fetch["status"], "completed")
+        transition_stage(run_dir, "ingest_vision", "running", reason="test_stage_started")
+        transition_stage(run_dir, "ingest_vision", "skipped", reason="test_no_visual_tasks")
+        transition_stage(run_dir, "enforce_guardrails", "running", reason="test_stage_started")
+        transition_stage(run_dir, "enforce_guardrails", "completed", reason="test_stage_completed")
+
+        command = subprocess.run(
+            [
+                str(RUNNER),
+                "run-status",
+                "--run",
+                prepared["run_id"],
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(command.returncode, 0, command.stderr)
+        payload = json.loads(command.stdout)
+        stages = {stage["stage"]: stage for stage in payload["stages"]}
+        self.assertEqual(payload["next_safe_stage"], "verify_claims")
+        self.assertFalse(payload["next_stage_retryable"])
+        self.assertEqual(stages["ingest"]["status"], "completed")
+        self.assertEqual(stages["fetch_claims"]["status"], "completed")
+        self.assertEqual(stages["verify_claims"]["status"], "pending")
+        self.assertEqual(stages["synthesize"]["status"], "pending")
+        self.assertEqual(
+            stages["verify_claims"]["stale_reset"]["reason"],
+            "stale_reset_after_upstream_completion",
+        )
+        self.assertEqual(
+            stages["verify_claims"]["stale_reset"]["upstream_stage"],
+            "fetch_claims",
+        )
+        self.assertEqual(
+            stages["verify_claims"]["stale_terminal_status"]["status"],
+            "completed",
         )
 
     def test_completed_stage_rerun_is_retryable_before_trace_completion(self) -> None:
