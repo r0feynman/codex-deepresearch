@@ -90,6 +90,60 @@ class RunStateTests(unittest.TestCase):
         trace = read_trace_records(run_dir / "run_trace.jsonl")
         self.assertIn("run_steps", trace[0]["artifacts"])
 
+    def test_run_status_reconstructs_deleted_run_steps_from_trace(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="state machine reconstruction",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        run_steps_path(run_dir).unlink()
+
+        command = subprocess.run(
+            [
+                str(RUNNER),
+                "run-status",
+                "--run",
+                prepared["run_id"],
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(command.returncode, 0, command.stderr)
+        payload = json.loads(command.stdout)
+        stages = {stage["stage"]: stage for stage in payload["stages"]}
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(payload["next_safe_stage"], "ingest")
+        self.assertFalse(payload["next_stage_retryable"])
+        self.assertEqual(stages["planning"]["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "pending")
+
+    def test_run_status_reconstructs_deleted_run_steps_from_status_without_trace(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="state machine status artifact reconstruction",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        run_steps_path(run_dir).unlink()
+        (run_dir / "run_trace.jsonl").unlink()
+
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+
+        self.assertTrue(run_steps_path(run_dir).is_file())
+        self.assertEqual(state["next_safe_stage"], "ingest")
+        self.assertFalse(state["next_stage_retryable"])
+        self.assertEqual(stages["planning"]["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "pending")
+
     def test_completed_stage_rerun_is_explicitly_skipped(self) -> None:
         first = ingest_manual_sources(
             question="state machine manual rerun",
@@ -156,6 +210,57 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(second_ingest["last_rerun_status"], "completed")
         self.assertEqual(second_ingest["previous_terminal_status"]["status"], "completed")
         self.assertEqual(second_ingest["previous_terminal_status"]["attempt"], first_ingest["attempt"])
+
+    def test_completed_upstream_rerun_resets_downstream_terminal_stages(self) -> None:
+        prepared = prepare_run(
+            question="state machine stale downstream reset",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        for stage in (
+            "ingest",
+            "fetch_claims",
+            "ingest_vision",
+            "enforce_guardrails",
+            "verify_claims",
+            "synthesize",
+        ):
+            transition_stage(run_dir, stage, "running", reason="test_stage_started")
+            transition_stage(run_dir, stage, "completed", reason="test_stage_completed")
+        completed_state = inspect_run_state(run_dir)
+
+        started = begin_stage(run_dir, "fetch_claims")
+        transition_stage(run_dir, "fetch_claims", "completed", reason="test_rerun_completed")
+        rerun_state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in rerun_state["stages"]}
+
+        self.assertEqual(completed_state["status"], "completed")
+        self.assertIsNone(completed_state["next_safe_stage"])
+        self.assertEqual(started.status, "running")
+        self.assertFalse(started.skipped)
+        self.assertEqual(rerun_state["next_safe_stage"], "ingest_vision")
+        self.assertEqual(stages["fetch_claims"]["status"], "completed")
+        self.assertEqual(stages["ingest_vision"]["status"], "pending")
+        self.assertEqual(stages["enforce_guardrails"]["status"], "pending")
+        self.assertEqual(stages["verify_claims"]["status"], "pending")
+        self.assertEqual(stages["synthesize"]["status"], "pending")
+        self.assertEqual(
+            stages["enforce_guardrails"]["stale_reset"]["status"],
+            "stale-reset",
+        )
+        self.assertEqual(
+            stages["enforce_guardrails"]["stale_reset"]["upstream_stage"],
+            "fetch_claims",
+        )
+        self.assertEqual(
+            stages["enforce_guardrails"]["stale_terminal_status"]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            stages["enforce_guardrails"]["history"][-1]["reason"],
+            "stale_reset_after_upstream_rerun",
+        )
 
     def test_completed_stage_rerun_is_retryable_before_trace_completion(self) -> None:
         prepared = prepare_run(

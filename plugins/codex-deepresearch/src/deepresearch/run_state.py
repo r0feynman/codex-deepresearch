@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 RUN_STEPS_SCHEMA_VERSION = "codex-deepresearch.run-steps.v0"
 RUN_STEPS_FILENAME = "run_steps.json"
+_RUN_TRACE_FILENAME = "run_trace.jsonl"
 
 RUN_STAGE_ORDER = (
     "planning",
@@ -56,6 +57,16 @@ _SKIPPED_STAGE_STATUSES = {
     "no_visual_tasks",
     "skipped",
 }
+_STAGE_STATUS_ARTIFACTS = (
+    ("planning", "status.json"),
+    ("ingest", "ingest_status.json"),
+    ("ingest_manual", "manual_ingest_status.json"),
+    ("fetch_claims", "fetch_claims_status.json"),
+    ("ingest_vision", "vision_ingest_status.json"),
+    ("enforce_guardrails", "guardrails_status.json"),
+    ("verify_claims", "verification_matrix_status.json"),
+    ("synthesize", "report_status.json"),
+)
 
 
 class RunStepStateError(ValueError):
@@ -116,6 +127,7 @@ def initialize_run_steps(
     *,
     run_id: str | None = None,
     created_at: str | None = None,
+    reconstruct_missing: bool = True,
 ) -> dict[str, Any]:
     """Create or update the run step state artifact with pending stages."""
 
@@ -126,23 +138,9 @@ def initialize_run_steps(
         state = _read_state(path)
         changed = _ensure_state_shape(state, run_dir, run_id=run_id, timestamp=now)
     else:
-        state = {
-            "schema_version": RUN_STEPS_SCHEMA_VERSION,
-            "run_id": _resolve_run_id(run_dir, run_id),
-            "run_dir": str(run_dir.resolve()),
-            "created_at": now,
-            "updated_at": now,
-            "transition_rules": {
-                status: list(targets)
-                for status, targets in RUN_STEP_TRANSITIONS.items()
-            },
-            "stage_order": list(RUN_STAGE_ORDER),
-            "optional_stages": list(OPTIONAL_RUN_STAGES),
-            "stages": {
-                stage: _new_stage_record(stage, order=index, timestamp=now)
-                for index, stage in enumerate(RUN_STAGES, start=1)
-            },
-        }
+        state = _new_run_steps_state(run_dir, run_id=run_id, timestamp=now)
+        if reconstruct_missing:
+            _reconstruct_state_from_artifacts(state, run_dir, timestamp=now)
         changed = True
     if changed:
         _write_state(path, state)
@@ -217,74 +215,15 @@ def transition_stage(
     run_dir = Path(run_dir)
     path = run_steps_path(run_dir)
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=timestamp)
-    record = _stage_record(state, stage)
-    from_status = _status(record)
-    allowed = set(RUN_STEP_TRANSITIONS[from_status])
-    if to_status not in allowed:
-        raise RunStepStateError(
-            code="invalid_state_transition",
-            message=(
-                f"cannot transition stage '{stage}' from {from_status} to {to_status}"
-            ),
-            stage=stage,
-            from_status=from_status,
-            to_status=to_status,
-        )
-
-    now = timestamp or _utc_now()
-    record["status"] = to_status
-    record["updated_at"] = now
-    record["retryable"] = to_status in RETRYABLE_STEP_STATUSES
-    record["terminal"] = to_status in TERMINAL_STEP_STATUSES
-    if to_status == "running":
-        if from_status in TERMINAL_STEP_STATUSES:
-            snapshot = _terminal_snapshot(record, from_status)
-            record["previous_terminal_status"] = snapshot
-            terminal_history = record.setdefault("terminal_history", [])
-            if isinstance(terminal_history, list):
-                terminal_history.append({**snapshot, "rerun_started_at": now})
-            record["last_rerun_status"] = "running"
-            record["last_rerun_at"] = now
-        record["attempt"] = int(record.get("attempt") or 0) + 1
-        record["started_at"] = now
-        record.pop("finished_at", None)
-    elif from_status == "running" and record.get("previous_terminal_status"):
-        record["last_rerun_status"] = to_status
-        record["last_rerun_at"] = now
-    if to_status in TERMINAL_STEP_STATUSES or to_status == "failed":
-        record["finished_at"] = now
-    if to_status == "failed" and status_payload is not None:
-        record["failure"] = _failure_summary(status_payload)
-    elif to_status != "failed":
-        record["failure"] = None
-    if to_status == "skipped":
-        record["skip_reason"] = reason
-    elif to_status == "running":
-        record["skip_reason"] = None
-    if trace_event_id:
-        trace_ids = record.setdefault("trace_event_ids", [])
-        if isinstance(trace_ids, list) and trace_event_id not in trace_ids:
-            trace_ids.append(trace_event_id)
-    if status_payload is not None:
-        artifacts = _string_artifacts(status_payload.get("artifacts"))
-        if artifacts:
-            record["artifacts"] = artifacts
-        raw_status = status_payload.get("status")
-        if isinstance(raw_status, str) and raw_status:
-            record["stage_status"] = raw_status
-
-    history = record.setdefault("history", [])
-    if isinstance(history, list):
-        history.append(
-            {
-                "at": now,
-                "from": from_status,
-                "to": to_status,
-                "reason": reason,
-                **({"trace_event_id": trace_event_id} if trace_event_id else {}),
-            }
-        )
-    state["updated_at"] = now
+    _apply_stage_transition(
+        state,
+        stage,
+        to_status,
+        reason=reason,
+        timestamp=timestamp,
+        trace_event_id=trace_event_id,
+        status_payload=status_payload,
+    )
     _write_state(path, _with_resume_summary(state))
     return _with_resume_summary(state)
 
@@ -299,110 +238,20 @@ def record_trace_state(
 ) -> dict[str, Any]:
     """Update run_steps.json from a stage trace/status payload."""
 
-    target = stage_status_to_step_status(stage, status_payload)
-    state = initialize_run_steps(run_dir, run_id=_payload_run_id(status_payload), created_at=timestamp)
-    record = _stage_record(state, stage)
-    current = _status(record)
-    if current == "completed" and target == "skipped":
-        return _record_completed_stage_skip(
-            run_dir,
-            stage=stage,
-            status_payload=status_payload,
-            trace_event_id=trace_event_id,
-            timestamp=timestamp,
-        )
-    if (
-        current == "running"
-        and target == "skipped"
-        and _previous_terminal_status(record) == "completed"
-    ):
-        return _record_completed_stage_skip(
-            run_dir,
-            stage=stage,
-            status_payload=status_payload,
-            trace_event_id=trace_event_id,
-            timestamp=timestamp,
-            from_status="running",
-        )
-    if current == "pending" and target != "running":
-        transition_stage(
-            run_dir,
-            stage,
-            "running",
-            reason="implicit_stage_started",
-            timestamp=timestamp,
-            run_id=_payload_run_id(status_payload),
-        )
-    reason = _transition_reason(target, status_payload)
-    return transition_stage(
+    state = initialize_run_steps(
         run_dir,
-        stage,
-        target,
-        reason=reason,
-        timestamp=timestamp,
         run_id=_payload_run_id(status_payload),
-        trace_event_id=trace_event_id,
-        status_payload=status_payload,
+        created_at=timestamp,
+        reconstruct_missing=False,
     )
-
-
-def _record_completed_stage_skip(
-    run_dir: str | Path,
-    *,
-    stage: str,
-    status_payload: Mapping[str, Any],
-    trace_event_id: str,
-    timestamp: str | None,
-    from_status: str = "completed",
-) -> dict[str, Any]:
-    """Record a skipped rerun without erasing the completed primary state."""
-
-    run_dir = Path(run_dir)
-    path = run_steps_path(run_dir)
-    state = initialize_run_steps(run_dir, run_id=_payload_run_id(status_payload), created_at=timestamp)
-    record = _stage_record(state, stage)
-    now = timestamp or _utc_now()
-    snapshot = _previous_terminal_snapshot(record) if from_status == "running" else None
-    if snapshot is None:
-        snapshot = _terminal_snapshot(record, "completed")
-    record["status"] = "completed"
-    record["updated_at"] = now
-    record["retryable"] = False
-    record["terminal"] = True
-    record["skip_reason"] = _transition_reason("skipped", status_payload)
-    record["previous_terminal_status"] = snapshot
-    record["last_rerun_status"] = "skipped"
-    record["last_rerun_at"] = now
-    for key in ("started_at", "finished_at"):
-        value = snapshot.get(key)
-        if value is not None:
-            record[key] = value
-    artifacts = _string_artifacts(status_payload.get("artifacts"))
-    if artifacts:
-        record["artifacts"] = artifacts
-    raw_status = status_payload.get("status")
-    if isinstance(raw_status, str) and raw_status:
-        record["stage_status"] = raw_status
-    trace_ids = record.setdefault("trace_event_ids", [])
-    if isinstance(trace_ids, list) and trace_event_id not in trace_ids:
-        trace_ids.append(trace_event_id)
-    history = record.setdefault("history", [])
-    if isinstance(history, list):
-        history.append(
-            {
-                "at": now,
-                "from": from_status,
-                "to": "completed",
-                "reason": record["skip_reason"],
-                "rerun_status": "skipped",
-                "trace_event_id": trace_event_id,
-            }
-        )
-    terminal_history = record.setdefault("terminal_history", [])
-    if isinstance(terminal_history, list):
-        terminal_history.append({**snapshot, "rerun_status": "skipped", "rerun_at": now})
-    state["updated_at"] = now
-    _write_state(path, _with_resume_summary(state))
+    _apply_status_to_state(
+        state,
+        stage=stage,
+        status_payload=status_payload,
+        trace_event_id=trace_event_id,
+        timestamp=timestamp,
+    )
+    _write_state(run_steps_path(run_dir), _with_resume_summary(state))
     return _with_resume_summary(state)
 
 
@@ -611,6 +460,372 @@ def _new_stage_record(stage: str, *, order: int, timestamp: str) -> dict[str, An
     }
 
 
+def _new_run_steps_state(
+    run_dir: Path,
+    *,
+    run_id: str | None,
+    timestamp: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": RUN_STEPS_SCHEMA_VERSION,
+        "run_id": _resolve_run_id(run_dir, run_id),
+        "run_dir": str(run_dir.resolve()),
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "transition_rules": {
+            status: list(targets)
+            for status, targets in RUN_STEP_TRANSITIONS.items()
+        },
+        "stage_order": list(RUN_STAGE_ORDER),
+        "optional_stages": list(OPTIONAL_RUN_STAGES),
+        "stages": {
+            stage: _new_stage_record(stage, order=index, timestamp=timestamp)
+            for index, stage in enumerate(RUN_STAGES, start=1)
+        },
+    }
+
+
+def _reconstruct_state_from_artifacts(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> None:
+    sources: list[str] = []
+    trace_applied = _replay_trace_artifact(state, run_dir, timestamp=timestamp)
+    if trace_applied:
+        sources.append(_RUN_TRACE_FILENAME)
+    else:
+        sources.extend(_replay_status_artifacts(state, run_dir, timestamp=timestamp))
+    if sources:
+        state["reconstructed_from_artifacts"] = {
+            "at": timestamp,
+            "sources": sources,
+        }
+
+
+def _replay_trace_artifact(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> bool:
+    trace_path = run_dir / _RUN_TRACE_FILENAME
+    if not trace_path.exists():
+        return False
+    applied = False
+    for record in _read_jsonl_records(trace_path):
+        stage = _string_value(record.get("stage"))
+        if stage not in RUN_STAGES:
+            continue
+        _apply_status_to_state(
+            state,
+            stage=stage,
+            status_payload=record,
+            trace_event_id=_string_value(record.get("event_id")),
+            timestamp=_string_value(record.get("timestamp")) or timestamp,
+            replay_terminal_rerun=True,
+        )
+        applied = True
+    return applied
+
+
+def _replay_status_artifacts(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> list[str]:
+    applied: list[str] = []
+    for stage, filename in _STAGE_STATUS_ARTIFACTS:
+        record = _stage_record(state, stage)
+        if _status(record) != "pending":
+            continue
+        status_payload = _read_json_artifact(run_dir / filename)
+        if status_payload is None:
+            continue
+        _apply_status_to_state(
+            state,
+            stage=stage,
+            status_payload=status_payload,
+            trace_event_id=None,
+            timestamp=_payload_timestamp(status_payload) or timestamp,
+        )
+        applied.append(filename)
+    return applied
+
+
+def _apply_status_to_state(
+    state: dict[str, Any],
+    *,
+    stage: str,
+    status_payload: Mapping[str, Any],
+    trace_event_id: str | None,
+    timestamp: str | None,
+    replay_terminal_rerun: bool = False,
+) -> None:
+    target = stage_status_to_step_status(stage, status_payload)
+    if target == "pending":
+        return
+    record = _stage_record(state, stage)
+    current = _status(record)
+    if replay_terminal_rerun and current in TERMINAL_STEP_STATUSES and target != "skipped":
+        _apply_stage_transition(
+            state,
+            stage,
+            "running",
+            reason="replay_terminal_stage_rerun",
+            timestamp=timestamp,
+            trace_event_id=trace_event_id,
+        )
+        current = _status(record)
+    if current == "completed" and target == "skipped":
+        _apply_completed_stage_skip_to_state(
+            state,
+            stage=stage,
+            status_payload=status_payload,
+            trace_event_id=trace_event_id,
+            timestamp=timestamp,
+        )
+        return
+    if (
+        current == "running"
+        and target == "skipped"
+        and _previous_terminal_status(record) == "completed"
+    ):
+        _apply_completed_stage_skip_to_state(
+            state,
+            stage=stage,
+            status_payload=status_payload,
+            trace_event_id=trace_event_id,
+            timestamp=timestamp,
+            from_status="running",
+        )
+        return
+    if current == "pending" and target != "running":
+        _apply_stage_transition(
+            state,
+            stage,
+            "running",
+            reason="implicit_stage_started",
+            timestamp=timestamp,
+        )
+    _apply_stage_transition(
+        state,
+        stage,
+        target,
+        reason=_transition_reason(target, status_payload),
+        timestamp=timestamp,
+        trace_event_id=trace_event_id,
+        status_payload=status_payload,
+    )
+
+
+def _apply_stage_transition(
+    state: dict[str, Any],
+    stage: str,
+    to_status: str,
+    *,
+    reason: str,
+    timestamp: str | None,
+    trace_event_id: str | None = None,
+    status_payload: Mapping[str, Any] | None = None,
+) -> None:
+    record = _stage_record(state, stage)
+    from_status = _status(record)
+    allowed = set(RUN_STEP_TRANSITIONS[from_status])
+    if to_status not in allowed:
+        raise RunStepStateError(
+            code="invalid_state_transition",
+            message=(
+                f"cannot transition stage '{stage}' from {from_status} to {to_status}"
+            ),
+            stage=stage,
+            from_status=from_status,
+            to_status=to_status,
+        )
+
+    now = timestamp or _utc_now()
+    record["status"] = to_status
+    record["updated_at"] = now
+    record["retryable"] = to_status in RETRYABLE_STEP_STATUSES
+    record["terminal"] = to_status in TERMINAL_STEP_STATUSES
+    if to_status == "running":
+        if from_status in TERMINAL_STEP_STATUSES:
+            snapshot = _terminal_snapshot(record, from_status)
+            record["previous_terminal_status"] = snapshot
+            terminal_history = record.setdefault("terminal_history", [])
+            if isinstance(terminal_history, list):
+                terminal_history.append({**snapshot, "rerun_started_at": now})
+            record["last_rerun_status"] = "running"
+            record["last_rerun_at"] = now
+        record["attempt"] = int(record.get("attempt") or 0) + 1
+        record["started_at"] = now
+        record.pop("finished_at", None)
+    elif from_status == "running" and record.get("previous_terminal_status"):
+        record["last_rerun_status"] = to_status
+        record["last_rerun_at"] = now
+    if to_status in TERMINAL_STEP_STATUSES or to_status == "failed":
+        record["finished_at"] = now
+    if to_status == "failed" and status_payload is not None:
+        record["failure"] = _failure_summary(status_payload)
+    elif to_status != "failed":
+        record["failure"] = None
+    if to_status == "skipped":
+        record["skip_reason"] = reason
+    elif to_status == "running":
+        record["skip_reason"] = None
+    if trace_event_id:
+        trace_ids = record.setdefault("trace_event_ids", [])
+        if isinstance(trace_ids, list) and trace_event_id not in trace_ids:
+            trace_ids.append(trace_event_id)
+    if status_payload is not None:
+        artifacts = _string_artifacts(status_payload.get("artifacts"))
+        if artifacts:
+            record["artifacts"] = artifacts
+        raw_status = status_payload.get("status")
+        if isinstance(raw_status, str) and raw_status:
+            record["stage_status"] = raw_status
+
+    history = record.setdefault("history", [])
+    if isinstance(history, list):
+        history.append(
+            {
+                "at": now,
+                "from": from_status,
+                "to": to_status,
+                "reason": reason,
+                **({"trace_event_id": trace_event_id} if trace_event_id else {}),
+            }
+        )
+    if to_status == "running" and from_status in TERMINAL_STEP_STATUSES:
+        _reset_downstream_ordered_terminal_stages(
+            state,
+            upstream_stage=stage,
+            timestamp=now,
+            trace_event_id=trace_event_id,
+        )
+    state["updated_at"] = now
+
+
+def _apply_completed_stage_skip_to_state(
+    state: dict[str, Any],
+    *,
+    stage: str,
+    status_payload: Mapping[str, Any],
+    trace_event_id: str | None,
+    timestamp: str | None,
+    from_status: str = "completed",
+) -> None:
+    record = _stage_record(state, stage)
+    now = timestamp or _utc_now()
+    snapshot = _previous_terminal_snapshot(record) if from_status == "running" else None
+    if snapshot is None:
+        snapshot = _terminal_snapshot(record, "completed")
+    record["status"] = "completed"
+    record["updated_at"] = now
+    record["retryable"] = False
+    record["terminal"] = True
+    record["skip_reason"] = _transition_reason("skipped", status_payload)
+    record["previous_terminal_status"] = snapshot
+    record["last_rerun_status"] = "skipped"
+    record["last_rerun_at"] = now
+    for key in ("started_at", "finished_at"):
+        value = snapshot.get(key)
+        if value is not None:
+            record[key] = value
+    artifacts = _string_artifacts(status_payload.get("artifacts"))
+    if artifacts:
+        record["artifacts"] = artifacts
+    raw_status = status_payload.get("status")
+    if isinstance(raw_status, str) and raw_status:
+        record["stage_status"] = raw_status
+    trace_ids = record.setdefault("trace_event_ids", [])
+    if isinstance(trace_ids, list) and trace_event_id and trace_event_id not in trace_ids:
+        trace_ids.append(trace_event_id)
+    history = record.setdefault("history", [])
+    if isinstance(history, list):
+        history.append(
+            {
+                "at": now,
+                "from": from_status,
+                "to": "completed",
+                "reason": record["skip_reason"],
+                "rerun_status": "skipped",
+                **({"trace_event_id": trace_event_id} if trace_event_id else {}),
+            }
+        )
+    terminal_history = record.setdefault("terminal_history", [])
+    if isinstance(terminal_history, list):
+        terminal_history.append({**snapshot, "rerun_status": "skipped", "rerun_at": now})
+    state["updated_at"] = now
+
+
+def _reset_downstream_ordered_terminal_stages(
+    state: dict[str, Any],
+    *,
+    upstream_stage: str,
+    timestamp: str,
+    trace_event_id: str | None,
+) -> None:
+    if upstream_stage not in RUN_STAGE_ORDER:
+        return
+    start = RUN_STAGE_ORDER.index(upstream_stage) + 1
+    for stage in RUN_STAGE_ORDER[start:]:
+        record = _stage_record(state, stage)
+        from_status = _status(record)
+        if from_status not in TERMINAL_STEP_STATUSES:
+            continue
+        snapshot = _terminal_snapshot(record, from_status)
+        record["status"] = "pending"
+        record["updated_at"] = timestamp
+        record["retryable"] = False
+        record["terminal"] = False
+        record["failure"] = None
+        record["skip_reason"] = None
+        record["artifacts"] = {}
+        record["stale_terminal_status"] = snapshot
+        record["stale_reset"] = {
+            "status": "stale-reset",
+            "at": timestamp,
+            "reason": "stale_reset_after_upstream_rerun",
+            "upstream_stage": upstream_stage,
+            "previous_terminal_status": snapshot,
+            **({"trace_event_id": trace_event_id} if trace_event_id else {}),
+        }
+        for key in (
+            "finished_at",
+            "last_rerun_at",
+            "last_rerun_status",
+            "previous_terminal_status",
+            "stage_status",
+            "started_at",
+        ):
+            record.pop(key, None)
+        history = record.setdefault("history", [])
+        if isinstance(history, list):
+            history.append(
+                {
+                    "at": timestamp,
+                    "from": from_status,
+                    "to": "pending",
+                    "reason": "stale_reset_after_upstream_rerun",
+                    "upstream_stage": upstream_stage,
+                    **({"trace_event_id": trace_event_id} if trace_event_id else {}),
+                }
+            )
+        terminal_history = record.setdefault("terminal_history", [])
+        if isinstance(terminal_history, list):
+            terminal_history.append(
+                {
+                    **snapshot,
+                    "stale_reset_at": timestamp,
+                    "stale_reset_reason": "stale_reset_after_upstream_rerun",
+                    "upstream_stage": upstream_stage,
+                }
+            )
+
+
 def _with_resume_summary(state: dict[str, Any]) -> dict[str, Any]:
     stages = state.get("stages")
     if not isinstance(stages, dict):
@@ -758,6 +973,49 @@ def _read_state(path: Path) -> dict[str, Any]:
     return state
 
 
+def _read_json_artifact(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        raise RunStepStateError(
+            code="invalid_json",
+            message=f"invalid JSON in {path}: {exc}",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RunStepStateError(
+            code="expected_object",
+            message=f"{path} must contain a JSON object",
+        )
+    return payload
+
+
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return records
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RunStepStateError(
+                code="invalid_json",
+                message=f"invalid JSONL in {path} line {line_number}: {exc}",
+            ) from exc
+        if not isinstance(record, dict):
+            raise RunStepStateError(
+                code="expected_object",
+                message=f"{path} line {line_number} must contain a JSON object",
+            )
+        records.append(record)
+    return records
+
+
 def _write_state(path: Path, state: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -779,6 +1037,14 @@ def _resolve_run_id(run_dir: Path, run_id: str | None = None) -> str:
 def _payload_run_id(status_payload: Mapping[str, Any]) -> str | None:
     run_id = status_payload.get("run_id")
     return run_id if isinstance(run_id, str) and run_id else None
+
+
+def _payload_timestamp(status_payload: Mapping[str, Any]) -> str | None:
+    for key in ("updated_at", "created_at", "generated_at", "fetched_at", "ingested_at"):
+        value = status_payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _string_value(value: Any) -> str | None:
