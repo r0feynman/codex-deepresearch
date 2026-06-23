@@ -28,6 +28,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
     "plugins/codex-deepresearch/src/deepresearch/fetch_claims.py",
+    "plugins/codex-deepresearch/src/deepresearch/guardrails.py",
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/report_generation.py",
@@ -44,6 +45,7 @@ REQUIRED_FILES = [
     "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
     "tests/test_fetch_claims.py",
+    "tests/test_guardrails.py",
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
     "tests/test_report_generation.py",
@@ -275,6 +277,85 @@ def main() -> None:
     validation = fetch_validation.get("validation")
     if not isinstance(validation, dict) or validation.get("valid") is not True:
         fail("runner fetch-claims did not produce valid evidence")
+
+    with tempfile.TemporaryDirectory() as guardrail_runs_dir:
+        run_dir = Path(guardrail_runs_dir) / "guardrails-smoke"
+        run_dir.mkdir()
+        evidence = {
+            "schema_version": "0.1.0",
+            "run_id": "guardrails-smoke",
+            "created_at": "2026-06-22T00:00:00Z",
+            "question": "Guardrails smoke",
+            "mode": "codex-plugin",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+            "routing": [],
+            "search_tasks": [],
+            "sources": [
+                {
+                    "id": "src_guardrails_smoke",
+                    "type": "web",
+                    "url": "https://example.com/guardrails",
+                    "title": "Guardrails Smoke Source",
+                    "published_at": None,
+                    "accessed_at": "2026-06-22T00:00:00Z",
+                    "quality": "secondary",
+                    "retrieval_status": "fetched",
+                    "local_artifact_path": "sources/src_guardrails_smoke.html",
+                    "license_policy": "allowed",
+                    "robots_policy": "disallowed",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                }
+            ],
+            "images": [],
+            "claims": [
+                {
+                    "id": "claim_guardrails_smoke",
+                    "text": "A legal compliance claim needs guardrail review.",
+                    "claim_type": "text",
+                    "supporting_sources": ["src_guardrails_smoke"],
+                    "supporting_images": [],
+                    "quote_spans": [
+                        {
+                            "source_id": "src_guardrails_smoke",
+                            "quote": "A legal compliance claim needs guardrail review.",
+                            "location": "paragraph 1",
+                        }
+                    ],
+                    "votes": [],
+                    "verification_status": "supported",
+                    "review_status": "human_accepted",
+                    "promotion_status": "promoted_memory",
+                    "confidence": "high",
+                    "caveats": [],
+                }
+            ],
+        }
+        (run_dir / "evidence.json").write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        guardrails_result = subprocess.run(
+            [str(runner), "enforce-guardrails", "--run", str(run_dir)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if guardrails_result.returncode != 0:
+        fail("runner enforce-guardrails must apply local policy gates")
+    try:
+        guardrails_validation = json.loads(guardrails_result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"runner enforce-guardrails must output valid JSON: {exc}")
+    if guardrails_validation.get("status") != "completed":
+        fail("runner enforce-guardrails did not report completed")
+    if guardrails_validation.get("claims", [{}])[0].get("verification_status") != "policy_blocked":
+        fail("runner enforce-guardrails did not policy-block disallowed evidence")
+    validation = guardrails_validation.get("validation")
+    if not isinstance(validation, dict) or validation.get("valid") is not True:
+        fail("runner enforce-guardrails did not produce valid evidence")
 
     with tempfile.TemporaryDirectory() as verify_runs_dir:
         run_dir = Path(verify_runs_dir) / "verify-claims-smoke"

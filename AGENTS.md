@@ -42,6 +42,44 @@ python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.
 plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --evidence tests/fixtures/evidence_schema/valid_evidence.json --search-results tests/fixtures/evidence_schema/search_results.jsonl --visual-observations tests/fixtures/evidence_schema/visual_observations.jsonl --verifier-votes tests/fixtures/evidence_schema/verifier_votes.jsonl
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "Manual validation" --runs-dir /tmp/codex-deepresearch-manual-validation --url https://example.com/manual-source
 tmpdir=/tmp/codex-deepresearch-vision-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Vision adapter validation" --runs-dir "$tmpdir" --route visual_required | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision --run "$run_dir" --provider codex-interactive
+tmpdir=/tmp/codex-deepresearch-guardrail-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Guardrail validation" --runs-dir "$tmpdir" --route text_only | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); python3 - "$run_dir" <<'PY'
+import json, sys
+from pathlib import Path
+run_dir = Path(sys.argv[1])
+evidence = json.loads((run_dir / "evidence.json").read_text())
+source = {
+    "id": "src_guardrail_validation",
+    "type": "web",
+    "url": "https://example.com/guardrail",
+    "title": "Guardrail Validation Source",
+    "published_at": None,
+    "accessed_at": "2026-06-22T00:00:00Z",
+    "quality": "secondary",
+    "retrieval_status": "fetched",
+    "local_artifact_path": "sources/src_guardrail_validation.html",
+    "license_policy": "allowed",
+    "robots_policy": "disallowed",
+    "policy_decision": "allowed",
+    "policy_flags": [],
+}
+evidence["sources"] = [source]
+evidence["claims"] = [{
+    "id": "claim_guardrail_validation",
+    "text": "A legal compliance claim needs guardrail review.",
+    "claim_type": "text",
+    "supporting_sources": ["src_guardrail_validation"],
+    "supporting_images": [],
+    "quote_spans": [{"source_id": "src_guardrail_validation", "quote": "A legal compliance claim needs guardrail review.", "location": "paragraph 1"}],
+    "votes": [],
+    "verification_status": "supported",
+    "review_status": "human_accepted",
+    "promotion_status": "promoted_memory",
+    "confidence": "high",
+    "caveats": [],
+}]
+(run_dir / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+PY
+plugins/codex-deepresearch/scripts/codex-deepresearch enforce-guardrails --run "$run_dir"
 tmpdir=/tmp/codex-deepresearch-verify-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Verification matrix validation" --runs-dir "$tmpdir" --route text_only | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); page="$run_dir/source.html"; printf '<html><body><p>The verification matrix validation command extracts a source linked claim.</p></body></html>' > "$page"; python3 - "$run_dir" "$page" <<'PY'
 import json, sys
 from pathlib import Path
@@ -86,7 +124,7 @@ plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run "$run_
 plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run "$run_dir"
 ```
 
-`python3 scripts/validate_repo.py` also runs no-network `fetch-claims` and `synthesize` smokes against temporary local artifacts.
+`python3 scripts/validate_repo.py` also runs no-network `fetch-claims`, `enforce-guardrails`, and `synthesize` smokes against temporary local artifacts.
 
 Keep this section current when new implementation test commands are added.
 

@@ -48,6 +48,8 @@ plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --eviden
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "Manual validation" --runs-dir /tmp/codex-deepresearch-manual-validation --url https://example.com/manual-source
 ```
 
+`scripts/validate_repo.py` also exercises no-network fetch, guardrail, verification, vision, and report-generation smokes against temporary local artifacts. See `AGENTS.md` for the full pre-PR validation command block.
+
 ## GitHub Project Management
 
 Milestones, labels, and starter issues can be seeded with:
