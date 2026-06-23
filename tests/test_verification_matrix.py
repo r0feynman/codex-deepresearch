@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +16,8 @@ PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import validate_artifacts, verify_claims
+
+verification_matrix_module = importlib.import_module("deepresearch.verification_matrix")
 
 
 class VerificationMatrixTests(unittest.TestCase):
@@ -424,15 +428,142 @@ class VerificationMatrixTests(unittest.TestCase):
         evidence["claims"] = [self.claim(claim_id="claim_repeat")]
         self.write_json(run_dir / "evidence.json", evidence)
 
-        verify_claims(run=run_dir)
-        first_vote_ids = [vote["id"] for vote in self.votes_for(run_dir, "claim_repeat")]
-        verify_claims(run=run_dir)
-        second_vote_ids = [vote["id"] for vote in self.votes_for(run_dir, "claim_repeat")]
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+        first_votes = self.votes_for(run_dir, "claim_repeat")
 
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:05:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+        second_votes = self.votes_for(run_dir, "claim_repeat")
+
+        first_vote_ids = [vote["id"] for vote in first_votes]
+        second_vote_ids = [vote["id"] for vote in second_votes]
         self.assertEqual(first_vote_ids, second_vote_ids)
         self.assertEqual(len(second_vote_ids), len(set(second_vote_ids)))
+        self.assertEqual({vote["created_at"] for vote in second_votes}, {"2026-06-22T00:00:00Z"})
+        self.assertEqual(result["claims_reused"], 1)
+        self.assertTrue(result["claim_statuses"][0]["cache_hit"])
         evidence = self.assert_valid_run(run_dir)
         self.assertEqual(len(evidence["claims"][0]["votes"]), 3)
+
+    def test_changed_claim_text_invalidates_verification_cache(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [self.claim(claim_id="claim_changed_text")]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        old_cache_key = evidence["claims"][0]["verification_cache_key"]
+        evidence["claims"][0]["text"] = "The changed source says Example."
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:10:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertFalse(result["claim_statuses"][0]["cache_hit"])
+        self.assertEqual(
+            {vote["created_at"] for vote in self.votes_for(run_dir, "claim_changed_text")},
+            {"2026-06-22T00:10:00Z"},
+        )
+
+    def test_changed_source_policy_invalidates_verification_cache(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [self.claim(claim_id="claim_changed_policy")]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        old_cache_key = evidence["claims"][0]["verification_cache_key"]
+        evidence["sources"][0]["policy_decision"] = "blocked"
+        evidence["sources"][0]["policy_flags"] = ["robots_disallowed"]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:15:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertEqual(
+            {vote["created_at"] for vote in self.votes_for(run_dir, "claim_changed_policy")},
+            {"2026-06-22T00:15:00Z"},
+        )
+
+    def test_changed_visual_evidence_invalidates_verification_cache(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_changed_image",
+                claim_type="visual",
+                supporting_images=["img_001"],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        old_cache_key = evidence["claims"][0]["verification_cache_key"]
+        evidence["images"][0]["hash"] = "sha256:changed"
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:20:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        self.assertNotEqual(evidence["claims"][0]["verification_cache_key"], old_cache_key)
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertEqual(
+            {vote["created_at"] for vote in self.votes_for(run_dir, "claim_changed_image")},
+            {"2026-06-22T00:20:00Z"},
+        )
 
     def test_cli_verify_claims_outputs_status_json(self) -> None:
         run_dir = self.temp_run(route="text_only")

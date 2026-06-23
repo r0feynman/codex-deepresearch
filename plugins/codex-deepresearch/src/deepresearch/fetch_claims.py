@@ -15,6 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from .cache_keys import claim_cache_key, source_cache_key
 from .evidence_schema import validate_artifacts
 from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
@@ -210,16 +211,12 @@ def fetch_claims(
         for source in sources
         if isinstance(source, dict) and isinstance(source.get("id"), str)
     }
-    evidence["quote_candidates"] = [
-        quote
-        for quote in evidence.get("quote_candidates", [])
-        if not (isinstance(quote, Mapping) and quote.get("extraction_stage") == "fetch_claims")
-    ]
-    evidence["claims"] = [
-        claim
-        for claim in evidence.get("claims", [])
-        if not (isinstance(claim, Mapping) and claim.get("extraction_stage") == "fetch_claims")
-    ]
+    evidence.setdefault("quote_candidates", [])
+    evidence.setdefault("claims", [])
+    if not isinstance(evidence["quote_candidates"], list):
+        raise FetchClaimsError("evidence.quote_candidates must be a list")
+    if not isinstance(evidence["claims"], list):
+        raise FetchClaimsError("evidence.claims must be a list")
     quote_candidates: list[dict[str, Any]] = evidence["quote_candidates"]
     claims: list[dict[str, Any]] = evidence["claims"]
 
@@ -227,6 +224,7 @@ def fetch_claims(
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     errors: list[dict[str, Any]] = []
     fetched_count = 0
+    reused_count = 0
     partial_count = 0
     failed_count = 0
     created_quote_count = 0
@@ -249,6 +247,34 @@ def fetch_claims(
             )
             entry["retrieval_status"] = "failed"
             continue
+
+        previous_source_cache_key = source.get("cache_key")
+        current_source_cache_key = source_cache_key(source, entry)
+        source["cache_key"] = current_source_cache_key
+        entry["cache_key"] = current_source_cache_key
+        if _can_reuse_completed_source(
+            run_dir,
+            source,
+            current_source_cache_key,
+            previous_cache_key=previous_source_cache_key,
+        ):
+            _refresh_fetch_claim_cache_keys(
+                evidence,
+                source=source,
+                source_by_id=source_by_id,
+            )
+            entry["retrieval_status"] = source.get("retrieval_status", "fetched")
+            if isinstance(source.get("local_artifact_path"), str):
+                entry["local_artifact_path"] = source["local_artifact_path"]
+            source_quote_count = _existing_quote_count(quote_candidates, source_id)
+            source_claim_count = _existing_claim_count(claims, source_id)
+            entry["quote_candidate_count"] = source_quote_count
+            entry["claim_count"] = source_claim_count
+            _write_source_metadata(run_dir, source)
+            reused_count += 1
+            continue
+
+        _remove_fetch_claim_records(evidence, source_id)
 
         if _policy_decision(source, entry) != "allowed":
             _mark_policy_blocked(source, entry, now)
@@ -321,6 +347,7 @@ def fetch_claims(
                 "extracted_at": now,
                 "extraction_stage": "fetch_claims",
                 "confidence": "low",
+                "source_cache_key": current_source_cache_key,
             }
             quote_candidates.append(candidate)
             source["quote_candidate_ids"].append(quote_id)
@@ -347,7 +374,12 @@ def fetch_claims(
                 "caveats": ["Automatically extracted from fetched source text; not verified."],
                 "quote_candidate_id": quote_id,
                 "extraction_stage": "fetch_claims",
+                "source_cache_key": current_source_cache_key,
             }
+            claim["cache_key"] = claim_cache_key(
+                claim,
+                sources_by_id={source_id: source},
+            )
             claims.append(claim)
             source_claim_count += 1
 
@@ -364,6 +396,7 @@ def fetch_claims(
         "status": "completed_with_errors" if errors else "completed",
         "fetched_at": now,
         "fetch_queue_path": "fetch_queue.json",
+        "sources_reused": reused_count,
         "quote_candidates_created": created_quote_count,
         "claims_created": created_claim_count,
         "high_confidence_claims_created": 0,
@@ -376,6 +409,7 @@ def fetch_claims(
     status.update(
         {
             "validation": validation.to_dict(),
+            "sources_reused": reused_count,
             "sources_fetched": fetched_count,
             "sources_partial": partial_count,
             "sources_failed": failed_count,
@@ -398,7 +432,7 @@ def fetch_claims(
         agent_role="fetch_claims_agent",
         status_payload=status,
         prompt_summary="Fetch queued sources and extract low-confidence source-linked claims.",
-        tool_call_summary="Fetched allowed source bodies, preserved local artifacts, and extracted quote candidates.",
+        tool_call_summary="Reused completed source cache hits, fetched changed source bodies, preserved local artifacts, and extracted quote candidates.",
     )
     _write_run_json(run_dir, "fetch_claims_status.json", status)
     return status
@@ -616,6 +650,99 @@ def _claim_id(source_id: str, index: int) -> str:
 def _safe_id(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
     return safe or "source"
+
+
+def _can_reuse_completed_source(
+    run_dir: Path,
+    source: Mapping[str, Any],
+    current_cache_key: str,
+    *,
+    previous_cache_key: Any,
+) -> bool:
+    if isinstance(previous_cache_key, str) and previous_cache_key != current_cache_key:
+        return False
+    if source.get("retrieval_status") not in {"fetched", "partial"}:
+        return False
+    local_artifact_path = source.get("local_artifact_path")
+    if not isinstance(local_artifact_path, str) or not local_artifact_path:
+        return False
+    if local_artifact_path == _metadata_path(source):
+        return False
+    try:
+        return _resolve_run_relative_path(run_dir, local_artifact_path).is_file()
+    except FetchClaimsError:
+        return False
+
+
+def _refresh_fetch_claim_cache_keys(
+    evidence: Mapping[str, Any],
+    *,
+    source: Mapping[str, Any],
+    source_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    source_id = source.get("id")
+    source_key = source.get("cache_key")
+    if not isinstance(source_id, str) or not isinstance(source_key, str):
+        return
+    quotes = evidence.get("quote_candidates", [])
+    if isinstance(quotes, list):
+        for quote in quotes:
+            if (
+                isinstance(quote, dict)
+                and quote.get("extraction_stage") == "fetch_claims"
+                and quote.get("source_id") == source_id
+            ):
+                quote["source_cache_key"] = source_key
+    claims = evidence.get("claims", [])
+    if isinstance(claims, list):
+        for claim in claims:
+            if not _is_fetch_claim_for_source(claim, source_id):
+                continue
+            claim["source_cache_key"] = source_key
+            claim["cache_key"] = claim_cache_key(claim, sources_by_id=source_by_id)
+
+
+def _remove_fetch_claim_records(evidence: Mapping[str, Any], source_id: str) -> None:
+    quotes = evidence.get("quote_candidates", [])
+    if isinstance(quotes, list):
+        quotes[:] = [
+            quote
+            for quote in quotes
+            if not (
+                isinstance(quote, Mapping)
+                and quote.get("extraction_stage") == "fetch_claims"
+                and quote.get("source_id") == source_id
+            )
+        ]
+    claims = evidence.get("claims", [])
+    if isinstance(claims, list):
+        claims[:] = [
+            claim
+            for claim in claims
+            if not _is_fetch_claim_for_source(claim, source_id)
+        ]
+
+
+def _is_fetch_claim_for_source(claim: Any, source_id: str) -> bool:
+    return (
+        isinstance(claim, Mapping)
+        and claim.get("extraction_stage") == "fetch_claims"
+        and source_id in _string_list(claim.get("supporting_sources"))
+    )
+
+
+def _existing_quote_count(quotes: list[dict[str, Any]], source_id: str) -> int:
+    return sum(
+        1
+        for quote in quotes
+        if isinstance(quote, Mapping)
+        and quote.get("extraction_stage") == "fetch_claims"
+        and quote.get("source_id") == source_id
+    )
+
+
+def _existing_claim_count(claims: list[dict[str, Any]], source_id: str) -> int:
+    return sum(1 for claim in claims if _is_fetch_claim_for_source(claim, source_id))
 
 
 def _policy_decision(source: Mapping[str, Any], entry: Mapping[str, Any]) -> str:

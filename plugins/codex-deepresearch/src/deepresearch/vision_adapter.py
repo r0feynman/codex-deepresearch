@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
+from .cache_keys import image_cache_key
 from .evidence_schema import VLM_PROVIDERS, validate_artifacts
 from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import resolve_run_dir
@@ -83,7 +84,8 @@ def ingest_vision_observations(
     normalized_images: list[dict[str, Any]] = []
     existing_image_ids = _existing_ids(evidence["images"])
     used_image_ids: set[str] = set()
-    source_ids = _source_ids(evidence.get("sources", []))
+    sources_by_id = _sources_by_id(evidence.get("sources", []))
+    source_ids = set(sources_by_id)
 
     for index, record in enumerate(records):
         if not isinstance(record, Mapping):
@@ -96,7 +98,7 @@ def ingest_vision_observations(
                     provider=normalized_provider,
                     index=index,
                     run_dir=run_dir,
-                    source_ids=source_ids,
+                    sources_by_id=sources_by_id,
                     existing_image_ids=existing_image_ids,
                     used_image_ids=used_image_ids,
                     now=now,
@@ -139,7 +141,12 @@ def ingest_vision_observations(
         )
     ]
 
+    images_reused = 0
     if normalized_images:
+        normalized_images, images_reused = _reuse_completed_images(
+            evidence["images"],
+            normalized_images,
+        )
         new_ids = {image["id"] for image in normalized_images}
         evidence["images"] = [
             image
@@ -171,6 +178,7 @@ def ingest_vision_observations(
         "input_observations_path": _relative_or_string(run_dir, input_path),
         "visual_observations_path": "visual_observations.jsonl",
         "images_ingested": len(normalized_images),
+        "images_reused": images_reused,
         "missing_visual_claims_created": 0
         if normalized_images
         else len(
@@ -201,6 +209,7 @@ def ingest_vision_observations(
         {
             "provider": normalized_provider,
             "images_ingested": len(normalized_images),
+            "images_reused": images_reused,
             "missing_visual_claims_created": evidence["vision_adapter"][
                 "missing_visual_claims_created"
             ],
@@ -219,7 +228,7 @@ def ingest_vision_observations(
         agent_role="vision_adapter",
         status_payload=status,
         prompt_summary="Normalize visual handoff records into VisualEvidence.",
-        tool_call_summary="Read visual observations, normalized image evidence, and updated evidence.json without VLM calls.",
+        tool_call_summary="Read visual observations, reused unchanged image cache hits, normalized changed image evidence, and updated evidence.json without VLM calls.",
     )
     _write_json(run_dir / "vision_ingest_status.json", status)
     return status
@@ -231,7 +240,7 @@ def _normalize_visual_record(
     provider: str,
     index: int,
     run_dir: Path,
-    source_ids: set[str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
     existing_image_ids: set[str],
     used_image_ids: set[str],
     now: str,
@@ -250,12 +259,14 @@ def _normalize_visual_record(
         used_image_ids=used_image_ids,
     )
     source_id = _first_string(record, "source_id") or _first_string(image, "source_id")
+    source_ids = set(sources_by_id)
     if source_id is None and len(source_ids) == 1:
         source_id = next(iter(source_ids))
     if source_id is None:
         raise VisionAdapterError("visual observation requires source_id")
     if source_ids and source_id not in source_ids:
         raise VisionAdapterError(f"source_id '{source_id}' does not exist in evidence.sources")
+    source = sources_by_id.get(source_id)
 
     explicit_artifact_path = _first_string(
         record,
@@ -322,14 +333,17 @@ def _normalize_visual_record(
     if explicit_artifact_path is None and not artifact_file.exists():
         caveats.append("metadata-only visual record; no local image artifact was provided")
 
+    artifact_size_bytes = _artifact_size_bytes(record, image, artifact_file)
     visual = {
         "id": image_id,
         "source_id": source_id,
         "origin": _origin(record, image, provider),
+        "source_url": _first_optional_string(source or {}, "url"),
         "image_url": image_url,
         "page_url": page_url,
         "local_artifact_path": local_path,
         "mime_type": _mime_type(record, image, local_path),
+        "artifact_size_bytes": artifact_size_bytes,
         "width": _number(record, image, "width"),
         "height": _number(record, image, "height"),
         "hash": _hash(record, image, artifact_file),
@@ -351,6 +365,7 @@ def _normalize_visual_record(
         visual["raw_provider_metadata"] = dict(raw_provider_metadata)
     elif isinstance(response, Mapping):
         visual["raw_provider_metadata"] = {"response": dict(response)}
+    visual["cache_key"] = image_cache_key(visual, source=source)
     return visual
 
 
@@ -504,6 +519,30 @@ def _hash(record: Mapping[str, Any], image: Mapping[str, Any], artifact_file: Pa
     return None
 
 
+def _artifact_size_bytes(
+    record: Mapping[str, Any],
+    image: Mapping[str, Any],
+    artifact_file: Path,
+) -> int | None:
+    if artifact_file.exists() and artifact_file.is_file():
+        return artifact_file.stat().st_size
+    for container in (record, image):
+        for key in ("artifact_size_bytes", "size_bytes", "content_length", "file_size", "byte_size"):
+            value = container.get(key)
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, str) and value.strip():
+                try:
+                    return int(value)
+                except ValueError:
+                    continue
+    return None
+
+
 def _number(record: Mapping[str, Any], image: Mapping[str, Any], key: str) -> int | float:
     for container in (record, image):
         value = container.get(key)
@@ -580,8 +619,68 @@ def _existing_ids(records: Any) -> set[str]:
     }
 
 
-def _source_ids(records: Any) -> set[str]:
-    return _existing_ids(records)
+def _sources_by_id(records: Any) -> dict[str, Mapping[str, Any]]:
+    if not isinstance(records, list):
+        return {}
+    return {
+        record["id"]: record
+        for record in records
+        if isinstance(record, Mapping) and isinstance(record.get("id"), str)
+    }
+
+
+def _reuse_completed_images(
+    existing_images: list[Any],
+    normalized_images: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    by_id: dict[str, Mapping[str, Any]] = {}
+    by_cache_key: dict[str, Mapping[str, Any]] = {}
+    for image in existing_images:
+        if not isinstance(image, Mapping):
+            continue
+        image_id = image.get("id")
+        cache_key = image.get("cache_key")
+        if isinstance(image_id, str):
+            by_id[image_id] = image
+        if isinstance(cache_key, str):
+            by_cache_key[cache_key] = image
+
+    reused_count = 0
+    result: list[dict[str, Any]] = []
+    for image in normalized_images:
+        current_key = image.get("cache_key")
+        existing = None
+        image_id = image.get("id")
+        if isinstance(image_id, str):
+            existing = by_id.get(image_id)
+        if existing is None and isinstance(current_key, str):
+            existing = by_cache_key.get(current_key)
+        if _can_reuse_image(existing, current_key):
+            reused = dict(existing)
+            reused["cache_key"] = current_key
+            if image.get("artifact_size_bytes") is not None:
+                reused.setdefault("artifact_size_bytes", image["artifact_size_bytes"])
+            if image.get("source_url") is not None:
+                reused.setdefault("source_url", image["source_url"])
+            result.append(reused)
+            reused_count += 1
+            continue
+        result.append(image)
+    return result, reused_count
+
+
+def _can_reuse_image(existing: Mapping[str, Any] | None, current_key: Any) -> bool:
+    if not isinstance(existing, Mapping) or not isinstance(current_key, str):
+        return False
+    previous_key = existing.get("cache_key")
+    if isinstance(previous_key, str) and previous_key != current_key:
+        return False
+    return existing.get("analysis_status") in {
+        "analyzed",
+        "needs_manual_review",
+        "policy_blocked",
+        "skipped",
+    }
 
 
 def _image_id(

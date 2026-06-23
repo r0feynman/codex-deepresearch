@@ -470,6 +470,88 @@ class FetchClaimsTests(unittest.TestCase):
         self.assertIn("$.evidence.claims[0].supporting_sources", dangling_paths)
         self.assertIn("$.evidence.claims[0].quote_spans[0].source_id", dangling_paths)
 
+    def test_completed_source_cache_hit_skips_refetch_on_resume(self) -> None:
+        run_dir = self.prepare_ingested_run([self.base_search_result()])
+        html = b"""
+        <html><body>
+          <p>The source cache hit test extracts a reusable source linked claim.</p>
+        </body></html>
+        """
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(html, mime_type="text/html"),
+        ):
+            first = fetch_claims(run=run_dir)
+
+        self.assertEqual(first["sources_fetched"], 1)
+        first_evidence = self.load_json(run_dir / "evidence.json")
+        first_source_key = first_evidence["sources"][0]["cache_key"]
+        first_claims = list(first_evidence["claims"])
+
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            side_effect=AssertionError("unchanged completed source was re-fetched"),
+        ):
+            second = fetch_claims(run=run_dir)
+
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(second["sources_reused"], 1)
+        self.assertEqual(second["sources_fetched"], 0)
+        self.assertEqual(second["claims_created"], 0)
+        self.assertEqual(second["quote_candidates_created"], 0)
+        second_evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(second_evidence["sources"][0]["cache_key"], first_source_key)
+        self.assertEqual(second_evidence["claims"], first_claims)
+
+    def test_changed_source_url_invalidates_cache_and_replaces_generated_claims(self) -> None:
+        run_dir = self.prepare_ingested_run([self.base_search_result()])
+        original_html = b"""
+        <html><body>
+          <p>The original cache key source creates a source linked claim.</p>
+        </body></html>
+        """
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(original_html, mime_type="text/html"),
+        ):
+            fetch_claims(run=run_dir)
+
+        evidence_path = run_dir / "evidence.json"
+        queue_path = run_dir / "fetch_queue.json"
+        first_evidence = self.load_json(evidence_path)
+        first_source_key = first_evidence["sources"][0]["cache_key"]
+        first_claim_text = first_evidence["claims"][0]["text"]
+
+        changed_url = "https://example.com/source?changed=1"
+        first_evidence["sources"][0]["url"] = changed_url
+        self.write_json(evidence_path, first_evidence)
+        fetch_queue = self.load_json(queue_path)
+        fetch_queue["entries"][0]["url"] = changed_url
+        self.write_json(queue_path, fetch_queue)
+
+        changed_html = b"""
+        <html><body>
+          <p>The changed cache key source creates a replacement claim.</p>
+        </body></html>
+        """
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(changed_html, mime_type="text/html", url=changed_url),
+        ):
+            result = fetch_claims(run=run_dir)
+
+        self.assertEqual(result["sources_reused"], 0)
+        self.assertEqual(result["sources_fetched"], 1)
+        evidence = self.load_json(evidence_path)
+        self.assertNotEqual(evidence["sources"][0]["cache_key"], first_source_key)
+        self.assertEqual(len(evidence["claims"]), 1)
+        self.assertNotEqual(evidence["claims"][0]["text"], first_claim_text)
+        self.assertIn("changed cache key source", evidence["claims"][0]["text"])
+
     def test_cli_fetch_claims_uses_local_file_without_network(self) -> None:
         runs_dir = self.temp_runs_dir()
         page = runs_dir / "source.html"
