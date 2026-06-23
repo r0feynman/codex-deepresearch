@@ -17,6 +17,15 @@ from .guardrails import GuardrailsError, enforce_guardrails
 from .manual_sources import ManualSourcesError, ingest_manual_sources
 from .modality_router import ModalityDecision, route_angle, route_angles
 from .mvp_smoke import MvpSmokeError, run_mvp_smoke
+from .parallel_orchestrator import (
+    AdapterUnavailable,
+    CodexExecAdapter,
+    FixtureAdapter,
+    ParallelOrchestrationError,
+    merge_evidence_shards,
+    plan_research_tasks,
+    run_parallel_orchestration,
+)
 from .report_generation import ReportGenerationError, synthesize_report
 from .run_state import (
     RUN_STEPS_FILENAME,
@@ -47,12 +56,16 @@ __all__ = [
     "BUDGET_ESTIMATE_SCHEMA_VERSION",
     "BudgetCaps",
     "BudgetEstimateError",
+    "AdapterUnavailable",
+    "CodexExecAdapter",
     "ConfigResolutionError",
+    "FixtureAdapter",
     "FetchClaimsError",
     "GuardrailsError",
     "ManualSourcesError",
     "ModalityDecision",
     "MvpSmokeError",
+    "ParallelOrchestrationError",
     "ReportGenerationError",
     "RunConfig",
     "RUN_STEPS_FILENAME",
@@ -80,6 +93,8 @@ __all__ = [
     "ingest_manual_sources",
     "ingest_vision_observations",
     "inspect_run_state",
+    "merge_evidence_shards",
+    "plan_research_tasks",
     "prepare_run",
     "route_angle",
     "route_angles",
@@ -87,6 +102,7 @@ __all__ = [
     "resolve_run_dir",
     "run_steps_path",
     "run_mvp_smoke",
+    "run_parallel_orchestration",
     "synthesize_report",
     "transition_stage",
     "validate_artifacts",

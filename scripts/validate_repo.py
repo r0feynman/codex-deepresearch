@@ -33,6 +33,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/mvp_smoke.py",
+    "plugins/codex-deepresearch/src/deepresearch/parallel_orchestrator.py",
     "plugins/codex-deepresearch/src/deepresearch/report_generation.py",
     "plugins/codex-deepresearch/src/deepresearch/run_state.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
@@ -52,6 +53,7 @@ REQUIRED_FILES = [
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
     "tests/test_mvp_smoke.py",
+    "tests/test_parallel_orchestrator.py",
     "tests/test_report_generation.py",
     "tests/test_run_state.py",
     "tests/test_search_handoff.py",
@@ -173,6 +175,69 @@ def run_mvp_smoke_validation(runner: Path) -> None:
     )
 
 
+def run_parallel_orchestration_validation(runner: Path) -> None:
+    """Validate the deterministic no-auth M18 orchestration smoke path."""
+
+    with tempfile.TemporaryDirectory() as runs_dir:
+        prepare = subprocess.run(
+            [
+                str(runner),
+                "prepare",
+                "Validate M18 parallel orchestration",
+                "--runs-dir",
+                runs_dir,
+                "--route",
+                "text_only",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if prepare.returncode != 0:
+            fail("runner prepare must succeed for M18 parallel validation")
+        try:
+            prepared = json.loads(prepare.stdout)
+        except json.JSONDecodeError as exc:
+            fail(f"runner prepare must output valid JSON for M18 validation: {exc}")
+        run_dir = prepared.get("run_dir")
+        if not run_dir:
+            fail("runner prepare must output run_dir for M18 validation")
+
+        orchestrate = subprocess.run(
+            [
+                str(runner),
+                "orchestrate-parallel",
+                "--run",
+                run_dir,
+                "--adapter",
+                "fixture",
+                "--min-tasks",
+                "3",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if orchestrate.returncode != 0:
+            fail("runner orchestrate-parallel fixture smoke must exit 0")
+        try:
+            result = json.loads(orchestrate.stdout)
+        except json.JSONDecodeError as exc:
+            fail(f"runner orchestrate-parallel must output valid JSON: {exc}")
+        if result.get("status") != "completed":
+            fail("runner orchestrate-parallel fixture smoke did not complete")
+        if result.get("parallel_degraded") is not False:
+            fail("fixture orchestration smoke must not mark degraded execution")
+        merge = result.get("merge", {})
+        if merge.get("status") != "completed":
+            fail("parallel shard merge did not report completed")
+        validation = merge.get("validation", {})
+        if validation.get("valid") is not True:
+            fail("parallel shard merge did not leave schema-valid evidence")
+
+
 def main() -> None:
     for relative_path in REQUIRED_FILES:
         if not (ROOT / relative_path).exists():
@@ -252,6 +317,8 @@ def main() -> None:
         fail(f"runner validate-evidence must output valid JSON: {exc}")
     if evidence_validation.get("valid") is not True:
         fail("runner validate-evidence did not report valid fixture artifacts")
+
+    run_parallel_orchestration_validation(runner)
 
     with tempfile.TemporaryDirectory() as manual_runs_dir:
         manual_result = subprocess.run(

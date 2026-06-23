@@ -22,9 +22,10 @@ RUN_STAGE_ORDER = (
     "verify_claims",
     "synthesize",
 )
-OPTIONAL_RUN_STAGES = ("ingest_manual",)
+OPTIONAL_RUN_STAGES = ("ingest_manual", "parallel_orchestration")
 RUN_STAGES = (
     "planning",
+    "parallel_orchestration",
     "ingest",
     "ingest_manual",
     "fetch_claims",
@@ -59,6 +60,7 @@ _SKIPPED_STAGE_STATUSES = {
 }
 _STAGE_STATUS_ARTIFACTS = (
     ("planning", "status.json"),
+    ("parallel_orchestration", "parallel_orchestration_status.json"),
     ("ingest", "ingest_status.json"),
     ("ingest_manual", "manual_ingest_status.json"),
     ("fetch_claims", "fetch_claims_status.json"),

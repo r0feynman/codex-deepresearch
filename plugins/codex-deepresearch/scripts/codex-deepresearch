@@ -21,6 +21,12 @@ from deepresearch.fetch_claims import FetchClaimsError, fetch_claims
 from deepresearch.guardrails import GuardrailsError, enforce_guardrails
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
 from deepresearch.mvp_smoke import DEFAULT_INVOKE, MvpSmokeError, run_mvp_smoke
+from deepresearch.parallel_orchestrator import (
+    AdapterUnavailable,
+    ParallelOrchestrationError,
+    plan_research_tasks,
+    run_parallel_orchestration,
+)
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
 from deepresearch.run_state import RunStepStateError, inspect_run_state
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
@@ -472,6 +478,48 @@ def run_run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_plan_parallel(args: argparse.Namespace) -> int:
+    try:
+        result = plan_research_tasks(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            min_tasks=args.min_tasks,
+            max_tasks=args.max_tasks,
+            confirm_exhaustive=args.confirm_exhaustive,
+            max_cost_usd=args.max_cost_usd,
+        )
+    except (ParallelOrchestrationError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_orchestrate_parallel(args: argparse.Namespace) -> int:
+    try:
+        result = run_parallel_orchestration(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            adapter_name=args.adapter,
+            min_tasks=args.min_tasks,
+            max_tasks=args.max_tasks,
+            retry_failed=args.retry_failed,
+            allow_degraded=not args.no_degrade,
+            confirm_exhaustive=args.confirm_exhaustive,
+            max_cost_usd=args.max_cost_usd,
+        )
+    except (AdapterUnavailable, ParallelOrchestrationError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    validation = result.get("merge", {}).get("validation")
+    if isinstance(validation, dict) and validation.get("valid") is False:
+        return 2
+    return 0
+
+
 def run_mvp_smoke_command(args: argparse.Namespace) -> int:
     try:
         result = run_mvp_smoke(
@@ -617,6 +665,99 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for run artifacts, relative to the repo root by default.",
     )
     run_status.set_defaults(func=run_run_status)
+
+    plan_parallel = subparsers.add_parser(
+        "plan-parallel",
+        help="Expand planner output into bounded parallel ResearchTask records.",
+    )
+    plan_parallel.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    plan_parallel.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    plan_parallel.add_argument(
+        "--min-tasks",
+        type=int,
+        default=1,
+        help="Minimum ResearchTask records to create, capped by the budget preset.",
+    )
+    plan_parallel.add_argument(
+        "--max-tasks",
+        type=int,
+        help="Optional task cap below the preset hard cap.",
+    )
+    plan_parallel.add_argument(
+        "--confirm-exhaustive",
+        action="store_true",
+        help="Confirm exhaustive parallel planning when no prepared budget confirmation exists.",
+    )
+    plan_parallel.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Explicit exhaustive max-cost cap when no prepared budget cap exists.",
+    )
+    plan_parallel.set_defaults(func=run_plan_parallel)
+
+    orchestrate_parallel = subparsers.add_parser(
+        "orchestrate-parallel",
+        help="Run parallel ResearchTasks through a Codex adapter and merge shards.",
+    )
+    orchestrate_parallel.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    orchestrate_parallel.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    orchestrate_parallel.add_argument(
+        "--adapter",
+        default="codex-exec",
+        choices=("codex-exec", "fixture"),
+        help=(
+            "Runner adapter. codex-exec degrades to an honest serial blocked-task "
+            "path when unavailable; fixture is only for deterministic tests/smokes."
+        ),
+    )
+    orchestrate_parallel.add_argument(
+        "--min-tasks",
+        type=int,
+        default=1,
+        help="Minimum ResearchTask records to create before execution.",
+    )
+    orchestrate_parallel.add_argument(
+        "--max-tasks",
+        type=int,
+        help="Optional task cap below the preset hard cap.",
+    )
+    orchestrate_parallel.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry failed retry-safe tasks without rerunning completed or merged tasks.",
+    )
+    orchestrate_parallel.add_argument(
+        "--confirm-exhaustive",
+        action="store_true",
+        help="Confirm exhaustive orchestration when no prepared budget confirmation exists.",
+    )
+    orchestrate_parallel.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Explicit exhaustive max-cost cap when no prepared budget cap exists.",
+    )
+    orchestrate_parallel.add_argument(
+        "--no-degrade",
+        action="store_true",
+        help="Fail instead of serially degrading when codex-exec is unavailable.",
+    )
+    orchestrate_parallel.set_defaults(func=run_orchestrate_parallel)
 
     prepare = subparsers.add_parser(
         "prepare",
