@@ -30,6 +30,14 @@ class BudgetEstimatorTests(unittest.TestCase):
         self.addCleanup(temp_dir.cleanup)
         return Path(temp_dir.name)
 
+    def strict_json_loads(self, payload: str) -> dict:
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"non-strict JSON constant: {value}")
+
+        parsed = json.loads(payload, parse_constant=reject_constant)
+        self.assertIsInstance(parsed, dict)
+        return parsed
+
     def routing(
         self,
         *,
@@ -222,6 +230,56 @@ class BudgetEstimatorTests(unittest.TestCase):
             )
         self.assertEqual(impossible.exception.to_dict()["code"], "impossible_image_cap")
         json.loads(str(impossible.exception))
+
+    def test_non_finite_cost_cap_cli_error_is_strict_json(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        result = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "Non-finite cost cap",
+                "--runs-dir",
+                str(runs_dir),
+                "--max-cost-usd",
+                "nan",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        payload = self.strict_json_loads(result.stderr)
+        self.assertEqual(payload["code"], "invalid_cap")
+        self.assertEqual(payload["field"], "max_cost_usd")
+        self.assertEqual(payload["value"], "nan")
+        self.assertEqual(list(runs_dir.iterdir()), [])
+
+    def test_max_results_zero_cli_error_is_machine_readable(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        result = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "Invalid max results",
+                "--runs-dir",
+                str(runs_dir),
+                "--max-results",
+                "0",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        payload = self.strict_json_loads(result.stderr)
+        self.assertEqual(payload["code"], "invalid_cap")
+        self.assertEqual(payload["field"], "max_results")
+        self.assertEqual(payload["value"], 0)
+        self.assertEqual(list(runs_dir.iterdir()), [])
 
     def test_prepare_requires_confirmation_for_deep_budget(self) -> None:
         runs_dir = self.temp_runs_dir()

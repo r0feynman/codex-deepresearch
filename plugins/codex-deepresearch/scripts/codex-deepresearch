@@ -243,7 +243,7 @@ def run_prepare(args: argparse.Namespace) -> int:
             confirm_budget=args.confirm_budget,
         )
     except BudgetEstimateError as exc:
-        print(json.dumps(exc.to_dict(), sort_keys=True), file=sys.stderr)
+        print(json.dumps(exc.to_dict(), sort_keys=True, allow_nan=False), file=sys.stderr)
         return 2
     except (ConfigResolutionError, SearchHandoffError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

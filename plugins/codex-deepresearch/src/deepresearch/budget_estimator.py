@@ -67,18 +67,31 @@ class BudgetEstimateError(ValueError):
         if field is not None:
             payload["field"] = field
         if value is not None:
-            payload["value"] = value
+            payload["value"] = _json_safe_value(value)
         if minimum_supported is not None:
-            payload["minimum_supported"] = minimum_supported
+            payload["minimum_supported"] = _json_safe_value(minimum_supported)
         if allowed_values is not None:
-            payload["allowed_values"] = list(allowed_values)
+            payload["allowed_values"] = _json_safe_value(list(allowed_values))
         if details is not None:
-            payload["details"] = dict(details)
+            payload["details"] = _json_safe_value(dict(details))
         self.payload = payload
-        super().__init__(json.dumps(payload, sort_keys=True))
+        super().__init__(json.dumps(payload, sort_keys=True, allow_nan=False))
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.payload)
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_value(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)

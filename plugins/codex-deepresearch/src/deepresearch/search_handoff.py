@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from .budget_estimator import (
     BudgetCaps,
+    BudgetEstimateError,
     add_budget_estimate_artifact,
     estimate_budget,
     write_budget_estimate,
@@ -72,7 +73,13 @@ def prepare_run(
     if route is not None and route not in SEARCH_ROUTES:
         raise SearchHandoffError("route must be one of: " + ", ".join(SEARCH_ROUTES))
     if max_results < 1:
-        raise SearchHandoffError("max_results must be at least 1")
+        raise BudgetEstimateError(
+            code="invalid_cap",
+            message="max_results must be at least 1",
+            field="max_results",
+            value=max_results,
+            minimum_supported=1,
+        )
 
     config = resolve_config(
         mode=mode,
