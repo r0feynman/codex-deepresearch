@@ -366,6 +366,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(result["degraded_reason"], "codex_exec_unavailable")
         self.assertEqual(result["adapter"], "serial-degraded")
         self.assertEqual(result["max_scheduled_concurrency"], 1)
+        self.assertEqual(result["status"], "degraded_serial_handoff_required")
+        self.assertTrue(result["needs_serial_handoff"])
         tasks = self.load_json(run_dir / "research_tasks.json")
         self.assertTrue(tasks["parallel_degraded"])
         self.assertTrue(all(task["state"] == "blocked" for task in tasks["tasks"]))
@@ -373,6 +375,12 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(evidence["claims"], [])
         merge = self.load_json(run_dir / "merge_status.json")
         self.assertEqual(len(merge["blocked_tasks"]), 2)
+        self.assertEqual(merge["accepted_shards"], [])
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+        self.assertEqual(stages["parallel_orchestration"]["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "pending")
+        self.assertEqual(state["next_safe_stage"], "ingest")
 
     def test_exhaustive_plan_requires_confirmation_and_cost_cap(self) -> None:
         run_dir = self.prepare()

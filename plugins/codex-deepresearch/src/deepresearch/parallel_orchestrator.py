@@ -569,7 +569,15 @@ def _run_parallel_orchestration_started(
         tasks_artifact["degraded_reason"] = degraded_reason
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     merge_status = merge_evidence_shards(run=run_dir)
-    status_value = "completed" if merge_status.get("status") == "completed" else "failed_validation"
+    accepted_shards = _list(merge_status.get("accepted_shards"))
+    needs_serial_handoff = bool(parallel_degraded or not accepted_shards)
+    status_value = (
+        "degraded_serial_handoff_required"
+        if merge_status.get("status") == "completed" and needs_serial_handoff
+        else "completed"
+        if merge_status.get("status") == "completed"
+        else "failed_validation"
+    )
     status = _parallel_status(
         run_dir,
         evidence=evidence,
@@ -581,9 +589,10 @@ def _run_parallel_orchestration_started(
         runnable_task_count=len(runnable),
         max_scheduled_concurrency=max_concurrent,
         merge_status=merge_status,
+        needs_serial_handoff=needs_serial_handoff,
     )
     _write_json(run_dir / "parallel_orchestration_status.json", status)
-    if status_value == "completed":
+    if status_value in {"completed", "degraded_serial_handoff_required"}:
         transition_stage(
             run_dir,
             "parallel_orchestration",
@@ -591,7 +600,8 @@ def _run_parallel_orchestration_started(
             reason="stage_completed",
             status_payload=status,
         )
-        _skip_serial_handoff_after_parallel(run_dir, status)
+        if status_value == "completed":
+            _skip_serial_handoff_after_parallel(run_dir, status)
     else:
         transition_stage(
             run_dir,
@@ -823,6 +833,7 @@ def _parallel_status(
     runnable_task_count: int,
     max_scheduled_concurrency: int,
     merge_status: Mapping[str, Any] | None,
+    needs_serial_handoff: bool = False,
     skip_reason: str | None = None,
     errors: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -838,6 +849,7 @@ def _parallel_status(
         "planned_task_count": planned_task_count,
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
+        "needs_serial_handoff": needs_serial_handoff,
         "artifacts": {
             "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json"),
             "research_tasks": str(run_dir / RESEARCH_TASKS_FILENAME),
