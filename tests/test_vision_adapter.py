@@ -206,6 +206,65 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(claim["confidence"], "low")
         self.assertEqual(claim["supporting_images"], [])
 
+    def test_missing_local_artifact_fails_normalization(self) -> None:
+        run_dir = self.prepared_visual_run()
+        observations_path = run_dir / "missing_artifact.jsonl"
+        self.write_jsonl(
+            observations_path,
+            [
+                {
+                    "image_id": "missing-artifact",
+                    "source_id": "src_checkout",
+                    "local_artifact_path": "images/missing.png",
+                    "observations": ["This should not become analyzed evidence."],
+                    "width": 1,
+                    "height": 1,
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+
+        self.assertEqual(result["status"], "failed_normalization")
+        self.assertEqual(result["errors"][0]["code"], "normalization_failed")
+        self.assertIn("local_artifact_path", result["errors"][0]["detail"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+
+    def test_invalid_image_url_fails_normalization(self) -> None:
+        run_dir = self.prepared_visual_run()
+        observations_path = run_dir / "invalid_url.jsonl"
+        self.write_jsonl(
+            observations_path,
+            [
+                {
+                    "image_id": "bad-url",
+                    "source_id": "src_checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "image_url": "not a url",
+                    "observations": ["This should not become analyzed evidence."],
+                    "width": 1,
+                    "height": 1,
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+
+        self.assertEqual(result["status"], "failed_normalization")
+        self.assertEqual(result["errors"][0]["code"], "normalization_failed")
+        self.assertIn("image_url", result["errors"][0]["detail"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+
     def test_cli_ingest_vision_normalizes_observations(self) -> None:
         run_dir = self.prepared_visual_run()
         observations_path = run_dir / "cli_observations.jsonl"

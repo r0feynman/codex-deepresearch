@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import unquote, urlparse
 
 from .evidence_schema import VLM_PROVIDERS, validate_artifacts
 from .search_handoff import resolve_run_dir
@@ -212,23 +213,43 @@ def _normalize_visual_record(
     if source_ids and source_id not in source_ids:
         raise VisionAdapterError(f"source_id '{source_id}' does not exist in evidence.sources")
 
-    artifact_path = (
-        _first_string(record, "local_artifact_path", "artifact_path", "image_path")
-        or _first_string(image, "local_artifact_path", "artifact_path", "path")
-        or f"images/{image_id}.json"
-    )
+    explicit_artifact_path = _first_string(
+        record,
+        "local_artifact_path",
+        "artifact_path",
+        "image_path",
+    ) or _first_string(image, "local_artifact_path", "artifact_path", "path")
+    artifact_path = explicit_artifact_path or f"images/{image_id}.json"
     artifact_file = _resolve_run_relative_path(run_dir, artifact_path)
     local_path = artifact_file.relative_to(run_dir.resolve()).as_posix()
-    image_url = (
-        _first_optional_string(record, "image_url")
-        or _first_optional_string(image, "image_url", "url")
-        or artifact_file.as_uri()
+    raw_image_url = _first_optional_string(record, "image_url") or _first_optional_string(
+        image,
+        "image_url",
+        "url",
     )
-    page_url = _first_optional_string(record, "page_url", "source_url") or _first_optional_string(
+    raw_page_url = _first_optional_string(record, "page_url", "source_url") or _first_optional_string(
         image,
         "page_url",
         "source_url",
     )
+    image_url = _validated_optional_url(raw_image_url, "image_url", allow_file=True)
+    page_url = _validated_optional_url(raw_page_url, "page_url", allow_file=False)
+    if explicit_artifact_path is not None and not artifact_file.is_file():
+        raise VisionAdapterError(
+            f"local_artifact_path '{local_path}' does not reference an existing run-local file"
+        )
+    if image_url is not None and image_url.startswith("file://") and not _file_uri_exists(image_url):
+        raise VisionAdapterError(f"image_url '{image_url}' does not reference an existing file")
+    if artifact_file.is_file():
+        fallback_image_url = artifact_file.as_uri()
+    else:
+        fallback_image_url = None
+    image_url = image_url or fallback_image_url
+    if image_url is None and page_url is None:
+        raise VisionAdapterError(
+            "visual observation requires an existing local_artifact_path, "
+            "valid image_url, or valid page_url"
+        )
 
     observations = _string_list(
         record,
@@ -254,8 +275,8 @@ def _normalize_visual_record(
     observations = _dedupe(observations)
     inferences = _dedupe(inferences)
     caveats = _dedupe(_string_list(record, "caveats") + _string_list(image, "caveats"))
-    if not artifact_file.exists():
-        caveats.append("local artifact path was recorded but file was not present at ingest time")
+    if explicit_artifact_path is None and not artifact_file.exists():
+        caveats.append("metadata-only visual record; no local image artifact was provided")
 
     visual = {
         "id": image_id,
@@ -361,6 +382,31 @@ def _normalize_provider(provider: str) -> str:
     if normalized not in VLM_PROVIDERS:
         raise VisionAdapterError("provider must be one of: " + ", ".join(VLM_PROVIDERS))
     return normalized
+
+
+def _validated_optional_url(value: str | None, field_name: str, *, allow_file: bool) -> str | None:
+    if value is None:
+        return None
+    if any(character.isspace() for character in value):
+        raise VisionAdapterError(f"{field_name} contains whitespace")
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise VisionAdapterError(f"{field_name} is malformed: {value}") from exc
+    if parsed.scheme in {"http", "https"} and parsed.netloc and hostname:
+        return value
+    if allow_file and parsed.scheme == "file" and parsed.path:
+        return value
+    raise VisionAdapterError(f"{field_name} must be a valid http(s) URL")
+
+
+def _file_uri_exists(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return False
+    return Path(unquote(parsed.path)).is_file()
 
 
 def _origin(record: Mapping[str, Any], image: Mapping[str, Any], provider: str) -> str:
