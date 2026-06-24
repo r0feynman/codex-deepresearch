@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import subprocess
@@ -18,6 +19,7 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import (  # noqa: E402
     RunStepStateError,
+    acquire_visual_candidates,
     begin_stage,
     enforce_guardrails,
     fetch_claims,
@@ -560,9 +562,9 @@ class RunStateTests(unittest.TestCase):
         self.assertIsNone(completed_state["next_safe_stage"])
         self.assertEqual(started.status, "running")
         self.assertFalse(started.skipped)
-        self.assertEqual(rerun_state["next_safe_stage"], "ingest_vision")
+        self.assertEqual(rerun_state["next_safe_stage"], "enforce_guardrails")
         self.assertEqual(stages["fetch_claims"]["status"], "completed")
-        self.assertEqual(stages["ingest_vision"]["status"], "pending")
+        self.assertEqual(stages["ingest_vision"]["status"], "completed")
         self.assertEqual(stages["enforce_guardrails"]["status"], "pending")
         self.assertEqual(stages["verify_claims"]["status"], "pending")
         self.assertEqual(stages["synthesize"]["status"], "pending")
@@ -734,6 +736,137 @@ class RunStateTests(unittest.TestCase):
             stages["synthesize"]["stale_terminal_status"]["status"],
             "completed",
         )
+
+    def test_visual_text_sequence_stays_completed_after_idempotent_reruns(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="visual text state stability regression",
+            runs_dir=runs_dir,
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        source_path = run_dir / "sources" / "visual-text-source.html"
+        source_path.parent.mkdir(exist_ok=True)
+        source_html = b"""
+            <html>
+              <body>
+                <img src="/media/product.png" alt="Product detail" width="640" height="360">
+                <p>The visual text sequence extracts a source linked claim.</p>
+              </body>
+            </html>
+            """
+        source_path.write_text(
+            source_html.decode("utf-8"),
+            encoding="utf-8",
+        )
+        self.write_search_results(
+            run_dir,
+            [
+                self.base_search_result(
+                    url="https://example.com/visual-text-source",
+                    title="Visual Text Source",
+                    route="visual_required",
+                )
+            ],
+        )
+
+        ingest = ingest_run(run=run_dir)
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["local_artifact_path"] = "sources/visual-text-source.html"
+        source_hash = "sha256:" + hashlib.sha256(source_html).hexdigest()
+        evidence["sources"][0]["input_content_sha256"] = source_hash
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        fetch_queue_path = run_dir / "fetch_queue.json"
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["input_content_sha256"] = source_hash
+        fetch_queue_path.write_text(json.dumps(fetch_queue), encoding="utf-8")
+        visual = acquire_visual_candidates(run=run_dir, screenshot_modes=("all",))
+        vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(
+                source_html,
+                url="https://example.com/visual-text-source",
+            ),
+        ):
+            fetch = fetch_claims(run=run_dir)
+        guardrails = enforce_guardrails(run=run_dir)
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(ingest["status"], "ingested")
+        self.assertEqual(visual["status"], "visual_candidates_collected")
+        self.assertEqual(vision["status"], "visual_evidence_ingested")
+        self.assertEqual(fetch["status"], "completed")
+        self.assertEqual(guardrails["status"], "completed")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        initial = self.run_status_payload(runs_dir, prepared["run_id"])
+        initial_stages = {stage["stage"]: stage for stage in initial["stages"]}
+        self.assertEqual(initial["status"], "completed")
+        self.assertIsNone(initial["next_safe_stage"])
+        self.assertEqual(initial_stages["ingest_vision"]["status"], "completed")
+
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(
+                source_html,
+                url="https://example.com/visual-text-source",
+            ),
+        ):
+            rerun_fetch = fetch_claims(run=run_dir)
+        after_fetch_rerun = self.run_status_payload(runs_dir, prepared["run_id"])
+        after_fetch_stages = {
+            stage["stage"]: stage for stage in after_fetch_rerun["stages"]
+        }
+        self.assertEqual(after_fetch_rerun["status"], "completed")
+        self.assertEqual(after_fetch_stages["ingest_vision"]["status"], "completed")
+        self.assertEqual(after_fetch_stages["enforce_guardrails"]["status"], "completed")
+        self.assertEqual(after_fetch_stages["verify_claims"]["status"], "completed")
+        self.assertEqual(after_fetch_stages["synthesize"]["status"], "completed")
+        self.assertNotIn("stale_reset", after_fetch_stages["ingest_vision"])
+        rerun_vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        rerun_guardrails = enforce_guardrails(run=run_dir)
+        rerun_verify = verify_claims(run=run_dir)
+        rerun_report = synthesize_report(run=run_dir)
+        final = self.run_status_payload(runs_dir, prepared["run_id"])
+        final_stages = {stage["stage"]: stage for stage in final["stages"]}
+
+        self.assertEqual(rerun_fetch["status"], "completed")
+        self.assertEqual(rerun_vision["status"], "visual_evidence_ingested")
+        self.assertEqual(rerun_guardrails["status"], "completed")
+        self.assertEqual(rerun_verify["status"], "completed")
+        self.assertEqual(rerun_report["status"], "completed")
+        self.assertEqual(final["status"], "completed")
+        self.assertIsNone(final["next_safe_stage"])
+        self.assertFalse(final["next_stage_retryable"])
+        for stage in (
+            "planning",
+            "ingest",
+            "fetch_claims",
+            "ingest_vision",
+            "enforce_guardrails",
+            "verify_claims",
+            "synthesize",
+        ):
+            self.assertIn(final_stages[stage]["status"], {"completed", "skipped"})
+        self.assertEqual(final_stages["ingest_vision"]["status"], "completed")
+        self.assertNotIn("stale_reset", final_stages["ingest_vision"])
+        self.assertEqual(
+            final_stages["fetch_claims"]["previous_terminal_status"]["status"],
+            "completed",
+        )
+        self.assertEqual(final_stages["fetch_claims"]["last_rerun_status"], "completed")
+        self.assertEqual(
+            final_stages["ingest_vision"]["previous_terminal_status"]["status"],
+            "completed",
+        )
+        self.assertEqual(final_stages["ingest_vision"]["last_rerun_status"], "completed")
+        self.assertGreaterEqual(len(final_stages["fetch_claims"]["history"]), 4)
+        self.assertGreaterEqual(len(final_stages["ingest_vision"]["history"]), 4)
 
     def test_completed_stage_rerun_is_retryable_before_trace_completion(self) -> None:
         prepared = prepare_run(

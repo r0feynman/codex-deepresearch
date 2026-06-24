@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,6 +74,46 @@ _STAGE_STATUS_ARTIFACTS = (
     ("verify_claims", "verification_matrix_status.json"),
     ("synthesize", "report_status.json"),
 )
+_DOWNSTREAM_RESET_DEPENDENCIES = {
+    "planning": (
+        "ingest",
+        "fetch_claims",
+        "ingest_vision",
+        "enforce_guardrails",
+        "verify_claims",
+        "synthesize",
+    ),
+    "ingest": (
+        "fetch_claims",
+        "ingest_vision",
+        "enforce_guardrails",
+        "verify_claims",
+        "synthesize",
+    ),
+    "fetch_claims": ("enforce_guardrails", "verify_claims", "synthesize"),
+    "ingest_vision": ("enforce_guardrails", "verify_claims", "synthesize"),
+    "enforce_guardrails": ("verify_claims", "synthesize"),
+    "verify_claims": ("synthesize",),
+    "synthesize": (),
+}
+_STAGE_DOWNSTREAM_INPUT_ARTIFACT_KEYS = {
+    "planning": ("evidence", "fetch_queue", "search_handoff"),
+    "ingest": ("evidence", "fetch_queue"),
+    "fetch_claims": ("evidence",),
+    "ingest_vision": ("evidence", "visual_observations"),
+    "enforce_guardrails": ("evidence",),
+    "verify_claims": ("evidence", "verifier_votes"),
+    "synthesize": ("evidence", "report"),
+}
+_EVIDENCE_FINGERPRINT_KEYS = (
+    "question",
+    "routing",
+    "sources",
+    "images",
+    "claims",
+    "quote_candidates",
+    "handoff",
+)
 _TIMESTAMP_KEYS = (
     "updated_at",
     "finished_at",
@@ -86,6 +127,17 @@ _TIMESTAMP_KEYS = (
     "recorded_at",
     "started_at",
     "timestamp",
+)
+_FINGERPRINT_VOLATILE_KEYS = frozenset(
+    [
+        *_TIMESTAMP_KEYS,
+        "recorded_at",
+        "started_at",
+        "finished_at",
+        "cache_key",
+        "source_cache_key",
+        "verification_cache_key",
+    ]
 )
 
 
@@ -655,6 +707,8 @@ def _latest_relevant_upstream_ordered_stage(
         return None
     latest: dict[str, str] | None = None
     for upstream_stage in RUN_STAGE_ORDER[: RUN_STAGE_ORDER.index(stage)]:
+        if not _stage_depends_on_upstream(upstream_stage, stage):
+            continue
         record = stages.get(upstream_stage)
         if not isinstance(record, Mapping):
             continue
@@ -973,6 +1027,13 @@ def _apply_stage_transition(
         if from_status in TERMINAL_STEP_STATUSES:
             snapshot = _terminal_snapshot(record, from_status)
             record["previous_terminal_status"] = snapshot
+            rerun_start_hash = _stage_downstream_input_hash_from_artifacts(
+                state,
+                stage,
+                _string_artifacts(record.get("artifacts")),
+            )
+            if rerun_start_hash is not None:
+                record["rerun_start_downstream_input_hash"] = rerun_start_hash
             terminal_history = record.setdefault("terminal_history", [])
             if isinstance(terminal_history, list):
                 terminal_history.append({**snapshot, "rerun_started_at": now})
@@ -1010,6 +1071,14 @@ def _apply_stage_transition(
             record["stage_status"] = raw_status
         if stage == "parallel_orchestration":
             _copy_parallel_status_fields(record, status_payload)
+        if to_status in TERMINAL_STEP_STATUSES:
+            downstream_input_hash = _stage_downstream_input_hash(
+                state,
+                stage,
+                status_payload,
+            )
+            if downstream_input_hash is not None:
+                record["downstream_input_hash"] = downstream_input_hash
 
     history = record.setdefault("history", [])
     if isinstance(history, list):
@@ -1022,22 +1091,23 @@ def _apply_stage_transition(
                 **({"trace_event_id": trace_event_id} if trace_event_id else {}),
             }
         )
-    if to_status == "running" and from_status in TERMINAL_STEP_STATUSES:
+    if (
+        from_status == "running"
+        and to_status in TERMINAL_STEP_STATUSES
+        and _completed_stage_changed_downstream_inputs(record)
+    ):
+        reset_reason = "stale_reset_after_upstream_completion"
+        if isinstance(record.get("previous_terminal_status"), Mapping):
+            reset_reason = "stale_reset_after_upstream_rerun"
         _reset_downstream_ordered_terminal_stages(
             state,
             upstream_stage=stage,
             timestamp=now,
             trace_event_id=trace_event_id,
-            reason="stale_reset_after_upstream_rerun",
+            reason=reset_reason,
         )
-    elif from_status == "running" and to_status in TERMINAL_STEP_STATUSES:
-        _reset_downstream_ordered_terminal_stages(
-            state,
-            upstream_stage=stage,
-            timestamp=now,
-            trace_event_id=trace_event_id,
-            reason="stale_reset_after_upstream_completion",
-        )
+    if to_status in TERMINAL_STEP_STATUSES or to_status == "failed":
+        record.pop("rerun_start_downstream_input_hash", None)
     state["updated_at"] = now
 
 
@@ -1125,6 +1195,8 @@ def _reset_downstream_ordered_terminal_stages(
         return
     start = RUN_STAGE_ORDER.index(upstream_stage) + 1
     for stage in RUN_STAGE_ORDER[start:]:
+        if not _stage_depends_on_upstream(upstream_stage, stage):
+            continue
         record = _stage_record(state, stage)
         from_status = _status(record)
         if from_status not in TERMINAL_STEP_STATUSES:
@@ -1177,6 +1249,35 @@ def _reset_downstream_ordered_terminal_stages(
                     "upstream_stage": upstream_stage,
                 }
             )
+
+
+def _stage_depends_on_upstream(upstream_stage: str, downstream_stage: str) -> bool:
+    return downstream_stage in _DOWNSTREAM_RESET_DEPENDENCIES.get(upstream_stage, ())
+
+
+def _completed_stage_changed_downstream_inputs(record: Mapping[str, Any]) -> bool:
+    current_hash = record.get("downstream_input_hash")
+    rerun_start_hash = record.get("rerun_start_downstream_input_hash")
+    if (
+        isinstance(rerun_start_hash, str)
+        and rerun_start_hash
+        and isinstance(current_hash, str)
+        and current_hash
+    ):
+        return rerun_start_hash != current_hash
+
+    previous = _previous_terminal_snapshot(record)
+    if previous is None:
+        return True
+    previous_hash = previous.get("downstream_input_hash")
+    if (
+        isinstance(previous_hash, str)
+        and previous_hash
+        and isinstance(current_hash, str)
+        and current_hash
+    ):
+        return previous_hash != current_hash
+    return True
 
 
 def _with_resume_summary(state: dict[str, Any]) -> dict[str, Any]:
@@ -1273,7 +1374,14 @@ def _terminal_snapshot(record: Mapping[str, Any], status: str) -> dict[str, Any]
         "status": status,
         "attempt": int(record.get("attempt") or 0),
     }
-    for key in ("stage_status", "started_at", "finished_at", "updated_at", "skip_reason"):
+    for key in (
+        "stage_status",
+        "started_at",
+        "finished_at",
+        "updated_at",
+        "skip_reason",
+        "downstream_input_hash",
+    ):
         value = record.get(key)
         if value is not None:
             snapshot[key] = value
@@ -1308,6 +1416,102 @@ def _string_artifacts(value: Any) -> dict[str, str]:
         for key, item in value.items()
         if isinstance(key, str) and key and item is not None and str(item)
     }
+
+
+def _stage_downstream_input_hash(
+    state: Mapping[str, Any],
+    stage: str,
+    status_payload: Mapping[str, Any],
+) -> str | None:
+    return _stage_downstream_input_hash_from_artifacts(
+        state,
+        stage,
+        _string_artifacts(status_payload.get("artifacts")),
+    )
+
+
+def _stage_downstream_input_hash_from_artifacts(
+    state: Mapping[str, Any],
+    stage: str,
+    artifacts: Mapping[str, str],
+) -> str | None:
+    artifact_keys = _STAGE_DOWNSTREAM_INPUT_ARTIFACT_KEYS.get(stage, ())
+    if not artifact_keys or not artifacts:
+        return None
+    run_dir = _state_run_dir(state)
+    fingerprint_parts: dict[str, Any] = {}
+    for artifact_key in artifact_keys:
+        artifact_path = artifacts.get(artifact_key)
+        if artifact_path is None:
+            continue
+        path = _resolve_artifact_path(run_dir, artifact_path)
+        artifact_fingerprint = _artifact_fingerprint(path)
+        if artifact_fingerprint is not None:
+            fingerprint_parts[artifact_key] = artifact_fingerprint
+    if not fingerprint_parts:
+        return None
+
+    encoded = json.dumps(
+        fingerprint_parts,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _state_run_dir(state: Mapping[str, Any]) -> Path | None:
+    run_dir = state.get("run_dir")
+    if isinstance(run_dir, str) and run_dir:
+        return Path(run_dir)
+    return None
+
+
+def _resolve_artifact_path(run_dir: Path | None, artifact_path: str) -> Path:
+    path = Path(artifact_path)
+    if path.is_absolute() or run_dir is None:
+        return path
+    return run_dir / path
+
+
+def _artifact_fingerprint(path: Path) -> Any | None:
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if path.name == "evidence.json" and isinstance(payload, Mapping):
+                payload = {
+                    key: payload[key]
+                    for key in _EVIDENCE_FINGERPRINT_KEYS
+                    if key in payload
+                }
+            return {
+                "kind": "json",
+                "value": _stable_fingerprint_value(payload),
+            }
+        if suffix == ".jsonl":
+            rows = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rows.append(_stable_fingerprint_value(json.loads(line)))
+            return {"kind": "jsonl", "value": rows}
+        return {
+            "kind": "bytes",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _stable_fingerprint_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_fingerprint_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if isinstance(key, str) and key not in _FINGERPRINT_VOLATILE_KEYS
+        }
+    if isinstance(value, list):
+        return [_stable_fingerprint_value(item) for item in value]
+    return value
 
 
 def _timestamp_is_after(left: str | None, right: str | None) -> bool:
