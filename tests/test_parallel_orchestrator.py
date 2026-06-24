@@ -168,6 +168,60 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("sandbox_mode=workspace-write", command)
         self.assertIn("approval_policy=never", command)
         self.assertIn(str(run_dir / "evidence_shards/task_research_001/evidence_shard.json"), command[-1])
+        shard_dir = run_dir / "evidence_shards/task_research_001"
+        self.assertIn(str(shard_dir / "search_results.jsonl"), command[-1])
+        self.assertIn(str(shard_dir / "visual_observations.jsonl"), command[-1])
+        self.assertIn(str(shard_dir / "verifier_votes.jsonl"), command[-1])
+        self.assertIn(f"Do not write sidecars outside {shard_dir}", command[-1])
+
+    def test_invalid_output_shard_paths_are_rejected_before_child_execution(self) -> None:
+        run_dir = self.prepare()
+        base_task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            for raw_path in ("/tmp/escape/evidence_shard.json", "../escape/evidence_shard.json"):
+                task = dict(base_task)
+                task["output_shard_path"] = raw_path
+
+                result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.failure_category, "missing_shard")
+                self.assertIsNotNone(result.message)
+                assert result.message is not None
+                self.assertIn("invalid output_shard_path", result.message)
+                self.assertIn(raw_path, result.message)
+                self.assertIn("must be relative and stay under run_dir", result.message)
+                self.assertEqual(result.events[-1]["raw_event"]["output_shard_path"], raw_path)
+
+            run_mock.assert_not_called()
+
+    def test_merge_discards_escaped_output_shard_path_without_reading_outside_run_dir(self) -> None:
+        run_dir = self.prepare()
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["output_shard_path"] = "../outside/evidence_shard.json"
+        outside_shard = run_dir.parent / "outside" / "evidence_shard.json"
+        outside_shard.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(outside_shard, self.shard(run_dir, task))
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["accepted_shards"], [])
+        self.assertEqual(merge["rejected_shards"][0]["reason"], "invalid_output_shard_path")
+        self.assertIn("must be relative and stay under run_dir", merge["rejected_shards"][0]["diagnostic"])
+        tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
+        self.assertEqual(tasks[0]["state"], "discarded")
+        self.assertEqual(tasks[0]["discard_reason"], "invalid_output_shard_path")
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["claims"], [])
 
     def test_codex_exec_adapter_runs_from_project_root_and_reports_trust_errors(self) -> None:
         run_dir = self.prepare()
