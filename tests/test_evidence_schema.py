@@ -109,6 +109,18 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assert_error_code(result, "missing_visual_evidence")
 
+    def test_visual_support_observation_ref_must_match_image_observation(self) -> None:
+        evidence = self.load_valid_evidence()
+        support = evidence["claims"][1]["visual_supports"][0]
+        support["observation_ref"] = "images.img_001.observations[1]"
+        support["observation_index"] = 1
+        support["observation_text"] = "Wrong observation"
+
+        result = validate_artifacts(evidence_path=self.write_evidence(evidence))
+
+        self.assertFalse(result.valid)
+        self.assert_error_code(result, "invalid_observation_reference")
+
     def test_cli_outputs_json_for_pass_and_fail_cases(self) -> None:
         passing = subprocess.run(
             [

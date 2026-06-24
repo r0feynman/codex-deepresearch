@@ -163,11 +163,13 @@ def ingest_vision_observations(
             )
         ] + normalized_images
         _write_jsonl(visual_observations_path, normalized_images)
+        linkage_count = _link_visual_evidence_to_claims(evidence)
         adapter_status = "visual_evidence_ingested"
     else:
         missing_claims = _missing_visual_claims(evidence, now=now)
         evidence["claims"].extend(missing_claims)
         _write_jsonl(visual_observations_path, [])
+        linkage_count = 0
         adapter_status = "needs_visual_evidence" if missing_claims else "no_visual_tasks"
 
     evidence["vision_adapter"] = {
@@ -179,6 +181,7 @@ def ingest_vision_observations(
         "visual_observations_path": "visual_observations.jsonl",
         "images_ingested": len(normalized_images),
         "images_reused": images_reused,
+        "claim_visual_links_created": linkage_count,
         "missing_visual_claims_created": 0
         if normalized_images
         else len(
@@ -210,6 +213,7 @@ def ingest_vision_observations(
             "provider": normalized_provider,
             "images_ingested": len(normalized_images),
             "images_reused": images_reused,
+            "claim_visual_links_created": linkage_count,
             "missing_visual_claims_created": evidence["vision_adapter"][
                 "missing_visual_claims_created"
             ],
@@ -232,6 +236,231 @@ def ingest_vision_observations(
     )
     _write_json(run_dir / "vision_ingest_status.json", status)
     return status
+
+
+def _link_visual_evidence_to_claims(evidence: dict[str, Any]) -> int:
+    claims = evidence.get("claims", [])
+    images = evidence.get("images", [])
+    if not isinstance(claims, list) or not isinstance(images, list):
+        return 0
+
+    routing_by_angle = _routing_by_angle(evidence.get("routing", []))
+    sources_by_id = _sources_by_id(evidence.get("sources", []))
+    created = 0
+    for claim in claims:
+        if not isinstance(claim, dict) or not _claim_accepts_visual_link(
+            claim,
+            routing_by_angle=routing_by_angle,
+            sources_by_id=sources_by_id,
+        ):
+            continue
+
+        supports = _valid_existing_visual_supports(claim, images)
+        support_keys = {
+            (support["image_id"], support["observation_index"])
+            for support in supports
+        }
+        supporting_images = _dedupe(_string_list(claim, "supporting_images"))
+        for image in images:
+            if not isinstance(image, Mapping):
+                continue
+            observation_index, observation_text = _first_observation(image)
+            if observation_index is None or observation_text is None:
+                continue
+            if not _image_matches_claim(
+                claim,
+                image,
+                routing_by_angle=routing_by_angle,
+                sources_by_id=sources_by_id,
+            ):
+                continue
+
+            image_id = str(image["id"])
+            key = (image_id, observation_index)
+            if key not in support_keys:
+                supports.append(
+                    {
+                        "image_id": image_id,
+                        "observation_ref": f"images.{image_id}.observations[{observation_index}]",
+                        "observation_index": observation_index,
+                        "observation_text": observation_text,
+                        "relation_type": _visual_relation_type(image),
+                        "provider": _visual_support_provider(image),
+                        "rationale": _visual_support_rationale(claim, image),
+                        "confidence": 0.74,
+                    }
+                )
+                support_keys.add(key)
+                created += 1
+            if image_id not in supporting_images:
+                supporting_images.append(image_id)
+        if supports:
+            claim["supporting_images"] = supporting_images
+            claim["visual_supports"] = supports
+    return created
+
+
+def _valid_existing_visual_supports(
+    claim: Mapping[str, Any],
+    images: Sequence[Any],
+) -> list[dict[str, Any]]:
+    images_by_id = {
+        image["id"]: image
+        for image in images
+        if isinstance(image, Mapping) and isinstance(image.get("id"), str)
+    }
+    supports: list[dict[str, Any]] = []
+    raw_supports = claim.get("visual_supports", [])
+    if not isinstance(raw_supports, list):
+        return supports
+    for raw_support in raw_supports:
+        if not isinstance(raw_support, Mapping):
+            continue
+        image_id = raw_support.get("image_id")
+        observation_index = raw_support.get("observation_index")
+        if not isinstance(image_id, str) or not isinstance(observation_index, int):
+            continue
+        image = images_by_id.get(image_id)
+        if not isinstance(image, Mapping):
+            continue
+        observations = image.get("observations", [])
+        if (
+            not isinstance(observations, list)
+            or observation_index < 0
+            or observation_index >= len(observations)
+        ):
+            continue
+        observation_text = observations[observation_index]
+        if not isinstance(observation_text, str) or not observation_text:
+            continue
+        support = dict(raw_support)
+        support["observation_ref"] = f"images.{image_id}.observations[{observation_index}]"
+        support["observation_text"] = observation_text
+        supports.append(support)
+    return supports
+
+
+def _claim_accepts_visual_link(
+    claim: Mapping[str, Any],
+    *,
+    routing_by_angle: Mapping[str, str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if claim.get("claim_type") in {"visual", "mixed"}:
+        return True
+    route = _claim_route(
+        claim,
+        routing_by_angle=routing_by_angle,
+        sources_by_id=sources_by_id,
+    )
+    return route == "visual_required"
+
+
+def _image_matches_claim(
+    claim: Mapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    routing_by_angle: Mapping[str, str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if image.get("analysis_status") != "analyzed":
+        return False
+    if not isinstance(image.get("id"), str):
+        return False
+    if _string_list(image, "policy_flags"):
+        return False
+
+    source_id = image.get("source_id")
+    if isinstance(source_id, str) and source_id in _string_list(claim, "supporting_sources"):
+        return True
+    claim_angle = claim.get("angle_id")
+    image_angle = image.get("angle_id")
+    if isinstance(claim_angle, str) and claim_angle and claim_angle == image_angle:
+        return True
+    claim_route = _claim_route(
+        claim,
+        routing_by_angle=routing_by_angle,
+        sources_by_id=sources_by_id,
+    )
+    return claim_route == "visual_required" and image.get("route") == "visual_required"
+
+
+def _claim_route(
+    claim: Mapping[str, Any],
+    *,
+    routing_by_angle: Mapping[str, str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> str:
+    for key in ("route", "search_route", "verification_route"):
+        value = claim.get(key)
+        if value in {"text_only", "visual_required", "visual_optional"}:
+            return str(value)
+    angle_id = claim.get("angle_id")
+    if isinstance(angle_id, str) and angle_id in routing_by_angle:
+        return routing_by_angle[angle_id]
+    source_routes = {
+        source.get("route")
+        for source_id in _string_list(claim, "supporting_sources")
+        for source in [sources_by_id.get(source_id)]
+        if isinstance(source, Mapping)
+        and source.get("route") in {"text_only", "visual_required", "visual_optional"}
+    }
+    if "visual_required" in source_routes:
+        return "visual_required"
+    if len(source_routes) == 1:
+        return str(next(iter(source_routes)))
+    return "text_only"
+
+
+def _routing_by_angle(routes: Any) -> dict[str, str]:
+    if not isinstance(routes, list):
+        return {}
+    return {
+        route["id"]: route["modality"]
+        for route in routes
+        if isinstance(route, Mapping)
+        and isinstance(route.get("id"), str)
+        and route.get("modality") in {"text_only", "visual_required", "visual_optional"}
+    }
+
+
+def _first_observation(image: Mapping[str, Any]) -> tuple[int | None, str | None]:
+    observations = image.get("observations", [])
+    if not isinstance(observations, list):
+        return None, None
+    for index, observation in enumerate(observations):
+        if isinstance(observation, str) and observation.strip():
+            return index, observation.strip()
+    return None, None
+
+
+def _visual_relation_type(image: Mapping[str, Any]) -> str:
+    tasks = set(_string_list(image, "visual_tasks"))
+    if "chart_reading" in tasks or "chart_support" in tasks:
+        return "chart_support"
+    if "ocr" in tasks and image.get("ocr_text"):
+        return "ocr_support"
+    if image.get("origin") == "screenshot":
+        return "screenshot_support"
+    return "visual_match"
+
+
+def _visual_support_provider(image: Mapping[str, Any]) -> str:
+    return (
+        _first_optional_string(image, "visual_provider")
+        or _first_optional_string(image, "analysis_provider")
+        or "unknown"
+    )
+
+
+def _visual_support_rationale(claim: Mapping[str, Any], image: Mapping[str, Any]) -> str:
+    source_id = image.get("source_id")
+    if isinstance(source_id, str) and source_id in _string_list(claim, "supporting_sources"):
+        return f"Linked because claim and image cite source_id '{source_id}'."
+    claim_angle = claim.get("angle_id")
+    if isinstance(claim_angle, str) and claim_angle == image.get("angle_id"):
+        return f"Linked because claim and image share angle_id '{claim_angle}'."
+    return "Linked because both claim and image belong to a visual-required route."
 
 
 def _normalize_visual_record(
@@ -593,14 +822,16 @@ def _copy_optional_visual_metadata(
     visual: dict[str, Any],
 ) -> None:
     scalar_keys = (
+        "angle_id",
         "candidate_id",
         "candidate_class",
-        "visual_provider",
-        "visual_acquisition_provider",
         "duplicate_of",
         "near_duplicate_group_id",
         "near_duplicate_of",
         "removal_reason",
+        "route",
+        "visual_provider",
+        "visual_acquisition_provider",
     )
     list_keys = ("removal_reasons",)
     mapping_keys = ("visual_validation", "validation_checks", "screenshot")

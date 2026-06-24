@@ -138,8 +138,9 @@ class VerificationMatrixTests(unittest.TestCase):
         verification_status: str = "unverified",
         review_status: str = "not_reviewed",
         promotion_status: str = "not_eligible",
+        visual_supports: list[dict] | None = None,
     ) -> dict:
-        return {
+        claim = {
             "id": claim_id,
             "text": "The source says Example.",
             "claim_type": claim_type,
@@ -161,6 +162,21 @@ class VerificationMatrixTests(unittest.TestCase):
             "confidence": "low",
             "caveats": [],
             "angle_id": "angle_001",
+        }
+        if visual_supports is not None:
+            claim["visual_supports"] = visual_supports
+        return claim
+
+    def visual_support(self, image_id: str = "img_001", observation_index: int = 0) -> dict:
+        return {
+            "image_id": image_id,
+            "observation_ref": f"images.{image_id}.observations[{observation_index}]",
+            "observation_index": observation_index,
+            "observation_text": "Visible Example text is present.",
+            "relation_type": "screenshot_support",
+            "provider": "codex-interactive",
+            "rationale": "Linked because claim and image cite source_id 'src_001'.",
+            "confidence": 0.74,
         }
 
     def assert_valid_run(self, run_dir: Path) -> dict:
@@ -201,6 +217,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_visual",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)
@@ -339,6 +356,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_page_image_missing_asset",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)
@@ -534,6 +552,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_changed_image",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)
@@ -562,6 +581,55 @@ class VerificationMatrixTests(unittest.TestCase):
         self.assertEqual(result["claims_reused"], 0)
         self.assertEqual(
             {vote["created_at"] for vote in self.votes_for(run_dir, "claim_changed_image")},
+            {"2026-06-22T00:20:00Z"},
+        )
+
+    def test_added_visual_supports_invalidate_stale_needs_visual_cache(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_added_visual_support",
+                claim_type="visual",
+                supporting_images=["img_001"],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            first = verify_claims(run=run_dir)
+
+        self.assertEqual(first["status"], "failed_validation")
+        evidence = self.load_json(run_dir / "evidence.json")
+        claim = evidence["claims"][0]
+        old_cache_key = claim["verification_cache_key"]
+        self.assertEqual(claim["verification_status"], "needs_visual_evidence")
+        self.assertFalse(claim["include_in_final_report"])
+        evidence["claims"][0]["visual_supports"] = [self.visual_support()]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:20:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertFalse(result["claim_statuses"][0]["cache_hit"])
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(claim["verification_status"], "supported")
+        self.assertTrue(claim["include_in_final_report"])
+        self.assertEqual(
+            {vote["created_at"] for vote in self.votes_for(run_dir, "claim_added_visual_support")},
             {"2026-06-22T00:20:00Z"},
         )
 
@@ -614,6 +682,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_changed_image_policy",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)

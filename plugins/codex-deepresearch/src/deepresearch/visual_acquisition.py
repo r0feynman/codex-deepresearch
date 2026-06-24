@@ -708,6 +708,8 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         else [],
         "candidate_id": candidate["id"],
         "candidate_class": candidate["candidate_class"],
+        "angle_id": candidate.get("angle_id"),
+        "route": candidate.get("route"),
         "visual_provider": candidate["provider"],
         "visual_validation": dict(candidate.get("validation_checks", {})),
         "source_url": candidate.get("source_url"),

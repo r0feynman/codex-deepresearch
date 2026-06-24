@@ -1483,11 +1483,25 @@ def _write_fixture_shard(run_dir: Path, task: Mapping[str, Any], shard_path: Pat
     }
     claim_type = "text"
     supporting_images: list[str] = []
+    visual_supports: list[dict[str, Any]] = []
     images: list[dict[str, Any]] = []
     if int(task.get("max_images") or 0) > 0:
         claim_type = "mixed"
         image_id = f"img_{task['id']}_001"
+        observation_text = f"Fixture visual observation for {task['query']}"
         supporting_images.append(image_id)
+        visual_supports.append(
+            {
+                "image_id": image_id,
+                "observation_ref": f"images.{image_id}.observations[0]",
+                "observation_index": 0,
+                "observation_text": observation_text,
+                "relation_type": "screenshot_support",
+                "provider": str(evidence.get("vlm_provider", "codex-interactive")),
+                "rationale": "Linked because shard claim and image cite the same fixture source.",
+                "confidence": 0.74,
+            }
+        )
         images.append(
             {
                 "id": image_id,
@@ -1499,7 +1513,7 @@ def _write_fixture_shard(run_dir: Path, task: Mapping[str, Any], shard_path: Pat
                 "mime_type": "image/png",
                 "width": 640,
                 "height": 360,
-                "observations": [f"Fixture visual observation for {task['query']}"],
+                "observations": [observation_text],
                 "inferences": [],
                 "visual_tasks": [str(task["id"])],
                 "analysis_provider": evidence.get("vlm_provider", "codex-interactive"),
@@ -1527,6 +1541,7 @@ def _write_fixture_shard(run_dir: Path, task: Mapping[str, Any], shard_path: Pat
                 "claim_type": claim_type,
                 "supporting_sources": [source_id],
                 "supporting_images": supporting_images,
+                "visual_supports": visual_supports,
                 "quote_spans": [
                     {
                         "source_id": source_id,
@@ -1904,6 +1919,22 @@ def _remap_claim_refs(claim: Mapping[str, Any], id_map: Mapping[str, str]) -> di
             )
             quote_spans.append(quote_copy)
     claim_copy["quote_spans"] = quote_spans
+    visual_supports = []
+    for visual_support in claim_copy.get("visual_supports", []):
+        if not isinstance(visual_support, Mapping):
+            continue
+        support_copy = dict(visual_support)
+        image_id = str(support_copy.get("image_id"))
+        remapped_image_id = id_map.get(image_id, image_id)
+        support_copy["image_id"] = remapped_image_id
+        observation_index = support_copy.get("observation_index")
+        if isinstance(observation_index, int):
+            support_copy["observation_ref"] = (
+                f"images.{remapped_image_id}.observations[{observation_index}]"
+            )
+        visual_supports.append(support_copy)
+    if visual_supports:
+        claim_copy["visual_supports"] = visual_supports
     return claim_copy
 
 

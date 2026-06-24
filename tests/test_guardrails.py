@@ -104,7 +104,7 @@ class GuardrailsTests(unittest.TestCase):
         review_status: str = "human_accepted",
         promotion_status: str = "promoted_memory",
     ) -> dict:
-        return {
+        claim = {
             "id": claim_id,
             "text": text,
             "claim_type": claim_type,
@@ -127,6 +127,21 @@ class GuardrailsTests(unittest.TestCase):
             "caveats": [],
             "include_in_final_report": True,
         }
+        if claim_type in {"visual", "mixed"} and supporting_images:
+            image_id = supporting_images[0]
+            claim["visual_supports"] = [
+                {
+                    "image_id": image_id,
+                    "observation_ref": f"images.{image_id}.observations[0]",
+                    "observation_index": 0,
+                    "observation_text": "Visible text is present.",
+                    "relation_type": "screenshot_support",
+                    "provider": "codex-interactive",
+                    "rationale": "Linked because guardrail fixture claim and image cite the same source.",
+                    "confidence": 0.74,
+                }
+            ]
+        return claim
 
     def assert_valid_evidence(self, run_dir: Path) -> dict:
         result = validate_artifacts(evidence_path=run_dir / "evidence.json")

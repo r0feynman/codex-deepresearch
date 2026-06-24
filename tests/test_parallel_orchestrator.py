@@ -124,6 +124,18 @@ class ParallelOrchestratorTests(unittest.TestCase):
                     "claim_type": "mixed",
                     "supporting_sources": [source_id],
                     "supporting_images": [image_id],
+                    "visual_supports": [
+                        {
+                            "image_id": image_id,
+                            "observation_ref": f"images.{image_id}.observations[0]",
+                            "observation_index": 0,
+                            "observation_text": "A visible fixture image.",
+                            "relation_type": "screenshot_support",
+                            "provider": evidence["vlm_provider"],
+                            "rationale": "Linked because shard claim and image cite the same source.",
+                            "confidence": 0.74,
+                        }
+                    ],
                     "quote_spans": [
                         {
                             "source_id": source_id,

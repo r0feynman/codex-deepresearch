@@ -144,6 +144,7 @@ def claim_cache_key(
             }
             for image_id in image_refs
         ],
+        "visual_supports": _visual_support_inputs(claim.get("visual_supports")),
         "quote_spans": _quote_span_inputs(claim.get("quote_spans")),
     }
     return _digest("claim", payload)
@@ -240,6 +241,46 @@ def _quote_span_inputs(value: Any) -> list[dict[str, str]]:
     return sorted(spans, key=lambda span: (span["source_id"], span["quote"], span["location"]))
 
 
+def _visual_support_inputs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray, str)):
+        return []
+    supports: list[dict[str, Any]] = []
+    for support in value:
+        if not isinstance(support, Mapping):
+            continue
+        image_id = _first_string(support, "image_id") or ""
+        observation_ref = _first_string(support, "observation_ref") or ""
+        observation_text = _first_string(support, "observation_text") or ""
+        relation_type = _first_string(support, "relation_type") or ""
+        provider = _first_string(support, "provider") or ""
+        rationale = _first_string(support, "rationale") or ""
+        supports.append(
+            {
+                "image_id": _compact_whitespace(image_id),
+                "observation_ref": _compact_whitespace(observation_ref),
+                "observation_index": _integer_or_string(support.get("observation_index")),
+                "observation_text": normalize_text(observation_text),
+                "relation_type": _normalize_scalar(relation_type),
+                "provider": _normalize_scalar(provider),
+                "rationale": normalize_text(rationale),
+                "confidence": _number_or_string(support.get("confidence")),
+            }
+        )
+    return sorted(
+        supports,
+        key=lambda support: (
+            str(support["image_id"]),
+            str(support["observation_index"]),
+            str(support["observation_ref"]),
+            str(support["observation_text"]),
+            str(support["relation_type"]),
+            str(support["provider"]),
+            str(support["rationale"]),
+            str(support["confidence"]),
+        ),
+    )
+
+
 def _digest(kind: str, payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"{kind}:{CACHE_KEY_SCHEMA_VERSION}:sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
@@ -310,6 +351,25 @@ def _integer_or_string(value: Any) -> int | str | None:
         return int(text)
     except ValueError:
         return text
+
+
+def _number_or_string(value: Any) -> int | float | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        return _compact_whitespace(text)
+    return int(numeric) if numeric.is_integer() else numeric
 
 
 def _compact_whitespace(value: str) -> str:

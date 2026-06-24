@@ -783,7 +783,7 @@ def _claim(
     image_id: str | None = None,
 ) -> dict[str, Any]:
     text = f"The MVP smoke fixture {fixture_id} has deterministic local evidence."
-    return {
+    claim = {
         "id": f"claim_{fixture_id}",
         "text": text,
         "claim_type": claim_type,
@@ -805,6 +805,20 @@ def _claim(
         "angle_id": "angle_001",
         "route": route,
     }
+    if image_id:
+        claim["visual_supports"] = [
+            {
+                "image_id": image_id,
+                "observation_ref": f"images.{image_id}.observations[0]",
+                "observation_index": 0,
+                "observation_text": f"The {fixture_id} fixture contains an inspectable local PNG.",
+                "relation_type": "screenshot_support",
+                "provider": "codex-interactive",
+                "rationale": "Linked because claim and image cite the same fixture source.",
+                "confidence": 0.74,
+            }
+        ]
+    return claim
 
 
 def _validate_fixture(
