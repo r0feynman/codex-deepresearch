@@ -685,6 +685,7 @@ def _run_parallel_orchestration_started(
 
     tasks_artifact["tasks"] = tasks
     tasks_artifact["parallel_degraded"] = parallel_degraded
+    tasks_artifact["last_adapter"] = adapter.name
     if degraded_reason:
         tasks_artifact["degraded_reason"] = degraded_reason
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
@@ -896,12 +897,18 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
 
     _write_json(evidence_path, evidence)
     validation = validate_artifacts(evidence_path=evidence_path)
+    evidence_source = _parallel_evidence_source(
+        adapter_name=str(tasks_artifact.get("last_adapter") or ""),
+        parallel_degraded=bool(tasks_artifact.get("parallel_degraded")),
+        accepted_shards=accepted_shards,
+    )
     merge_status = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "generated_at": _utc_now(),
         "status": "completed" if validation.valid else "failed_validation",
         "parallel_degraded": bool(tasks_artifact.get("parallel_degraded")),
+        "evidence_source": evidence_source,
         "accepted_shards": accepted_shards,
         "rejected_shards": rejected_shards,
         "blocked_tasks": blocked_tasks,
@@ -971,6 +978,12 @@ def _parallel_status(
     skip_reason: str | None = None,
     errors: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    accepted_shards = _list(merge_status.get("accepted_shards")) if merge_status else []
+    evidence_source = _parallel_evidence_source(
+        adapter_name=adapter_name,
+        parallel_degraded=parallel_degraded,
+        accepted_shards=accepted_shards,
+    )
     payload: dict[str, Any] = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
@@ -981,6 +994,7 @@ def _parallel_status(
         "degraded_reason": degraded_reason,
         "adapter": adapter_name,
         "repo_check_bypass_used": False,
+        "evidence_source": evidence_source,
         "planned_task_count": planned_task_count,
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
@@ -995,13 +1009,50 @@ def _parallel_status(
         },
     }
     if merge_status is not None:
-        payload["merge"] = dict(merge_status)
+        merge = dict(merge_status)
+        merge.setdefault("evidence_source", evidence_source)
+        payload["merge"] = merge
     if skip_reason:
         payload["skip_reason"] = skip_reason
     if errors:
         payload["errors"] = [dict(error) for error in errors]
     add_run_steps_artifact(payload, run_dir)
     return payload
+
+
+def _parallel_evidence_source(
+    *,
+    adapter_name: str,
+    parallel_degraded: bool,
+    accepted_shards: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    accepted_count = len(accepted_shards)
+    if adapter_name == "fixture":
+        source_type = "fixture"
+        description = "deterministic no-network fixture shards"
+    elif adapter_name == "codex-exec":
+        source_type = "real_child_execution"
+        description = "real Codex child execution shards"
+    elif adapter_name == "serial-degraded" or parallel_degraded:
+        source_type = "serial_handoff"
+        description = "serial degraded handoff after parallel execution could not provide accepted shards"
+    else:
+        source_type = "unknown"
+        description = "parallel evidence source could not be classified"
+    return {
+        "type": source_type,
+        "adapter": adapter_name,
+        "accepted_shards": accepted_count,
+        "fixture_only": source_type == "fixture",
+        "manual_handoff": False,
+        "real_child_execution": source_type == "real_child_execution",
+        "real_use_e2e_eligible": (
+            source_type == "real_child_execution"
+            and accepted_count > 0
+            and not parallel_degraded
+        ),
+        "description": description,
+    }
 
 
 def _skip_serial_handoff_after_parallel(

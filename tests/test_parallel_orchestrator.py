@@ -301,6 +301,13 @@ class ParallelOrchestratorTests(unittest.TestCase):
         result = run_parallel_orchestration(run=run_dir, adapter_name="fixture", min_tasks=3)
 
         self.assertFalse(result["parallel_degraded"])
+        self.assertEqual(result["adapter"], "fixture")
+        self.assertEqual(result["evidence_source"]["type"], "fixture")
+        self.assertTrue(result["evidence_source"]["fixture_only"])
+        self.assertFalse(result["evidence_source"]["real_child_execution"])
+        self.assertFalse(result["evidence_source"]["real_use_e2e_eligible"])
+        self.assertEqual(result["evidence_source"]["accepted_shards"], 3)
+        self.assertEqual(result["merge"]["evidence_source"]["type"], "fixture")
         self.assertEqual(result["max_scheduled_concurrency"], 8)
         self.assertTrue((run_dir / "subagent_assignments.jsonl").is_file())
         tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
@@ -322,6 +329,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         state = inspect_run_state(run_dir)
         stages = {stage["stage"]: stage for stage in state["stages"]}
         self.assertEqual(stages["parallel_orchestration"]["status"], "completed")
+        self.assertEqual(
+            stages["parallel_orchestration"]["evidence_source"]["type"],
+            "fixture",
+        )
         self.assertEqual(stages["ingest"]["status"], "skipped")
         self.assertEqual(stages["fetch_claims"]["status"], "skipped")
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
@@ -496,6 +507,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(result["parallel_degraded"])
         self.assertEqual(result["degraded_reason"], "codex_exec_unavailable")
         self.assertEqual(result["adapter"], "serial-degraded")
+        self.assertEqual(result["evidence_source"]["type"], "serial_handoff")
+        self.assertFalse(result["evidence_source"]["fixture_only"])
+        self.assertFalse(result["evidence_source"]["real_child_execution"])
+        self.assertFalse(result["evidence_source"]["real_use_e2e_eligible"])
         self.assertEqual(result["max_scheduled_concurrency"], 1)
         self.assertEqual(result["status"], "degraded_serial_handoff_required")
         self.assertTrue(result["needs_serial_handoff"])
@@ -505,6 +520,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
         evidence = self.load_json(run_dir / "evidence.json")
         self.assertEqual(evidence["claims"], [])
         merge = self.load_json(run_dir / "merge_status.json")
+        self.assertEqual(merge["evidence_source"]["type"], "serial_handoff")
         self.assertEqual(len(merge["blocked_tasks"]), 2)
         self.assertEqual(merge["accepted_shards"], [])
         state = inspect_run_state(run_dir)
@@ -574,6 +590,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(smoke.returncode, 0, smoke.stderr)
         payload = json.loads(smoke.stdout)
         self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["adapter"], "fixture")
+        self.assertEqual(payload["evidence_source"]["type"], "fixture")
+        self.assertTrue(payload["evidence_source"]["fixture_only"])
+        self.assertFalse(payload["evidence_source"]["real_use_e2e_eligible"])
         self.assertTrue((run_dir / "merge_status.json").is_file())
 
 

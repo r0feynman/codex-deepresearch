@@ -1638,12 +1638,23 @@ Output:
 
 - docs and validation output that identify adapter type and evidence source
 - real E2E checklist distinct from fixture merge checks
+- `parallel_orchestration_status.json` and `merge_status.json` include an `evidence_source` object with `type`, `adapter`, `accepted_shards`, `fixture_only`, `manual_handoff`, `real_child_execution`, and `real_use_e2e_eligible`.
+- `manual_ingest_status.json` includes `evidence_source.type=manual_handoff`.
+
+Real-use E2E checklist:
+
+- Run `orchestrate-parallel --adapter codex-exec --no-degrade` against a prepared real-use run when Codex auth/runtime is available.
+- Require `adapter=codex-exec`, `evidence_source.type=real_child_execution`, and `accepted_shards > 0`.
+- Treat `adapter=fixture`, `evidence_source.fixture_only=true`, or deterministic `example.com` fixture evidence as fixture-only validation, never as real-use E2E success.
+- If the run degrades or fails, report `status`, `parallel_degraded`, `needs_serial_handoff`, `degraded_reason`, `evidence_source`, and rejected or blocked task diagnostics from `parallel_orchestration_status.json` and `merge_status.json`.
+- Interpret the result against the PRD Parallel status matrix and Report quality gate before claiming Phase 2 readiness.
 
 Acceptance tests:
 
 - fixture tests remain documented as no-network merge mechanics tests.
 - real-use E2E requires `adapter=codex-exec` and `accepted_shards > 0` unless the run explicitly degrades or fails with actionable diagnostics.
 - validation output highlights whether evidence came from fixture, manual handoff, or real child execution.
+- fixture success cannot satisfy Phase 2 real-use `codex-exec` acceptance.
 
 ### Phase 3 WBS: Public Beta
 
