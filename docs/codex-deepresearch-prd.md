@@ -553,7 +553,9 @@ Agent 산정식:
       "visual_supports": [
         {
           "image_id": "img_001",
-          "observation_id": "vobs_001",
+          "observation_ref": "images.img_001.observations[0]",
+          "observation_index": 0,
+          "observation_text": "visible UI contains a pricing table",
           "relation_type": "ocr_support|visual_match|chart_support|screenshot_support|context_support",
           "confidence": 0.74,
           "provider": "codex-interactive",
@@ -617,7 +619,8 @@ Schema v0 implementation requirements:
 - 모든 high-confidence visual/mixed claim은 하나 이상의 `supporting_images`를 가진다.
 - `supporting_images`는 빠른 필터링용 image ID 목록이다. visual/mixed claim이 `supporting_images`를 가지면 `visual_supports[]`도 반드시 가져야 한다.
 - 모든 `visual_supports[].image_id`는 `images[].id`에 존재해야 한다.
-- 모든 `visual_supports[].observation_id`는 `visual_observations.jsonl` 또는 해당 image의 embedded observation 목록에 존재해야 한다.
+- 모든 `visual_supports[]`는 해당 image의 관찰 근거를 deterministic하게 가리켜야 한다. 현재 schema v0에서는 `observation_index`가 `images[].observations[]`의 유효한 index이고, `observation_ref`는 `images.<image_id>.observations[<index>]` 형식이어야 한다. 이후 `visual_observations.jsonl` records가 stable record identifier를 갖게 되면 `visual_observations.jsonl:<record-id>`도 허용할 수 있다.
+- `visual_supports[].observation_text`를 기록할 때는 참조한 observation 문자열과 일치해야 한다.
 - `visual_supports[].relation_type`은 `ocr_support`, `visual_match`, `chart_support`, `screenshot_support`, `context_support` 중 하나다.
 - `visual_supports[].confidence`는 0.0부터 1.0까지의 숫자이며, 별도 verifier vote 없이 claim을 high-confidence로 승격할 수 없다.
 - `claims[].votes[]`는 `VerifierVote` schema를 그대로 embed하거나 `verifier_votes.jsonl`의 `id`를 참조한다. MVP는 embed를 기본으로 한다.
@@ -1539,7 +1542,7 @@ Acceptance tests:
 
 #### Ticket M21: Visual Evidence to Claim and Report Linkage
 
-Depends on: stable evidence schema image IDs and visual observation IDs.
+Depends on: stable evidence schema image IDs and deterministic visual observation references.
 
 Unblocks: M22 visual-required report quality and visual Phase 2 exit gate.
 
@@ -1559,8 +1562,8 @@ Output:
 
 Linkage contract:
 
-- A claim may include an image in `supporting_images` only when a `visual_observation` references the image ID and includes an observation or OCR span relevant to the claim text.
-- The claim must store the image ID, observation ID, relation type (`ocr_support`, `visual_match`, `chart_support`, `screenshot_support`, or `context_support`), and visual confidence.
+- A claim may include an image in `supporting_images` only when a `VisualEvidence` record references the image ID and includes an observation or OCR span relevant to the claim text.
+- The claim must store the image ID, deterministic observation reference/index, relation type (`ocr_support`, `visual_match`, `chart_support`, `screenshot_support`, or `context_support`), provider, rationale, and visual confidence.
 - Visual verifier eligibility requires at least one linked observation that is not policy-blocked and whose provider is recorded as real VLM, Codex interactive handoff, manual visual review, local screenshot fixture, local image fixture, or fixture.
 - `report.md` may count an image as used only when a report claim cites that image-backed claim or its evidence ID.
 
