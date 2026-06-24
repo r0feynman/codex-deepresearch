@@ -48,6 +48,10 @@ _COMPLETED_STAGE_STATUSES = {
     "awaiting_search_results",
     "completed",
     "completed_with_errors",
+    "completed_fixture",
+    "completed_parallel",
+    "completed_partial_parallel",
+    "completed_serial_handoff",
     "ingested",
     "ingested_with_rejections",
     "manual_sources_ingested",
@@ -1004,6 +1008,8 @@ def _apply_stage_transition(
         raw_status = status_payload.get("status")
         if isinstance(raw_status, str) and raw_status:
             record["stage_status"] = raw_status
+        if stage == "parallel_orchestration":
+            _copy_parallel_status_fields(record, status_payload)
 
     history = record.setdefault("history", [])
     if isinstance(history, list):
@@ -1033,6 +1039,25 @@ def _apply_stage_transition(
             reason="stale_reset_after_upstream_completion",
         )
     state["updated_at"] = now
+
+
+def _copy_parallel_status_fields(
+    record: dict[str, Any],
+    status_payload: Mapping[str, Any],
+) -> None:
+    for key in (
+        "ok",
+        "adapter",
+        "parallel_degraded",
+        "degraded_reason",
+        "needs_serial_handoff",
+    ):
+        if key in status_payload:
+            record[key] = status_payload[key]
+    for key in ("failure_counts", "diagnostics"):
+        value = status_payload.get(key)
+        if isinstance(value, Mapping):
+            record[key] = dict(value)
 
 
 def _apply_completed_stage_skip_to_state(

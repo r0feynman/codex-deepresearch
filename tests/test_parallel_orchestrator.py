@@ -301,7 +301,9 @@ class ParallelOrchestratorTests(unittest.TestCase):
 
         result = run_parallel_orchestration(run=run_dir, adapter_name="fixture", min_tasks=3)
 
+        self.assertEqual(result["status"], "completed_fixture")
         self.assertFalse(result["parallel_degraded"])
+        self.assertFalse(result["needs_serial_handoff"])
         self.assertEqual(result["adapter"], "fixture")
         self.assertEqual(result["evidence_source"]["type"], "fixture")
         self.assertTrue(result["evidence_source"]["fixture_only"])
@@ -334,10 +336,89 @@ class ParallelOrchestratorTests(unittest.TestCase):
             stages["parallel_orchestration"]["evidence_source"]["type"],
             "fixture",
         )
+        self.assertEqual(stages["parallel_orchestration"]["stage_status"], "completed_fixture")
+        self.assertFalse(stages["parallel_orchestration"]["parallel_degraded"])
+        self.assertFalse(stages["parallel_orchestration"]["needs_serial_handoff"])
         self.assertEqual(stages["ingest"]["status"], "skipped")
         self.assertEqual(stages["fetch_claims"]["status"], "skipped")
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
         self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
+
+    def test_codex_exec_success_status_is_completed_parallel(self) -> None:
+        run_dir = self.prepare()
+
+        class SuccessfulCodexAdapter:
+            name = "codex-exec"
+
+            def run_task(inner_self, task, *, run_dir, max_threads):
+                shard_path = run_dir / task["output_shard_path"]
+                shard_path.parent.mkdir(parents=True, exist_ok=True)
+                self.write_json(shard_path, self.shard(run_dir, task))
+                return type("Result", (), {
+                    "task_id": task["id"],
+                    "status": "completed",
+                    "child_thread_id": f"codex-{task['id']}",
+                    "events": (),
+                    "shard_path": str(shard_path),
+                    "failure_category": None,
+                    "message": None,
+                })()
+
+        with mock.patch("deepresearch.parallel_orchestrator._adapter", return_value=SuccessfulCodexAdapter()):
+            result = run_parallel_orchestration(run=run_dir, adapter_name="codex-exec", min_tasks=2)
+
+        self.assertEqual(result["status"], "completed_parallel")
+        self.assertEqual(result["adapter"], "codex-exec")
+        self.assertFalse(result["parallel_degraded"])
+        self.assertFalse(result["needs_serial_handoff"])
+        self.assertEqual(result["evidence_source"]["type"], "real_child_execution")
+        self.assertTrue(result["evidence_source"]["real_use_e2e_eligible"])
+        self.assertEqual(result["failure_counts"]["failed_tasks"], 0)
+
+    def test_partial_codex_exec_success_status_is_completed_partial_parallel(self) -> None:
+        run_dir = self.prepare()
+
+        class PartialCodexAdapter:
+            name = "codex-exec"
+
+            def run_task(inner_self, task, *, run_dir, max_threads):
+                if str(task["id"]).endswith("001"):
+                    shard_path = run_dir / task["output_shard_path"]
+                    shard_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.write_json(shard_path, self.shard(run_dir, task))
+                    return type("Result", (), {
+                        "task_id": task["id"],
+                        "status": "completed",
+                        "child_thread_id": f"codex-{task['id']}",
+                        "events": (),
+                        "shard_path": str(shard_path),
+                        "failure_category": None,
+                        "message": None,
+                    })()
+                return type("Result", (), {
+                    "task_id": task["id"],
+                    "status": "failed",
+                    "child_thread_id": f"codex-{task['id']}",
+                    "events": (),
+                    "shard_path": None,
+                    "failure_category": "codex_exec_failed",
+                    "message": "codex exec exited 1; stderr=deterministic child failure; stdout=<empty>",
+                })()
+
+        with mock.patch("deepresearch.parallel_orchestrator._adapter", return_value=PartialCodexAdapter()):
+            result = run_parallel_orchestration(run=run_dir, adapter_name="codex-exec", min_tasks=2)
+
+        self.assertEqual(result["status"], "completed_partial_parallel")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["parallel_degraded"])
+        self.assertFalse(result["needs_serial_handoff"])
+        self.assertEqual(len(result["merge"]["accepted_shards"]), 1)
+        self.assertEqual(result["failure_counts"]["failed_tasks"], 1)
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["task_id"], "task_research_002")
+        self.assertEqual(failed_task["adapter"], "codex-exec")
+        self.assertEqual(failed_task["failure_category"], "codex_exec_failed")
+        self.assertEqual(failed_task["stdout_stderr_summary"]["stderr"], "deterministic child failure")
 
     def test_shard_merge_deduplicates_sources_images_and_claim_text(self) -> None:
         run_dir = self.prepare()
@@ -530,6 +611,144 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["ingest"]["status"], "pending")
         self.assertEqual(state["next_safe_stage"], "ingest")
 
+    def test_degraded_serial_fallback_preserves_codex_exec_failure_diagnostics(self) -> None:
+        run_dir = self.prepare()
+
+        class MissingCapabilityCodex(CodexExecAdapter):
+            name = "codex-exec"
+
+            def available(self) -> bool:
+                return True
+
+            def run_task(self, task, *, run_dir, max_threads):
+                child_thread_id = f"codex-{task['id']}"
+                command_context = {
+                    "adapter": self.name,
+                    "task_id": task["id"],
+                    "cwd": str(ROOT),
+                    "trusted_project_root": str(ROOT),
+                    "run_dir": str(run_dir.resolve()),
+                    "output_shard_path": str(run_dir / task["output_shard_path"]),
+                    "command": ["codex", "exec", "--json", "<prompt>"],
+                    "command_string": "codex exec --json '<prompt>'",
+                    "repo_check_bypass_used": False,
+                    "retryable": True,
+                }
+                diagnostic = (
+                    "codex exec exited 1; adapter=codex-exec; "
+                    f"task_id={task['id']}; cwd={ROOT}; "
+                    "stderr=Auth sandbox unavailable; stdout=<empty>"
+                )
+                return type("Result", (), {
+                    "task_id": task["id"],
+                    "status": "failed",
+                    "child_thread_id": child_thread_id,
+                    "events": ({
+                        "event_type": "wait",
+                        "task_id": task["id"],
+                        "child_thread_id": child_thread_id,
+                        "child_status": "failed",
+                        "child_message": diagnostic,
+                        "failure_category": "codex_exec_failed",
+                        "raw_event": command_context,
+                    },),
+                    "shard_path": None,
+                    "failure_category": "codex_exec_failed",
+                    "message": diagnostic,
+                })()
+
+        with mock.patch("deepresearch.parallel_orchestrator._adapter", return_value=MissingCapabilityCodex()):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                min_tasks=2,
+            )
+
+        self.assertTrue(result["parallel_degraded"])
+        self.assertEqual(result["status"], "degraded_serial_handoff_required")
+        self.assertEqual(result["failure_counts"]["blocked_tasks"], 2)
+        self.assertEqual(result["failure_counts"]["by_category"]["codex_exec_failed"], 2)
+        blocked_task = result["merge"]["blocked_tasks"][0]
+        self.assertEqual(blocked_task["task_id"], "task_research_001")
+        self.assertEqual(blocked_task["adapter"], "codex-exec")
+        self.assertEqual(blocked_task["failure_category"], "codex_exec_failed")
+        self.assertTrue(blocked_task["retryable"])
+        self.assertEqual(blocked_task["working_dir"], str(ROOT))
+        self.assertEqual(blocked_task["command_context"]["cwd"], str(ROOT))
+        self.assertEqual(blocked_task["stdout_stderr_summary"]["stderr"], "Auth sandbox unavailable")
+        self.assertEqual(blocked_task["serial_fallback"]["adapter"], "serial-degraded")
+        self.assertEqual(
+            result["diagnostics"]["first_blocked_failure_category"],
+            "codex_exec_failed",
+        )
+        self.assertEqual(result["diagnostics"]["first_blocked_adapter"], "codex-exec")
+        self.assertIn("Auth sandbox unavailable", result["diagnostics"]["first_blocked_diagnostic"])
+        state = inspect_run_state(run_dir)
+        parallel_stage = {
+            stage["stage"]: stage for stage in state["stages"]
+        }["parallel_orchestration"]
+        self.assertEqual(parallel_stage["failure_counts"]["by_category"]["codex_exec_failed"], 2)
+        self.assertEqual(
+            parallel_stage["diagnostics"]["first_blocked_failure_category"],
+            "codex_exec_failed",
+        )
+
+    def test_codex_exec_unavailable_no_degrade_returns_blocked_json_envelope(self) -> None:
+        run_dir = self.prepare()
+
+        with mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value=None):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                min_tasks=2,
+                allow_degraded=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "blocked_parallel_execution")
+        self.assertEqual(result["adapter"], "codex-exec")
+        self.assertFalse(result["parallel_degraded"])
+        self.assertTrue(result["needs_serial_handoff"])
+        self.assertEqual(result["failure_counts"]["blocked_tasks"], 2)
+        self.assertEqual(result["failure_counts"]["by_category"]["adapter_unavailable"], 2)
+        self.assertEqual(
+            result["diagnostics"]["actionable_cause"],
+            "no evidence shards were accepted because child tasks were blocked",
+        )
+        blocked_task = result["merge"]["blocked_tasks"][0]
+        self.assertEqual(blocked_task["task_id"], "task_research_001")
+        self.assertEqual(blocked_task["adapter"], "codex-exec")
+        self.assertEqual(blocked_task["failure_category"], "adapter_unavailable")
+        self.assertTrue(blocked_task["retryable"])
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+        self.assertEqual(stages["parallel_orchestration"]["status"], "failed")
+        self.assertEqual(stages["parallel_orchestration"]["stage_status"], "blocked_parallel_execution")
+        self.assertFalse(stages["parallel_orchestration"]["ok"])
+        self.assertTrue(stages["parallel_orchestration"]["needs_serial_handoff"])
+
+    def test_direct_serial_degraded_without_evidence_is_blocked_not_completed(self) -> None:
+        run_dir = self.prepare()
+
+        result = run_parallel_orchestration(
+            run=run_dir,
+            adapter_name="serial-degraded",
+            min_tasks=2,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "blocked_parallel_execution")
+        self.assertEqual(result["adapter"], "serial-degraded")
+        self.assertFalse(result["parallel_degraded"])
+        self.assertTrue(result["needs_serial_handoff"])
+        self.assertEqual(result["evidence_source"]["type"], "serial_handoff")
+        self.assertEqual(result["failure_counts"]["blocked_tasks"], 2)
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+        self.assertEqual(stages["parallel_orchestration"]["status"], "failed")
+        self.assertEqual(stages["parallel_orchestration"]["stage_status"], "blocked_parallel_execution")
+        self.assertEqual(state["next_safe_stage"], "parallel_orchestration")
+
     def test_cli_codex_exec_no_degrade_fails_when_children_accept_no_shards(self) -> None:
         runs_dir = self.temp_runs_dir()
         bin_dir = self.temp_runs_dir()
@@ -607,6 +826,33 @@ class ParallelOrchestratorTests(unittest.TestCase):
             payload["diagnostics"]["actionable_cause"],
             "no evidence shards were accepted because child tasks failed",
         )
+        run_status = subprocess.run(
+            [
+                str(RUNNER),
+                "run-status",
+                "--run",
+                str(run_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(run_status.returncode, 0, run_status.stderr)
+        run_status_payload = json.loads(run_status.stdout)
+        run_status_stage = {
+            stage["stage"]: stage for stage in run_status_payload["stages"]
+        }["parallel_orchestration"]
+        for key in (
+            "stage_status",
+            "adapter",
+            "parallel_degraded",
+            "needs_serial_handoff",
+            "failure_counts",
+            "diagnostics",
+        ):
+            status_key = "status" if key == "stage_status" else key
+            self.assertEqual(run_status_stage[key], payload[status_key])
         state = inspect_run_state(run_dir)
         stages = {stage["stage"]: stage for stage in state["stages"]}
         self.assertEqual(stages["parallel_orchestration"]["status"], "failed")
@@ -614,6 +860,66 @@ class ParallelOrchestratorTests(unittest.TestCase):
             stages["parallel_orchestration"]["stage_status"],
             "failed_parallel_no_accepted_shards",
         )
+
+    def test_cli_codex_exec_no_degrade_reports_blocker_status_for_auth_sandbox_failures(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        bin_dir = self.temp_runs_dir()
+        fake_codex = bin_dir / "codex"
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"type\":\"message\",\"status\":\"error\",\"message\":\"Auth sandbox approval blocked\"}'\n"
+            "printf '%s\\n' 'Auth sandbox approval blocked before child could write shard' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        prepare = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "real codex auth blocker regression",
+                "--runs-dir",
+                str(runs_dir),
+                "--route",
+                "text_only",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = Path(json.loads(prepare.stdout)["run_dir"])
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+
+        result = subprocess.run(
+            [
+                str(RUNNER),
+                "orchestrate-parallel",
+                "--run",
+                str(run_dir),
+                "--adapter",
+                "codex-exec",
+                "--no-degrade",
+                "--min-tasks",
+                "1",
+            ],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "blocked_parallel_execution")
+        self.assertFalse(payload["parallel_degraded"])
+        self.assertTrue(payload["needs_serial_handoff"])
+        self.assertEqual(payload["diagnostics"]["first_failure_category"], "codex_exec_failed")
+        self.assertIn("Auth sandbox approval blocked", payload["diagnostics"]["first_failed_diagnostic"])
 
     def test_exhaustive_plan_requires_confirmation_and_cost_cap(self) -> None:
         run_dir = self.prepare()
@@ -675,7 +981,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(smoke.returncode, 0, smoke.stderr)
         payload = json.loads(smoke.stdout)
-        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["status"], "completed_fixture")
         self.assertEqual(payload["adapter"], "fixture")
         self.assertEqual(payload["evidence_source"]["type"], "fixture")
         self.assertTrue(payload["evidence_source"]["fixture_only"])

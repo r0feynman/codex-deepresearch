@@ -617,12 +617,47 @@ def _run_parallel_orchestration_started(
     evidence = _read_json(run_dir / "evidence.json")
     tasks = _task_list(tasks_artifact)
     max_concurrent = int(tasks_artifact.get("max_concurrent_codex_subagents") or 1)
+    requested_adapter_name = _normalize_adapter_name(adapter_name)
     adapter = _adapter(adapter_name)
     parallel_degraded = False
     degraded_reason = None
     if isinstance(adapter, CodexExecAdapter) and not adapter.available():
         if not allow_degraded:
-            raise AdapterUnavailable("codex exec is not available on PATH")
+            blocked_reason = "codex exec is not available on PATH"
+            for task in tasks:
+                task["state"] = "blocked"
+                task["last_adapter"] = adapter.name
+                task["failure_category"] = "adapter_unavailable"
+                task["blocked_reason"] = blocked_reason
+            tasks_artifact["tasks"] = tasks
+            tasks_artifact["parallel_degraded"] = False
+            tasks_artifact["last_adapter"] = adapter.name
+            tasks_artifact["attempted_real_child_execution"] = False
+            tasks_artifact["degraded_reason"] = "codex_exec_unavailable"
+            _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
+            merge_status = merge_evidence_shards(run=run_dir)
+            status = _parallel_status(
+                run_dir,
+                evidence=evidence,
+                status="blocked_parallel_execution",
+                parallel_degraded=False,
+                degraded_reason="codex_exec_unavailable",
+                adapter_name=adapter.name,
+                planned_task_count=len(tasks),
+                runnable_task_count=0,
+                max_scheduled_concurrency=0,
+                merge_status=merge_status,
+                needs_serial_handoff=True,
+            )
+            _write_json(run_dir / "parallel_orchestration_status.json", status)
+            transition_stage(
+                run_dir,
+                "parallel_orchestration",
+                "failed",
+                reason="stage_failed",
+                status_payload=status,
+            )
+            return status
         parallel_degraded = True
         degraded_reason = "codex_exec_unavailable"
         adapter = SerialFallbackAdapter()
@@ -663,6 +698,7 @@ def _run_parallel_orchestration_started(
             ):
                 parallel_degraded = True
                 degraded_reason = result.failure_category or "codex_exec_unavailable"
+                _preserve_parallel_failure(task)
                 task["state"] = "retryable"
 
     if parallel_degraded and isinstance(adapter, CodexExecAdapter):
@@ -673,6 +709,7 @@ def _run_parallel_orchestration_started(
                 continue
             if task.get("state") in {"completed", "merged", "blocked", "discarded"}:
                 continue
+            _preserve_parallel_failure(task)
             _assign_task(
                 run_dir,
                 task,
@@ -696,21 +733,18 @@ def _run_parallel_orchestration_started(
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     merge_status = merge_evidence_shards(run=run_dir)
     accepted_shards = _list(merge_status.get("accepted_shards"))
-    needs_serial_handoff = bool(parallel_degraded or not accepted_shards)
-    real_no_accepted_shards = (
-        adapter.name == "codex-exec"
-        and attempted_real_child_execution
-        and not parallel_degraded
-        and not accepted_shards
+    status_value = _parallel_status_value(
+        requested_adapter_name=requested_adapter_name,
+        final_adapter_name=adapter.name,
+        merge_status=merge_status,
+        planned_task_count=len(tasks),
+        parallel_degraded=parallel_degraded,
+        attempted_real_child_execution=attempted_real_child_execution,
     )
-    status_value = (
-        "failed_parallel_no_accepted_shards"
-        if merge_status.get("status") == "completed" and real_no_accepted_shards
-        else "degraded_serial_handoff_required"
-        if merge_status.get("status") == "completed" and needs_serial_handoff
-        else "completed"
-        if merge_status.get("status") == "completed"
-        else "failed_validation"
+    needs_serial_handoff = _needs_serial_handoff(
+        status=status_value,
+        accepted_shards=accepted_shards,
+        parallel_degraded=parallel_degraded,
     )
     status = _parallel_status(
         run_dir,
@@ -726,7 +760,7 @@ def _run_parallel_orchestration_started(
         needs_serial_handoff=needs_serial_handoff,
     )
     _write_json(run_dir / "parallel_orchestration_status.json", status)
-    if status_value in {"completed", "degraded_serial_handoff_required"}:
+    if _parallel_status_ok(status_value):
         transition_stage(
             run_dir,
             "parallel_orchestration",
@@ -734,7 +768,7 @@ def _run_parallel_orchestration_started(
             reason="stage_completed",
             status_payload=status,
         )
-        if status_value == "completed":
+        if status_value in {"completed_fixture", "completed_parallel", "completed_partial_parallel"}:
             _skip_serial_handoff_after_parallel(run_dir, status)
     else:
         transition_stage(
@@ -966,15 +1000,19 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     return merge_status
 
 
-def _adapter(name: str) -> CodexExecAdapter | FixtureAdapter:
-    normalized = name.strip().lower().replace("_", "-")
+def _adapter(name: str) -> CodexExecAdapter | FixtureAdapter | SerialFallbackAdapter:
+    normalized = _normalize_adapter_name(name)
     if normalized == "codex-exec":
         return CodexExecAdapter()
     if normalized in {"fixture", "fake", "deterministic"}:
         return FixtureAdapter()
     if normalized in {"serial-degraded", "serial-fallback"}:
         return SerialFallbackAdapter()
-    raise ParallelOrchestrationError("adapter must be codex-exec or fixture")
+    raise ParallelOrchestrationError("adapter must be codex-exec, fixture, or serial-degraded")
+
+
+def _normalize_adapter_name(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
 
 
 def _tasks_payload(
@@ -1078,11 +1116,15 @@ def _parallel_evidence_source(
         source_type = "fixture"
         description = "deterministic no-network fixture shards"
     elif adapter_name == "codex-exec":
-        attempted_real_child_execution = True
-        if accepted_count > 0 and not parallel_degraded:
+        if accepted_count == 0 and not attempted_real_child_execution:
+            source_type = "blocked_parallel_execution"
+            description = "real Codex child execution was blocked before launch"
+        elif accepted_count > 0 and not parallel_degraded:
+            attempted_real_child_execution = True
             source_type = "real_child_execution"
             description = "accepted evidence shards from real Codex child execution"
         else:
+            attempted_real_child_execution = True
             source_type = "failed_real_child_execution"
             description = "real Codex child execution was attempted, but no evidence shard was accepted"
     elif adapter_name == "serial-degraded" or parallel_degraded:
@@ -1115,6 +1157,90 @@ def _parallel_status_ok(status: str) -> bool:
         "failed_parallel_no_accepted_shards",
         "blocked_parallel_execution",
     }
+
+
+def _parallel_status_value(
+    *,
+    requested_adapter_name: str,
+    final_adapter_name: str,
+    merge_status: Mapping[str, Any],
+    planned_task_count: int,
+    parallel_degraded: bool,
+    attempted_real_child_execution: bool,
+) -> str:
+    if merge_status.get("status") != "completed":
+        return "failed_validation"
+    accepted_shards = _list(merge_status.get("accepted_shards"))
+    accepted_count = len(accepted_shards)
+    failure_counts = merge_status.get("failure_counts")
+    has_failures = False
+    if isinstance(failure_counts, Mapping):
+        has_failures = any(
+            int(failure_counts.get(key) or 0) > 0
+            for key in ("failed_tasks", "blocked_tasks", "rejected_shards", "discarded_tasks")
+        )
+    if final_adapter_name == "fixture":
+        return "completed_fixture" if accepted_count > 0 else "failed_parallel_no_accepted_shards"
+    if final_adapter_name == "serial-degraded" or parallel_degraded:
+        if requested_adapter_name in {"serial-degraded", "serial-fallback"} and accepted_count == 0:
+            return "blocked_parallel_execution"
+        return "degraded_serial_handoff_required"
+    if (
+        final_adapter_name == "codex-exec"
+        and attempted_real_child_execution
+        and accepted_count == 0
+    ):
+        if _merge_has_parallel_execution_blocker(merge_status):
+            return "blocked_parallel_execution"
+        return "failed_parallel_no_accepted_shards"
+    if final_adapter_name == "codex-exec" and accepted_count > 0:
+        if accepted_count < planned_task_count or has_failures:
+            return "completed_partial_parallel"
+        return "completed_parallel"
+    return "completed_partial_parallel" if accepted_count > 0 else "failed_parallel_no_accepted_shards"
+
+
+def _needs_serial_handoff(
+    *,
+    status: str,
+    accepted_shards: Sequence[Mapping[str, Any]],
+    parallel_degraded: bool,
+) -> bool:
+    if status in {
+        "degraded_serial_handoff_required",
+        "failed_parallel_no_accepted_shards",
+        "blocked_parallel_execution",
+    }:
+        return True
+    if status == "completed_serial_handoff":
+        return False
+    return bool(parallel_degraded or not accepted_shards)
+
+
+def _merge_has_parallel_execution_blocker(merge_status: Mapping[str, Any]) -> bool:
+    failed_tasks = _list(merge_status.get("failed_tasks"))
+    blocked_tasks = _list(merge_status.get("blocked_tasks"))
+    observed_parts: list[str] = []
+    for task in failed_tasks:
+        observed_parts.append(str(task.get("failure_category") or ""))
+        summary = task.get("stdout_stderr_summary")
+        if isinstance(summary, Mapping):
+            observed_parts.extend(str(value) for value in summary.values())
+    for task in blocked_tasks:
+        observed_parts.append(str(task.get("failure_category") or ""))
+        observed_parts.append(str(task.get("reason") or ""))
+    blocker_text = " ".join(observed_parts).lower()
+    markers = (
+        "adapter_unavailable",
+        "auth",
+        "login",
+        "credential",
+        "sandbox",
+        "approval",
+        "permission",
+        "not inside a trusted directory",
+    )
+    return any(marker in blocker_text for marker in markers)
 
 
 def _skip_serial_handoff_after_parallel(
@@ -1663,9 +1789,7 @@ def _is_missing_capability_failure(result: RunnerResult) -> bool:
         "subagent",
         "max_threads",
         "spawn_agent",
-        "trusted directory",
-        "git-repo-check",
-        "git repo check",
+        "not inside a trusted directory",
     )
     return any(marker in text for marker in markers)
 
@@ -1792,12 +1916,59 @@ def _claim_is_mergeable(claim: Mapping[str, Any]) -> bool:
 
 
 def _task_status_record(task: Mapping[str, Any], reason: Any) -> dict[str, Any]:
-    return {
+    preserved_failure = task.get("parallel_failure")
+    if not isinstance(preserved_failure, Mapping):
+        preserved_failure = {}
+    command_context = preserved_failure.get("command_context") or task.get("last_command_context")
+    if not isinstance(command_context, Mapping):
+        command_context = {}
+    diagnostic = str(
+        preserved_failure.get("diagnostic")
+        or reason
+        or task.get("last_error")
+        or task.get("blocked_reason")
+        or ""
+    )
+    failure_category = str(
+        preserved_failure.get("failure_category")
+        or task.get("failure_category")
+        or reason
+        or "blocked"
+    )
+    state = str(task.get("state") or "blocked")
+    stdout_stderr_summary = preserved_failure.get("stdout_stderr_summary")
+    if not isinstance(stdout_stderr_summary, Mapping):
+        stdout_stderr_summary = _stdout_stderr_summary(diagnostic)
+    adapter = preserved_failure.get("adapter") or task.get("last_adapter") or _adapter_from_assignment(task)
+    retryable = preserved_failure.get("retryable")
+    if not isinstance(retryable, bool):
+        retryable = failure_category in RETRY_SAFE_FAILURES
+    record = {
         "task_id": task.get("id"),
-        "state": task.get("state"),
+        "state": state,
         "reason": reason,
         "output_shard_path": task.get("output_shard_path"),
+        "adapter": adapter,
+        "failure_category": failure_category,
+        "retryable": retryable,
+        "attempt": int(task.get("attempt") or 0),
+        "max_attempts": int(task.get("max_attempts") or 0),
+        "child_thread_id": preserved_failure.get("child_thread_id") or task.get("last_child_thread_id"),
+        "assigned_subagent_id": (
+            preserved_failure.get("assigned_subagent_id") or task.get("assigned_subagent_id")
+        ),
+        "working_dir": str(preserved_failure.get("working_dir") or command_context.get("cwd") or ""),
+        "diagnostic": diagnostic,
+        "stdout_stderr_summary": dict(stdout_stderr_summary),
+        "command_context": dict(command_context),
     }
+    if preserved_failure:
+        record["serial_fallback"] = {
+            "adapter": task.get("last_adapter") or _adapter_from_assignment(task),
+            "assigned_subagent_id": task.get("assigned_subagent_id"),
+            "blocked_reason": task.get("blocked_reason"),
+        }
+    return record
 
 
 def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
@@ -1818,10 +1989,17 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
         "child_thread_id": task.get("last_child_thread_id"),
         "assigned_subagent_id": task.get("assigned_subagent_id"),
         "output_shard_path": task.get("output_shard_path"),
+        "working_dir": str(command_context.get("cwd") or ""),
         "diagnostic": diagnostic,
         "stdout_stderr_summary": _stdout_stderr_summary(diagnostic),
         "command_context": dict(command_context),
     }
+
+
+def _preserve_parallel_failure(task: dict[str, Any]) -> None:
+    if isinstance(task.get("parallel_failure"), Mapping):
+        return
+    task["parallel_failure"] = _task_failure_record(task)
 
 
 def _adapter_from_assignment(task: Mapping[str, Any]) -> str | None:
@@ -1863,7 +2041,7 @@ def _failure_counts(
         category = str(task.get("failure_category") or "unknown_failure")
         by_category[category] = by_category.get(category, 0) + 1
     for task in blocked_tasks:
-        category = str(task.get("reason") or "blocked")
+        category = str(task.get("failure_category") or task.get("reason") or "blocked")
         by_category[category] = by_category.get(category, 0) + 1
     for shard in rejected_shards:
         category = str(shard.get("reason") or "rejected_shard")
@@ -1905,6 +2083,11 @@ def _merge_diagnostics(
             "actionable_cause": "no evidence shards were accepted because child tasks were blocked",
             "first_blocked_task_id": first.get("task_id"),
             "first_blocked_reason": first.get("reason"),
+            "first_blocked_failure_category": first.get("failure_category"),
+            "first_blocked_adapter": first.get("adapter"),
+            "first_blocked_retryable": first.get("retryable"),
+            "first_blocked_diagnostic": first.get("diagnostic"),
+            "first_blocked_stdout_stderr_summary": first.get("stdout_stderr_summary"),
         }
     if rejected_shards:
         first = rejected_shards[0]
