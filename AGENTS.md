@@ -31,6 +31,18 @@ When the user asks to implement work, the main Codex agent must act as a coordin
 - After blockers are cleared, the main Codex coordinator performs the final review and reports the outcome to the user.
 - When the user asks to merge a PR, complete the post-merge cleanup as part of the same workflow: merge the PR, verify the linked issue closed, update the GitHub Project item to `Done`, fetch/prune remotes, switch back to the target branch, fast-forward it to the remote, delete the merged local branch when safe, and report any remaining unrelated worktree changes.
 
+## GitHub Issue Creation
+
+When the user asks to create, register, publish, split, or bulk-create GitHub issues, use `.agents/skills/github-issue-quality-gate` before creating any issue.
+
+- Draft issues locally first; do not run `gh issue create` until the draft passes the quality gate.
+- Spawn an adversarial issue-review subagent to review the local draft for blockers, ambiguity, duplicate risk, PRD/roadmap mismatch, missing dependencies, unsafe content, weak acceptance criteria, and metadata problems.
+- Revise the local draft and repeat adversarial review until no blockers remain.
+- After blockers are cleared, the main Codex coordinator scores the local draft using the skill rubric. A draft must score at least 9/10 before it can be registered as a GitHub issue.
+- Only after the local draft has no blockers and scores at least 9/10, create the GitHub issue.
+- After creation, add the registered issue to the GitHub Project, set Project fields, and verify `projectItems` plus `gh project item-list` before reporting completion.
+- Report the created issue URL, final score, review result, and Project field status to the user.
+
 ## Validation
 
 Before publishing or opening a PR, run:
