@@ -191,6 +191,60 @@ codex-deepresearch synthesize --run <run_id>
 
 The Skill must guide the user and Codex-side agent through this protocol. The runner must never assume it can call Codex-native search or `codex-interactive` VLM as a hidden API.
 
+### Automatic Web Visual Research Contract
+
+Phase 3 Public Beta must support complete automatic web image research for visual-required tasks. "Complete automatic web image research" means a user can ask a question without providing image files, and DeepResearch can discover web images, screenshots, charts, or paper figures, analyze them through an allowed VLM path, connect the observations to claims, and use the image-backed claims in the final report.
+
+Automatic web visual research flow:
+
+```text
+visual-required or visual-optional research task
+-> visual_search_plan.json records query, target evidence type, provider, caps, and policy constraints
+-> web/image provider returns candidate image URLs and source pages
+-> page image extractor collects Open Graph images, body images, captions, alt text, surrounding text, srcset/lazy-loaded candidates
+-> screenshot collector captures allowed first-viewport, full-page, scroll, or interaction screenshots when configured
+-> PDF/academic collector rasterizes allowed PDF pages or figures when configured
+-> image fetcher stores allowed images/screenshots as local artifacts with MIME, size, hash, page context, license/robots/policy metadata
+-> image ranker deduplicates and selects VLM candidates under max image/model-call/cost caps
+-> VisionExtractAgent writes visual_observations.jsonl through codex-interactive, openai-responses-vision, or manual-visual-review
+-> VisualVerifierAgent links observations to claim visual_supports and verifier votes
+-> synthesis cites image evidence IDs and includes an image appendix
+```
+
+Required Phase 3 automatic visual artifacts:
+
+- `visual_search_plan.json`: planned image search/page extraction/screenshot/PDF figure work per visual task.
+- `visual_candidates.jsonl`: every discovered candidate with provider, origin, page URL, image URL, ranking score, rejection reason if pruned, and policy state.
+- `image_fetch_status.jsonl`: fetch/download/screenshot/rasterization result, byte size, MIME, content hash, perceptual hash, local artifact path, and failure code.
+- `visual_observations.jsonl`: OCR, chart/table reading, object/layout description, image-claim alignment, caveats, and provider metadata.
+- `visual_provider_status.json`: configured visual providers, availability, real-vs-fixture provenance, VLM invocation counts, skipped work, and cost.
+
+Provider requirements:
+
+- `codex-plugin` mode may use Codex-native search and `codex-interactive` VLM through handoff artifacts, but Public Beta automatic visual E2E must also have an `automated-cli` path using explicit provider adapters.
+- `automated-cli` mode must support at least one real web/image search provider and the `openai-responses-vision` VLM adapter before Public Beta can claim complete automatic web image research.
+- Fixture, local test, manual, or user-provided image evidence may validate mechanics, but cannot satisfy the Public Beta automatic web visual E2E gate.
+- Text-only routes must still perform zero image search, screenshot capture, image fetch, or VLM analysis.
+
+Automatic visual completion states:
+
+- `completed_auto_visual`: at least one non-fixture web visual provider ran, at least one allowed visual artifact was fetched or captured, at least one VLM observation was ingested, and at least one supported visual/mixed claim was cited in `report.md`.
+- `partial_auto_visual`: providers ran and candidates were found, but no image-backed claim reached supported status because of policy, quality, or cost limits.
+- `blocked_missing_visual_provider`: the selected mode requires automatic visual research but no real image/search/screenshot provider is configured.
+- `blocked_missing_vlm_provider`: visual artifacts exist but no allowed VLM path is executable.
+- `policy_blocked_visual`: usable visual artifacts were blocked by robots, copyright, PII, sensitive image, or high-risk policy.
+- `budget_pruned_visual`: visual work was skipped or truncated because configured image/model-call/cost caps were reached.
+
+Public Beta automatic visual acceptance:
+
+- A visual-required run with no user-provided images can complete through real web image/page/screenshot/PDF visual acquisition.
+- At least 10 web visual candidates are collected for image-centric questions unless policy or provider failure blocks the run with an explicit state.
+- At least 3 non-fixture images/screenshots/figures are analyzed by `openai-responses-vision` or a Codex interactive handoff in accepted real-use E2E.
+- At least one supported visual or mixed claim has `supporting_images[]`, valid `visual_supports[]`, a visual verifier vote, and is cited in `report.md`.
+- The report clearly distinguishes observed image facts from text-source facts and records image caveats.
+- The evidence browser can show the source page, image artifact, VLM observation, visual verifier vote, linked claim, and report citation together.
+- Manual or user-provided image fallback is allowed only as supplemental evidence; it cannot hide failure of the automatic path.
+
 ### Parallel Codex Subagent Orchestration Contract
 
 DeepResearch의 목표 조사 모델은 단일 agent가 모든 조사를 순차 처리하는 것이 아니라, planner가 만든 bounded research task를 여러 Codex subagent에 나눠 병렬 처리하는 구조다.
@@ -927,7 +981,7 @@ Exit criteria:
 
 ### Phase 3: Public Beta
 
-목표: 반복 사용 가능한 제품 경험과 검토 UX를 제공하고, 병렬 subagent 조사를 사용자가 관찰하고 제어할 수 있게 한다.
+목표: 반복 사용 가능한 제품 경험과 검토 UX를 제공하고, 병렬 subagent 조사를 사용자가 관찰하고 제어할 수 있게 한다. 이 단계에서 visual-required 질문은 사용자가 이미지를 직접 제공하지 않아도 웹 이미지, 페이지 스크린샷, 차트, 논문 figure를 자동 수집하고 VLM으로 판독해 보고서에 반영할 수 있어야 한다.
 
 범위:
 
@@ -937,6 +991,9 @@ Exit criteria:
 - run list, progress, pause/resume/cancel.
 - parallel subagent monitor: active/queued/failed/merged task count, subagent count, shard merge status.
 - evidence browser: source, image, claim, vote를 탐색.
+- automatic web visual research: web/image search provider, page image extraction, screenshot capture, optional PDF figure rasterization, image fetch/cache, VLM analysis, visual verifier, report citation까지 end-to-end 자동화.
+- `openai-responses-vision` automated adapter를 Public Beta automatic visual E2E의 명시적 VLM path로 지원.
+- visual provider diagnostics: real provider, fixture, manual fallback, user-provided supplemental evidence를 구분해서 표시.
 - human review: claim을 `accepted`, `rejected`, `needs_more_evidence`로 수동 판정.
 - report templates: technical report, market report, competitor analysis, incident report.
 - export: Markdown, JSON, CSV, HTML bundle.
@@ -946,9 +1003,13 @@ Exit criteria:
 - 사용자가 코드 파일을 직접 열지 않고 run 상태와 evidence를 확인할 수 있다.
 - 사용자가 active subagent count, queued task count, failed task count, merged shard count를 볼 수 있다.
 - 사용자가 `deep` 또는 `exhaustive` 실행 전 `max_concurrent_codex_subagents`와 cost cap을 확인하고 승인할 수 있다.
+- visual-required 실사용 E2E에서 사용자 제공 이미지 없이 `completed_auto_visual` 상태가 나온다.
+- accepted real-use visual E2E에서 최소 10개 web visual candidate, 최소 3개 non-fixture VLM 분석 이미지, 최소 1개 report-cited visual/mixed claim을 기록한다.
+- evidence browser가 source page, image artifact, VLM observation, visual verifier vote, linked claim, report citation을 한 흐름으로 보여준다.
+- fixture/local/manual/user-provided visual evidence만으로는 Public Beta automatic visual gate를 통과하지 않는다.
 - human review 결과가 다음 run과 후속 Codex 작업에 반영된다.
 - plugin 설치/업데이트/제거 절차가 문서화된다.
-- 20개 이상 실제 리서치 태스크에서 실패 유형이 분류되어 있다.
+- 20개 이상 실제 리서치 태스크에서 실패 유형이 분류되어 있고, 그중 8개 이상은 자동 웹 이미지 조사가 필요한 visual-required 또는 visual-optional 태스크다.
 
 ### Phase 4: Product v1
 
@@ -1666,6 +1727,7 @@ Epics:
 
 - Product UX
 - Parallel research UX
+- Automatic web visual research
 - Evidence review
 - Report templates
 - Install/update flow
@@ -1684,16 +1746,51 @@ Tasks:
 10. plugin 설치, 업데이트, 제거 절차를 문서화한다.
 11. 실제 리서치 태스크 20개 이상을 실행하고 실패 유형을 수집한다.
 12. onboarding quickstart와 example gallery를 만든다.
+13. `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json` artifact를 구현한다.
+14. real web/image search provider adapter를 구현하고, provider별 결과를 `visual_candidates.jsonl`로 정규화한다.
+15. 웹페이지 Open Graph image, 본문 image, `srcset`, lazy-loaded image, caption, alt text, 주변 문맥 추출기를 구현한다.
+16. 원격 이미지 fetch/cache layer를 구현하고 MIME, size, hash, perceptual hash, local artifact path, policy metadata를 기록한다.
+17. Playwright 또는 equivalent browser automation 기반 first-viewport/full-page/scroll screenshot collector를 구현한다.
+18. 논문/보고서 PDF page 또는 figure rasterization provider를 구현한다. CAPTCHA, 로그인, paywall 우회는 비목표로 유지한다.
+19. `openai-responses-vision` automated adapter가 image URL, local artifact, screenshot, PDF page image를 분석해 `visual_observations.jsonl`을 생성하게 한다.
+20. VisualVerifierAgent가 VLM observation을 claim `visual_supports[]`, visual verifier vote, report citation으로 연결하게 한다.
+21. `completed_auto_visual`, `partial_auto_visual`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` 상태를 run-status와 dashboard에 표시한다.
+22. fixture/manual/user-provided-only visual runs와 real automatic web visual runs를 validation에서 구분한다.
+23. 자동 웹 이미지 조사 real-use E2E suite를 만든다: 제품 이미지 비교, UI screenshot 비교, 뉴스/시장 차트 판독, 논문 figure 판독, 지도/현장 이미지 확인.
+24. automatic visual E2E 실패 유형을 provider failure, fetch failure, policy block, VLM failure, visual contradiction, report linkage failure로 분류한다.
 
 Deliverables:
 
 - dashboard/TUI
 - parallel subagent progress monitor
+- automatic web visual research pipeline
+- real visual provider diagnostics
 - evidence browser
 - human review workflow
 - report templates
 - export bundle
 - beta documentation
+
+Phase 3 automatic visual issue candidates and ordering:
+
+| Issue candidate | Scope | Depends on | Can run in parallel with |
+| --- | --- | --- | --- |
+| P3-AV1 Visual artifact schema and status states | Implement `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json`, automatic visual run states, and validation fixtures. | Phase 2 stable evidence schema and run-step state | Product UX shell |
+| P3-AV2 Real image search provider adapter | Add one real web/image search provider, candidate normalization, provider diagnostics, cost counters, and no-fixture provenance checks. | P3-AV1 | P3-AV3, P3-AV4, P3-AV5 |
+| P3-AV3 Page image extraction and fetch/cache | Extract Open Graph/body/srcset/lazy/captioned images, fetch allowed images, record MIME/size/hash/policy/local path, and dedupe. | P3-AV1 | P3-AV2, P3-AV4, P3-AV5 |
+| P3-AV4 Browser screenshot collector | Capture allowed first-viewport/full-page/scroll screenshots with viewport/capture metadata and policy state. | P3-AV1 | P3-AV2, P3-AV3, P3-AV5 |
+| P3-AV5 PDF figure/page rasterizer | Rasterize allowed PDF pages/figures and record page/figure provenance. | P3-AV1 | P3-AV2, P3-AV3, P3-AV4 |
+| P3-AV6 Automated VLM adapter | Implement `openai-responses-vision` analysis for image URL/local image/screenshot/PDF page image and emit validated `visual_observations.jsonl`. | P3-AV2 or P3-AV3 or P3-AV4 or P3-AV5 | Evidence browser UX |
+| P3-AV7 Visual verifier and report linkage | Convert VLM observations into `visual_supports[]`, visual verifier votes, image appendix entries, report citations, and evidence browser links. | P3-AV6 | Report templates |
+| P3-AV8 Real automatic visual E2E gate | Add no-user-image E2E prompts and enforce `completed_auto_visual`, 10 candidates, 3 VLM analyzed images, and 1 report-cited visual/mixed claim. | P3-AV7 | Install/update docs |
+
+Safe development waves:
+
+- Wave 1: P3-AV1. It defines the state/schema contract and must land before provider work.
+- Wave 2: P3-AV2, P3-AV3, P3-AV4, and P3-AV5 can proceed in parallel after P3-AV1 because they write the same normalized candidate/fetch artifacts.
+- Wave 3: P3-AV6 depends on at least one real image artifact path from Wave 2.
+- Wave 4: P3-AV7 depends on validated VLM observations from P3-AV6.
+- Wave 5: P3-AV8 is the release gate and cannot pass until P3-AV2/P3-AV3/P3-AV4 or P3-AV5, P3-AV6, and P3-AV7 are complete.
 
 ### Phase 4 WBS: Product v1
 
@@ -1775,8 +1872,10 @@ Deliverables:
 | CLI 실행 | Dev wrapper | Dev wrapper | Yes | Yes | Yes | Yes |
 | 텍스트 검색/fetch | Basic | Yes | Yes | Yes | Yes | Yes |
 | 이미지 URL 분석 | Basic | Yes | Yes | Yes | Yes | Yes |
-| 자동 이미지 검색 | No | Basic | Yes | Yes | Yes | Yes |
-| 스크린샷 수집 | No | Basic | Yes | Yes | Yes | Yes |
+| 자동 이미지 검색 | No | Basic | Provider beta | Yes | Yes | Yes |
+| 스크린샷 수집 | No | Basic | Provider beta | Yes | Yes | Yes |
+| 자동 웹 이미지 조사 E2E | No | No | Partial | Yes | Stable | Team-managed |
+| PDF/논문 figure 자동 판독 | No | No | Prototype | Basic | Yes | Yes |
 | ModalityRouter | Basic | Yes | Yes | Yes | Yes | Policy-aware |
 | Agent budget | Manual | Presets | Cost estimator | User controls | Policy controls | Team controls |
 | Evidence 저장 | Schema v0 JSON/MD | Schema v0 JSON/MD | Versioned draft | Browsable | Versioned stable | Shared |
@@ -1798,6 +1897,8 @@ Deliverables:
 - `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
 - text-only 작업은 VLM 비용을 쓰지 않는다.
 - visual-required 작업은 VLM 분석과 visual verifier를 생략하지 않는다.
+- Public Beta visual-required 작업은 사용자 제공 이미지 없이도 real web/image/screenshot/PDF visual acquisition과 VLM analysis를 통해 `completed_auto_visual` 상태에 도달할 수 있다.
+- Public Beta automatic visual gate는 fixture, local test provider, manual review, user-provided-only image evidence만으로 통과할 수 없다.
 - 최종 보고서의 모든 high-confidence claim은 quote 또는 image evidence를 가진다.
 - high-risk domain claim은 primary source 또는 caveat 없이는 high confidence가 될 수 없다.
 - 사용자는 `verification_status=supported`이고 `review_status=auto_reviewed|human_accepted`인 evidence만 memory/playbook/skill/PRD로 승격할 수 있다.
@@ -1820,6 +1921,7 @@ Deliverables:
 - VLM adapters: `codex-interactive`, `openai-responses-vision`, `manual-visual-review`.
 - Storage: JSONL + Markdown, 나중에 SQLite로 확장.
 - Image processing: perceptual hash, EXIF 추출, screenshot 캡처, OCR/VLM 결과 병합.
+- Web visual acquisition: image search provider, page image extractor, browser screenshot collector, PDF figure/page rasterizer, image fetch/cache, visual candidate ranker를 분리된 adapter로 구현한다. Public Beta automatic visual E2E는 최소 하나의 real web/image provider와 `openai-responses-vision` path로 재현 가능해야 한다.
 
 ## Search Provider Modes and Cost Model
 
@@ -1847,6 +1949,17 @@ Mode-specific provider policy:
 | `codex-plugin` | `codex-native` | `manual` | Plugin MVP 기본값. Codex 세션 품질과 사용자의 승인 흐름을 우선한다. |
 | `automated-cli` | `openai` 또는 `manual` | `brave`, `tavily`, `serpapi` | 재현 가능한 batch run, CI smoke, provider 비교에 사용한다. |
 | `manual-sources` | `manual` | 없음 | 사용자가 제공한 URL/PDF/image만 처리한다. |
+
+Visual provider policy:
+
+| Visual acquisition path | Public Beta role | Must record |
+| --- | --- | --- |
+| web image search provider | visual-required/optional automatic image candidate discovery | query, provider, result rank, image URL, source page URL, usage policy |
+| page image extractor | representative, Open Graph, body, captioned, and lazy-loaded image discovery | page URL, DOM/source context, alt/caption/surrounding text, rejection reason |
+| browser screenshot collector | first-viewport/full-page/scroll/interaction screenshots when allowed | page URL, viewport, capture mode, local path, policy state |
+| PDF figure/page rasterizer | academic paper/report figure and page image candidates | PDF URL/path, page number, figure hint, rasterized artifact path |
+| image fetch/cache | local artifact creation and dedupe | MIME, byte size, hash, perceptual hash, cache key, policy flags |
+| VLM adapter | OCR, chart reading, object/layout interpretation, image-claim alignment | provider, model or handoff path, observation, inference, caveats, cost metadata |
 
 Provider options:
 
@@ -1893,7 +2006,10 @@ Budget controls:
 
 - `--max-search-calls`
 - `--max-sources`
+- `--max-visual-candidates`
 - `--max-images`
+- `--max-screenshots`
+- `--max-pdf-pages`
 - `--max-subagents`
 - `--max-agents`
 - `--max-cost-usd`
@@ -1908,6 +2024,14 @@ MVP policy:
 - 실행 전 예상 search calls, model calls, image analyses, upper-bound cost를 표시한다.
 - `text_only` route는 이미지 검색과 VLM 비용을 쓰지 않는다.
 - `visual_optional` route는 budget이 부족하면 이미지 검색을 생략한다.
+
+Public Beta automatic visual policy:
+
+- visual-required route는 configured real visual provider가 없으면 `blocked_missing_visual_provider`로 종료한다.
+- visual-required route에서 visual artifacts가 있지만 VLM path가 없으면 `blocked_missing_vlm_provider`로 종료한다.
+- provider가 fixture/local/manual/user-provided-only이면 `completed_auto_visual`이 될 수 없다.
+- copyright, robots, paywall, PII, sensitive image, high-risk domain policy가 image artifact 단위로 기록되지 않으면 해당 image는 supported claim에 연결할 수 없다.
+- 비용 상한을 초과한 visual candidate, screenshot, PDF page, VLM call은 `budget_pruned_visual`로 기록한다.
 
 ## Success Metrics and Phase Thresholds
 
@@ -1928,6 +2052,8 @@ Metric denominators:
 | parallel task shard merge success rate | n/a | n/a | 95% | 98% | 99% |
 | real codex-exec E2E accepted shard success rate | n/a | n/a | 90% | 95% | 98% |
 | visual evidence used in visual-required report | n/a | 95% | 98% | 99% | 99% |
+| automatic web visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
+| real visual provider provenance coverage | n/a | n/a | 95% | 99% | 99% |
 | user-requested report shape adherence | n/a | 90% | 95% | 98% | 99% |
 | duplicate source/image/claim merge leakage | n/a | n/a | < 2% | < 1% | < 0.5% |
 | median standard run completion | n/a | < 20 min | < 15 min | < 12 min | < 10 min |
@@ -1937,6 +2063,8 @@ Metric definitions:
 
 - `real codex-exec E2E accepted shard success rate`: percentage of non-blocked real `adapter=codex-exec` E2E runs where `accepted_shards > 0`; fixture adapter runs are excluded from numerator and denominator.
 - `visual evidence used in visual-required report`: percentage of non-blocked visual-required runs where at least one supported claim has `supporting_images`, `visual_supports[]`, and `report_status.used_images > 0`.
+- `automatic web visual E2E pass rate`: percentage of non-blocked visual-required real-use runs with no user-provided images where `run-status` reaches `completed_auto_visual`, at least 3 non-fixture VLM-analyzed images exist, and at least one visual/mixed claim is cited in `report.md`.
+- `real visual provider provenance coverage`: percentage of image/screenshot/PDF visual artifacts with provider, origin, source page, local artifact, hash, policy state, VLM path, and real-vs-fixture provenance recorded.
 - `user-requested report shape adherence`: percentage of sampled real-use reports scoring `>=9/10` on the report quality gate.
 
 ## 구현 순서
@@ -1951,9 +2079,12 @@ Metric definitions:
 8. Agent budget preset과 pruning을 구현한다.
 9. run trace, run step state machine, cache key를 구현한다.
 10. Automated runner adapter를 통해 `codex exec --json` 또는 Codex SDK/MCP server 기반 Codex subagent 병렬 orchestration, evidence shard, merge/dedupe를 구현한다.
-11. 시각 evidence appendix를 생성한다.
-12. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
-13. 웹 UI/워크플로우 대시보드에서 subagent 진행 상태와 cost cap을 제어한다.
+11. Phase 3 automatic web visual research artifacts와 provider diagnostics를 구현한다.
+12. real web/image search provider, page image extractor, screenshot collector, PDF figure rasterizer, image fetch/cache를 구현한다.
+13. `openai-responses-vision` automated adapter와 visual verifier/report linkage를 구현한다.
+14. 시각 evidence appendix를 생성한다.
+15. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
+16. 웹 UI/워크플로우 대시보드에서 subagent 진행 상태, automatic visual status, visual provider provenance, cost cap을 제어한다.
 
 ## 참고 근거
 
@@ -1968,8 +2099,8 @@ Metric definitions:
 
 ## 자체 검토
 
-문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 실사용 E2E에서는 Phase 2 artifact는 생성되지만, real `codex-exec` shard가 accepted 되지 않고, visual evidence가 final report에 쓰이지 않으며, report synthesis가 사용자 질문 형식을 따르지 않는 문제가 확인됐다.
+문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 실사용 E2E에서는 Phase 2 artifact는 생성되지만, real `codex-exec` shard가 accepted 되지 않고, visual evidence가 final report에 쓰이지 않으며, report synthesis가 사용자 질문 형식을 따르지 않는 문제가 확인됐다. 2026-06-24 추가 PRD 리뷰에서는 Phase 3가 dashboard/evidence review 중심으로 정의되어 있어, 사용자가 원하는 "웹 조사 중 이미지/차트/논문 figure를 자동 발견하고 VLM으로 판독하는" end-to-end 자동 웹 이미지 조사가 구현 범위와 gate에 충분히 명시되어 있지 않다는 문제가 확인됐다.
 
-수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다. 2026-06-24 수정에서는 real-use E2E finding을 PRD에 추가하고, M19-M24 hardening tickets로 trusted `codex-exec` context, parallel status semantics, visual evidence linkage, user-shaped report synthesis, run-step stability, fixture-vs-real E2E distinction을 공식 Phase 2 후속 범위로 편입했다.
+수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다. 2026-06-24 수정에서는 real-use E2E finding을 PRD에 추가하고, M19-M24 hardening tickets로 trusted `codex-exec` context, parallel status semantics, visual evidence linkage, user-shaped report synthesis, run-step stability, fixture-vs-real E2E distinction을 공식 Phase 2 후속 범위로 편입했다. 이번 Phase 3 진화에서는 Automatic Web Visual Research Contract를 추가하고, `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json`, real provider provenance, `completed_auto_visual` 상태, `openai-responses-vision` automated adapter, browser screenshot, PDF figure rasterization, visual E2E gate를 Phase 3 범위와 WBS에 명시했다.
 
-남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 병렬 subagent 실행 자체는 Codex CLI smoke test로 확인됐지만, automated runner adapter는 Codex auth, sandbox, approval policy, nested `codex exec`, SDK/MCP server availability, JSON event compatibility, child thread cleanup을 안정적으로 처리해야 한다. Codex subagent를 사용할 수 없는 surface에서는 serial handoff 또는 `automated-cli` worker fallback으로 degrade해야 한다. 100-subagent high fan-out은 비용, rate limit, workspace policy, trace volume을 크게 키우므로 `exhaustive` preset에서만 explicit confirmation과 cost cap으로 제한한다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Real-use E2E가 fixture validation과 다른 실패를 드러냈으므로, 앞으로 Phase 2 acceptance는 fixture-only smoke가 아니라 실제 `codex-exec` child run, visual-required run, 사용자 형식의 report synthesis를 별도 gate로 검증해야 한다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
+남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 병렬 subagent 실행 자체는 Codex CLI smoke test로 확인됐지만, automated runner adapter는 Codex auth, sandbox, approval policy, nested `codex exec`, SDK/MCP server availability, JSON event compatibility, child thread cleanup을 안정적으로 처리해야 한다. Codex subagent를 사용할 수 없는 surface에서는 serial handoff 또는 `automated-cli` worker fallback으로 degrade해야 한다. 100-subagent high fan-out은 비용, rate limit, workspace policy, trace volume을 크게 키우므로 `exhaustive` preset에서만 explicit confirmation과 cost cap으로 제한한다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Phase 3 automatic visual E2E는 real provider, remote image fetch, browser automation, PDF rasterization, VLM API 비용, provider 약관과 rate limit에 의존하므로 fixture 통과와 별도 gate로 운영해야 한다. Real-use E2E가 fixture validation과 다른 실패를 드러냈으므로, 앞으로 Phase 2 acceptance는 fixture-only smoke가 아니라 실제 `codex-exec` child run, visual-required run, 사용자 형식의 report synthesis를 별도 gate로 검증해야 한다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
