@@ -584,6 +584,55 @@ class VerificationMatrixTests(unittest.TestCase):
             {"2026-06-22T00:20:00Z"},
         )
 
+    def test_added_visual_supports_invalidate_stale_needs_visual_cache(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_added_visual_support",
+                claim_type="visual",
+                supporting_images=["img_001"],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            first = verify_claims(run=run_dir)
+
+        self.assertEqual(first["status"], "failed_validation")
+        evidence = self.load_json(run_dir / "evidence.json")
+        claim = evidence["claims"][0]
+        old_cache_key = claim["verification_cache_key"]
+        self.assertEqual(claim["verification_status"], "needs_visual_evidence")
+        self.assertFalse(claim["include_in_final_report"])
+        evidence["claims"][0]["visual_supports"] = [self.visual_support()]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:20:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertFalse(result["claim_statuses"][0]["cache_hit"])
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(claim["verification_status"], "supported")
+        self.assertTrue(claim["include_in_final_report"])
+        self.assertEqual(
+            {vote["created_at"] for vote in self.votes_for(run_dir, "claim_added_visual_support")},
+            {"2026-06-22T00:20:00Z"},
+        )
+
     def test_changed_route_ignores_stale_verification_route_and_regenerates(self) -> None:
         run_dir = self.temp_run(route="text_only")
         evidence = self.load_json(run_dir / "evidence.json")
