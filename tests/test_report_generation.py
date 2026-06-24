@@ -525,6 +525,10 @@ class ReportGenerationTests(unittest.TestCase):
                 text="Skip to content navigation menu sign in privacy policy.",
             ),
             self.claim(
+                claim_id="claim_footer_labels",
+                text="Privacy Policy Terms of Service Contact",
+            ),
+            self.claim(
                 claim_id="claim_real_finding",
                 text="A substantive report finding remains visible.",
             ),
@@ -539,10 +543,13 @@ class ReportGenerationTests(unittest.TestCase):
 
         report = (run_dir / "report.md").read_text(encoding="utf-8")
         self.assertEqual(status["claims_included"], 2)
-        self.assertEqual(status["excluded_claims"][0]["claim_id"], "claim_boilerplate")
-        self.assertIn("boilerplate_noise", status["excluded_claims"][0]["exclusion_reasons"])
+        excluded = {item["claim_id"]: item for item in status["excluded_claims"]}
+        self.assertEqual(set(excluded), {"claim_boilerplate", "claim_footer_labels"})
+        self.assertIn("boilerplate_noise", excluded["claim_boilerplate"]["exclusion_reasons"])
+        self.assertIn("boilerplate_noise", excluded["claim_footer_labels"]["exclusion_reasons"])
         confirmed = report.split("## Confirmed Findings", 1)[1].split("## Conflicts", 1)[0]
         self.assertNotIn("Skip to content", confirmed)
+        self.assertNotIn("Privacy Policy Terms of Service Contact", confirmed)
         self.assertIn("A substantive report finding remains visible.", confirmed)
         self.assertIn(
             "The privacy policy now requires users to accept arbitration for some disputes.",

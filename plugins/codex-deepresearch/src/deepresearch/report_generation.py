@@ -801,6 +801,9 @@ def _is_boilerplate_claim(claim: Mapping[str, Any]) -> bool:
     if len(tokens) > 10:
         return False
 
+    if _is_label_only_navigation_text(tokens):
+        return True
+
     boilerplate_token_count = sum(
         1
         for token in tokens
@@ -819,6 +822,34 @@ def _looks_like_navigation_list(value: str) -> bool:
     if separators < 2:
         return False
     return any(pattern in value for pattern in BOILERPLATE_PATTERNS)
+
+
+def _is_label_only_navigation_text(tokens: Sequence[str]) -> bool:
+    footer_label_tokens = {
+        "about",
+        "accept",
+        "contact",
+        "cookie",
+        "cookies",
+        "home",
+        "log",
+        "login",
+        "menu",
+        "navigation",
+        "policy",
+        "privacy",
+        "search",
+        "service",
+        "sign",
+        "skip",
+        "subscribe",
+        "terms",
+    }
+    filler_tokens = {"and", "in", "of", "to", "us"}
+    meaningful_tokens = [token for token in tokens if token not in filler_tokens]
+    if len(meaningful_tokens) < 2:
+        return False
+    return all(token in footer_label_tokens for token in meaningful_tokens)
 
 
 def _mapping_records(value: Any) -> Iterable[Mapping[str, Any]]:
