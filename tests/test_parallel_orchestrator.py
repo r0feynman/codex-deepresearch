@@ -156,13 +156,90 @@ class ParallelOrchestratorTests(unittest.TestCase):
         run_dir = self.prepare()
         task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
 
-        command = CodexExecAdapter().build_command(task, max_threads=8, run_dir=run_dir)
+        command = CodexExecAdapter(project_root=ROOT).build_command(task, max_threads=8, run_dir=run_dir)
 
-        self.assertEqual(command[:4], ["codex", "exec", "--json", "-c"])
-        self.assertEqual(command[4], "agents.max_threads=8")
+        self.assertEqual(command[:3], ["codex", "exec", "--json"])
+        self.assertIn("-C", command)
+        self.assertEqual(command[command.index("-C") + 1], str(ROOT))
+        self.assertIn("--add-dir", command)
+        self.assertEqual(command[command.index("--add-dir") + 1], str(run_dir.resolve()))
+        self.assertNotIn("--skip-git-repo-check", command)
+        self.assertIn("agents.max_threads=8", command)
         self.assertIn("sandbox_mode=workspace-write", command)
         self.assertIn("approval_policy=never", command)
-        self.assertIn("evidence_shards/task_research_001/evidence_shard.json", command[-1])
+        self.assertIn(str(run_dir / "evidence_shards/task_research_001/evidence_shard.json"), command[-1])
+
+    def test_codex_exec_adapter_runs_from_project_root_and_reports_trust_errors(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        stderr = "Not inside a trusted directory and --skip-git-repo-check was not specified."
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["codex"],
+                returncode=1,
+                stdout='{"type":"message","status":"error","message":"trust failed"}\n',
+                stderr=stderr,
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        command = run_mock.call_args.args[0]
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["cwd"], ROOT)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(command[command.index("-C") + 1], str(ROOT))
+        self.assertEqual(command[command.index("--add-dir") + 1], str(run_dir.resolve()))
+        self.assertNotIn("--skip-git-repo-check", command)
+        self.assertIn(str(run_dir / task["output_shard_path"]), command[-1])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.failure_category, "codex_exec_failed")
+        self.assertIsNotNone(result.message)
+        assert result.message is not None
+        self.assertIn(stderr, result.message)
+        self.assertIn(f"cwd={ROOT}", result.message)
+        self.assertIn(f"run_dir={run_dir.resolve()}", result.message)
+        self.assertIn("repo_check_bypass_used=False", result.message)
+        self.assertIn("do not count --skip-git-repo-check bypass runs", result.message)
+        spawn_context = result.events[0]["raw_event"]
+        self.assertEqual(spawn_context["trusted_project_root"], str(ROOT))
+        self.assertEqual(spawn_context["run_dir"], str(run_dir.resolve()))
+        self.assertFalse(spawn_context["repo_check_bypass_used"])
+
+    def test_codex_exec_timeout_after_valid_shard_keeps_completed_output(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, self.shard(run_dir, task))
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.side_effect = subprocess.TimeoutExpired(
+                cmd="codex",
+                timeout=12,
+                output='{"type":"thread.started"}\n',
+                stderr="Auth(AuthorizationRequired)",
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        self.assertEqual(run_mock.call_args.kwargs["cwd"], ROOT)
+        self.assertEqual(run_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(result.status, "completed")
+        self.assertIsNone(result.failure_category)
+        self.assertEqual(result.shard_path, str(shard_path))
+        wait_events = [event for event in result.events if event["event_type"] == "wait"]
+        self.assertEqual(wait_events[-1]["child_status"], "completed")
+        self.assertIn("timed out after writing a valid shard", wait_events[-1]["child_message"])
+        self.assertTrue(wait_events[-1]["raw_event"]["timeout_after_valid_shard"])
 
     def test_fixture_runner_records_codex_events_and_schema_valid_shards(self) -> None:
         run_dir = self.prepare(route="visual_optional")
