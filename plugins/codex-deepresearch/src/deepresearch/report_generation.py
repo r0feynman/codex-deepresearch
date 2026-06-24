@@ -591,17 +591,21 @@ def _answer_lines(
     first = included[0]
     first_refs = ", ".join(_citation_refs(first["source_ids"]) + _image_refs(first["image_ids"])) or "근거 없음"
     if report_shape.get("recommendation"):
-        if is_ko:
-            return [
-                f"직접 답변: 현재 확인된 근거 {first_refs} 기준으로 판단했습니다. "
-                "아래 확인된 내용, 상충 근거, 주의점과 남은 gap을 함께 검토해야 합니다."
-            ]
-        first_text = _claim_text_for_report(
-            first["claim"],
-            first["source_ids"],
+        answer_item = _recommendation_answer_item(included, language="ko" if is_ko else "en")
+        answer_text = _claim_text_for_report(
+            answer_item["claim"],
+            answer_item["source_ids"],
             sources_by_id=sources_by_id,
         )
-        return [f"Direct answer: Based on the verified evidence in this run, {first_text}"]
+        answer_refs = ", ".join(
+            _citation_refs(answer_item["source_ids"]) + _image_refs(answer_item["image_ids"])
+        ) or first_refs
+        if is_ko:
+            return [
+                f"직접 답변: {_evidence_text_for_report(answer_text, language='ko')} "
+                f"근거: {answer_refs}. 아래 확인된 내용, 상충 근거, 주의점과 남은 gap을 함께 검토해야 합니다."
+            ]
+        return [f"Direct answer: {answer_text} Evidence: {answer_refs}."]
     if report_shape.get("comparison"):
         if is_ko:
             return [f"직접 답변: 비교 질문에 대해 {len(included)}개의 확인된 근거를 기준별로 정리했습니다."]
@@ -609,6 +613,33 @@ def _answer_lines(
     if is_ko:
         return [f"직접 답변: {len(included)}개의 확인된 근거가 보고 요건을 충족했습니다."]
     return [f"Direct answer: {len(included)} supported claim(s) met the report evidence requirements."]
+
+
+def _recommendation_answer_item(
+    included: Sequence[Mapping[str, Any]],
+    *,
+    language: str,
+) -> Mapping[str, Any]:
+    if not included:
+        raise ReportGenerationError("recommendation answer requires at least one included claim")
+    keywords = (
+        ("판단", "적합", "도입", "프로덕션", "production", "adoption", "suitable", "readiness", "judgment")
+        if language == "ko"
+        else ("production", "adoption", "suitable", "readiness", "judgment", "recommend")
+    )
+    for item in included:
+        claim = item.get("claim")
+        if not isinstance(claim, Mapping):
+            continue
+        haystack = " ".join(
+            [
+                _string_value(claim.get("id"), ""),
+                _string_value(claim.get("text"), ""),
+            ]
+        ).lower()
+        if any(keyword.lower() in haystack for keyword in keywords):
+            return item
+    return included[0]
 
 
 def _evidence_text_for_report(value: str, *, language: str) -> str:

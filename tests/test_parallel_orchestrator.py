@@ -172,6 +172,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
         command = CodexExecAdapter(project_root=ROOT).build_command(task, max_threads=8, run_dir=run_dir)
 
         self.assertEqual(command[:3], ["codex", "exec", "--json"])
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
         self.assertIn("-C", command)
         self.assertEqual(command[command.index("-C") + 1], str(ROOT))
         self.assertIn("--add-dir", command)
@@ -186,6 +188,23 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn(str(shard_dir / "visual_observations.jsonl"), command[-1])
         self.assertIn(str(shard_dir / "verifier_votes.jsonl"), command[-1])
         self.assertIn(f"Do not write sidecars outside {shard_dir}", command[-1])
+        self.assertIn("Write claim text, caveats, rationales, and synthesized source snippets in English", command[-1])
+        self.assertIn("Use `vlm_provider` exactly `codex-interactive`", command[-1])
+        self.assertIn("Every source must include a non-empty `local_artifact_path`", command[-1])
+        self.assertIn("Verifier vote `method` must be one of", command[-1])
+        self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", command[-1])
+
+        korean_task = dict(task)
+        korean_task["query"] = "한국어 질문은 한국어 claim으로 작성해야 한다."
+        korean_command = CodexExecAdapter(project_root=ROOT).build_command(
+            korean_task,
+            max_threads=8,
+            run_dir=run_dir,
+        )
+        self.assertIn("Write claim text, caveats, rationales, and synthesized source snippets in Korean", korean_command[-1])
+        self.assertIn("translate/summarize English source findings into Korean", korean_command[-1])
+        self.assertIn("Only direct quote_spans.quote values should remain verbatim", korean_command[-1])
+        self.assertIn("Prioritize a compact shard", korean_command[-1])
 
     def test_invalid_output_shard_paths_are_rejected_before_child_execution(self) -> None:
         run_dir = self.prepare()
@@ -262,6 +281,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(command[command.index("-C") + 1], str(ROOT))
         self.assertEqual(command[command.index("--add-dir") + 1], str(run_dir.resolve()))
         self.assertNotIn("--skip-git-repo-check", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
         self.assertIn(str(run_dir / task["output_shard_path"]), command[-1])
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.failure_category, "codex_exec_failed")
@@ -462,7 +483,23 @@ class ParallelOrchestratorTests(unittest.TestCase):
             task["state"] = "completed"
             shard_path = run_dir / task["output_shard_path"]
             shard_path.parent.mkdir(parents=True, exist_ok=True)
-            self.write_json(shard_path, self.shard(run_dir, task, common_ids=True))
+            shard = self.shard(run_dir, task, common_ids=True)
+            shard["claims"][0]["votes"] = [
+                {
+                    "id": f"vote_{task['id']}_001",
+                    "claim_id": "claim_001",
+                    "verifier_type": "text",
+                    "agent_name": "merge-test-verifier",
+                    "method": "runner-agent",
+                    "model_or_tool": "unittest",
+                    "vote": "support",
+                    "confidence": 0.84,
+                    "rationale": "The source and image support the claim.",
+                    "evidence_refs": ["src_001", "img_001"],
+                    "created_at": "2026-06-23T00:00:00Z",
+                }
+            ]
+            self.write_json(shard_path, shard)
         self.write_json(run_dir / "research_tasks.json", tasks_artifact)
 
         merge = merge_evidence_shards(run=run_dir)
@@ -481,6 +518,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
             self.assertIn(claim["supporting_sources"][0], source_ids)
             self.assertEqual(claim["quote_spans"][0]["source_id"], claim["supporting_sources"][0])
             self.assertIn(claim["supporting_images"][0], image_ids)
+            self.assertIn(claim["votes"][0]["evidence_refs"][0], source_ids)
+            self.assertIn(claim["votes"][0]["evidence_refs"][1], image_ids)
         self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
 
     def test_completed_task_requires_schema_valid_shard(self) -> None:

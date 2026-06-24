@@ -475,8 +475,8 @@ class ReportGenerationTests(unittest.TestCase):
         evidence["claims"] = [
             self.claim(
                 claim_id="claim_adoption_fit",
-                text="Python free-threading is not yet a default production adoption choice for all workloads.",
-                caveats=["Package compatibility must be checked per deployment."],
+                text="Python free-threading은 전체 워크로드의 기본 프로덕션 선택지로 전환하기에는 아직 이르다.",
+                caveats=["패키지 호환성은 배포 단위로 확인해야 한다."],
             ),
             self.claim(
                 claim_id="claim_package_gap",
@@ -505,11 +505,12 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(status["report_shape"]["language"], "ko")
         answer = report.split("## 결론", 1)[1].split("## 확인된 내용", 1)[0]
         self.assertIn("직접 답변:", answer)
-        self.assertIn("현재 확인된 근거", answer)
+        self.assertIn("전체 워크로드의 기본 프로덕션 선택지로 전환하기에는 아직 이르다", answer)
+        self.assertIn("근거:", answer)
         self.assertNotIn("not yet a default production adoption choice", answer)
         self.assertIn("## 확인된 내용", report)
         confirmed = report.split("## 확인된 내용", 1)[1].split("## 상충되는 근거", 1)[0]
-        self.assertIn("원문 근거: Python free-threading is not yet a default production adoption choice", confirmed)
+        self.assertIn("Python free-threading은 전체 워크로드의 기본 프로덕션 선택지", confirmed)
         self.assertIn("## 상충되는 근거", report)
         self.assertIn("claim_refuted_package", report)
         self.assertIn("## 주의점과 남은 gap", report)
