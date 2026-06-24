@@ -106,6 +106,18 @@
       "claim_type": "visual",
       "supporting_sources": ["src_001"],
       "supporting_images": ["img_001"],
+      "visual_supports": [
+        {
+          "image_id": "img_001",
+          "observation_ref": "images.img_001.observations[0]",
+          "observation_index": 0,
+          "observation_text": "Visible text says Example",
+          "relation_type": "screenshot_support",
+          "provider": "codex-interactive",
+          "rationale": "The visual observation contains the same text.",
+          "confidence": 0.81
+        }
+      ],
       "quote_spans": [],
       "votes": [
         {

@@ -719,6 +719,9 @@ def _usable_image_refs(
     *,
     images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
+    if claim.get("claim_type") in {"visual", "mixed"}:
+        return _usable_visual_support_refs(claim, images_by_id=images_by_id)
+
     usable: list[str] = []
     for image_id in _string_list(claim.get("supporting_images")):
         image = images_by_id.get(image_id)
@@ -737,6 +740,44 @@ def _usable_image_refs(
         elif isinstance(inferences, list) and inferences:
             usable.append(image_id)
     return usable
+
+
+def _usable_visual_support_refs(
+    claim: Mapping[str, Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    supports = claim.get("visual_supports", [])
+    if not isinstance(supports, list):
+        return []
+    usable: list[str] = []
+    for support in supports:
+        if not isinstance(support, Mapping):
+            continue
+        image_id = support.get("image_id")
+        observation_index = support.get("observation_index")
+        if not isinstance(image_id, str) or not isinstance(observation_index, int):
+            continue
+        if image_id not in _string_list(claim.get("supporting_images")):
+            continue
+        image = images_by_id.get(image_id)
+        if not isinstance(image, Mapping):
+            continue
+        if image.get("analysis_status") != "analyzed":
+            continue
+        if _image_policy_blocks(image, claim=claim):
+            continue
+        if not _has_image_source_or_capture(claim, image):
+            continue
+        observations = image.get("observations", [])
+        if not isinstance(observations, list):
+            continue
+        if observation_index < 0 or observation_index >= len(observations):
+            continue
+        if support.get("observation_text") != observations[observation_index]:
+            continue
+        usable.append(image_id)
+    return list(dict.fromkeys(usable))
 
 
 def _image_policy_blocks(image: Mapping[str, Any], *, claim: Mapping[str, Any]) -> bool:

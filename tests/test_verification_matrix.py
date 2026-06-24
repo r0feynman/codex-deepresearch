@@ -138,8 +138,9 @@ class VerificationMatrixTests(unittest.TestCase):
         verification_status: str = "unverified",
         review_status: str = "not_reviewed",
         promotion_status: str = "not_eligible",
+        visual_supports: list[dict] | None = None,
     ) -> dict:
-        return {
+        claim = {
             "id": claim_id,
             "text": "The source says Example.",
             "claim_type": claim_type,
@@ -161,6 +162,21 @@ class VerificationMatrixTests(unittest.TestCase):
             "confidence": "low",
             "caveats": [],
             "angle_id": "angle_001",
+        }
+        if visual_supports is not None:
+            claim["visual_supports"] = visual_supports
+        return claim
+
+    def visual_support(self, image_id: str = "img_001", observation_index: int = 0) -> dict:
+        return {
+            "image_id": image_id,
+            "observation_ref": f"images.{image_id}.observations[{observation_index}]",
+            "observation_index": observation_index,
+            "observation_text": "Visible Example text is present.",
+            "relation_type": "screenshot_support",
+            "provider": "codex-interactive",
+            "rationale": "Linked because claim and image cite source_id 'src_001'.",
+            "confidence": 0.74,
         }
 
     def assert_valid_run(self, run_dir: Path) -> dict:
@@ -201,6 +217,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_visual",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)
@@ -339,6 +356,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_page_image_missing_asset",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)
@@ -534,6 +552,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_changed_image",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)
@@ -614,6 +633,7 @@ class VerificationMatrixTests(unittest.TestCase):
                 claim_id="claim_changed_image_policy",
                 claim_type="visual",
                 supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
             )
         ]
         self.write_json(run_dir / "evidence.json", evidence)

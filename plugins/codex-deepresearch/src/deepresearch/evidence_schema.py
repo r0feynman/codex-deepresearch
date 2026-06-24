@@ -65,6 +65,13 @@ POLICY_DECISIONS = ("allowed", "blocked", "manual_review")
 VERIFIER_TYPES = ("text", "visual", "policy", "freshness")
 VERIFIER_METHODS = ("codex-subagent", "runner-agent", "model-call", "manual-review")
 VERIFIER_VOTES = ("support", "refute", "uncertain", "blocked")
+VISUAL_RELATION_TYPES = (
+    "ocr_support",
+    "visual_match",
+    "chart_support",
+    "screenshot_support",
+    "context_support",
+)
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,7 @@ class _ValidationContext:
         self.mode: str | None = None
         self.source_ids: set[str] = set()
         self.image_ids: set[str] = set()
+        self.images_by_id: dict[str, Mapping[str, Any]] = {}
         self.claims_provided = False
         self.claim_ids: set[str] = set()
         self.routing_provided = False
@@ -276,6 +284,7 @@ def _validate_evidence(
             )
             if image_id is not None:
                 _add_unique_id(image_id, context.image_ids, image_path, collector)
+                context.images_by_id[image_id] = image
 
     claims = _optional_list(evidence, "claims", "$.evidence", collector)
     if claims is not None:
@@ -442,6 +451,14 @@ def _validate_claim(
                 f"claim references unknown image '{image_id}'",
             )
 
+    visual_supports = _validate_visual_supports(
+        claim,
+        path,
+        collector,
+        context,
+        supporting_images=supporting_images,
+    )
+
     quote_spans = _check_list(claim, "quote_spans", path, collector)
     for index, quote_span in enumerate(quote_spans):
         quote_path = f"{path}.quote_spans[{index}]"
@@ -470,6 +487,12 @@ def _validate_claim(
             "missing_visual_evidence",
             "high-confidence visual or mixed claims require image evidence",
         )
+    if claim_type in {"visual", "mixed"} and supporting_images and not visual_supports:
+        collector.add(
+            f"{path}.visual_supports",
+            "missing_visual_support",
+            "visual or mixed claims with supporting_images require visual_supports",
+        )
 
     votes = claim.get("votes", [])
     if votes is None:
@@ -484,6 +507,131 @@ def _validate_claim(
         f"{path}.votes",
         allow_string_refs=True,
     )
+
+
+def _validate_visual_supports(
+    claim: Mapping[str, Any],
+    path: str,
+    collector: _Collector,
+    context: _ValidationContext,
+    *,
+    supporting_images: Sequence[str],
+) -> list[Mapping[str, Any]]:
+    raw_supports = claim.get("visual_supports", [])
+    if "visual_supports" not in claim:
+        return []
+    if not isinstance(raw_supports, list):
+        collector.add(f"{path}.visual_supports", "invalid_type", "visual_supports must be a list")
+        return []
+
+    valid_supports: list[Mapping[str, Any]] = []
+    for index, visual_support in enumerate(raw_supports):
+        support_path = f"{path}.visual_supports[{index}]"
+        if not _require_object(visual_support, support_path, collector):
+            continue
+        _require_fields(
+            visual_support,
+            support_path,
+            (
+                "image_id",
+                "observation_ref",
+                "observation_index",
+                "observation_text",
+                "relation_type",
+                "provider",
+                "rationale",
+                "confidence",
+            ),
+            collector,
+        )
+        image_id = _check_string(visual_support, "image_id", support_path, collector)
+        observation_ref = _check_string(
+            visual_support,
+            "observation_ref",
+            support_path,
+            collector,
+        )
+        observation_index = _check_number(
+            visual_support,
+            "observation_index",
+            support_path,
+            collector,
+        )
+        observation_text = _check_string(
+            visual_support,
+            "observation_text",
+            support_path,
+            collector,
+        )
+        _check_enum(
+            visual_support,
+            "relation_type",
+            VISUAL_RELATION_TYPES,
+            support_path,
+            collector,
+        )
+        _check_string(visual_support, "provider", support_path, collector)
+        _check_string(visual_support, "rationale", support_path, collector)
+        confidence = _check_number(visual_support, "confidence", support_path, collector)
+        if confidence is not None and not 0.0 <= confidence <= 1.0:
+            collector.add(
+                f"{support_path}.confidence",
+                "invalid_range",
+                "confidence must be between 0.0 and 1.0",
+            )
+
+        if image_id is not None:
+            if image_id not in context.image_ids:
+                collector.add(
+                    f"{support_path}.image_id",
+                    "dangling_reference",
+                    f"visual support references unknown image '{image_id}'",
+                )
+            if supporting_images and image_id not in supporting_images:
+                collector.add(
+                    f"{support_path}.image_id",
+                    "visual_support_not_in_supporting_images",
+                    f"visual support image '{image_id}' is not listed in supporting_images",
+                )
+
+        if image_id is None or observation_index is None:
+            continue
+        if not isinstance(observation_index, int):
+            collector.add(
+                f"{support_path}.observation_index",
+                "invalid_type",
+                "observation_index must be an integer",
+            )
+            continue
+        image = context.images_by_id.get(image_id)
+        if not isinstance(image, Mapping):
+            continue
+        observations = image.get("observations", [])
+        if not isinstance(observations, list):
+            continue
+        if observation_index < 0 or observation_index >= len(observations):
+            collector.add(
+                f"{support_path}.observation_index",
+                "invalid_observation_reference",
+                f"observation_index {observation_index} is out of range for image '{image_id}'",
+            )
+            continue
+        expected_ref = f"images.{image_id}.observations[{observation_index}]"
+        if observation_ref is not None and observation_ref != expected_ref:
+            collector.add(
+                f"{support_path}.observation_ref",
+                "invalid_observation_reference",
+                f"observation_ref must equal '{expected_ref}'",
+            )
+        expected_text = observations[observation_index]
+        if observation_text is not None and observation_text != expected_text:
+            collector.add(
+                f"{support_path}.observation_text",
+                "observation_text_mismatch",
+                "observation_text must match the referenced image observation",
+            )
+        valid_supports.append(visual_support)
+    return valid_supports
 
 
 def _validate_search_results(

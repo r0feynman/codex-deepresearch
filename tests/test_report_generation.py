@@ -128,6 +128,18 @@ class ReportGenerationTests(unittest.TestCase):
             claim["include_in_final_report"] = include_in_final_report
         return claim
 
+    def visual_support(self, image_id: str = "img_001", observation_index: int = 0) -> dict:
+        return {
+            "image_id": image_id,
+            "observation_ref": f"images.{image_id}.observations[{observation_index}]",
+            "observation_index": observation_index,
+            "observation_text": "Visible Example text is present.",
+            "relation_type": "screenshot_support",
+            "provider": "codex-interactive",
+            "rationale": "Linked because claim and image cite source_id 'src_001'.",
+            "confidence": 0.74,
+        }
+
     def test_high_confidence_text_claim_gets_source_quote_citation(self) -> None:
         run_dir = self.temp_run()
         evidence = self.load_json(run_dir / "evidence.json")
@@ -157,13 +169,16 @@ class ReportGenerationTests(unittest.TestCase):
                 quote_spans=[],
             )
         ]
+        evidence["claims"][0]["visual_supports"] = [self.visual_support()]
         self.write_json(run_dir / "evidence.json", evidence)
 
         status = synthesize_report(run=run_dir)
 
         report = (run_dir / "report.md").read_text(encoding="utf-8")
         self.assertEqual(status["used_images"], ["img_001"])
+        self.assertIn("## Visual Findings", report)
         self.assertIn("## Image Appendix", report)
+        self.assertIn("provider `codex-interactive`", report)
         self.assertIn("Image `img_001`", report)
         self.assertIn("claim `claim_visual`", report)
         self.assertIn("Images: `img_001`", report)

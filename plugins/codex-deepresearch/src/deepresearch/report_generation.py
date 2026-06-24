@@ -355,6 +355,28 @@ def _render_report(
     lines.append("")
 
     if any(item["image_ids"] for item in included):
+        lines.append("## Visual Findings")
+        for item in included:
+            if not item["image_ids"]:
+                continue
+            claim = item["claim"]
+            claim_text = _claim_text_for_report(
+                claim,
+                item["source_ids"],
+                sources_by_id=sources_by_id,
+            )
+            lines.append(f"- Claim `{item['claim_id']}`: {claim_text}")
+            for support in _resolved_visual_supports(claim, images_by_id=images_by_id):
+                image_id = _string_value(support.get("image_id"), "unknown")
+                observation_text = _string_value(support.get("observation_text"), "")
+                provider = _string_value(support.get("provider"), "unknown")
+                relation_type = _string_value(support.get("relation_type"), "visual_match")
+                lines.append(
+                    f"  - Image `{image_id}` ({relation_type}; provider `{provider}`): "
+                    f"{_truncate(observation_text, 180)}"
+                )
+        lines.append("")
+
         lines.append("## Image Appendix")
         for image_id in _ordered_unique(image_id for item in included for image_id in item["image_ids"]):
             image = images_by_id.get(image_id, {})
@@ -480,6 +502,13 @@ def _resolved_image_ids(
     *,
     images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
+    support_image_ids = [
+        _string_value(support.get("image_id"), "")
+        for support in _resolved_visual_supports(claim, images_by_id=images_by_id)
+    ]
+    if claim.get("claim_type") in {"visual", "mixed"}:
+        return _ordered_unique(support_image_ids)
+
     ids: list[str] = []
     for image_id in _string_list(claim.get("supporting_images")):
         image = images_by_id.get(image_id)
@@ -491,6 +520,38 @@ def _resolved_image_ids(
             continue
         ids.append(image_id)
     return _ordered_unique(ids)
+
+
+def _resolved_visual_supports(
+    claim: Mapping[str, Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    supports = claim.get("visual_supports", [])
+    if not isinstance(supports, list):
+        return []
+    resolved: list[Mapping[str, Any]] = []
+    for support in supports:
+        if not isinstance(support, Mapping):
+            continue
+        image_id = support.get("image_id")
+        observation_index = support.get("observation_index")
+        if not isinstance(image_id, str) or not isinstance(observation_index, int):
+            continue
+        image = images_by_id.get(image_id)
+        if not isinstance(image, Mapping):
+            continue
+        if image.get("analysis_status") == "policy_blocked":
+            continue
+        if _image_policy_blocks(image, claim=claim):
+            continue
+        observations = image.get("observations", [])
+        if not isinstance(observations, list) or observation_index < 0 or observation_index >= len(observations):
+            continue
+        if support.get("observation_text") != observations[observation_index]:
+            continue
+        resolved.append(support)
+    return resolved
 
 
 def _quote_spans(claim: Mapping[str, Any]) -> list[Mapping[str, Any]]:

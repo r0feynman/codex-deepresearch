@@ -17,7 +17,9 @@ from deepresearch import (  # noqa: E402
     acquire_visual_candidates,
     ingest_vision_observations,
     prepare_run,
+    synthesize_report,
     validate_artifacts,
+    verify_claims,
 )
 
 
@@ -194,6 +196,72 @@ class VisualAcquisitionTests(unittest.TestCase):
         acquisition = evidence["visual_acquisition"]
         self.assertTrue(acquisition["near_duplicate_groups"])
         self.assertEqual(acquisition["external_vlm_call"], False)
+
+    def test_visual_required_fixture_links_observation_to_claim_and_report(self) -> None:
+        run_dir = self.prepared_visual_run_with_html_source()
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            {
+                "id": "claim_visual_fixture",
+                "text": "The product visual source contains fixture visual summary evidence.",
+                "claim_type": "visual",
+                "supporting_sources": ["src_visual_page"],
+                "supporting_images": [],
+                "quote_spans": [
+                    {
+                        "source_id": "src_visual_page",
+                        "quote": "Product screenshot",
+                        "location": "body image alt text",
+                    }
+                ],
+                "votes": [],
+                "verification_status": "unverified",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "low",
+                "caveats": [],
+                "angle_id": "angle_001",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        acquire = acquire_visual_candidates(run=run_dir)
+        ingest = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        verified = verify_claims(run=run_dir)
+        report_status = synthesize_report(run=run_dir)
+
+        self.assertEqual(acquire["status"], "visual_candidates_collected")
+        self.assertGreater(acquire["candidate_records"], 0)
+        self.assertGreater(acquire["selected_observations"], 0)
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertGreater(ingest["claim_visual_links_created"], 0)
+        self.assertEqual(verified["status"], "completed")
+        evidence = self.read_json(run_dir / "evidence.json")
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "supported")
+        self.assertTrue(claim["supporting_images"])
+        self.assertTrue(claim["visual_supports"])
+        first_support = claim["visual_supports"][0]
+        first_image = next(
+            image for image in evidence["images"] if image["id"] == first_support["image_id"]
+        )
+        self.assertEqual(
+            first_support["observation_ref"],
+            f"images.{first_support['image_id']}.observations[{first_support['observation_index']}]",
+        )
+        self.assertEqual(
+            first_support["observation_text"],
+            first_image["observations"][first_support["observation_index"]],
+        )
+        self.assertIn(
+            first_support["provider"],
+            {"local-page", "local-image-fixture", "local-screenshot-fixture"},
+        )
+        self.assertEqual(report_status["status"], "completed")
+        self.assertTrue(report_status["used_images"])
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## Visual Findings", report)
+        self.assertIn("claim `claim_visual_fixture`", report)
 
     def test_text_only_route_collects_zero_visual_work(self) -> None:
         prepared = prepare_run(
