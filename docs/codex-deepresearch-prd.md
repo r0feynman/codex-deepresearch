@@ -61,7 +61,7 @@ Primary Codex Plugin flow:
 Codex에 codex-deepresearch plugin 설치
 -> $deep-research: <질문>
 -> Codex 세션의 search/context/VLM capability와 plugin runner를 조합
--> report.md + evidence.json 생성
+-> report.md + evidence.json + run_status.json + synthesized-run report_status.json 생성
 ```
 
 Codex Skill:
@@ -210,14 +210,33 @@ $deep-research: <question>
 -> parallel orchestrator runs ready tasks through Codex subagents or equivalent worker contexts
 -> status summary reports active, queued, failed, accepted, merged, and retried shard counts
 -> guardrails, verifier matrix, and synthesis run on merged evidence only
--> final response gives report.md, evidence.json, run-status, and key diagnostics
+-> final response gives report.md, evidence.json, run_status.json, report_status.json when synthesized, and visual/parallel status artifacts when applicable
 ```
+
+`codex-plugin` full-runner state machine:
+
+| State | Entry action | Required artifacts or diagnostics | Allowed next states |
+| --- | --- | --- | --- |
+| `preflight_diagnostics` | Validate plugin install, runner executable, trusted project root, run directory write access, search handoff availability, visual provider needs, auth/sandbox/approval constraints, and cost caps. | If a run directory can be created, write `run_status.json` with the exact terminal status, `ok=false`, `terminal=true`, and `diagnostics.actionable_cause` on failure. Visual-required runs with no configured real visual acquisition provider use `blocked_missing_visual_provider`, not generic preflight failure. If no run directory can be created, final response must show the same diagnostics and no success claim. | `prepared`, `blocked_preflight`, `blocked_missing_visual_provider` |
+| `prepared` | Create run directory and canonical task placeholders. | `run_status.json`, `research_tasks.json`, `search_tasks.json`, `visual_tasks.json` when needed, `budget_estimate.json`. | `awaiting_search_handoff`, `parallel_orchestrating`, `serial_fallback_pending`, `blocked_missing_search_handoff`, `blocked_missing_visual_provider` |
+| `awaiting_search_handoff` | Pause runner-owned ingestion while the Codex-side agent fills search results. | `search_tasks.json` plus `search_results.jsonl` records using `SearchResult`. Missing or invalid records remain explicit diagnostics. | `awaiting_visual_handoff`, `ingesting_handoff`, `blocked_missing_search_handoff`, `serial_fallback_pending` |
+| `awaiting_visual_handoff` | For visual routes, expose local image/screenshot/PDF artifacts to the Codex-side agent or configured VLM adapter. | `visual_tasks.json`, selected image artifacts, `visual_observations.jsonl` records using `VisualEvidence`. If no real acquisition provider can produce required artifacts, write `blocked_missing_visual_provider`. | `ingesting_handoff`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` |
+| `ingesting_handoff` | Validate handoff artifacts, fetch allowed sources/images, normalize evidence. | Validated `SearchResult`/`VisualEvidence`, `evidence.json`, policy/fetch diagnostics. | `parallel_orchestrating`, `verifying`, `serial_fallback_pending`, `failed_validation` |
+| `parallel_orchestrating` | Run ready `ResearchTask` items through Codex subagents or equivalent worker contexts. | `parallel_orchestration_status.json`, `subagent_assignments.jsonl`, `run_trace.jsonl`, evidence shards. | `verifying`, `serial_fallback_pending`, `failed_parallel_no_accepted_shards`, `blocked_parallel_execution` |
+| `serial_fallback_pending` | Record why intended parallel or handoff execution cannot continue and whether fallback is allowed. | `run_status.json` with blocker, `needs_serial_handoff=true`, and fallback decision. `parallel_degraded` stays `false` until fallback actually runs. | `serial_fallback_running`, terminal blocked/failed status |
+| `serial_fallback_running` | Execute the same task queue serially only when user/runner policy permits fallback. | `run_status.json` with `parallel_degraded=true`, serial task diagnostics, merged evidence artifacts. | `verifying`, `completed_serial_handoff`, `failed_validation` |
+| `verifying` | Run guardrails and verifier matrix against merged evidence only. | `verifier_votes.jsonl`, updated `evidence.json`, guardrail diagnostics. | `synthesizing`, `policy_blocked_visual`, `budget_pruned_visual`, `failed_validation` |
+| `synthesizing` | Generate final report from supported evidence only. | `report.md`, `report_status.json`, final `run_status.json`. | recognized terminal status, `failed_synthesis` |
+
+Recognized terminal statuses for full-runner UX are: `completed_parallel`, `completed_partial_parallel`, `completed_serial_handoff`, `completed_auto_visual`, `partial_auto_visual`, `completed_fixture`, `blocked_preflight`, `blocked_missing_search_handoff`, `blocked_parallel_execution`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual`, `failed_parallel_no_accepted_shards`, `failed_validation`, and `failed_synthesis`. "Recognized" means the UX must report the state honestly; it does not mean the run passed a release gate. `completed_fixture` is accepted only for development validation and never for real-use or release readiness gates.
+
+The state machine reconciles the Skill UX with the Search/VLM handoff contract: `codex-plugin` mode may ask the active Codex agent to fill handoff artifacts, but the runner must not call Codex-native search, Codex interactive VLM, subagent spawning, or hidden Codex APIs as if they were stable library functions. Every Codex-side action must be represented by an artifact, a status transition, and diagnostics when blocked.
 
 Allowed invocation modes:
 
 | Invocation mode | Trigger | Required behavior | Artifact requirement |
 | --- | --- | --- | --- |
-| `full-runner` | default `$deep-research: <question>` | Execute the plugin runner through synthesis or an explicit blocked state. | Must create a run directory and final `report.md` or blocked diagnostics. |
+| `full-runner` | default `$deep-research: <question>` | Execute the plugin runner through synthesis or an explicit blocked state. | Must create a run directory plus `run_status.json`; synthesized runs must also create `report.md`, `evidence.json`, and `report_status.json`; visual/parallel runs include their status artifacts. |
 | `quick-chat` | explicit user request such as "quick answer" or "do not run full pipeline" | The assistant may answer conversationally using available tools. | Must state that no DeepResearch evidence bundle was produced. |
 | `manual-handoff` | user provides URLs, PDFs, image URLs, or local files and asks to use them | Use manual source ingestion and then continue runner stages when possible. | Must create or update a run directory and show artifact paths. |
 | `blocked` | missing search, Codex execution, VLM, auth, sandbox, or policy capability | Stop with an actionable blocked status instead of pretending full research completed. | Must write status diagnostics when the runner was started. |
@@ -225,7 +244,8 @@ Allowed invocation modes:
 User-visible status requirements:
 
 - During execution, the user can see at least: run id/path, current stage, active task count, queued task count, failed task count, accepted shard count, merged shard count, retry count, and whether fallback/degradation occurred.
-- The final assistant response must include direct links or paths to `report.md`, `evidence.json`, `parallel_orchestration_status.json` or equivalent status artifact, and `run_trace.jsonl` when present.
+- The final assistant response must include exact status artifacts, not an unspecified equivalent. Successful synthesized runs must include `report.md`, `evidence.json`, `run_status.json`, and `report_status.json`; parallel runs also include `parallel_orchestration_status.json`; visual-attempted runs also include `visual_provider_status.json`; `run_trace.jsonl` is included when present.
+- Blocked pre-synthesis runs must include `run_status.json` with `ok=false`, `terminal=true`, final `status`, and actionable diagnostics. They do not need `report_status.json` unless synthesis actually ran.
 - If the run uses fixture, manual, serial fallback, or quick-chat mode, the final response must label that provenance clearly and must not imply a real parallel DeepResearch run occurred.
 - If `--no-degrade` or the product equivalent is active, a blocked or failed parallel run must not synthesize a report in the same command unless the user explicitly starts a fallback run.
 - A normal `$deep-research` completion cannot be considered successful unless the final report is generated from supported evidence after guardrails and verifier stages.
@@ -234,8 +254,8 @@ Fresh-session acceptance:
 
 - In a new Codex session with the plugin installed, `$deep-research: <text-heavy question>` reaches `completed_parallel`, `completed_partial_parallel` with enough accepted evidence for synthesis, or an explicit blocked status; it must not end as chat-only without a run directory.
 - The same fresh-session E2E records `accepted_shards > 0` for real `codex-exec` or equivalent subagent execution when the Codex runtime is available.
-- The final assistant message exposes the generated `report.md` path and a compact shard/status summary.
-- A regression test or scripted smoke captures the transcript and fails if the final response lacks a run artifact path or if `report_status.json` is missing after an apparently successful run.
+- The final assistant message exposes generated `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifact paths, and a compact shard/status summary.
+- A regression test or scripted smoke captures the transcript and fails if the final response lacks a run artifact path or if the required final status artifact set is missing. For any successful synthesized run, missing `report_status.json` is a failure.
 
 ### Automatic Web Visual Research Contract
 
@@ -265,12 +285,39 @@ Required Phase 3 automatic visual artifacts:
 - `visual_observations.jsonl`: OCR, chart/table reading, object/layout description, image-claim alignment, caveats, and provider metadata.
 - `visual_provider_status.json`: configured visual providers, availability, real-vs-fixture provenance, VLM invocation counts, skipped work, and cost.
 
+Minimal Phase 3 visual artifact schemas:
+
+- `visual_search_plan.json` contains `schema_version`, `run_id`, `created_at`, and `tasks[]`. Each task has `plan_id`, `task_id`, `angle_id`, `route`, `target_evidence_type=web_image|page_image|screenshot|pdf_figure|chart_image`, `query`, `providers[]`, optional `source_search_result_ids[]`, `caps` (`max_candidates`, `max_fetches`, `max_vlm_images`, `max_cost_usd`), `policy_constraints`, `estimated_cost_usd`, and `state=planned|running|completed|blocked|skipped`.
+- `visual_candidates.jsonl` has one record per candidate: `candidate_id`, `plan_id`, `task_id`, `angle_id`, optional `source_search_result_id`, `provider`, `provider_kind=web_image_search|page_extractor|screenshot|pdf_rasterizer|manual|fixture`, `provider_mode=real|fixture|manual|user_provided`, `provider_run_id`, `origin=image_search|page_image|open_graph|srcset|lazy_loaded|screenshot|pdf_figure|pdf_page`, `page_url`, `image_url`, `rank`, `score`, `policy_decision=allowed|blocked|manual_review|budget_pruned`, `policy_flags[]`, `candidate_status=discovered|ranked|selected|rejected|policy_blocked|budget_pruned|fetch_failed|fetched|analyzed`, `rejection_reason`, `estimated_cost_usd`, and `actual_cost_usd`.
+- `image_fetch_status.jsonl` has one record per fetch/capture/rasterization attempt: `fetch_id`, `candidate_id`, `task_id`, `angle_id`, optional `source_search_result_id`, `fetch_status=fetched|failed|skipped|policy_blocked|budget_pruned|unsupported_mime|too_large|deduped`, `http_status`, `mime_type`, `byte_size`, `width`, `height`, `hash`, `phash`, `local_artifact_path`, `evidence_image_id`, `policy_decision`, `policy_flags[]`, `failure_code`, `estimated_cost_usd`, and `actual_cost_usd`.
+- `visual_observations.jsonl` has one record per VLM/manual observation: `observation_id`, `evidence_image_id`, `task_id`, `angle_id`, `candidate_id`, `fetch_id`, `provider`, `model_or_tool`, `provider_mode=real|fixture|manual|user_provided`, `provider_provenance`, `observation_status=analyzed|failed|skipped|needs_manual_review|policy_blocked`, `observations[]`, `inferences[]`, optional `ocr_text`, `confidence`, `policy_decision=allowed|blocked|manual_review|budget_pruned`, `policy_flags[]`, `caveats[]`, `verifier_links[]` (`claim_id`, optional `visual_support_ref`, optional `verifier_vote_id`), `report_links[]` (`claim_id`, optional `report_section_id`, optional `citation_id`), `estimated_cost_usd`, `actual_cost_usd`, and `created_at`.
+- `visual_provider_status.json` contains `schema_version`, `run_id`, `status`, `ok`, `terminal`, `metric_classification`, and `providers[]`. Each provider record has `provider`, `provider_kind`, `provider_mode=real|fixture|manual|user_provided`, `configured`, `available`, `blocked_reason`, `invocations`, `candidates_discovered`, `artifacts_fetched`, `vlm_images_analyzed`, `estimated_cost_usd`, `actual_cost_usd`, and `last_error`.
+
+Visual artifact validation rules:
+
+- `task_id` must reference `research_tasks.json[].id`; `angle_id` must match that task's angle and route.
+- `source_search_result_id`, when present, must reference `SearchResult.id`; page extraction, screenshot, and PDF rasterization candidates must preserve the source search result or explicit manual source that produced them.
+- `candidate_id` is globally unique within a run. Every `image_fetch_status.jsonl.candidate_id` must reference a candidate, and every fetched/analyzed candidate must have exactly one fetch record or a documented dedupe target.
+- `provider_mode=fixture|manual|user_provided` records are valid for mechanics but are excluded from real automatic visual release numerator counts.
+- `policy_decision=blocked|manual_review|budget_pruned` candidates cannot create supported claims unless a later human review changes the policy state and records that review.
+- If `fetch_status=fetched` and the artifact is selected for analysis, `evidence_image_id` must equal an `evidence.json.images[].id`; that image must preserve the same `task_id`, `angle_id`, `candidate_id`, `fetch_id`, `local_artifact_path`, `hash`, provider provenance, policy decision, and cost metadata.
+- `visual_observations.jsonl` records must reference the same `evidence_image_id`, `candidate_id`, and `fetch_id` lineage as the fetched artifact. `observations[]` are directly seen/OCR/chart-read facts; `inferences[]` are model interpretation and must not be used as direct evidence without caveats. Supported visual/mixed claims must reference the image through `supporting_images[]`, `visual_supports[]`, verifier links, and report links.
+- `run_status.json` and `visual_provider_status.json` must expose the terminal automatic visual state. `report_status.json.used_images` counts only cited image IDs from supported claims, and report citations must connect report section -> claim ID -> image ID -> candidate/fetch provenance.
+
 Provider requirements:
 
 - `codex-plugin` mode may use Codex-native search and `codex-interactive` VLM through handoff artifacts, but Public Beta automatic visual E2E must also have an `automated-cli` path using explicit provider adapters.
 - `automated-cli` mode must support at least one real web/image search provider and the `openai-responses-vision` VLM adapter before Public Beta can claim complete automatic web image research.
 - Fixture, local test, manual, or user-provided image evidence may validate mechanics, but cannot satisfy the Public Beta automatic web visual E2E gate.
 - Text-only routes must still perform zero image search, screenshot capture, image fetch, or VLM analysis.
+
+Public Beta provider and scenario gates:
+
+- Public Beta cannot claim complete automatic web visual research from one acquisition path. It must pass separate real-provider gates for web/image search candidate discovery, page image extraction plus fetch/cache, browser screenshot capture, PDF page/figure rasterization, `openai-responses-vision` analysis, visual verifier linkage, and report citation.
+- The `codex-plugin` interactive visual E2E gate proves product UX: a fresh `$deep-research` visual-required prompt uses Codex-native search/VLM handoff artifacts and exposes `report.md`, `evidence.json`, `run_status.json`, `report_status.json`, `visual_provider_status.json`, and shard/status summary without hidden Codex APIs. A diagnostic run may end in an explicit blocked terminal status, but the release gate passes only with `completed_auto_visual`.
+- The `automated-cli` real provider E2E gate proves reproducible automation: a no-user-image visual-required run uses at least one real web/image provider plus `openai-responses-vision`, records non-fixture provider provenance and cost, and reaches `completed_auto_visual`. This gate is required for Public Beta release readiness.
+- Scenario gates must include at least: product/image-centric web image discovery, UI/webpage screenshot comparison, public chart or market/report visual extraction, and public PDF/paper figure extraction. Each scenario needs at least one supported visual or mixed claim cited in `report.md`, except when it ends in an explicit blocked policy/capability state.
+- A provider blocked by auth, policy, terms, rate limit, or missing configuration may produce a correct blocked run, but that blocked run does not satisfy the Public Beta release gate for the provider/scenario it was meant to cover.
 
 Automatic visual completion states:
 
@@ -281,11 +328,22 @@ Automatic visual completion states:
 - `policy_blocked_visual`: usable visual artifacts were blocked by robots, copyright, PII, sensitive image, or high-risk policy.
 - `budget_pruned_visual`: visual work was skipped or truncated because configured image/model-call/cost caps were reached.
 
+Automatic visual status envelope:
+
+| Status | `ok` | `terminal` | Metric classification | Notes |
+| --- | ---: | ---: | --- | --- |
+| `completed_auto_visual` | `true` | `true` | success, included in numerator and denominator | Requires report-cited supported visual/mixed claim and non-fixture provenance. |
+| `partial_auto_visual` | `false` for visual-required, `true` only for explicitly allowed text-only partial delivery | `true` | failure, included in denominator but not numerator | May produce a caveated report, but cannot pass automatic visual E2E. |
+| `blocked_missing_visual_provider` | `false` | `true` | excluded from phase metric denominator, release-gate failure when the provider is required | Pre-run diagnostic must name missing provider/config. |
+| `blocked_missing_vlm_provider` | `false` | `true` | excluded from phase metric denominator, release-gate failure when visual analysis is required | Must preserve fetched artifacts for later review when policy allows. |
+| `policy_blocked_visual` | `true` when policy is enforced correctly, otherwise `false` | `true` | excluded from phase metric denominator | No blocked image can support a high-confidence claim. |
+| `budget_pruned_visual` | `true` only when pruning follows the selected preset; `false` when required evidence is pruned below gate minimums | `true` | included as failure for automatic visual E2E unless the run is explicitly low-budget/excluded | Cost fields must show which cap triggered pruning. |
+
 Public Beta automatic visual acceptance:
 
 - A visual-required run with no user-provided images can complete through real web image/page/screenshot/PDF visual acquisition.
 - At least 10 web visual candidates are collected for image-centric questions unless policy or provider failure blocks the run with an explicit state.
-- At least 3 non-fixture images/screenshots/figures are analyzed by `openai-responses-vision` or a Codex interactive handoff in accepted real-use E2E.
+- At least 3 non-fixture images/screenshots/figures are analyzed by `openai-responses-vision` in the automated-cli release gate, and at least 3 are analyzed by Codex interactive handoff in the codex-plugin release gate. Explicit blocked terminal states are valid diagnostics but do not count as release-gate passes.
 - At least one supported visual or mixed claim has `supporting_images[]`, valid `visual_supports[]`, a visual verifier vote, and is cited in `report.md`.
 - The report clearly distinguishes observed image facts from text-source facts and records image caveats.
 - The evidence browser can show the source page, image artifact, VLM observation, visual verifier vote, linked claim, and report citation together.
@@ -623,6 +681,10 @@ Agent 산정식:
   "images": [
     {
       "id": "img_001",
+      "task_id": "task_research_001",
+      "angle_id": "angle_001",
+      "candidate_id": "vc_001",
+      "fetch_id": "fetch_001",
       "source_id": "src_001",
       "origin": "screenshot",
       "image_url": "...",
@@ -639,7 +701,14 @@ Agent 산정식:
       "visual_tasks": ["ocr", "image_claim_alignment"],
       "analysis_provider": "codex-interactive",
       "analysis_status": "analyzed|failed|skipped|needs_manual_review|policy_blocked",
+      "provider_provenance": {
+        "provider": "local-page",
+        "provider_kind": "screenshot",
+        "provider_mode": "real|fixture|manual|user_provided"
+      },
+      "policy_decision": "allowed|blocked|manual_review|budget_pruned",
       "policy_flags": [],
+      "cost_usd": 0.0,
       "caveats": []
     }
   ],
@@ -714,6 +783,7 @@ Schema v0 implementation requirements:
 - 모든 source는 `accessed_at`, `retrieval_status`, `quality`, `local_artifact_path`를 가진다.
 - 모든 image/screenshot은 `VisualEvidence` schema를 따른다.
 - 모든 image/screenshot은 `page_url` 또는 `image_url` 중 하나 이상과 `local_artifact_path`를 가진다.
+- Phase 3 automatic visual image records must include `task_id`, `angle_id`, `candidate_id`, `fetch_id`, `provider_provenance`, `policy_decision`, and `cost_usd` when they came from automatic acquisition.
 - VLM output은 `observations`와 `inferences`를 분리한다.
 - 모든 high-confidence text claim은 하나 이상의 `quote_spans`를 가진다.
 - 모든 high-confidence visual/mixed claim은 하나 이상의 `supporting_images`를 가진다.
@@ -808,6 +878,10 @@ SearchResult validation rules:
 ```json
 {
   "id": "img_001",
+  "task_id": "task_research_001",
+  "angle_id": "angle_001",
+  "candidate_id": "vc_001",
+  "fetch_id": "fetch_001",
   "source_id": "src_001",
   "origin": "page_image|image_search|screenshot|user_upload|manual",
   "image_url": null,
@@ -824,7 +898,14 @@ SearchResult validation rules:
   "visual_tasks": ["ocr", "chart_reading", "image_claim_alignment"],
   "analysis_provider": "codex-interactive|openai-responses-vision|manual-visual-review",
   "analysis_status": "analyzed|failed|skipped|needs_manual_review|policy_blocked",
+  "provider_provenance": {
+    "provider": "example-provider",
+    "provider_kind": "web_image_search|page_extractor|screenshot|pdf_rasterizer|manual|fixture",
+    "provider_mode": "real|fixture|manual|user_provided"
+  },
+  "policy_decision": "allowed|blocked|manual_review|budget_pruned",
   "policy_flags": [],
+  "cost_usd": 0.0,
   "caveats": []
 }
 ```
@@ -900,6 +981,10 @@ Rules:
 ~/.codex/deepresearch/runs/<run_id>/
   report.md
   evidence.json
+  run_status.json
+  report_status.json
+  parallel_orchestration_status.json
+  visual_provider_status.json
   images/
   screenshots/
   claims.jsonl
@@ -918,14 +1003,14 @@ Codex는 후속 작업에서 `evidence.json`을 먼저 읽고, `verification_sta
 7. `ModalityRouterAgent`로 text-only/visual-required/visual-optional 분류를 구현한다.
 8. visual-required angle에서 이미지 검색, 대표 이미지 추출, first viewport screenshot 캡처를 수행한다.
 9. `standard` preset 기준 verifier invocation 80개, 동시 runner agent 8개를 기본값으로 둔다.
-10. 보고서 `report.md`와 schema v0 `evidence.json` 저장.
+10. 보고서 `report.md`, schema v0 `evidence.json`, `run_status.json`, 그리고 synthesis가 성공한 run의 `report_status.json` 저장.
 11. route-specific verifier matrix 구현.
 
 MVP plugin acceptance:
 
 - `.codex-plugin/plugin.json`이 validation을 통과한다.
 - personal marketplace metadata가 존재하고 install/update/remove 절차가 문서화되어 있다.
-- `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`을 생성한다.
+- `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`, `run_status.json`, 그리고 synthesis가 성공한 run의 `report_status.json`을 생성한다.
 - `codex-plugin` mode의 search handoff와 VLM handoff artifact가 schema validation을 통과한다.
 - `verification_status`, `review_status`, `promotion_status`가 모든 claim에 존재한다.
 - `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
@@ -955,7 +1040,7 @@ MVP security and policy guardrails:
 - 수동 source URL 입력 지원.
 - 수동 image file, screenshot, image URL 입력 지원.
 - `PlannerAgent`, `ModalityRouterAgent`, `SynthesisAgent` 최소 구현.
-- 출력: `report.md`, schema v0 `evidence.json`.
+- 출력: `report.md`, schema v0 `evidence.json`, `run_status.json`, 그리고 synthesis가 성공한 run의 `report_status.json`.
 
 Exit criteria:
 
@@ -1023,7 +1108,7 @@ Exit criteria:
 - 중단 후 재개해도 이미 처리한 source/image를 다시 분석하지 않는다.
 - 사용자가 실행 전 비용 상한을 설정할 수 있다.
 - 최종 report는 사용자가 요청한 형식, 언어, 비교표, gap list를 반영한다.
-- 전체 visual/text pipeline이 끝나면 `run-status`가 completed 상태를 보고한다.
+- 전체 visual/text pipeline이 끝나면 `run_status.json`과 applicable visual/parallel status artifacts가 completed 상태를 보고한다.
 
 ### Phase 3: Public Beta
 
@@ -1034,7 +1119,7 @@ Exit criteria:
 - Codex Plugin marketplace 등록 또는 개인 marketplace 등록 자동화.
 - `/skills`에서 선택 가능한 안정 skill metadata.
 - `$deep-research` fresh-session invocation이 기본적으로 full-runner run을 시작하고, chat-only 답변으로 새지 않게 하는 invocation router.
-- final response artifact handoff: run directory, `report.md`, `evidence.json`, status artifact, shard summary를 사용자에게 노출.
+- final response artifact handoff: run directory, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary를 사용자에게 노출.
 - TUI 또는 lightweight web dashboard.
 - run list, progress, pause/resume/cancel.
 - parallel subagent monitor: active/queued/failed/merged task count, subagent count, shard merge status.
@@ -1048,7 +1133,7 @@ Exit criteria:
 
 Exit criteria:
 
-- 새 Codex 세션에서 `$deep-research: <text-heavy question>`을 실행하면 full-runner run directory가 생성되고, 최종 응답에 `report.md`, `evidence.json`, status artifact, shard summary가 표시된다.
+- 새 Codex 세션에서 `$deep-research: <text-heavy question>`을 실행하면 full-runner run directory가 생성되고, 최종 응답에 `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary가 표시된다.
 - `$deep-research`가 quick-chat mode로 답할 수 있는 경우는 사용자가 명시적으로 빠른 답변을 요청했을 때뿐이며, 이 경우 evidence bundle이 생성되지 않았음을 표시한다.
 - 사용자가 코드 파일을 직접 열지 않고 run 상태와 evidence를 확인할 수 있다.
 - 사용자가 active subagent count, queued task count, failed task count, merged shard count를 볼 수 있다.
@@ -1786,9 +1871,9 @@ Tasks:
 
 1. `$deep-research` skill invocation router를 만든다. 기본 mode는 `full-runner`이고, `quick-chat`은 명시 요청이 있을 때만 허용한다.
 2. fresh-session skill invocation이 `prepare -> orchestrate-parallel -> guardrails -> verify -> synthesize`를 끝까지 실행하거나 explicit blocked status로 종료하게 한다.
-3. 최종 assistant response가 run directory, `report.md`, `evidence.json`, status artifact, shard summary, fallback/degradation 여부를 항상 표시하게 한다.
-4. chat-only, fixture-only, manual-only, serial fallback, real parallel provenance를 최종 응답과 status artifact에서 구분한다.
-5. `$deep-research` fresh-session E2E transcript gate를 추가한다. 성공처럼 보이는 응답에 run artifact path 또는 `report_status.json`이 없으면 실패한다.
+3. 최종 assistant response가 run directory, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary, fallback/degradation 여부를 항상 표시하게 한다.
+4. chat-only, fixture-only, manual-only, serial fallback, real parallel provenance를 최종 응답과 `run_status.json` 및 applicable status artifacts에서 구분한다.
+5. `$deep-research` fresh-session E2E transcript gate를 추가한다. 성공처럼 보이는 응답에 run artifact path, `run_status.json`, 또는 synthesis 이후 `report_status.json`이 없으면 실패한다.
 6. run list, run detail, claim detail을 볼 수 있는 TUI 또는 lightweight web dashboard를 만든다.
 7. 진행 중 run의 phase, active/queued/failed/merged task count, Codex subagent count, source count, image count를 표시한다.
 8. pause/resume/cancel control을 구현한다.
@@ -1809,16 +1894,19 @@ Tasks:
 23. 논문/보고서 PDF page 또는 figure rasterization provider를 구현한다. CAPTCHA, 로그인, paywall 우회는 비목표로 유지한다.
 24. `openai-responses-vision` automated adapter가 image URL, local artifact, screenshot, PDF page image를 분석해 `visual_observations.jsonl`을 생성하게 한다.
 25. VisualVerifierAgent가 VLM observation을 claim `visual_supports[]`, visual verifier vote, report citation으로 연결하게 한다.
-26. `completed_auto_visual`, `partial_auto_visual`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` 상태를 run-status와 dashboard에 표시한다.
+26. `completed_auto_visual`, `partial_auto_visual`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` 상태를 `run_status.json`, `visual_provider_status.json`, dashboard에 표시한다.
 27. fixture/manual/user-provided-only visual runs와 real automatic web visual runs를 validation에서 구분한다.
-28. 자동 웹 이미지 조사 real-use E2E suite를 만든다: 제품 이미지 비교, UI screenshot 비교, 뉴스/시장 차트 판독, 논문 figure 판독, 지도/현장 이미지 확인.
-29. automatic visual E2E 실패 유형을 provider failure, fetch failure, policy block, VLM failure, visual contradiction, report linkage failure로 분류한다.
+28. codex-plugin interactive visual E2E suite를 만든다. fresh-session `$deep-research`가 Codex-native search/VLM handoff artifacts를 채우고 hidden API 없이 `completed_auto_visual`에 도달하는지 검증한다. explicit blocked terminal status는 진단으로 기록하지만 release-gate pass로 계산하지 않는다.
+29. automated-cli real provider visual E2E suite를 만든다. no-user-image run이 real provider acquisition과 `openai-responses-vision`을 사용해 제품 이미지 비교, UI screenshot 비교, 뉴스/시장 차트 판독, 논문 figure 판독을 통과해야 한다.
+30. automatic visual E2E 실패 유형을 provider failure, fetch failure, policy block, VLM failure, visual contradiction, report linkage failure로 분류한다.
 
 Deliverables:
 
 - skill invocation router
 - fresh-session full-runner E2E gate
 - final response artifact handoff
+- codex-plugin interactive visual E2E gate
+- automated-cli real provider visual E2E gate
 - dashboard/TUI
 - parallel subagent progress monitor
 - automatic web visual research pipeline
@@ -1833,9 +1921,9 @@ Phase 3 product UX issue candidates and ordering:
 
 | Issue candidate | Scope | Depends on | Can run in parallel with |
 | --- | --- | --- | --- |
-| P3-UX1 Skill full-runner invocation router | Update the Skill/runner handoff so `$deep-research` defaults to `full-runner`, allows `quick-chat` only by explicit request, and records mode/provenance in status artifacts. | Phase 2 real `codex-exec` orchestration and run-step state | P3-AV1 |
-| P3-UX2 Final response artifact handoff | Ensure successful or blocked skill runs always return run directory, `report.md`, `evidence.json`, status artifact, shard counts, fallback/degradation state, and key diagnostics. | P3-UX1 | P3-AV1, P3-AV2 |
-| P3-UX3 Fresh-session skill E2E gate | Add a scripted/transcript E2E that invokes the installed skill in a fresh Codex session and fails if a successful-looking response lacks runner artifacts or `report_status.json`. | P3-UX2 | P3-AV2, P3-AV3, P3-AV4, P3-AV5 |
+| P3-UX1 Skill full-runner invocation router | Update the Skill/runner handoff so `$deep-research` defaults to `full-runner`, allows `quick-chat` only by explicit request, and records mode/provenance in `run_status.json` plus applicable visual/parallel status artifacts. | Phase 2 real `codex-exec` orchestration and run-step state | P3-AV1 |
+| P3-UX2 Final response artifact handoff | Ensure successful or blocked skill runs always return run directory, `report.md`, `evidence.json`, `run_status.json`, `report_status.json` when synthesized, shard counts, fallback/degradation state, and key diagnostics. | P3-UX1 | P3-AV1, P3-AV2 |
+| P3-UX3 Fresh-session skill E2E gate | Add a scripted/transcript E2E that invokes the installed skill in a fresh Codex session and fails if a successful-looking response lacks runner artifacts, `run_status.json`, or `report_status.json` after synthesis. | P3-UX2 | P3-AV2, P3-AV3, P3-AV4, P3-AV5 |
 | P3-UX4 Progress and shard monitor shell | Show active, queued, failed, accepted, merged, retried shard counts plus stage and run id in TUI or lightweight dashboard. | P3-UX2 | P3-AV2, P3-AV3, P3-AV4, P3-AV5 |
 | P3-UX5 Pause/resume/cancel controls | Add user controls that operate on the same run-state model used by full-runner skill invocations. | P3-UX4 | Evidence browser UX |
 
@@ -1850,15 +1938,16 @@ Phase 3 automatic visual issue candidates and ordering:
 | P3-AV5 PDF figure/page rasterizer | Rasterize allowed PDF pages/figures and record page/figure provenance. | P3-AV1 | P3-AV2, P3-AV3, P3-AV4 |
 | P3-AV6 Automated VLM adapter | Implement `openai-responses-vision` analysis for image URL/local image/screenshot/PDF page image and emit validated `visual_observations.jsonl`. | P3-AV2 or P3-AV3 or P3-AV4 or P3-AV5 | Evidence browser UX |
 | P3-AV7 Visual verifier and report linkage | Convert VLM observations into `visual_supports[]`, visual verifier votes, image appendix entries, report citations, and evidence browser links. | P3-AV6 | Report templates |
-| P3-AV8 Real automatic visual E2E gate | Add no-user-image E2E prompts and enforce `completed_auto_visual`, 10 candidates, 3 VLM analyzed images, and 1 report-cited visual/mixed claim. | P3-AV7 | Install/update docs |
+| P3-AV8 Codex-plugin interactive visual E2E gate | Add fresh-session `$deep-research` visual prompts that prove Codex-native search/VLM handoff artifacts are filled, ingested, and reported without hidden API assumptions. | P3-UX3, P3-AV7 | Install/update docs |
+| P3-AV9 Automated-cli real provider visual E2E gate | Add no-user-image automated CLI prompts using real provider acquisition plus `openai-responses-vision`; enforce provider scenario gates, `completed_auto_visual`, 10 candidates for image-centric prompts, 3 VLM analyzed images, and 1 report-cited visual/mixed claim. | P3-AV7 | Install/update docs |
 
 Safe development waves:
 
 - Wave 1: P3-UX1 and P3-AV1. P3-UX1 closes the product invocation gap; P3-AV1 defines the automatic visual state/schema contract.
 - Wave 2: P3-UX2, P3-UX3, P3-AV2, P3-AV3, P3-AV4, and P3-AV5 can proceed after their Wave 1 dependencies because UX artifact handoff and visual acquisition providers write separate normalized artifacts.
-- Wave 3: P3-UX4 and P3-AV6. P3-UX4 consumes status artifacts; P3-AV6 depends on at least one real image artifact path from Wave 2.
+- Wave 3: P3-UX4 and P3-AV6. P3-UX4 consumes `run_status.json` plus applicable visual/parallel status artifacts; P3-AV6 depends on at least one real image artifact path from Wave 2.
 - Wave 4: P3-UX5 and P3-AV7. P3-UX5 extends run controls; P3-AV7 depends on validated VLM observations from P3-AV6.
-- Wave 5: P3-AV8 is the release gate and cannot pass until P3-UX3, P3-AV2/P3-AV3/P3-AV4 or P3-AV5, P3-AV6, and P3-AV7 are complete.
+- Wave 5: P3-AV8 and P3-AV9 are release gates. P3-AV8 cannot pass until P3-UX3 and P3-AV7 are complete. P3-AV9 cannot pass until P3-AV2, P3-AV3, P3-AV4, P3-AV5, P3-AV6, and P3-AV7 are complete.
 
 ### Phase 4 WBS: Product v1
 
@@ -1959,13 +2048,13 @@ Deliverables:
 - 모든 run은 schema v0 이상을 따르는 재사용 가능한 `evidence.json`을 남긴다.
 - plugin manifest `.codex-plugin/plugin.json`이 validation을 통과한다.
 - personal marketplace metadata가 존재하고 install/update/remove 절차가 문서화되어 있다.
-- `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`을 생성한다.
+- `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`, `run_status.json`, 그리고 synthesis가 성공한 run의 `report_status.json`을 생성한다.
 - `codex-plugin` mode의 search handoff와 VLM handoff artifact가 schema validation을 통과한다.
 - `verification_status`, `review_status`, `promotion_status`가 모든 claim에 존재한다.
 - `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
 - text-only 작업은 VLM 비용을 쓰지 않는다.
 - visual-required 작업은 VLM 분석과 visual verifier를 생략하지 않는다.
-- Public Beta visual-required 작업은 사용자 제공 이미지 없이도 real web/image/screenshot/PDF visual acquisition과 VLM analysis를 통해 `completed_auto_visual` 상태에 도달할 수 있다.
+- Public Beta visual-required 작업은 사용자 제공 이미지 없이도 codex-plugin interactive E2E와 automated-cli real provider E2E를 모두 통과해야 한다. automated-cli gate는 real web/image/page/screenshot/PDF visual acquisition과 `openai-responses-vision`을 통해 `completed_auto_visual` 상태에 도달해야 한다.
 - Public Beta automatic visual gate는 fixture, local test provider, manual review, user-provided-only image evidence만으로 통과할 수 없다.
 - 최종 보고서의 모든 high-confidence claim은 quote 또는 image evidence를 가진다.
 - high-risk domain claim은 primary source 또는 caveat 없이는 high confidence가 될 수 없다.
@@ -2106,8 +2195,20 @@ Public Beta automatic visual policy:
 Metric denominators:
 
 - Product-Level Acceptance Criteria는 release gate다. gate 항목은 해당 release에서 100% 통과해야 한다.
-- 아래 phase metric은 `policy_blocked`, `needs_manual_review`, `blocked_missing_search_handoff`로 정상 차단된 run을 제외한 completed non-blocked runs 기준이다.
-- blocked run은 실패가 아니라 별도 `blocked_*` 상태로 집계한다.
+- 아래 phase metric은 `policy_blocked`, `needs_manual_review`, `blocked_missing_search_handoff`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`로 정상 차단된 run을 제외한 completed non-blocked runs 기준이다.
+- blocked run은 실패가 아니라 별도 `blocked_*` 상태로 집계하지만, Public Beta에서 필수 provider/scenario gate를 검증하는 run이 `blocked_*`로 끝나면 해당 release gate는 미충족이다.
+- `partial_auto_visual`과 non-exempt `budget_pruned_visual`은 automatic visual E2E denominator에 포함하고 numerator에서는 제외한다.
+- `completed_fixture`는 fixture-only metric에는 사용할 수 있지만 real-use, codex-plugin interactive, automated-cli real provider, Public Beta release denominator와 numerator에서 제외한다.
+
+Metric status classification:
+
+| Status family | `ok`/terminal rule | Phase metric classification |
+| --- | --- | --- |
+| `completed_parallel`, `completed_partial_parallel`, `completed_serial_handoff`, `completed_auto_visual` | `ok=true`, `terminal=true` | success when the metric-specific artifact gates pass |
+| `partial_auto_visual` | `terminal=true`; `ok=false` for visual-required unless explicit text-only partial delivery was allowed | included failure for automatic visual E2E |
+| `budget_pruned_visual` | `terminal=true`; `ok` depends on selected preset | included failure for automatic visual E2E unless the run is explicitly marked low-budget/excluded before launch |
+| `blocked_*`, `policy_blocked_visual` | `ok=false` except policy blocks that are correctly enforced with no unsafe claim leakage; always `terminal=true` | excluded from phase-rate denominators, but not accepted for required release gates |
+| `failed_*`, `failed_validation`, `failed_synthesis` | `ok=false`, `terminal=true` | included failure when the run reached the metric scope |
 
 | Metric | Prototype | MVP | Private Alpha | Public Beta | Product v1 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -2121,6 +2222,8 @@ Metric denominators:
 | real codex-exec E2E accepted shard success rate | n/a | n/a | 90% | 95% | 98% |
 | visual evidence used in visual-required report | n/a | 95% | 98% | 99% | 99% |
 | automatic web visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
+| codex-plugin interactive visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
+| automated-cli real provider visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
 | real visual provider provenance coverage | n/a | n/a | 95% | 99% | 99% |
 | user-requested report shape adherence | n/a | 90% | 95% | 98% | 99% |
 | duplicate source/image/claim merge leakage | n/a | n/a | < 2% | < 1% | < 0.5% |
@@ -2132,10 +2235,12 @@ Metric definitions:
 
 - `real codex-exec E2E accepted shard success rate`: percentage of non-blocked real `adapter=codex-exec` E2E runs where `accepted_shards > 0`; fixture adapter runs are excluded from numerator and denominator.
 - `visual evidence used in visual-required report`: percentage of non-blocked visual-required runs where at least one supported claim has `supporting_images`, `visual_supports[]`, and `report_status.used_images > 0`.
-- `automatic web visual E2E pass rate`: percentage of non-blocked visual-required real-use runs with no user-provided images where `run-status` reaches `completed_auto_visual`, at least 3 non-fixture VLM-analyzed images exist, and at least one visual/mixed claim is cited in `report.md`.
+- `automatic web visual E2E pass rate`: aggregate percentage of non-blocked visual-required real-use runs with no user-provided images where `run_status.json.status` reaches `completed_auto_visual`, at least 3 non-fixture VLM-analyzed images exist, provider scenario gates are satisfied, and at least one visual/mixed claim is cited in `report.md`.
+- `codex-plugin interactive visual E2E pass rate`: percentage of fresh-session `$deep-research` visual E2E runs where Codex-native search/VLM handoff artifacts are filled, ingested, reported, and surfaced in the final response without hidden Codex API assumptions. Explicit blocked terminal statuses are tracked separately and do not count as passes.
+- `automated-cli real provider visual E2E pass rate`: percentage of no-user-image automated CLI visual E2E runs where real provider acquisition plus `openai-responses-vision` reaches `completed_auto_visual` with required provider provenance, cost fields, and report citation linkage.
 - `real visual provider provenance coverage`: percentage of image/screenshot/PDF visual artifacts with provider, origin, source page, local artifact, hash, policy state, VLM path, and real-vs-fixture provenance recorded.
 - `user-requested report shape adherence`: percentage of sampled real-use reports scoring `>=9/10` on the report quality gate.
-- `fresh-session skill full-runner artifact handoff pass rate`: percentage of fresh Codex session `$deep-research` E2E runs where the final response includes a run artifact path, `report.md`, `evidence.json`, status/shard summary, and the backing files exist after the response.
+- `fresh-session skill full-runner artifact handoff pass rate`: percentage of fresh Codex session `$deep-research` E2E runs where the final response includes a run artifact path, `report.md`, `evidence.json`, `run_status.json`, `report_status.json` after synthesis, status/shard summary, and the backing files exist after the response.
 
 ## 구현 순서
 
@@ -2172,6 +2277,6 @@ Metric definitions:
 
 문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 실사용 E2E에서는 Phase 2 artifact는 생성되지만, real `codex-exec` shard가 accepted 되지 않고, visual evidence가 final report에 쓰이지 않으며, report synthesis가 사용자 질문 형식을 따르지 않는 문제가 확인됐다. 2026-06-24 추가 PRD 리뷰에서는 Phase 3가 dashboard/evidence review 중심으로 정의되어 있어, 사용자가 원하는 "웹 조사 중 이미지/차트/논문 figure를 자동 발견하고 VLM으로 판독하는" end-to-end 자동 웹 이미지 조사가 구현 범위와 gate에 충분히 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 skill UX 리뷰에서는 새 Codex 세션의 `$deep-research` invocation이 full runner를 끝까지 실행하지 않고 일반 대화형 답변으로 새어 나갈 수 있어, 개발 검증용 runner 결과와 실제 사용자 체감이 달라지는 문제가 확인됐다.
 
-수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다. 2026-06-24 수정에서는 real-use E2E finding을 PRD에 추가하고, M19-M24 hardening tickets로 trusted `codex-exec` context, parallel status semantics, visual evidence linkage, user-shaped report synthesis, run-step stability, fixture-vs-real E2E distinction을 공식 Phase 2 후속 범위로 편입했다. 이번 Phase 3 진화에서는 Automatic Web Visual Research Contract를 추가하고, `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json`, real provider provenance, `completed_auto_visual` 상태, `openai-responses-vision` automated adapter, browser screenshot, PDF figure rasterization, visual E2E gate를 Phase 3 범위와 WBS에 명시했다. 또한 Skill Invocation Full-Runner UX Contract를 추가해 `$deep-research` 기본 mode를 `full-runner`로 고정하고, `quick-chat`은 명시 요청 때만 허용하며, 최종 응답이 run directory, `report.md`, `evidence.json`, status artifact, shard summary를 노출해야 한다는 fresh-session E2E gate를 Phase 3 P3-UX 이슈로 분리했다.
+수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다. 2026-06-24 수정에서는 real-use E2E finding을 PRD에 추가하고, M19-M24 hardening tickets로 trusted `codex-exec` context, parallel status semantics, visual evidence linkage, user-shaped report synthesis, run-step stability, fixture-vs-real E2E distinction을 공식 Phase 2 후속 범위로 편입했다. 이번 Phase 3 진화에서는 Automatic Web Visual Research Contract를 추가하고, `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json`, real provider provenance, `completed_auto_visual` 상태, `openai-responses-vision` automated adapter, browser screenshot, PDF figure rasterization, visual E2E gate를 Phase 3 범위와 WBS에 명시했다. 또한 Skill Invocation Full-Runner UX Contract를 추가해 `$deep-research` 기본 mode를 `full-runner`로 고정하고, `quick-chat`은 명시 요청 때만 허용하며, 최종 응답이 run directory, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary를 노출해야 한다는 fresh-session E2E gate를 Phase 3 P3-UX 이슈로 분리했다. PR #56 후속 검토에서는 codex-plugin full-runner state machine, final status artifact set(`run_status.json`, synthesized-run `report_status.json`, visual/parallel status files), Phase 3 visual artifact field rules, codex-plugin interactive visual E2E와 automated-cli real provider E2E 분리, Public Beta provider/scenario gates, automatic visual ok/terminal/metric classification을 추가해 implementation contract를 더 좁혔다. 추가 후속 검토에서는 `blocked_missing_visual_provider` 전이를 preflight/prepared/visual handoff에서 명시하고, `visual_observations.jsonl` record schema를 추가했다.
 
 남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 병렬 subagent 실행 자체는 Codex CLI smoke test로 확인됐지만, automated runner adapter는 Codex auth, sandbox, approval policy, nested `codex exec`, SDK/MCP server availability, JSON event compatibility, child thread cleanup을 안정적으로 처리해야 한다. Codex subagent를 사용할 수 없는 surface에서는 serial handoff 또는 `automated-cli` worker fallback으로 degrade해야 한다. 100-subagent high fan-out은 비용, rate limit, workspace policy, trace volume을 크게 키우므로 `exhaustive` preset에서만 explicit confirmation과 cost cap으로 제한한다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Phase 3 automatic visual E2E는 real provider, remote image fetch, browser automation, PDF rasterization, VLM API 비용, provider 약관과 rate limit에 의존하므로 fixture 통과와 별도 gate로 운영해야 한다. Fresh-session skill E2E는 Codex plugin installation, skill selection, session transcript capture, and nested runner availability에 의존하므로 CLI-only validation과 별도 gate로 운영해야 한다. Real-use E2E가 fixture validation과 다른 실패를 드러냈으므로, 앞으로 Phase 2 acceptance는 fixture-only smoke가 아니라 실제 `codex-exec` child run, visual-required run, 사용자 형식의 report synthesis를 별도 gate로 검증해야 한다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
