@@ -505,8 +505,11 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(status["report_shape"]["language"], "ko")
         answer = report.split("## 결론", 1)[1].split("## 확인된 내용", 1)[0]
         self.assertIn("직접 답변:", answer)
-        self.assertIn("not yet a default production adoption choice", answer)
+        self.assertIn("현재 확인된 근거", answer)
+        self.assertNotIn("not yet a default production adoption choice", answer)
         self.assertIn("## 확인된 내용", report)
+        confirmed = report.split("## 확인된 내용", 1)[1].split("## 상충되는 근거", 1)[0]
+        self.assertIn("원문 근거: Python free-threading is not yet a default production adoption choice", confirmed)
         self.assertIn("## 상충되는 근거", report)
         self.assertIn("claim_refuted_package", report)
         self.assertIn("## 주의점과 남은 gap", report)
@@ -525,18 +528,26 @@ class ReportGenerationTests(unittest.TestCase):
                 claim_id="claim_real_finding",
                 text="A substantive report finding remains visible.",
             ),
+            self.claim(
+                claim_id="claim_substantive_privacy_policy",
+                text="The privacy policy now requires users to accept arbitration for some disputes.",
+            ),
         ]
         self.write_json(run_dir / "evidence.json", evidence)
 
         status = synthesize_report(run=run_dir)
 
         report = (run_dir / "report.md").read_text(encoding="utf-8")
-        self.assertEqual(status["claims_included"], 1)
+        self.assertEqual(status["claims_included"], 2)
         self.assertEqual(status["excluded_claims"][0]["claim_id"], "claim_boilerplate")
         self.assertIn("boilerplate_noise", status["excluded_claims"][0]["exclusion_reasons"])
         confirmed = report.split("## Confirmed Findings", 1)[1].split("## Conflicts", 1)[0]
         self.assertNotIn("Skip to content", confirmed)
         self.assertIn("A substantive report finding remains visible.", confirmed)
+        self.assertIn(
+            "The privacy policy now requires users to accept arbitration for some disputes.",
+            confirmed,
+        )
 
     def test_visual_required_report_fails_when_usable_image_evidence_is_unused(self) -> None:
         run_dir = self.temp_run()

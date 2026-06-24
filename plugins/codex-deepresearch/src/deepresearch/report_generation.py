@@ -402,7 +402,7 @@ def _render_report(
                 sources_by_id=sources_by_id,
             )
             lines.append(
-                f"{index}. {claim_text} "
+                f"{index}. {_evidence_text_for_report(claim_text, language=language)} "
                 f"({confidence} confidence; claim `{item['claim_id']}`; evidence {evidence_refs})."
             )
             for quote in item["quote_spans"]:
@@ -589,14 +589,18 @@ def _answer_lines(
         ]
 
     first = included[0]
-    first_text = _claim_text_for_report(
-        first["claim"],
-        first["source_ids"],
-        sources_by_id=sources_by_id,
-    )
+    first_refs = ", ".join(_citation_refs(first["source_ids"]) + _image_refs(first["image_ids"])) or "근거 없음"
     if report_shape.get("recommendation"):
         if is_ko:
-            return [f"직접 답변: 현재 확인된 근거 기준으로는 {first_text}"]
+            return [
+                f"직접 답변: 현재 확인된 근거 {first_refs} 기준으로 판단했습니다. "
+                "아래 확인된 내용, 상충 근거, 주의점과 남은 gap을 함께 검토해야 합니다."
+            ]
+        first_text = _claim_text_for_report(
+            first["claim"],
+            first["source_ids"],
+            sources_by_id=sources_by_id,
+        )
         return [f"Direct answer: Based on the verified evidence in this run, {first_text}"]
     if report_shape.get("comparison"):
         if is_ko:
@@ -605,6 +609,20 @@ def _answer_lines(
     if is_ko:
         return [f"직접 답변: {len(included)}개의 확인된 근거가 보고 요건을 충족했습니다."]
     return [f"Direct answer: {len(included)} supported claim(s) met the report evidence requirements."]
+
+
+def _evidence_text_for_report(value: str, *, language: str) -> str:
+    if language != "ko" or not _mostly_ascii(value):
+        return value
+    return f"원문 근거: {value}"
+
+
+def _mostly_ascii(value: str) -> bool:
+    letters = [char for char in value if char.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = [char for char in letters if char.isascii()]
+    return len(ascii_letters) / len(letters) >= 0.8
 
 
 def _comparison_table(
@@ -629,6 +647,10 @@ def _comparison_table(
             claim,
             item["source_ids"],
             sources_by_id=sources_by_id,
+        )
+        claim_text = _evidence_text_for_report(
+            claim_text,
+            language=_string_value(report_shape.get("language"), "en"),
         )
         criterion = _criterion_for_claim(
             claim_text,
@@ -726,8 +748,10 @@ def _excluded_line(
         sources_by_id=sources_by_id,
     )
     if prefix == "제외":
+        text = _evidence_text_for_report(text, language="ko")
         return f"- Claim `{item['claim_id']}` 제외: {reasons}. {text}"
     if prefix == "상충":
+        text = _evidence_text_for_report(text, language="ko")
         return f"- Claim `{item['claim_id']}` 상충: {reasons}. {text}"
     if prefix == "Conflict":
         return f"- Claim `{item['claim_id']}` conflict: {reasons}. {text}"
@@ -765,12 +789,36 @@ def _is_boilerplate_claim(claim: Mapping[str, Any]) -> bool:
     normalized = " ".join(text.lower().split())
     if normalized in BOILERPLATE_PATTERNS:
         return True
-    if any(pattern in normalized for pattern in BOILERPLATE_PATTERNS) and len(normalized) <= 140:
+
+    tokens = [
+        word
+        for word in (
+            raw.strip(".,:;!?()[]{}\"'").lower()
+            for raw in normalized.replace("/", " ").replace("|", " ").split()
+        )
+        if word
+    ]
+    if len(tokens) > 10:
+        return False
+
+    boilerplate_token_count = sum(
+        1
+        for token in tokens
+        if token in {"about", "accept", "cookie", "cookies", "home", "login", "menu", "navigation", "privacy", "search", "sign", "skip", "subscribe", "terms"}
+    )
+    if tokens and boilerplate_token_count / len(tokens) >= 0.5:
         return True
-    words = [word.strip(".,:;!?()[]{}\"'").lower() for word in text.split()]
-    if words and sum(1 for word in words if word in BOILERPLATE_PATTERNS) / len(words) >= 0.5:
+
+    if _looks_like_navigation_list(normalized):
         return True
     return False
+
+
+def _looks_like_navigation_list(value: str) -> bool:
+    separators = value.count("|") + value.count(" / ") + value.count(" · ")
+    if separators < 2:
+        return False
+    return any(pattern in value for pattern in BOILERPLATE_PATTERNS)
 
 
 def _mapping_records(value: Any) -> Iterable[Mapping[str, Any]]:
