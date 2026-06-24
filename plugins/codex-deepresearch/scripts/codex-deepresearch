@@ -722,10 +722,11 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrate_parallel.add_argument(
         "--adapter",
         default="codex-exec",
-        choices=("codex-exec", "fixture"),
+        choices=("codex-exec", "fixture", "serial-degraded"),
         help=(
             "Runner adapter. codex-exec degrades to an honest serial blocked-task "
-            "path when unavailable; fixture is only for deterministic tests/smokes."
+            "path when unavailable; fixture is only for deterministic tests/smokes; "
+            "serial-degraded records an explicit serial handoff."
         ),
     )
     orchestrate_parallel.add_argument(

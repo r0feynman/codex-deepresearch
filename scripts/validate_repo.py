@@ -226,7 +226,7 @@ def run_parallel_orchestration_validation(runner: Path) -> None:
             result = json.loads(orchestrate.stdout)
         except json.JSONDecodeError as exc:
             fail(f"runner orchestrate-parallel must output valid JSON: {exc}")
-        if result.get("status") != "completed":
+        if result.get("status") != "completed_fixture":
             fail("runner orchestrate-parallel fixture smoke did not complete")
         if result.get("parallel_degraded") is not False:
             fail("fixture orchestration smoke must not mark degraded execution")
