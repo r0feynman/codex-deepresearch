@@ -454,7 +454,13 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(status["report_shape"]["language"], "ko")
         self.assertTrue(status["report_shape"]["comparison"])
         self.assertIn("## 결론", report)
-        self.assertIn("직접 답변:", report)
+        answer = report.split("## 결론", 1)[1].split("## 비교표", 1)[0]
+        self.assertIn("직접 답변:", answer)
+        self.assertIn("Codex plugin은 준비, 병렬 오케스트레이션", answer)
+        self.assertIn("다만 제한은 Codex 실행 신뢰 디렉터리", answer)
+        self.assertIn("남은 gap은 fixture 성공과 real codex-exec 성공", answer)
+        self.assertIn("근거:", answer)
+        self.assertNotIn("확인된 근거를 기준별로 정리했습니다", answer)
         self.assertIn("## 비교표", report)
         self.assertIn("| 기준 | 확인된 내용 | 근거 | 주의점 |", report)
         self.assertIn("| 자동화 범위 |", report)
@@ -464,6 +470,52 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertIn("## 상충되는 근거", report)
         self.assertIn("## 주의점과 남은 gap", report)
         self.assertIn("## 제외 또는 낮은 신뢰도 근거", report)
+
+    def test_korean_comparison_direct_answer_avoids_table_like_gap_claim(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = (
+            "Claude Code deep-research식 20~100개 병렬 조사 경험을 Codex plugin에서 구현하려면 "
+            "현재 가능한 자동화 범위와 제한을 표로 비교하고, 남은 gap을 알려줘."
+        )
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_automation_scope",
+                text="Codex plugin은 shard 계획, codex exec 실행, evidence 병합까지 자동화할 수 있다.",
+            ),
+            self.claim(
+                claim_id="claim_limitations",
+                text=(
+                    "20~100개 병렬 조사 목표에 대한 decision table은 다음과 같다. "
+                    "행 1: shard 실행은 가능하지만 제한은 공식 동시성 보장 부재다."
+                ),
+                caveats=["주요 제한은 공식 동시성 보장 부재, sandbox/approval/auth 정책, 비용과 rate limit이다."],
+            ),
+            self.claim(
+                claim_id="claim_meta_gap_table",
+                text=(
+                    "의사결정용 비교표: 기능 | Claude Code deep-research식 경험 | "
+                    "Codex plugin에서 현재 가능한 대응 | 남은 gap."
+                ),
+                caveats=["제품 수준 스케줄링·재시도·모니터링 계층은 아직 별도 구현이 필요하다."],
+            ),
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["status"], "completed")
+        answer = report.split("## 결론", 1)[1].split("## 비교표", 1)[0]
+        self.assertIn("직접 답변:", answer)
+        self.assertIn("shard 계획", answer)
+        self.assertIn("공식 동시성 보장 부재", answer)
+        self.assertIn("제품 수준 스케줄링·재시도·모니터링 계층", answer)
+        self.assertNotIn("의사결정용 비교표", answer)
+        self.assertNotIn("decision table", answer)
+        self.assertNotIn("행 1:", answer)
+        self.assertNotIn("기능 | Claude", answer)
+        self.assertNotIn(" | ", answer)
 
     def test_technical_adoption_report_starts_with_direct_answer_and_separates_evidence(self) -> None:
         run_dir = self.temp_run()
@@ -516,6 +568,33 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertIn("## 주의점과 남은 gap", report)
         self.assertIn("claim_package_gap", report)
         self.assertIn("## 제외 또는 낮은 신뢰도 근거", report)
+
+    def test_recommendation_direct_answer_prefers_decision_claim_over_incidental_detail(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = (
+            "Python free-threading이 현재 프로덕션 도입에 적합한지 공식 문서와 "
+            "주요 패키지 호환성 근거로 판단해줘."
+        )
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_incidental_package_production_detail",
+                text="프로덕션 도입 검토에는 NumPy와 같은 패키지 호환성 확인이 포함된다.",
+            ),
+            self.claim(
+                claim_id="claim_decision_judgment",
+                text="판단: Python free-threading은 일반 프로덕션 기본값으로 전면 도입하기에는 아직 이르다.",
+            ),
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["status"], "completed")
+        answer = report.split("## 결론", 1)[1].split("## 확인된 내용", 1)[0]
+        self.assertIn("전면 도입하기에는 아직 이르다", answer)
+        self.assertNotIn("NumPy와 같은 패키지 호환성 확인", answer)
 
     def test_boilerplate_supported_claim_is_downranked_from_confirmed_findings(self) -> None:
         run_dir = self.temp_run()
