@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -92,9 +93,16 @@ class CodexExecAdapter:
 
     name = "codex-exec"
 
-    def __init__(self, *, codex_binary: str = "codex", timeout_seconds: float = 300.0) -> None:
+    def __init__(
+        self,
+        *,
+        codex_binary: str = "codex",
+        timeout_seconds: float = 300.0,
+        project_root: str | Path | None = None,
+    ) -> None:
         self.codex_binary = codex_binary
         self.timeout_seconds = timeout_seconds
+        self.project_root = Path(project_root).resolve() if project_root else _default_project_root()
 
     def available(self) -> bool:
         return shutil.which(self.codex_binary) is not None
@@ -108,11 +116,17 @@ class CodexExecAdapter:
         sandbox_mode: str = "workspace-write",
         approval_policy: str = "never",
     ) -> list[str]:
-        prompt = _child_prompt(task, run_dir=run_dir)
+        run_dir = run_dir.resolve()
+        shard_path = _resolve_task_shard_path(task, run_dir)
+        prompt = _child_prompt(task, run_dir=run_dir, shard_path=shard_path)
         return [
             self.codex_binary,
             "exec",
             "--json",
+            "-C",
+            str(self.project_root),
+            "--add-dir",
+            str(run_dir),
             "-c",
             f"agents.max_threads={max_threads}",
             "-c",
@@ -131,8 +145,26 @@ class CodexExecAdapter:
     ) -> RunnerResult:
         if not self.available():
             raise AdapterUnavailable("codex exec is not available on PATH")
-        command = self.build_command(task, max_threads=max_threads, run_dir=run_dir)
+        run_dir = run_dir.resolve()
         child_thread_id = f"codex-{task['id']}-{uuid.uuid4().hex[:8]}"
+        try:
+            shard_path = _resolve_task_shard_path(task, run_dir)
+            command = self.build_command(task, max_threads=max_threads, run_dir=run_dir)
+        except ParallelOrchestrationError as exc:
+            return _invalid_output_shard_result(
+                adapter_name=self.name,
+                task=task,
+                child_thread_id=child_thread_id,
+                message=str(exc),
+            )
+        command_context = _codex_exec_command_context(
+            adapter_name=self.name,
+            task=task,
+            command=command,
+            cwd=self.project_root,
+            run_dir=run_dir,
+            shard_path=shard_path,
+        )
         events = [
             _codex_event(
                 "spawn_agent",
@@ -140,19 +172,56 @@ class CodexExecAdapter:
                 child_thread_id=child_thread_id,
                 child_status="running",
                 child_message="codex exec JSON runner started",
-                raw_event={"command": command[:5] + ["<prompt>"]},
+                raw_event=command_context,
             )
         ]
         try:
             completed = subprocess.run(
                 command,
-                cwd=run_dir,
+                cwd=self.project_root,
                 check=False,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 timeout=self.timeout_seconds,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            diagnostic = _codex_exec_failure_message(
+                command_context=command_context,
+                cause=exc.__class__.__name__,
+                stdout=getattr(exc, "stdout", None),
+                stderr=getattr(exc, "stderr", None),
+            )
+            if shard_path.exists() and validate_artifacts(evidence_path=shard_path).valid:
+                valid_shard_context = dict(command_context)
+                valid_shard_context["timeout_after_valid_shard"] = True
+                events.append(
+                    _codex_event(
+                        "wait",
+                        task,
+                        child_thread_id=child_thread_id,
+                        child_status="completed",
+                        child_message=f"codex exec timed out after writing a valid shard; {diagnostic}",
+                        raw_event=valid_shard_context,
+                    )
+                )
+                events.append(
+                    _codex_event(
+                        "close_agent",
+                        task,
+                        child_thread_id=child_thread_id,
+                        child_status="completed",
+                    )
+                )
+                return RunnerResult(
+                    task_id=str(task["id"]),
+                    status="completed",
+                    child_thread_id=child_thread_id,
+                    events=tuple(events),
+                    shard_path=str(shard_path),
+                    message=diagnostic,
+                )
+            diagnostic = _append_shard_validation_context(diagnostic, shard_path)
             events.append(
                 _codex_event(
                     "wait",
@@ -160,7 +229,8 @@ class CodexExecAdapter:
                     child_thread_id=child_thread_id,
                     child_status="failed",
                     failure_category="codex_exec_failed",
-                    child_message=exc.__class__.__name__,
+                    child_message=diagnostic,
+                    raw_event=command_context,
                 )
             )
             events.append(
@@ -177,7 +247,41 @@ class CodexExecAdapter:
                 child_thread_id=child_thread_id,
                 events=tuple(events),
                 failure_category="codex_exec_failed",
-                message=exc.__class__.__name__,
+                message=diagnostic,
+            )
+        except OSError as exc:
+            diagnostic = _codex_exec_failure_message(
+                command_context=command_context,
+                cause=exc.__class__.__name__,
+                stdout=getattr(exc, "stdout", None),
+                stderr=getattr(exc, "stderr", None),
+            )
+            events.append(
+                _codex_event(
+                    "wait",
+                    task,
+                    child_thread_id=child_thread_id,
+                    child_status="failed",
+                    failure_category="codex_exec_failed",
+                    child_message=diagnostic,
+                    raw_event=command_context,
+                )
+            )
+            events.append(
+                _codex_event(
+                    "close_agent",
+                    task,
+                    child_thread_id=child_thread_id,
+                    child_status="failed",
+                )
+            )
+            return RunnerResult(
+                task_id=str(task["id"]),
+                status="failed",
+                child_thread_id=child_thread_id,
+                events=tuple(events),
+                failure_category="codex_exec_failed",
+                message=diagnostic,
             )
 
         parsed_events = _parse_json_events(completed.stdout)
@@ -195,6 +299,14 @@ class CodexExecAdapter:
         )
         status = "completed" if completed.returncode == 0 else "failed"
         failure = None if status == "completed" else "codex_exec_failed"
+        diagnostic = None
+        if status == "failed":
+            diagnostic = _codex_exec_failure_message(
+                command_context=command_context,
+                cause=f"codex exec exited {completed.returncode}",
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
         events.append(
             _codex_event(
                 "wait",
@@ -202,7 +314,8 @@ class CodexExecAdapter:
                 child_thread_id=child_thread_id,
                 child_status=status,
                 failure_category=failure,
-                child_message=f"codex exec exited {completed.returncode}",
+                child_message=diagnostic or f"codex exec exited {completed.returncode}",
+                raw_event=command_context if diagnostic else None,
             )
         )
         events.append(
@@ -214,15 +327,14 @@ class CodexExecAdapter:
                 failure_category=failure,
             )
         )
-        shard_path = str(run_dir / str(task["output_shard_path"]))
         return RunnerResult(
             task_id=str(task["id"]),
             status=status,
             child_thread_id=child_thread_id,
             events=tuple(events),
-            shard_path=shard_path if status == "completed" else None,
+            shard_path=str(shard_path) if status == "completed" else None,
             failure_category=failure,
-            message=completed.stderr.strip()[:500] or None,
+            message=diagnostic,
         )
 
 
@@ -239,7 +351,15 @@ class FixtureAdapter:
         max_threads: int,
     ) -> RunnerResult:
         child_thread_id = f"fixture-{task['id']}"
-        shard_path = run_dir / str(task["output_shard_path"])
+        try:
+            shard_path = _resolve_task_shard_path(task, run_dir)
+        except ParallelOrchestrationError as exc:
+            return _invalid_output_shard_result(
+                adapter_name=self.name,
+                task=task,
+                child_thread_id=child_thread_id,
+                message=str(exc),
+            )
         _write_fixture_shard(run_dir, task, shard_path)
         events = (
             _codex_event(
@@ -658,7 +778,21 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             continue
         if state not in {"completed", "merged"}:
             continue
-        shard_path = run_dir / str(task.get("output_shard_path"))
+        try:
+            shard_path = _resolve_task_shard_path(task, run_dir)
+        except ParallelOrchestrationError as exc:
+            task["state"] = "discarded"
+            task["discard_reason"] = "invalid_output_shard_path"
+            rejected_shards.append(
+                {
+                    "task_id": task.get("id"),
+                    "path": str(task.get("output_shard_path") or ""),
+                    "reason": "invalid_output_shard_path",
+                    "diagnostic": str(exc),
+                }
+            )
+            discarded_tasks.append(_task_status_record(task, "invalid_output_shard_path"))
+            continue
         validation = validate_artifacts(evidence_path=shard_path)
         if not validation.valid:
             task["state"] = "discarded"
@@ -846,6 +980,7 @@ def _parallel_status(
         "parallel_degraded": parallel_degraded,
         "degraded_reason": degraded_reason,
         "adapter": adapter_name,
+        "repo_check_bypass_used": False,
         "planned_task_count": planned_task_count,
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
@@ -1021,6 +1156,8 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
         return
     failure = result.failure_category or "missing_shard"
     task["failure_category"] = failure
+    if result.message:
+        task["last_error"] = result.message
     if failure in RETRY_SAFE_FAILURES and int(task.get("attempt") or 0) < int(task.get("max_attempts") or 1):
         task["state"] = "retryable"
     else:
@@ -1202,13 +1339,162 @@ def _write_task_handoffs(
         _append_jsonl(visual_path, image)
 
 
-def _child_prompt(task: Mapping[str, Any], *, run_dir: Path) -> str:
+def _resolve_task_shard_path(task: Mapping[str, Any], run_dir: Path) -> Path:
+    run_root = run_dir.resolve()
+    raw_path = task.get("output_shard_path")
+    task_id = str(task.get("id") or "unknown")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ParallelOrchestrationError(
+            f"invalid output_shard_path for task_id={task_id}: missing; "
+            f"run_dir={run_root}; output shard paths must be relative and stay under run_dir"
+        )
+    relative_path = Path(raw_path)
+    if relative_path.is_absolute():
+        raise ParallelOrchestrationError(
+            f"invalid output_shard_path for task_id={task_id}: {raw_path}; "
+            f"run_dir={run_root}; output shard paths must be relative and stay under run_dir"
+        )
+    resolved_path = (run_root / relative_path).resolve()
+    try:
+        resolved_path.relative_to(run_root)
+    except ValueError as exc:
+        raise ParallelOrchestrationError(
+            f"invalid output_shard_path for task_id={task_id}: {raw_path}; "
+            f"resolved_path={resolved_path}; run_dir={run_root}; "
+            "output shard paths must be relative and stay under run_dir"
+        ) from exc
+    return resolved_path
+
+
+def _invalid_output_shard_result(
+    *,
+    adapter_name: str,
+    task: Mapping[str, Any],
+    child_thread_id: str,
+    message: str,
+) -> RunnerResult:
+    event = _codex_event(
+        "wait",
+        task,
+        child_thread_id=child_thread_id,
+        child_status="failed",
+        child_message=message,
+        failure_category="missing_shard",
+        raw_event={
+            "adapter": adapter_name,
+            "task_id": str(task.get("id") or "unknown"),
+            "output_shard_path": task.get("output_shard_path"),
+            "diagnostic": message,
+        },
+    )
+    return RunnerResult(
+        task_id=str(task.get("id") or "unknown"),
+        status="failed",
+        child_thread_id=child_thread_id,
+        events=(event,),
+        failure_category="missing_shard",
+        message=message,
+    )
+
+
+def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | None = None) -> str:
+    shard_path = shard_path or _resolve_task_shard_path(task, run_dir)
+    shard_dir = shard_path.parent
+    search_results_path = shard_dir / "search_results.jsonl"
+    visual_observations_path = shard_dir / "visual_observations.jsonl"
+    verifier_votes_path = shard_dir / "verifier_votes.jsonl"
     return (
         "Run this Codex DeepResearch bounded ResearchTask and write only schema-valid "
-        f"evidence to {run_dir / str(task['output_shard_path'])}. "
-        "Also write per-task search_results.jsonl and visual_observations.jsonl when applicable. "
+        f"evidence to {shard_path}. "
+        f"Write per-task search results exactly to {search_results_path}. "
+        f"Write visual observations exactly to {visual_observations_path} when applicable. "
+        f"Write verifier votes exactly to {verifier_votes_path} when applicable. "
+        f"Do not write sidecars outside {shard_dir}. "
         f"Task JSON: {json.dumps(dict(task), sort_keys=True)}"
     )
+
+
+def _default_project_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _codex_exec_command_context(
+    *,
+    adapter_name: str,
+    task: Mapping[str, Any],
+    command: Sequence[str],
+    cwd: Path,
+    run_dir: Path,
+    shard_path: Path,
+) -> dict[str, Any]:
+    command_without_prompt = list(command[:-1]) + ["<prompt>"]
+    return {
+        "adapter": adapter_name,
+        "task_id": str(task.get("id") or "unknown"),
+        "cwd": str(cwd),
+        "trusted_project_root": str(cwd),
+        "run_dir": str(run_dir),
+        "output_shard_path": str(shard_path),
+        "command": command_without_prompt,
+        "command_string": shlex.join(command_without_prompt),
+        "repo_check_bypass_used": False,
+        "retryable": True,
+    }
+
+
+def _codex_exec_failure_message(
+    *,
+    command_context: Mapping[str, Any],
+    cause: str,
+    stdout: Any = None,
+    stderr: Any = None,
+) -> str:
+    stdout_summary = _output_summary(stdout)
+    stderr_summary = _output_summary(stderr)
+    observed = " ".join(part for part in (stderr_summary, stdout_summary) if part)
+    remediation = (
+        "Run codex-exec from a trusted project root with -C and keep --add-dir pointed at "
+        "the selected run directory; --skip-git-repo-check is diagnostic-only and cannot "
+        "satisfy real-use E2E acceptance."
+    )
+    if "not inside a trusted directory" in observed.lower():
+        remediation = (
+            "Trust the project root or pass -C to a trusted git checkout; do not count "
+            "--skip-git-repo-check bypass runs as passing real-use E2E."
+        )
+    return (
+        f"{cause}; adapter={command_context.get('adapter')}; "
+        f"task_id={command_context.get('task_id')}; "
+        f"cwd={command_context.get('cwd')}; "
+        f"trusted_project_root={command_context.get('trusted_project_root')}; "
+        f"run_dir={command_context.get('run_dir')}; "
+        f"output_shard_path={command_context.get('output_shard_path')}; "
+        f"command={command_context.get('command_string')}; "
+        f"repo_check_bypass_used={command_context.get('repo_check_bypass_used')}; "
+        f"retryable={command_context.get('retryable')}; "
+        f"stderr={stderr_summary or '<empty>'}; stdout={stdout_summary or '<empty>'}; "
+        f"remediation={remediation}"
+    )
+
+
+def _append_shard_validation_context(message: str, shard_path: Path) -> str:
+    if not shard_path.exists():
+        return f"{message}; shard_status=missing; shard_path={shard_path}"
+    validation = validate_artifacts(evidence_path=shard_path)
+    return (
+        f"{message}; shard_status=invalid; shard_path={shard_path}; "
+        f"shard_validation={json.dumps(validation.to_dict(), sort_keys=True)}"
+    )
+
+
+def _output_summary(value: Any, *, limit: int = 700) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    return " ".join(text.split())[:limit]
 
 
 def _parse_json_events(stdout: str) -> list[dict[str, Any]]:
@@ -1259,6 +1545,9 @@ def _is_missing_capability_failure(result: RunnerResult) -> bool:
         "subagent",
         "max_threads",
         "spawn_agent",
+        "trusted directory",
+        "git-repo-check",
+        "git repo check",
     )
     return any(marker in text for marker in markers)
 
