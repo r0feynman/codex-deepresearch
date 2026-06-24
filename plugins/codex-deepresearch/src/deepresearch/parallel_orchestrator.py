@@ -123,6 +123,8 @@ class CodexExecAdapter:
             self.codex_binary,
             "exec",
             "--json",
+            "--ignore-user-config",
+            "--ignore-rules",
             "-C",
             str(self.project_root),
             "--add-dir",
@@ -1662,15 +1664,30 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
     search_results_path = shard_dir / "search_results.jsonl"
     visual_observations_path = shard_dir / "visual_observations.jsonl"
     verifier_votes_path = shard_dir / "verifier_votes.jsonl"
+    query = str(task.get("query") or "")
+    response_language = "Korean" if _contains_korean(query) else "English"
     return (
-        "Run this Codex DeepResearch bounded ResearchTask and write only schema-valid "
+        "Run this bounded research shard task and write only schema-valid "
         f"evidence to {shard_path}. "
+        f"Write claim text, caveats, rationales, and synthesized source snippets in {response_language}; "
+        "for Korean queries, translate/summarize English source findings into Korean user-facing prose. "
+        "Only direct quote_spans.quote values should remain verbatim in the source language. "
+        "Prioritize a compact shard with decision-ready claims and do not read repository docs or skills unless the schema is otherwise impossible to satisfy. "
+        "Use `vlm_provider` exactly `codex-interactive` unless the input evidence specifies another allowed value. "
+        "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
+        "Verifier vote `method` must be one of `codex-subagent`, `runner-agent`, `model-call`, or `manual-review`; "
+        "`vote` must be one of `support`, `refute`, `uncertain`, or `blocked`; "
+        "`evidence_refs` must reference only source or image IDs present in the same shard. "
         f"Write per-task search results exactly to {search_results_path}. "
         f"Write visual observations exactly to {visual_observations_path} when applicable. "
         f"Write verifier votes exactly to {verifier_votes_path} when applicable. "
         f"Do not write sidecars outside {shard_dir}. "
         f"Task JSON: {json.dumps(dict(task), sort_keys=True)}"
     )
+
+
+def _contains_korean(value: str) -> bool:
+    return any("\uac00" <= char <= "\ud7a3" for char in value)
 
 
 def _default_project_root() -> Path:
@@ -1935,6 +1952,17 @@ def _remap_claim_refs(claim: Mapping[str, Any], id_map: Mapping[str, str]) -> di
         visual_supports.append(support_copy)
     if visual_supports:
         claim_copy["visual_supports"] = visual_supports
+    votes = []
+    for vote in claim_copy.get("votes", []):
+        if not isinstance(vote, Mapping):
+            continue
+        vote_copy = dict(vote)
+        vote_copy["evidence_refs"] = [
+            id_map.get(str(evidence_ref), str(evidence_ref))
+            for evidence_ref in vote_copy.get("evidence_refs", [])
+        ]
+        votes.append(vote_copy)
+    claim_copy["votes"] = votes
     return claim_copy
 
 

@@ -429,7 +429,12 @@ def _render_report(
         lines.append(f"- {'상충되는 근거가 확인되지 않았습니다.' if is_ko else 'No conflicts recorded.'}")
     lines.append("")
 
-    caveat_records = _caveat_records(included, excluded, language=language)
+    caveat_records = _caveat_records(
+        included,
+        excluded,
+        language=language,
+        max_records=8 if report_shape.get("comparison") else None,
+    )
     lines.append(f"## {'주의점과 남은 gap' if is_ko else 'Caveats And Gaps'}")
     if caveat_records:
         for record in caveat_records:
@@ -591,30 +596,362 @@ def _answer_lines(
     first = included[0]
     first_refs = ", ".join(_citation_refs(first["source_ids"]) + _image_refs(first["image_ids"])) or "근거 없음"
     if report_shape.get("recommendation"):
-        if is_ko:
-            return [
-                f"직접 답변: 현재 확인된 근거 {first_refs} 기준으로 판단했습니다. "
-                "아래 확인된 내용, 상충 근거, 주의점과 남은 gap을 함께 검토해야 합니다."
-            ]
-        first_text = _claim_text_for_report(
-            first["claim"],
-            first["source_ids"],
+        answer_item = _recommendation_answer_item(included, language="ko" if is_ko else "en")
+        answer_text = _claim_text_for_report(
+            answer_item["claim"],
+            answer_item["source_ids"],
             sources_by_id=sources_by_id,
         )
-        return [f"Direct answer: Based on the verified evidence in this run, {first_text}"]
-    if report_shape.get("comparison"):
+        answer_refs = ", ".join(
+            _citation_refs(answer_item["source_ids"]) + _image_refs(answer_item["image_ids"])
+        ) or first_refs
         if is_ko:
-            return [f"직접 답변: 비교 질문에 대해 {len(included)}개의 확인된 근거를 기준별로 정리했습니다."]
-        return [f"Direct answer: The comparison below is based on {len(included)} confirmed finding(s)."]
+            return [
+                f"직접 답변: {_evidence_text_for_report(answer_text, language='ko')} "
+                f"근거: {answer_refs}. 아래 확인된 내용, 상충 근거, 주의점과 남은 gap을 함께 검토해야 합니다."
+            ]
+        return [f"Direct answer: {answer_text} Evidence: {answer_refs}."]
+    if report_shape.get("comparison"):
+        return [
+            _comparison_answer_line(
+                included,
+                report_shape=report_shape,
+                sources_by_id=sources_by_id,
+            )
+        ]
     if is_ko:
         return [f"직접 답변: {len(included)}개의 확인된 근거가 보고 요건을 충족했습니다."]
     return [f"Direct answer: {len(included)} supported claim(s) met the report evidence requirements."]
 
 
+def _recommendation_answer_item(
+    included: Sequence[Mapping[str, Any]],
+    *,
+    language: str,
+) -> Mapping[str, Any]:
+    if not included:
+        raise ReportGenerationError("recommendation answer requires at least one included claim")
+    return max(
+        enumerate(included),
+        key=lambda indexed: (
+            _recommendation_answer_score(indexed[1], language=language),
+            -indexed[0],
+        ),
+    )[1]
+
+
+def _recommendation_answer_score(item: Mapping[str, Any], *, language: str) -> int:
+    claim = item.get("claim")
+    if not isinstance(claim, Mapping):
+        return 0
+    haystack = " ".join(
+        [
+            _string_value(claim.get("id"), ""),
+            _string_value(claim.get("text"), ""),
+        ]
+    ).lower()
+    if language == "ko":
+        decision_phrases = (
+            "결론",
+            "판단",
+            "적합하지",
+            "적합하다",
+            "아직 이르",
+            "권고",
+            "추천",
+            "도입하기에는",
+            "전환하기에는",
+            "프로덕션 선택지",
+        )
+        recommendation_terms = ("도입", "프로덕션", "적합", "production", "adoption", "suitable")
+        detail_terms = ("호환성", "패키지", "문서", "성능", "지원", "compatibility", "package")
+    else:
+        decision_phrases = (
+            "conclusion",
+            "judgment",
+            "recommend",
+            "not suitable",
+            "suitable",
+            "not ready",
+            "too early",
+            "should",
+            "should not",
+            "default production",
+        )
+        recommendation_terms = ("production", "adoption", "suitable", "readiness", "recommend")
+        detail_terms = ("compatibility", "package", "documentation", "performance", "support")
+
+    score = 0
+    if any(term in haystack for term in ("decision", "judgment", "verdict", "recommendation", "adoption_fit", "판단", "결론")):
+        score += 8
+    if any(phrase in haystack for phrase in decision_phrases):
+        score += 10
+    if any(term in haystack for term in recommendation_terms):
+        score += 3
+    if any(term in haystack for term in detail_terms):
+        score -= 2
+    if item.get("source_ids"):
+        score += 1
+    return score
+
+
+def _comparison_answer_line(
+    included: Sequence[Mapping[str, Any]],
+    *,
+    report_shape: Mapping[str, Any],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> str:
+    language = _string_value(report_shape.get("language"), "en")
+    is_ko = language == "ko"
+    records = _comparison_answer_records(
+        included,
+        report_shape=report_shape,
+        sources_by_id=sources_by_id,
+    )
+    if not records:
+        return (
+            "직접 답변: 비교 질문에 답할 만큼 검증된 근거가 없습니다."
+            if is_ko
+            else "Direct answer: There is not enough verified evidence to answer the comparison."
+        )
+
+    refs = ", ".join(
+        _ordered_unique(
+            ref
+            for record in records
+            for ref in (_citation_refs(record["source_ids"]) + _image_refs(record["image_ids"]))
+        )
+    ) or ("근거 없음" if is_ko else "no evidence")
+    by_criterion = {record["criterion"]: record for record in records}
+    if is_ko:
+        scope = by_criterion.get("자동화 범위")
+        limits = by_criterion.get("제한")
+        gaps = by_criterion.get("남은 gap")
+        parts: list[str] = []
+        if scope:
+            parts.append(_answer_fragment(scope["text"]))
+        if limits:
+            parts.append(f"다만 {_limit_answer_fragment(limits, records=records, language=language)}")
+        if gaps:
+            gap_fragment = _gap_answer_fragment(gaps, records=records, language=language)
+            parts.append(f"남은 gap은 {gap_fragment}")
+        if not parts:
+            parts = [f"{record['criterion']}은 {_answer_fragment(record['text'])}" for record in records[:3]]
+        return f"직접 답변: {'; '.join(parts)}. 근거: {refs}."
+
+    scope = by_criterion.get("Automation scope")
+    limits = by_criterion.get("Limitations")
+    gaps = by_criterion.get("Remaining gaps")
+    parts = []
+    if scope:
+        parts.append(f"the current automation scope is {_answer_fragment(scope['text'])}")
+    if limits:
+        parts.append(f"the main limitations are {_answer_fragment(limits['text'])}")
+    if gaps:
+        parts.append(f"the remaining gaps are {_gap_answer_fragment(gaps, records=records, language=language)}")
+    if not parts:
+        parts = [f"{record['criterion']} is {_answer_fragment(record['text'])}" for record in records[:3]]
+    return f"Direct answer: {'; '.join(parts)}. Evidence: {refs}."
+
+
+def _comparison_answer_records(
+    included: Sequence[Mapping[str, Any]],
+    *,
+    report_shape: Mapping[str, Any],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    language = _string_value(report_shape.get("language"), "en")
+    desired = (
+        ["자동화 범위", "제한", "남은 gap"]
+        if language == "ko"
+        else ["Automation scope", "Limitations", "Remaining gaps"]
+    )
+    best_by_criterion: dict[str, tuple[int, dict[str, Any]]] = {}
+    for index, item in enumerate(included, start=1):
+        claim = item["claim"]
+        claim_text = _claim_text_for_report(
+            claim,
+            item["source_ids"],
+            sources_by_id=sources_by_id,
+        )
+        claim_text = _evidence_text_for_report(claim_text, language=language)
+        criterion = _criterion_for_claim(
+            claim_text,
+            index=index,
+            criteria=_string_list(report_shape.get("criteria")),
+            language=language,
+        )
+        if criterion not in desired:
+            continue
+        record = {
+            "criterion": criterion,
+            "text": claim_text,
+            "caveats": _string_list(claim.get("caveats")),
+            "source_ids": item["source_ids"],
+            "image_ids": item["image_ids"],
+        }
+        score = _comparison_answer_score(record, claim=claim, language=language)
+        current = best_by_criterion.get(criterion)
+        if current is None or score > current[0]:
+            best_by_criterion[criterion] = (score, record)
+    return [best_by_criterion[criterion][1] for criterion in desired if criterion in best_by_criterion]
+
+
+def _comparison_answer_score(record: Mapping[str, Any], *, claim: Mapping[str, Any], language: str) -> int:
+    text = _string_value(record.get("text"), "").lower()
+    criterion = _string_value(record.get("criterion"), "")
+    score = 0
+    if criterion in {"자동화 범위", "Automation scope"}:
+        terms = ("자동", "범위", "가능", "automation", "scope", "parallel", "orchestration")
+    elif criterion in {"제한", "Limitations"}:
+        terms = ("제한", "한계", "인증", "비용", "timeout", "limit", "constraint", "auth", "cost")
+    else:
+        terms = ("남은", "gap", "미구현", "필요", "remaining", "missing")
+    score += sum(2 for term in terms if term in text)
+    if _is_table_like_comparison_text(_string_value(record.get("text"), "")):
+        score -= 20
+    if criterion in {"남은 gap", "Remaining gaps"}:
+        if "남은 gap은" in text or "remaining gap" in text:
+            score += 6
+        if "핵심 gap" in text or "main gap" in text:
+            score += 4
+    if claim.get("confidence") == "high":
+        score += 1
+    if record.get("source_ids") or record.get("image_ids"):
+        score += 1
+    return score
+
+
+def _answer_fragment(value: str) -> str:
+    stripped = value.strip()
+    for terminator in (". ", "。", "."):
+        if terminator not in stripped:
+            continue
+        candidate = stripped.split(terminator, 1)[0].strip().rstrip(".。")
+        if len(candidate) >= 40:
+            return candidate
+    return _truncate(stripped.rstrip(".。"), 140)
+
+
+def _gap_answer_fragment(record: Mapping[str, Any], *, records: Sequence[Mapping[str, Any]], language: str) -> str:
+    text = _string_value(record.get("text"), "")
+    if not _is_table_like_comparison_text(text):
+        label = "남은 gap은" if language == "ko" else "the remaining gaps are"
+        return _strip_leading_label(_answer_fragment(text), label)
+
+    own_caveats = [caveat for caveat in _string_list(record.get("caveats")) if _gap_caveat_candidate(caveat)]
+    if own_caveats:
+        return _answer_fragment(own_caveats[0])
+    caveats = _ordered_unique(
+        caveat
+        for item in records
+        for caveat in _string_list(item.get("caveats"))
+        if _gap_caveat_candidate(caveat)
+    )
+    if caveats:
+        return _answer_fragment(caveats[0])
+    if language == "ko":
+        return (
+            "20~100개 조사자를 제품 수준으로 자동 스케줄링·재시도·모니터링하는 계층은 "
+            "아직 별도 구현이 필요합니다"
+        )
+    return "a product-grade scheduling, retry, monitoring, and merge layer still needs separate implementation"
+
+
+def _limit_answer_fragment(record: Mapping[str, Any], *, records: Sequence[Mapping[str, Any]], language: str) -> str:
+    text = _string_value(record.get("text"), "")
+    if not _is_table_like_comparison_text(text):
+        return _answer_fragment(text)
+
+    caveats = _ordered_unique(
+        caveat
+        for item in records
+        for caveat in _string_list(item.get("caveats"))
+        if _limit_caveat_candidate(caveat)
+    )
+    if caveats:
+        return _answer_fragment(caveats[0])
+    if language == "ko":
+        return "주요 제한은 공식 동시성 보장 부재, sandbox/approval/auth 정책, 비용과 rate limit입니다"
+    return "the main limitations are lack of official concurrency guarantees, sandbox/approval/auth policy, cost, and rate limits"
+
+
+def _is_table_like_comparison_text(value: str) -> bool:
+    lowered = value.lower()
+    table_markers = (
+        "비교표:",
+        "의사결정용 비교표",
+        "기능 |",
+        "| claude",
+        "| codex",
+        "comparison table",
+        "decision table",
+        "주요 제한 비교",
+        "행 1:",
+        "row 1:",
+    )
+    if any(marker in lowered for marker in table_markers):
+        return True
+    return value.count("|") >= 2
+
+
+def _gap_caveat_candidate(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "gap",
+            "제한",
+            "한계",
+            "필요",
+            "보장",
+            "구현",
+            "스케줄",
+            "재시도",
+            "모니터",
+            "limit",
+            "missing",
+            "requires",
+            "separate implementation",
+        )
+    )
+
+
+def _limit_caveat_candidate(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "제한",
+            "한계",
+            "보장",
+            "sandbox",
+            "approval",
+            "auth",
+            "비용",
+            "rate",
+            "limit",
+            "concurrency",
+            "sla",
+        )
+    )
+
+
+def _strip_leading_label(value: str, label: str) -> str:
+    stripped = value.strip()
+    if stripped.startswith(label):
+        return stripped[len(label) :].lstrip(" :은는")
+    return stripped
+
+
 def _evidence_text_for_report(value: str, *, language: str) -> str:
-    if language != "ko" or not _mostly_ascii(value):
+    if language != "ko" or _contains_hangul(value) or not _mostly_ascii(value):
         return value
     return f"원문 근거: {value}"
+
+
+def _contains_hangul(value: str) -> bool:
+    return any("\uac00" <= char <= "\ud7a3" for char in value)
 
 
 def _mostly_ascii(value: str) -> bool:
@@ -641,25 +978,15 @@ def _comparison_table(
         lines.append(f"| {empty} | - | - | - |")
         return lines
 
-    for index, item in enumerate(included, start=1):
-        claim = item["claim"]
-        claim_text = _claim_text_for_report(
-            claim,
-            item["source_ids"],
-            sources_by_id=sources_by_id,
-        )
-        claim_text = _evidence_text_for_report(
-            claim_text,
-            language=_string_value(report_shape.get("language"), "en"),
-        )
-        criterion = _criterion_for_claim(
-            claim_text,
-            index=index,
-            criteria=_string_list(report_shape.get("criteria")),
-            language=_string_value(report_shape.get("language"), "en"),
-        )
-        evidence_refs = ", ".join(_citation_refs(item["source_ids"]) + _image_refs(item["image_ids"])) or "-"
-        caveats = "; ".join(_string_list(claim.get("caveats"))) or ("없음" if is_ko else "None recorded")
+    for record in _comparison_answer_records(
+        included,
+        report_shape=report_shape,
+        sources_by_id=sources_by_id,
+    ):
+        criterion = record["criterion"]
+        claim_text = record["text"]
+        evidence_refs = ", ".join(_citation_refs(record["source_ids"]) + _image_refs(record["image_ids"])) or "-"
+        caveats = "; ".join(record["caveats"]) or ("없음" if is_ko else "None recorded")
         lines.append(
             "| "
             + " | ".join(
@@ -682,7 +1009,7 @@ def _criterion_for_claim(
     if language == "ko":
         if "자동" in claim_text or "범위" in claim_text:
             return "자동화 범위"
-        if "제한" in claim_text or "한계" in claim_text:
+        if "제한" in claim_text or "한계" in claim_text or "제약" in claim_text:
             return "제한"
         if "gap" in lower_text or "남은" in claim_text:
             return "남은 gap"
@@ -715,12 +1042,18 @@ def _caveat_records(
     excluded: Sequence[Mapping[str, Any]],
     *,
     language: str,
+    max_records: int | None = None,
 ) -> list[str]:
     is_ko = language == "ko"
     records: list[str] = []
+    seen_messages: set[str] = set()
     for item in included:
         caveats = _string_list(item["claim"].get("caveats"))
         for caveat in caveats:
+            normalized = caveat.strip().lower()
+            if normalized in seen_messages:
+                continue
+            seen_messages.add(normalized)
             label = "주의점" if is_ko else "caveat"
             records.append(f"- Claim `{item['claim_id']}` {label}: {caveat}")
     for item in excluded:
@@ -729,8 +1062,22 @@ def _caveat_records(
         if verification_status in {"insufficient_evidence", "needs_visual_evidence", "unverified"} or reasons.intersection(
             {"missing_quote_source", "missing_image_evidence", "missing_resolved_evidence"}
         ):
+            reason_text = ", ".join(item["exclusion_reasons"]) or _string_value(verification_status, "unknown")
+            normalized = reason_text.strip().lower()
+            if normalized in seen_messages:
+                continue
+            seen_messages.add(normalized)
             label = "gap" if is_ko else "gap"
-            records.append(f"- Claim `{item['claim_id']}` {label}: {', '.join(item['exclusion_reasons']) or verification_status}.")
+            records.append(f"- Claim `{item['claim_id']}` {label}: {reason_text}.")
+    if max_records is not None and len(records) > max_records:
+        hidden_count = len(records) - max_records
+        records = records[:max_records]
+        suffix = (
+            f"- 그 외 중복성이 낮은 주의점/gap {hidden_count}개는 `report_status.json`의 excluded/included claim 세부정보에 보존했습니다."
+            if is_ko
+            else f"- {hidden_count} additional caveat/gap item(s) are preserved in `report_status.json` included/excluded claim details."
+        )
+        records.append(suffix)
     return records
 
 
