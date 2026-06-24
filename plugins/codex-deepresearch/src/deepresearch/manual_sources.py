@@ -179,6 +179,7 @@ def ingest_manual_sources(
         "images_ingested": len(added_images),
         "external_search": False,
         "body_fetch": False,
+        "evidence_source": _manual_evidence_source(len(added_sources), len(added_images)),
     }
     _write_json(run_dir / "evidence.json", evidence)
 
@@ -193,6 +194,7 @@ def ingest_manual_sources(
         "images_ingested": len(added_images),
         "external_search": False,
         "body_fetch": False,
+        "evidence_source": _manual_evidence_source(len(added_sources), len(added_images)),
         "validation": validation.to_dict(),
         "artifacts": {
             "evidence": str(run_dir / "evidence.json"),
@@ -209,6 +211,20 @@ def ingest_manual_sources(
     )
     _write_json(run_dir / "manual_ingest_status.json", status)
     return status
+
+
+def _manual_evidence_source(sources_ingested: int, images_ingested: int) -> dict[str, Any]:
+    return {
+        "type": "manual_handoff",
+        "adapter": "manual-sources",
+        "sources_ingested": sources_ingested,
+        "images_ingested": images_ingested,
+        "fixture_only": False,
+        "manual_handoff": True,
+        "real_child_execution": False,
+        "real_use_e2e_eligible": False,
+        "description": "user-provided manual handoff sources; no fixture or Codex child execution evidence",
+    }
 
 
 def _build_manual_inputs(

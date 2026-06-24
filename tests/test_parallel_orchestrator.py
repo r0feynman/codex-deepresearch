@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -301,6 +302,13 @@ class ParallelOrchestratorTests(unittest.TestCase):
         result = run_parallel_orchestration(run=run_dir, adapter_name="fixture", min_tasks=3)
 
         self.assertFalse(result["parallel_degraded"])
+        self.assertEqual(result["adapter"], "fixture")
+        self.assertEqual(result["evidence_source"]["type"], "fixture")
+        self.assertTrue(result["evidence_source"]["fixture_only"])
+        self.assertFalse(result["evidence_source"]["real_child_execution"])
+        self.assertFalse(result["evidence_source"]["real_use_e2e_eligible"])
+        self.assertEqual(result["evidence_source"]["accepted_shards"], 3)
+        self.assertEqual(result["merge"]["evidence_source"]["type"], "fixture")
         self.assertEqual(result["max_scheduled_concurrency"], 8)
         self.assertTrue((run_dir / "subagent_assignments.jsonl").is_file())
         tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
@@ -322,6 +330,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         state = inspect_run_state(run_dir)
         stages = {stage["stage"]: stage for stage in state["stages"]}
         self.assertEqual(stages["parallel_orchestration"]["status"], "completed")
+        self.assertEqual(
+            stages["parallel_orchestration"]["evidence_source"]["type"],
+            "fixture",
+        )
         self.assertEqual(stages["ingest"]["status"], "skipped")
         self.assertEqual(stages["fetch_claims"]["status"], "skipped")
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
@@ -496,6 +508,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(result["parallel_degraded"])
         self.assertEqual(result["degraded_reason"], "codex_exec_unavailable")
         self.assertEqual(result["adapter"], "serial-degraded")
+        self.assertEqual(result["evidence_source"]["type"], "serial_handoff")
+        self.assertFalse(result["evidence_source"]["fixture_only"])
+        self.assertFalse(result["evidence_source"]["real_child_execution"])
+        self.assertFalse(result["evidence_source"]["real_use_e2e_eligible"])
         self.assertEqual(result["max_scheduled_concurrency"], 1)
         self.assertEqual(result["status"], "degraded_serial_handoff_required")
         self.assertTrue(result["needs_serial_handoff"])
@@ -505,6 +521,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
         evidence = self.load_json(run_dir / "evidence.json")
         self.assertEqual(evidence["claims"], [])
         merge = self.load_json(run_dir / "merge_status.json")
+        self.assertEqual(merge["evidence_source"]["type"], "serial_handoff")
         self.assertEqual(len(merge["blocked_tasks"]), 2)
         self.assertEqual(merge["accepted_shards"], [])
         state = inspect_run_state(run_dir)
@@ -512,6 +529,91 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["parallel_orchestration"]["status"], "completed")
         self.assertEqual(stages["ingest"]["status"], "pending")
         self.assertEqual(state["next_safe_stage"], "ingest")
+
+    def test_cli_codex_exec_no_degrade_fails_when_children_accept_no_shards(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        bin_dir = self.temp_runs_dir()
+        fake_codex = bin_dir / "codex"
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"type\":\"message\",\"status\":\"error\",\"message\":\"child failed\"}'\n"
+            "printf '%s\\n' 'fake codex child failed before writing shard' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        prepare = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "real codex child failure regression",
+                "--runs-dir",
+                str(runs_dir),
+                "--route",
+                "text_only",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = Path(json.loads(prepare.stdout)["run_dir"])
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+
+        result = subprocess.run(
+            [
+                str(RUNNER),
+                "orchestrate-parallel",
+                "--run",
+                str(run_dir),
+                "--adapter",
+                "codex-exec",
+                "--no-degrade",
+                "--min-tasks",
+                "2",
+            ],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "failed_parallel_no_accepted_shards")
+        self.assertEqual(payload["adapter"], "codex-exec")
+        self.assertTrue(payload["needs_serial_handoff"])
+        self.assertFalse(payload["parallel_degraded"])
+        self.assertEqual(payload["evidence_source"]["type"], "failed_real_child_execution")
+        self.assertTrue(payload["evidence_source"]["attempted_real_child_execution"])
+        self.assertFalse(payload["evidence_source"]["real_child_execution"])
+        self.assertFalse(payload["evidence_source"]["real_use_e2e_eligible"])
+        self.assertEqual(payload["merge"]["accepted_shards"], [])
+        self.assertEqual(payload["failure_counts"]["failed_tasks"], 2)
+        self.assertEqual(payload["failure_counts"]["by_category"]["codex_exec_failed"], 2)
+        failed_task = payload["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["adapter"], "codex-exec")
+        self.assertEqual(failed_task["failure_category"], "codex_exec_failed")
+        self.assertTrue(failed_task["retryable"])
+        self.assertIn("fake codex child failed", failed_task["stdout_stderr_summary"]["stderr"])
+        self.assertEqual(failed_task["command_context"]["trusted_project_root"], str(ROOT))
+        self.assertEqual(failed_task["command_context"]["run_dir"], str(run_dir.resolve()))
+        self.assertIn(" -C ", failed_task["command_context"]["command_string"])
+        self.assertEqual(
+            payload["diagnostics"]["actionable_cause"],
+            "no evidence shards were accepted because child tasks failed",
+        )
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+        self.assertEqual(stages["parallel_orchestration"]["status"], "failed")
+        self.assertEqual(
+            stages["parallel_orchestration"]["stage_status"],
+            "failed_parallel_no_accepted_shards",
+        )
 
     def test_exhaustive_plan_requires_confirmation_and_cost_cap(self) -> None:
         run_dir = self.prepare()
@@ -574,6 +676,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(smoke.returncode, 0, smoke.stderr)
         payload = json.loads(smoke.stdout)
         self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["adapter"], "fixture")
+        self.assertEqual(payload["evidence_source"]["type"], "fixture")
+        self.assertTrue(payload["evidence_source"]["fixture_only"])
+        self.assertFalse(payload["evidence_source"]["real_use_e2e_eligible"])
         self.assertTrue((run_dir / "merge_status.json").is_file())
 
 

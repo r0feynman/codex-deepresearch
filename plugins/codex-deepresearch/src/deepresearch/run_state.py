@@ -998,6 +998,9 @@ def _apply_stage_transition(
         artifacts = _string_artifacts(status_payload.get("artifacts"))
         if artifacts:
             record["artifacts"] = artifacts
+        evidence_source = status_payload.get("evidence_source")
+        if isinstance(evidence_source, Mapping):
+            record["evidence_source"] = dict(evidence_source)
         raw_status = status_payload.get("status")
         if isinstance(raw_status, str) and raw_status:
             record["stage_status"] = raw_status

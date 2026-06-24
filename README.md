@@ -52,6 +52,30 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual --question "
 
 `scripts/validate_repo.py` also exercises no-network fetch, guardrail, verification, vision, report-generation, and MVP release-gate smokes against temporary local artifacts. The standalone MVP release gate requires the `codex` CLI on `PATH` by default for plugin install/update smoke. In CI environments without Codex CLI, `validate_repo.py` runs `mvp-smoke --skip-codex-cli-install-check` and accepts only an honest recorded skip where all non-install checks pass and install/update is not marked passed. See `AGENTS.md` for the full pre-PR validation command block.
 
+### Fixture vs Real Parallel E2E
+
+The parallel fixture command in the validation block is a deterministic no-network merge test:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel --run "$run_dir" --adapter fixture --min-tasks 3
+```
+
+Fixture success proves task planning, shard validation, dedupe, and merge mechanics. It writes deterministic `example.com` fixture evidence and must not be cited as real Codex child execution.
+
+Real-use Phase 2 E2E is a separate gate. When Codex auth/runtime is available, prepare a real-use run and execute:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel --run "$run_dir" --adapter codex-exec --no-degrade
+```
+
+For real-use E2E acceptance, `parallel_orchestration_status.json` and `merge_status.json` must show `adapter=codex-exec`, `evidence_source.type=real_child_execution`, and `accepted_shards > 0`. If a real child run accepts no shards, the run is not successful: `--no-degrade` reports `ok=false` with `status=failed_parallel_no_accepted_shards`, and `evidence_source.type=failed_real_child_execution` with `real_use_e2e_eligible=false`.
+
+If the run explicitly degrades or fails, do not count it as passing real-use E2E. Report `status`, `ok`, `parallel_degraded`, `needs_serial_handoff`, `degraded_reason`, `evidence_source`, `failure_counts`, `diagnostics`, and `merge_status.json` `failed_tasks` / `rejected_shards` / `blocked_tasks` entries instead.
+
+Manual source runs are a third provenance path. `ingest-manual` writes `evidence_source.type=manual_handoff`; this can validate manual handoff mechanics but does not satisfy fixture or real `codex-exec` E2E.
+
+Use the PRD's "Parallel status matrix" and "Report quality gate" sections when interpreting Phase 2 results.
+
 ## GitHub Project Management
 
 Milestones, labels, and starter issues can be seeded with:

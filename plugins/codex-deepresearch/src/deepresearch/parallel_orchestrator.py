@@ -683,16 +683,30 @@ def _run_parallel_orchestration_started(
             result = adapter.run_task(dict(task), run_dir=run_dir, max_threads=max_concurrent)
             _record_runner_result(run_dir, task, result)
 
+    attempted_real_child_execution = any(
+        str(task.get("last_adapter") or "") == "codex-exec"
+        for task in tasks
+    )
     tasks_artifact["tasks"] = tasks
     tasks_artifact["parallel_degraded"] = parallel_degraded
+    tasks_artifact["last_adapter"] = adapter.name
+    tasks_artifact["attempted_real_child_execution"] = attempted_real_child_execution
     if degraded_reason:
         tasks_artifact["degraded_reason"] = degraded_reason
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     merge_status = merge_evidence_shards(run=run_dir)
     accepted_shards = _list(merge_status.get("accepted_shards"))
     needs_serial_handoff = bool(parallel_degraded or not accepted_shards)
+    real_no_accepted_shards = (
+        adapter.name == "codex-exec"
+        and attempted_real_child_execution
+        and not parallel_degraded
+        and not accepted_shards
+    )
     status_value = (
-        "degraded_serial_handoff_required"
+        "failed_parallel_no_accepted_shards"
+        if merge_status.get("status") == "completed" and real_no_accepted_shards
+        else "degraded_serial_handoff_required"
         if merge_status.get("status") == "completed" and needs_serial_handoff
         else "completed"
         if merge_status.get("status") == "completed"
@@ -754,6 +768,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     rejected_shards: list[dict[str, Any]] = []
     blocked_tasks: list[dict[str, Any]] = []
     discarded_tasks: list[dict[str, Any]] = []
+    failed_tasks: list[dict[str, Any]] = []
 
     evidence.setdefault("sources", [])
     evidence.setdefault("images", [])
@@ -775,6 +790,9 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             continue
         if state == "discarded":
             discarded_tasks.append(_task_status_record(task, task.get("discard_reason")))
+            continue
+        if state in {"failed", "retryable"}:
+            failed_tasks.append(_task_failure_record(task))
             continue
         if state not in {"completed", "merged"}:
             continue
@@ -896,16 +914,41 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
 
     _write_json(evidence_path, evidence)
     validation = validate_artifacts(evidence_path=evidence_path)
+    tasks_artifact["attempted_real_child_execution"] = any(
+        str(task.get("last_adapter") or "") == "codex-exec"
+        for task in tasks
+    )
+    evidence_source = _parallel_evidence_source(
+        adapter_name=str(tasks_artifact.get("last_adapter") or ""),
+        parallel_degraded=bool(tasks_artifact.get("parallel_degraded")),
+        accepted_shards=accepted_shards,
+        attempted_real_child_execution=bool(tasks_artifact.get("attempted_real_child_execution")),
+    )
+    failure_counts = _failure_counts(
+        failed_tasks=failed_tasks,
+        blocked_tasks=blocked_tasks,
+        rejected_shards=rejected_shards,
+        discarded_tasks=discarded_tasks,
+    )
     merge_status = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "generated_at": _utc_now(),
         "status": "completed" if validation.valid else "failed_validation",
         "parallel_degraded": bool(tasks_artifact.get("parallel_degraded")),
+        "evidence_source": evidence_source,
         "accepted_shards": accepted_shards,
         "rejected_shards": rejected_shards,
         "blocked_tasks": blocked_tasks,
         "discarded_tasks": discarded_tasks,
+        "failed_tasks": failed_tasks,
+        "failure_counts": failure_counts,
+        "diagnostics": _merge_diagnostics(
+            accepted_shards=accepted_shards,
+            failed_tasks=failed_tasks,
+            blocked_tasks=blocked_tasks,
+            rejected_shards=rejected_shards,
+        ),
         "source_dedupe": source_dedupe,
         "image_dedupe": image_dedupe,
         "claim_dedupe": claim_dedupe,
@@ -971,16 +1014,33 @@ def _parallel_status(
     skip_reason: str | None = None,
     errors: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    accepted_shards = _list(merge_status.get("accepted_shards")) if merge_status else []
+    existing_source = merge_status.get("evidence_source") if merge_status else None
+    attempted_real_child_execution = (
+        bool(existing_source.get("attempted_real_child_execution"))
+        if isinstance(existing_source, Mapping)
+        else adapter_name == "codex-exec"
+    )
+    evidence_source = _parallel_evidence_source(
+        adapter_name=adapter_name,
+        parallel_degraded=parallel_degraded,
+        accepted_shards=accepted_shards,
+        attempted_real_child_execution=attempted_real_child_execution,
+    )
     payload: dict[str, Any] = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "run_dir": str(run_dir),
+        "ok": _parallel_status_ok(status),
         "status": status,
         "created_at": _utc_now(),
         "parallel_degraded": parallel_degraded,
         "degraded_reason": degraded_reason,
         "adapter": adapter_name,
         "repo_check_bypass_used": False,
+        "evidence_source": evidence_source,
+        "failure_counts": dict(merge_status.get("failure_counts", {})) if merge_status else {},
+        "diagnostics": dict(merge_status.get("diagnostics", {})) if merge_status else {},
         "planned_task_count": planned_task_count,
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
@@ -995,13 +1055,66 @@ def _parallel_status(
         },
     }
     if merge_status is not None:
-        payload["merge"] = dict(merge_status)
+        merge = dict(merge_status)
+        merge.setdefault("evidence_source", evidence_source)
+        payload["merge"] = merge
     if skip_reason:
         payload["skip_reason"] = skip_reason
     if errors:
         payload["errors"] = [dict(error) for error in errors]
     add_run_steps_artifact(payload, run_dir)
     return payload
+
+
+def _parallel_evidence_source(
+    *,
+    adapter_name: str,
+    parallel_degraded: bool,
+    accepted_shards: Sequence[Mapping[str, Any]],
+    attempted_real_child_execution: bool = False,
+) -> dict[str, Any]:
+    accepted_count = len(accepted_shards)
+    if adapter_name == "fixture":
+        source_type = "fixture"
+        description = "deterministic no-network fixture shards"
+    elif adapter_name == "codex-exec":
+        attempted_real_child_execution = True
+        if accepted_count > 0 and not parallel_degraded:
+            source_type = "real_child_execution"
+            description = "accepted evidence shards from real Codex child execution"
+        else:
+            source_type = "failed_real_child_execution"
+            description = "real Codex child execution was attempted, but no evidence shard was accepted"
+    elif adapter_name == "serial-degraded" or parallel_degraded:
+        source_type = "serial_handoff"
+        description = "serial degraded handoff after parallel execution could not provide accepted shards"
+    else:
+        source_type = "unknown"
+        description = "parallel evidence source could not be classified"
+    return {
+        "type": source_type,
+        "adapter": adapter_name,
+        "accepted_shards": accepted_count,
+        "fixture_only": source_type == "fixture",
+        "manual_handoff": False,
+        "attempted_real_child_execution": attempted_real_child_execution,
+        "real_child_execution": source_type == "real_child_execution",
+        "real_use_e2e_eligible": (
+            source_type == "real_child_execution"
+            and accepted_count > 0
+            and not parallel_degraded
+        ),
+        "description": description,
+    }
+
+
+def _parallel_status_ok(status: str) -> bool:
+    return status not in {
+        "failed",
+        "failed_validation",
+        "failed_parallel_no_accepted_shards",
+        "blocked_parallel_execution",
+    }
 
 
 def _skip_serial_handoff_after_parallel(
@@ -1111,6 +1224,7 @@ def _assign_task(
 ) -> None:
     task["attempt"] = int(task.get("attempt") or 0) + 1
     task["assigned_subagent_id"] = f"{adapter_name}-{task['id']}-attempt-{task['attempt']}"
+    task["last_adapter"] = adapter_name
     task["state"] = "assigned"
     record = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
@@ -1130,6 +1244,10 @@ def _assign_task(
 
 def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerResult) -> None:
     trace_ids: list[str] = list(task.get("trace_event_ids") or [])
+    task["last_child_thread_id"] = result.child_thread_id
+    command_context = _last_command_context(result.events)
+    if command_context:
+        task["last_command_context"] = command_context
     for event in result.events:
         trace_record = _trace_record(run_dir, event)
         append_trace_record(run_dir, trace_record)
@@ -1680,6 +1798,122 @@ def _task_status_record(task: Mapping[str, Any], reason: Any) -> dict[str, Any]:
         "reason": reason,
         "output_shard_path": task.get("output_shard_path"),
     }
+
+
+def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
+    diagnostic = str(task.get("last_error") or task.get("blocked_reason") or "")
+    command_context = task.get("last_command_context")
+    if not isinstance(command_context, Mapping):
+        command_context = {}
+    failure_category = str(task.get("failure_category") or "unknown_failure")
+    state = str(task.get("state") or "failed")
+    return {
+        "task_id": task.get("id"),
+        "state": state,
+        "adapter": task.get("last_adapter") or _adapter_from_assignment(task),
+        "failure_category": failure_category,
+        "retryable": state == "retryable" or failure_category in RETRY_SAFE_FAILURES,
+        "attempt": int(task.get("attempt") or 0),
+        "max_attempts": int(task.get("max_attempts") or 0),
+        "child_thread_id": task.get("last_child_thread_id"),
+        "assigned_subagent_id": task.get("assigned_subagent_id"),
+        "output_shard_path": task.get("output_shard_path"),
+        "diagnostic": diagnostic,
+        "stdout_stderr_summary": _stdout_stderr_summary(diagnostic),
+        "command_context": dict(command_context),
+    }
+
+
+def _adapter_from_assignment(task: Mapping[str, Any]) -> str | None:
+    assigned = task.get("assigned_subagent_id")
+    if not isinstance(assigned, str) or not assigned:
+        return None
+    marker = f"-{task.get('id')}-attempt-"
+    if marker in assigned:
+        return assigned.split(marker, 1)[0]
+    return assigned.split("-", 1)[0]
+
+
+def _last_command_context(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(events):
+        raw_event = event.get("raw_event")
+        if isinstance(raw_event, Mapping) and raw_event.get("command"):
+            return dict(raw_event)
+    return None
+
+
+def _stdout_stderr_summary(diagnostic: str) -> dict[str, str]:
+    summary: dict[str, str] = {}
+    for key in ("stderr", "stdout"):
+        match = re.search(rf"{key}=([^;]*)", diagnostic)
+        if match:
+            summary[key] = match.group(1).strip()
+    return summary
+
+
+def _failure_counts(
+    *,
+    failed_tasks: Sequence[Mapping[str, Any]],
+    blocked_tasks: Sequence[Mapping[str, Any]],
+    rejected_shards: Sequence[Mapping[str, Any]],
+    discarded_tasks: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    by_category: dict[str, int] = {}
+    for task in failed_tasks:
+        category = str(task.get("failure_category") or "unknown_failure")
+        by_category[category] = by_category.get(category, 0) + 1
+    for task in blocked_tasks:
+        category = str(task.get("reason") or "blocked")
+        by_category[category] = by_category.get(category, 0) + 1
+    for shard in rejected_shards:
+        category = str(shard.get("reason") or "rejected_shard")
+        by_category[category] = by_category.get(category, 0) + 1
+    for task in discarded_tasks:
+        category = str(task.get("reason") or "discarded")
+        by_category[category] = by_category.get(category, 0) + 1
+    return {
+        "failed_tasks": len(failed_tasks),
+        "blocked_tasks": len(blocked_tasks),
+        "rejected_shards": len(rejected_shards),
+        "discarded_tasks": len(discarded_tasks),
+        "by_category": by_category,
+    }
+
+
+def _merge_diagnostics(
+    *,
+    accepted_shards: Sequence[Mapping[str, Any]],
+    failed_tasks: Sequence[Mapping[str, Any]],
+    blocked_tasks: Sequence[Mapping[str, Any]],
+    rejected_shards: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if accepted_shards:
+        return {}
+    if failed_tasks:
+        first = failed_tasks[0]
+        return {
+            "actionable_cause": "no evidence shards were accepted because child tasks failed",
+            "first_failure_category": first.get("failure_category"),
+            "first_failed_task_id": first.get("task_id"),
+            "first_failed_adapter": first.get("adapter"),
+            "first_failed_retryable": first.get("retryable"),
+            "first_failed_diagnostic": first.get("diagnostic"),
+        }
+    if blocked_tasks:
+        first = blocked_tasks[0]
+        return {
+            "actionable_cause": "no evidence shards were accepted because child tasks were blocked",
+            "first_blocked_task_id": first.get("task_id"),
+            "first_blocked_reason": first.get("reason"),
+        }
+    if rejected_shards:
+        first = rejected_shards[0]
+        return {
+            "actionable_cause": "no evidence shards were accepted because shard validation rejected the output",
+            "first_rejected_task_id": first.get("task_id"),
+            "first_rejected_reason": first.get("reason"),
+        }
+    return {"actionable_cause": "no evidence shards were accepted"}
 
 
 def _read_json(path: Path) -> dict[str, Any]:

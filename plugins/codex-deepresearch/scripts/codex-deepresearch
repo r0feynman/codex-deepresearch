@@ -514,6 +514,8 @@ def run_orchestrate_parallel(args: argparse.Namespace) -> int:
         return 2
 
     print(json.dumps(result, indent=2, sort_keys=True))
+    if result.get("ok") is False:
+        return 2
     validation = result.get("merge", {}).get("validation")
     if isinstance(validation, dict) and validation.get("valid") is False:
         return 2
