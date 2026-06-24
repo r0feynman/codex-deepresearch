@@ -250,7 +250,7 @@ Task state rules:
 
 Parallel mode requirements:
 
-- `codex-plugin` mode uses Codex subagents when the current Codex surface can spawn or delegate subagent work. If subagents are unavailable, the runner must degrade to serial handoff execution and record `parallel_degraded=true`.
+- `codex-plugin` mode uses Codex subagents when the current Codex surface can spawn or delegate subagent work. If subagents are unavailable and fallback is allowed, the runner must degrade to serial handoff execution and record `parallel_degraded=true`; `--no-degrade` fails fast with diagnostics.
 - `automated-cli` mode may use OpenAI Agents SDK or an equivalent local worker pool for reproducible parallel task execution.
 - `manual-sources` mode does not spawn subagents by default; it can still merge manually supplied evidence shards.
 - Every subagent output must be treated as untrusted until evidence schema validation, guardrails, and verifier matrix pass.
@@ -264,7 +264,52 @@ M18 implementation decision:
 - The adapter must parse JSON events for `spawn_agent`, `wait`, `close_agent`, thread IDs, child status, child messages, and failures.
 - Each child subagent prompt must require a schema-valid evidence shard file path or a strict JSON result. Natural-language summaries alone are insufficient for merge.
 - The adapter must persist the raw Codex event stream or a normalized projection in `run_trace.jsonl`.
-- If `codex exec`, Codex SDK, authentication, sandbox, approval policy, or subagent spawning is unavailable, the run records `parallel_degraded=true` and executes the same `research_tasks.json` queue serially.
+- If `codex exec`, Codex SDK, authentication, sandbox, approval policy, or subagent spawning is unavailable and serial fallback is allowed, the run records `parallel_degraded=true` and executes the same `research_tasks.json` queue serially. With `--no-degrade`, the run fails fast with diagnostics instead of falling back.
+
+2026-06-24 real-use E2E finding:
+
+- Fixture adapter success is not sufficient evidence that real Codex subagent research works. Fixture runs prove task planning, shard validation, and merge mechanics only.
+- Real-use E2E with `adapter=codex-exec` produced `research_tasks.json`, `subagent_assignments.jsonl`, and `parallel_orchestration_status.json`, but produced `accepted_shards=0`.
+- The concrete observed child execution blocker was `Not inside a trusted directory and --skip-git-repo-check was not specified.` Child `codex exec` runs were launched from a temporary run directory rather than a trusted project context.
+- The adapter must run child Codex sessions from a trusted project root with `-C <project-root>` while writing outputs to the target run directory. A repo-check bypass is allowed only for a user-approved diagnostic run where the output path is still under the selected run directory, the command records `repo_check_bypass_used=true`, and the run cannot be counted as passing real-use E2E acceptance.
+- If all child tasks fail or no shards are accepted, status must not imply successful parallel execution. `parallel_degraded`, `status`, `needs_serial_handoff`, failure counts, and diagnostics must agree.
+- Real-use visual E2E showed that image candidates and observations can be ingested, but final synthesis used `used_images=0`; therefore visual evidence ingestion is not complete until image observations can support claim `supporting_images` and appear in `report.md`.
+- Real-use report E2E showed mechanically valid `report.md` output, but not user-quality synthesis. The final report must follow the user's requested shape, language, comparison table, gap list, and direct-answer format.
+- A completed visual/text run must not remain `in_progress` because a later stage stale-reset an earlier visual stage.
+
+Real-use Phase 2 hardening gate:
+
+- A text-heavy real-use E2E using `adapter=codex-exec --no-degrade` must produce `accepted_shards > 0`, or fail fast with an explicit actionable diagnostic and no serial fallback.
+- A visual-required real-use E2E must produce image evidence that is linked to at least one supported claim and reported with `report_status.used_images > 0`.
+- A Korean user prompt must produce a Korean final report unless the user requests another language.
+- Fixture adapter runs must be labeled as fixture-only and cannot satisfy real `codex-exec` E2E acceptance.
+
+Parallel status matrix:
+
+| Scenario | Required `status` | `parallel_degraded` | `needs_serial_handoff` | Serial fallback allowed | Exit behavior |
+| --- | --- | ---: | ---: | ---: | --- |
+| Fixture adapter succeeds | `completed_fixture` | `false` | `false` | `false` | success, but fixture-only |
+| Real `codex-exec` partial or full success with `accepted_shards > 0` | `completed_parallel` or `completed_partial_parallel` | `false` | `false` when enough evidence remains, otherwise `true` | explicit user/runner policy only | success when acceptance threshold passes |
+| Adapter unavailable before launch, fallback not yet run | `degraded_serial_handoff_required` | `false` | `true` | `true` unless `--no-degrade` | pending/blocking handoff; fail fast with `--no-degrade` |
+| All child tasks fail or `accepted_shards=0`, fallback not yet run | `failed_parallel_no_accepted_shards` | `false` | `true` | `true` unless `--no-degrade` | fail fast with `--no-degrade`; otherwise continue only as explicit serial handoff |
+| Trust/sandbox/auth/approval blocker | `blocked_parallel_execution` | `false` unless fallback actually ran | `true` | `true` only after recording blocker and fallback decision | fail fast with `--no-degrade` |
+| Explicit serial fallback completes after a parallel blocker | `completed_serial_handoff` | `true` | `false` | already used | success only if serial evidence/report gates pass |
+
+`parallel_degraded=true` means a fallback path actually replaced intended parallel execution. A blocked or failed real parallel run that has not executed serial fallback must not set `parallel_degraded=true` merely to hide the failure.
+
+`--no-degrade` failure contract:
+
+- CLI commands exit non-zero.
+- JSON result envelopes set `ok=false`, `status` to the matrix failure or blocked status, `parallel_degraded=false`, `needs_serial_handoff=true`, and include `diagnostics.actionable_cause`.
+- No serial source fetching, report synthesis, or fallback evidence generation may run after the failure in the same command.
+
+Report quality gate:
+
+- Representative real-use reports are scored out of 10 before Phase 2 exit.
+- Passing threshold is `>=9/10`.
+- Score dimensions: language match 1.0, direct answer 1.5, requested structure/table/gap list 1.5, cited evidence and evidence IDs 2.0, conflict/caveat handling 1.0, source-boilerplate suppression 1.0, visual evidence integration when applicable 1.0, concise user-facing synthesis 1.0.
+- A report cannot score above 8 if it ignores the user's requested language or requested output shape.
+- A visual-required report cannot score above 8 if `report_status.used_images=0` while usable image evidence exists.
 
 Non-developer input path:
 
@@ -505,6 +550,18 @@ Agent 산정식:
       "claim_type": "text|visual|mixed",
       "supporting_sources": ["src_001"],
       "supporting_images": ["img_001"],
+      "visual_supports": [
+        {
+          "image_id": "img_001",
+          "observation_ref": "images.img_001.observations[0]",
+          "observation_index": 0,
+          "observation_text": "visible UI contains a pricing table",
+          "relation_type": "ocr_support|visual_match|chart_support|screenshot_support|context_support",
+          "confidence": 0.74,
+          "provider": "codex-interactive",
+          "rationale": "The screenshot text matches the pricing claim."
+        }
+      ],
       "quote_spans": [
         {
           "source_id": "src_001",
@@ -560,6 +617,12 @@ Schema v0 implementation requirements:
 - VLM output은 `observations`와 `inferences`를 분리한다.
 - 모든 high-confidence text claim은 하나 이상의 `quote_spans`를 가진다.
 - 모든 high-confidence visual/mixed claim은 하나 이상의 `supporting_images`를 가진다.
+- `supporting_images`는 빠른 필터링용 image ID 목록이다. visual/mixed claim이 `supporting_images`를 가지면 `visual_supports[]`도 반드시 가져야 한다.
+- 모든 `visual_supports[].image_id`는 `images[].id`에 존재해야 한다.
+- 모든 `visual_supports[]`는 해당 image의 관찰 근거를 deterministic하게 가리켜야 한다. 현재 schema v0에서는 `observation_index`가 `images[].observations[]`의 유효한 index이고, `observation_ref`는 `images.<image_id>.observations[<index>]` 형식이어야 한다. 이후 `visual_observations.jsonl` records가 stable record identifier를 갖게 되면 `visual_observations.jsonl:<record-id>`도 허용할 수 있다.
+- `visual_supports[].observation_text`를 기록할 때는 참조한 observation 문자열과 일치해야 한다.
+- `visual_supports[].relation_type`은 `ocr_support`, `visual_match`, `chart_support`, `screenshot_support`, `context_support` 중 하나다.
+- `visual_supports[].confidence`는 0.0부터 1.0까지의 숫자이며, 별도 verifier vote 없이 claim을 high-confidence로 승격할 수 없다.
 - `claims[].votes[]`는 `VerifierVote` schema를 그대로 embed하거나 `verifier_votes.jsonl`의 `id`를 참조한다. MVP는 embed를 기본으로 한다.
 - verifier vote는 `id`, `claim_id`, `verifier_type`, `agent_name`, `method`, `model_or_tool`, `vote`, `confidence`, `evidence_refs`, `rationale`, `created_at`을 가진다.
 - budget 때문에 검증하지 못한 claim은 `budget_pruned`로 남기고 최종 보고서의 확정 주장으로 쓰지 않는다.
@@ -851,12 +914,16 @@ Exit criteria:
 Exit criteria:
 
 - `standard` preset에서 최소 8개 Codex subagent 또는 equivalent worker가 병렬 research task를 처리하고 evidence shard를 생성한다.
+- `standard` preset의 real-use `codex-exec` E2E에서 trusted project context로 child Codex 실행이 성공하고 `accepted_shards > 0`을 기록한다.
 - `exhaustive` preset은 explicit confirmation과 cost cap이 있을 때 최대 100개 Codex subagent fan-out을 계획할 수 있다.
 - subagent evidence shard가 schema validation, guardrail, dedupe, merge를 거쳐 canonical `evidence.json`에 반영된다.
 - 이미지가 핵심인 조사에서 자동으로 최소 10개 후보 이미지를 수집한다.
+- visual-required real-use E2E에서 이미지 evidence가 claim `supporting_images`에 연결되고 최종 `report.md`의 visual finding에 사용된다.
 - 중복 이미지 제거율과 제거 근거가 evidence에 남는다.
 - 중단 후 재개해도 이미 처리한 source/image를 다시 분석하지 않는다.
 - 사용자가 실행 전 비용 상한을 설정할 수 있다.
+- 최종 report는 사용자가 요청한 형식, 언어, 비교표, gap list를 반영한다.
+- 전체 visual/text pipeline이 끝나면 `run-status`가 completed 상태를 보고한다.
 
 ### Phase 3: Public Beta
 
@@ -1295,7 +1362,7 @@ Tasks:
 15. subagent별 `evidence_shard.json`, per-task search/visual JSONL, trace event linkage를 구현한다.
 16. shard validation, source/image/claim dedupe, conflict marking, merge status를 구현한다.
 17. failed/retryable/blocked/discarded task를 전체 run 상태와 report caveat에 반영한다.
-18. subagent orchestration이 불가능한 Codex surface에서는 serial handoff로 degrade하고 `parallel_degraded=true`를 기록한다.
+18. subagent orchestration이 불가능한 Codex surface에서는 fallback 허용 시 serial handoff로 degrade하고 `parallel_degraded=true`를 기록한다. `--no-degrade`에서는 diagnostics와 함께 fail fast 한다.
 
 Deliverables:
 
@@ -1402,6 +1469,7 @@ Acceptance tests:
 
 - planner output can be expanded into at least 20 bounded `ResearchTask` records for a broad research question.
 - automated runner can invoke Codex with `codex exec --json -c agents.max_threads=N` or Codex SDK/MCP server equivalent.
+- real accepted `codex-exec` child runs execute from a trusted project context and still write outputs to the intended run directory; diagnostic repo-check bypass runs are recorded separately and do not satisfy real-use E2E acceptance.
 - raw or normalized JSON events record `spawn_agent`, child thread IDs, `wait` completion states, child messages, failures, and `close_agent`.
 - `standard` preset schedules up to 8 concurrent Codex subagents or equivalent worker contexts.
 - `exhaustive` preset can plan up to 100 Codex subagents only after explicit confirmation and cost cap.
@@ -1409,7 +1477,173 @@ Acceptance tests:
 - shard merge deduplicates repeated source URLs, image hashes, and equivalent claim text.
 - failed retry-safe tasks can be retried without re-running completed tasks.
 - blocked or discarded tasks are preserved in `merge_status.json` and excluded from final confident claims.
-- if Codex subagents, `codex exec`, SDK/MCP server, auth, sandbox, or approvals are unavailable, the run records `parallel_degraded=true` and executes the same task queue serially.
+- if Codex subagents, `codex exec`, SDK/MCP server, auth, sandbox, approvals, or all child shards fail, the run records an internally consistent degraded or failed state and executes serial handoff only when that fallback is explicit.
+
+M19-M24 sequencing:
+
+- M24 documentation/validation distinction can land at any time and should land early enough that future E2E reports label fixture vs real runs correctly.
+- M19 trusted `codex-exec` context and M20 status semantics are the implementation blockers for reliable real parallel E2E.
+- M21 visual evidence linkage depends on stable evidence/image IDs and should be validated before M22 claims visual report quality.
+- M22 report-quality synthesis depends on verified evidence/report status from M20 and, for visual prompts, M21.
+- M23 run-step state stability can be developed independently, but Phase 2 exit requires it before reporting completed visual/text E2E.
+
+#### Ticket M19: Real Codex-Exec Trusted Context
+
+Depends on: M18 adapter surface.
+
+Unblocks: M20 real failure semantics, M22 real parallel report E2E, Phase 2 exit gate.
+
+Input:
+
+- `research_tasks.json`
+- run directory under `/tmp`, repo-local `research-runs`, or user-selected `--runs-dir`
+- project root path
+- Codex CLI auth and trust policy
+
+Output:
+
+- child `codex exec` commands that run from trusted project context
+- evidence shards written to the intended run directory
+- actionable diagnostics when child execution is blocked
+
+Acceptance tests:
+
+- real-use `orchestrate-parallel --adapter codex-exec --no-degrade` produces `accepted_shards > 0` when Codex auth/runtime is available.
+- trusted-directory failures include the exact command context and remediation.
+- regression coverage fails if child execution uses an untrusted run directory as the Codex working root.
+- repo-check bypass is allowed only for explicit diagnostic runs, records `repo_check_bypass_used=true`, constrains output to the selected run directory, and cannot satisfy real-use E2E acceptance.
+
+#### Ticket M20: Parallel Status and Diagnostics Semantics
+
+Depends on: M19 for real `codex-exec` failure reproduction.
+
+Unblocks: honest user-facing run status, M22 report status, Phase 2 exit gate.
+
+Input:
+
+- `research_tasks.json`
+- `subagent_assignments.jsonl`
+- child stdout/stderr or normalized event stream
+- `merge_status.json`
+
+Output:
+
+- internally consistent `parallel_orchestration_status.json`
+- failure counts by category
+- preserved diagnostics sufficient to debug child failures
+
+Acceptance tests:
+
+- all-child-failed runs do not report successful parallel execution.
+- `parallel_degraded`, `status`, and `needs_serial_handoff` agree.
+- implementation matches the PRD parallel status matrix for fixture success, real partial/full success, adapter unavailable, all-child-failed, trust/sandbox/auth blocker, and completed serial handoff.
+- `run-status` reports the same state as `parallel_orchestration_status.json`.
+- tests cover all-child-failed, partial-shard, adapter-unavailable, and fixture-success cases.
+
+#### Ticket M21: Visual Evidence to Claim and Report Linkage
+
+Depends on: stable evidence schema image IDs and deterministic visual observation references.
+
+Unblocks: M22 visual-required report quality and visual Phase 2 exit gate.
+
+Input:
+
+- `visual_candidates.jsonl`
+- `visual_observations.jsonl`
+- `evidence.json.images`
+- visual or mixed claims
+
+Output:
+
+- claim `supporting_images`
+- visual verifier eligibility
+- `report.md` visual findings
+- `report_status.used_images`
+
+Linkage contract:
+
+- A claim may include an image in `supporting_images` only when a `VisualEvidence` record references the image ID and includes an observation or OCR span relevant to the claim text.
+- The claim must store the image ID, deterministic observation reference/index, relation type (`ocr_support`, `visual_match`, `chart_support`, `screenshot_support`, or `context_support`), provider, rationale, and visual confidence.
+- Visual verifier eligibility requires at least one linked observation that is not policy-blocked and whose provider is recorded as real VLM, Codex interactive handoff, manual visual review, local screenshot fixture, local image fixture, or fixture.
+- `report.md` may count an image as used only when a report claim cites that image-backed claim or its evidence ID.
+
+Acceptance tests:
+
+- visual observations can support claim `supporting_images`.
+- visual-required claims with usable image evidence can become report-eligible after verification.
+- visual-required real-use E2E writes `report_status.used_images > 0`.
+- evidence records whether image analysis came from real VLM, Codex interactive handoff, manual visual review, or fixture provider.
+
+#### Ticket M22: User-Shaped Final Report Synthesis
+
+Depends on: M20 status semantics for report status. Visual-required report quality also depends on M21.
+
+Unblocks: user-facing Phase 2 real-use acceptance.
+
+Input:
+
+- verified evidence
+- user question and requested output shape
+- report template hints
+
+Output:
+
+- user-facing `report.md`
+- structured report status explaining included and excluded evidence
+
+Acceptance tests:
+
+- Korean prompts produce Korean reports unless the user asks otherwise.
+- comparison prompts produce comparison tables.
+- recommendation prompts include direct answer, evidence, caveats, and gaps.
+- boilerplate headings and navigation text do not dominate final synthesis.
+- real-use technical adoption and competitor-comparison E2E reports pass the PRD report quality gate with score `>=9/10`.
+
+#### Ticket M23: Run-Step State Stability After Visual/Text Reruns
+
+Depends on: existing run-step state machine.
+
+Unblocks: completed-state Phase 2 real-use visual/text E2E.
+
+Input:
+
+- completed `ingest_vision`
+- later `fetch-claims`, guardrail, verification, and synthesis stages
+- `run_steps.json`
+
+Output:
+
+- completed run status after full visual/text pipeline
+- idempotent rerun history without corrupting primary stage status
+
+Acceptance tests:
+
+- sequence `prepare -> acquire-visual -> ingest-vision -> fetch-claims -> enforce-guardrails -> verify-claims -> synthesize -> run-status` ends completed.
+- later stages do not stale-reset earlier completed stages unless the upstream input hash changed.
+- reruns record skipped/rerun decisions in history without hiding the completed primary state.
+
+#### Ticket M24: Fixture vs Real E2E Validation Distinction
+
+Depends on: existing validation docs and runner status output.
+
+Unblocks: reliable interpretation of M19-M23 E2E results.
+
+Input:
+
+- fixture adapter validation runs
+- real `codex-exec` E2E runs
+- validation/reporting docs
+
+Output:
+
+- docs and validation output that identify adapter type and evidence source
+- real E2E checklist distinct from fixture merge checks
+
+Acceptance tests:
+
+- fixture tests remain documented as no-network merge mechanics tests.
+- real-use E2E requires `adapter=codex-exec` and `accepted_shards > 0` unless the run explicitly degrades or fails with actionable diagnostics.
+- validation output highlights whether evidence came from fixture, manual handoff, or real child execution.
 
 ### Phase 3 WBS: Public Beta
 
@@ -1677,9 +1911,18 @@ Metric denominators:
 | completed non-blocked report citation/evidence ID coverage | 80% | 95% | 98% | 99% | 99% |
 | plugin install + invocation smoke pass | skeleton | 100% | 100% | 100% | 100% |
 | parallel task shard merge success rate | n/a | n/a | 95% | 98% | 99% |
+| real codex-exec E2E accepted shard success rate | n/a | n/a | 90% | 95% | 98% |
+| visual evidence used in visual-required report | n/a | 95% | 98% | 99% | 99% |
+| user-requested report shape adherence | n/a | 90% | 95% | 98% | 99% |
 | duplicate source/image/claim merge leakage | n/a | n/a | < 2% | < 1% | < 0.5% |
 | median standard run completion | n/a | < 20 min | < 15 min | < 12 min | < 10 min |
 | policy-blocked evidence leakage into accepted claims | 0 | 0 | 0 | 0 | 0 |
+
+Metric definitions:
+
+- `real codex-exec E2E accepted shard success rate`: percentage of non-blocked real `adapter=codex-exec` E2E runs where `accepted_shards > 0`; fixture adapter runs are excluded from numerator and denominator.
+- `visual evidence used in visual-required report`: percentage of non-blocked visual-required runs where at least one supported claim has `supporting_images`, `visual_supports[]`, and `report_status.used_images > 0`.
+- `user-requested report shape adherence`: percentage of sampled real-use reports scoring `>=9/10` on the report quality gate.
 
 ## 구현 순서
 
@@ -1710,8 +1953,8 @@ Metric denominators:
 
 ## 자체 검토
 
-문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다.
+문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 실사용 E2E에서는 Phase 2 artifact는 생성되지만, real `codex-exec` shard가 accepted 되지 않고, visual evidence가 final report에 쓰이지 않으며, report synthesis가 사용자 질문 형식을 따르지 않는 문제가 확인됐다.
 
-수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다.
+수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다. 2026-06-24 수정에서는 real-use E2E finding을 PRD에 추가하고, M19-M24 hardening tickets로 trusted `codex-exec` context, parallel status semantics, visual evidence linkage, user-shaped report synthesis, run-step stability, fixture-vs-real E2E distinction을 공식 Phase 2 후속 범위로 편입했다.
 
-남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 병렬 subagent 실행 자체는 Codex CLI smoke test로 확인됐지만, automated runner adapter는 Codex auth, sandbox, approval policy, nested `codex exec`, SDK/MCP server availability, JSON event compatibility, child thread cleanup을 안정적으로 처리해야 한다. Codex subagent를 사용할 수 없는 surface에서는 serial handoff 또는 `automated-cli` worker fallback으로 degrade해야 한다. 100-subagent high fan-out은 비용, rate limit, workspace policy, trace volume을 크게 키우므로 `exhaustive` preset에서만 explicit confirmation과 cost cap으로 제한한다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.
+남은 리스크: Codex Plugin 안에서 `codex-interactive` VLM과 Codex-native search를 어느 정도까지 자동화할 수 있는지는 구현 중 검증이 필요하다. 병렬 subagent 실행 자체는 Codex CLI smoke test로 확인됐지만, automated runner adapter는 Codex auth, sandbox, approval policy, nested `codex exec`, SDK/MCP server availability, JSON event compatibility, child thread cleanup을 안정적으로 처리해야 한다. Codex subagent를 사용할 수 없는 surface에서는 serial handoff 또는 `automated-cli` worker fallback으로 degrade해야 한다. 100-subagent high fan-out은 비용, rate limit, workspace policy, trace volume을 크게 키우므로 `exhaustive` preset에서만 explicit confirmation과 cost cap으로 제한한다. 자동 실행을 위해 `openai-responses-vision` 또는 hosted search를 사용할 경우 비용과 API 정책이 별도로 적용된다. 이미지 검색 API, 저작권/robots 정책, VLM hallucination, 비용 폭증은 구현 단계에서 별도 guardrail과 rate limit이 필요하다. Real-use E2E가 fixture validation과 다른 실패를 드러냈으므로, 앞으로 Phase 2 acceptance는 fixture-only smoke가 아니라 실제 `codex-exec` child run, visual-required run, 사용자 형식의 report synthesis를 별도 gate로 검증해야 한다. Product v1 이후의 cloud/team 범위는 인증, 저장소, 결제, 조직 정책에 따라 별도 아키텍처 PRD가 필요할 수 있다.

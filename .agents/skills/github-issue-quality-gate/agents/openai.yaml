@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue Quality Gate"
+  short_description: "Review, score, and publish GitHub issues"
+  default_prompt: "Use $github-issue-quality-gate to draft, review, score, publish, and project-sync GitHub issues."

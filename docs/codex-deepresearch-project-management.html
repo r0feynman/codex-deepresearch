@@ -126,7 +126,7 @@
 
     .kanban {
       display: grid;
-      grid-template-columns: repeat(6, minmax(140px, 1fr));
+      grid-template-columns: repeat(5, minmax(140px, 1fr));
       gap: 10px;
       overflow-x: auto;
       padding-bottom: 6px;
@@ -339,7 +339,7 @@
     </header>
 
     <section class="note">
-      <strong>추천 결론:</strong> 지금은 GitHub repo 하나에 PRD, Issues, Project board, PR을 묶어 관리합니다. 핵심은 <code>Now</code>를 작게 유지하고, 모든 작업을 Acceptance Criteria가 있는 issue로 만드는 것입니다.
+      <strong>추천 결론:</strong> 지금은 GitHub repo 하나에 PRD, Issues, Project board, PR을 묶어 관리합니다. 핵심은 이번 safe wave만 <code>Ready</code>에 두고, 모든 작업을 Acceptance Criteria가 있는 issue로 만드는 것입니다.
     </section>
 
     <h2>전체 구조</h2>
@@ -379,26 +379,22 @@
     <h2>Project Board</h2>
     <div class="kanban">
       <div class="column">
-        <h3>Inbox <span class="badge">3</span></h3>
-        <div class="card">PDF page rasterization 아이디어 <span class="tag">type:research</span></div>
+        <h3>Backlog <span class="badge">3</span></h3>
+        <div class="card">뒤 wave visual linkage <span class="tag">soft-ordering</span></div>
         <div class="card">장기 캐시 정책 검토 <span class="tag">needs-decision</span></div>
       </div>
       <div class="column">
-        <h3>Ready <span class="badge">4</span></h3>
-        <div class="card">Open Graph image extractor <span class="tag">component:visual-acquisition</span></div>
-        <div class="card">Issue template 추가 <span class="tag">type:docs</span></div>
+        <h3>Ready <span class="badge">2</span></h3>
+        <div class="card">Trusted Codex exec context probe <span class="tag">component:agent-runner</span></div>
+        <div class="card">Real-vs-fixture E2E docs <span class="tag">type:docs</span></div>
       </div>
       <div class="column">
-        <h3>Now <span class="badge">1</span></h3>
-        <div class="card">First viewport screenshot collector <span class="tag">priority:p0</span></div>
-      </div>
-      <div class="column">
-        <h3>Review <span class="badge">1</span></h3>
-        <div class="card">ModalityRouter schema 검증 <span class="tag">type:test</span></div>
+        <h3>In Progress <span class="badge">1</span></h3>
+        <div class="card">Parallel runner hardening <span class="tag">priority:p1</span></div>
       </div>
       <div class="column">
         <h3>Blocked <span class="badge">1</span></h3>
-        <div class="card">이미지 검색 provider 선택 <span class="tag">blocked</span></div>
+        <div class="card">credential 필요한 실사용 검증 <span class="tag">blocked</span></div>
       </div>
       <div class="column">
         <h3>Done <span class="badge">2</span></h3>
@@ -469,12 +465,12 @@
       <div class="view">
         <div class="icon">B</div>
         <h3>Board - Current</h3>
-        <p class="muted">매일 보는 화면. 상태별로 이슈를 이동합니다.</p>
+        <p class="muted">매일 보는 화면. Workflow Status별로 이슈를 이동합니다.</p>
       </div>
       <div class="view">
         <div class="icon">N</div>
         <h3>Next</h3>
-        <p class="muted">다음 작업 1-3개만 남겨 선택 피로를 줄입니다.</p>
+        <p class="muted">이번 safe wave의 Ready 작업만 남겨 선택 피로를 줄입니다.</p>
       </div>
       <div class="view">
         <div class="icon">R</div>
@@ -484,7 +480,7 @@
       <div class="view">
         <div class="icon">!</div>
         <h3>Blocked</h3>
-        <p class="muted">결정이 필요한 작업만 따로 모읍니다.</p>
+        <p class="muted">선택 또는 착수 후 실제로 막힌 작업만 따로 모읍니다.</p>
       </div>
     </div>
 
@@ -509,11 +505,11 @@
     <h2>일일 개발 루틴</h2>
     <ol class="routine">
       <li><strong>Ready에서 하나 선택.</strong> 가장 중요한 작업만 고릅니다.</li>
-      <li><strong>Now로 이동.</strong> 혼자 개발이면 Now는 1개만 유지합니다.</li>
+      <li><strong>In Progress로 이동.</strong> 착수한 이슈만 작업 중으로 표시합니다.</li>
       <li><strong>Codex에게 구현 요청.</strong> Issue scope와 Acceptance Criteria를 기준으로 맡깁니다.</li>
       <li><strong>검증.</strong> 테스트, 산출물, 체크리스트를 확인합니다.</li>
       <li><strong>PR 또는 커밋.</strong> 변경 내용을 리뷰 가능한 단위로 묶습니다.</li>
-      <li><strong>Done 또는 Review.</strong> 끝난 일과 검토 중인 일을 분리합니다.</li>
+      <li><strong>Done으로 이동.</strong> 머지 또는 이슈 종료 후 완료로 표시합니다.</li>
     </ol>
 
     <h2>Issue Template</h2>
@@ -542,7 +538,7 @@
       </div>
       <div class="panel">
         <h3>처음 시작할 작업</h3>
-        <p>Phase 1 MVP Epic 5-7개와 실제 작업 issue 15-25개를 만들고, <code>Now</code>에는 하나만 둡니다.</p>
+        <p>Phase 1 MVP Epic 5-7개와 실제 작업 issue 15-25개를 만들고, 첫 safe wave만 <code>Ready</code>에 둡니다.</p>
       </div>
     </div>
 
