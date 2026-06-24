@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .evidence_schema import validate_artifacts
 from .run_state import begin_stage, skipped_stage_status
@@ -50,6 +50,41 @@ IMAGE_BLOCKING_POLICY_FLAGS = {
 IMAGE_REVIEW_GATE_POLICY_FLAGS = {
     "sensitive_possible",
     "unknown_license_image",
+}
+BOILERPLATE_PATTERNS = {
+    "about us",
+    "accept cookies",
+    "all rights reserved",
+    "cookie policy",
+    "home",
+    "log in",
+    "menu",
+    "navigation",
+    "privacy policy",
+    "search",
+    "sign in",
+    "skip to content",
+    "subscribe",
+    "terms of service",
+}
+COMPARISON_KEYWORDS = {
+    "compare",
+    "comparison",
+    "versus",
+    " vs ",
+    "비교",
+    "표",
+}
+RECOMMENDATION_KEYWORDS = {
+    "adopt",
+    "adoption",
+    "recommend",
+    "suitable",
+    "should",
+    "도입",
+    "추천",
+    "적합",
+    "판단",
 }
 
 
@@ -175,6 +210,13 @@ def synthesize_report(
         for item in included
         for image_id in item["image_ids"]
     )
+    report_shape = _report_shape(evidence)
+    usable_image_ids = _usable_image_ids(evidence, images_by_id=images_by_id)
+    visual_evidence_unused = (
+        report_shape["visual_required"]
+        and bool(usable_image_ids)
+        and not used_image_ids
+    )
     report_markdown = _render_report(
         evidence,
         included,
@@ -182,13 +224,16 @@ def synthesize_report(
         sources_by_id=sources_by_id,
         images_by_id=images_by_id,
         generated_at=generated_at,
+        report_shape=report_shape,
+        usable_image_ids=usable_image_ids,
+        visual_evidence_unused=visual_evidence_unused,
     )
     report_path.write_text(report_markdown, encoding="utf-8")
     status = {
         "schema_version": REPORT_STATUS_SCHEMA_VERSION,
         "run_id": evidence.get("run_id", run_dir.name),
         "run_dir": str(run_dir),
-        "status": "completed",
+        "status": "failed_visual_evidence_unused" if visual_evidence_unused else "completed",
         "created_at": generated_at,
         "generated_at": generated_at,
         "report_path": str(report_path),
@@ -210,6 +255,9 @@ def synthesize_report(
             "report": str(report_path),
             "report_status": str(status_path),
         },
+        "report_shape": report_shape,
+        "usable_images": usable_image_ids,
+        "visual_evidence_unused": visual_evidence_unused,
         "external_model_call": False,
     }
     record_stage_trace(
@@ -273,6 +321,8 @@ def _exclusion_reasons(
         reasons.append(_string_value(claim.get("report_exclusion_reason"), "not_report_eligible"))
     if claim.get("promotion_status") == "promotion_rejected":
         reasons.append("promotion_rejected")
+    if _is_boilerplate_claim(claim):
+        reasons.append("boilerplate_noise")
 
     confidence = claim.get("confidence")
     claim_type = claim.get("claim_type")
@@ -306,23 +356,39 @@ def _render_report(
     sources_by_id: Mapping[str, Mapping[str, Any]],
     images_by_id: Mapping[str, Mapping[str, Any]],
     generated_at: str,
+    report_shape: Mapping[str, Any],
+    usable_image_ids: Sequence[str],
+    visual_evidence_unused: bool,
 ) -> str:
     lines: list[str] = []
     title = _string_value(evidence.get("question"), "Codex DeepResearch Report")
+    language = _string_value(report_shape.get("language"), "en")
+    is_ko = language == "ko"
     lines.append(f"# {title}")
     lines.append("")
-    lines.append(f"Generated: {generated_at}")
-    lines.append(f"Run ID: `{_string_value(evidence.get('run_id'), 'unknown')}`")
+    lines.append(f"{'생성 시각' if is_ko else 'Generated'}: {generated_at}")
+    lines.append(f"{'실행 ID' if is_ko else 'Run ID'}: `{_string_value(evidence.get('run_id'), 'unknown')}`")
     lines.append("")
-    lines.append("## Answer")
-    if included:
-        lines.append(
-            f"{len(included)} supported claim(s) met the report evidence requirements."
-        )
-    else:
-        lines.append("No supported claims met the report evidence requirements.")
+    lines.append(f"## {'결론' if is_ko else 'Answer'}")
+    lines.extend(_answer_lines(included, report_shape=report_shape, sources_by_id=sources_by_id))
+    if visual_evidence_unused:
+        if is_ko:
+            lines.append(
+                f"시각 자료가 필요한 질문이고 사용 가능한 이미지 근거({', '.join(_image_refs(usable_image_ids))})가 있지만 "
+                "`report_status.used_images`가 비어 있어 이 보고서는 통과 상태가 아닙니다."
+            )
+        else:
+            lines.append(
+                f"This visual-required report is not passing because usable image evidence "
+                f"({', '.join(_image_refs(usable_image_ids))}) exists but `report_status.used_images` is empty."
+            )
     lines.append("")
-    lines.append("## Evidence")
+
+    if report_shape.get("comparison"):
+        lines.extend(_comparison_table(included, report_shape=report_shape, sources_by_id=sources_by_id))
+        lines.append("")
+
+    lines.append(f"## {'확인된 내용' if is_ko else 'Confirmed Findings'}")
     if included:
         for index, item in enumerate(included, start=1):
             claim = item["claim"]
@@ -336,7 +402,7 @@ def _render_report(
                 sources_by_id=sources_by_id,
             )
             lines.append(
-                f"{index}. {claim_text} "
+                f"{index}. {_evidence_text_for_report(claim_text, language=language)} "
                 f"({confidence} confidence; claim `{item['claim_id']}`; evidence {evidence_refs})."
             )
             for quote in item["quote_spans"]:
@@ -349,13 +415,31 @@ def _render_report(
                 lines.append(f"   - Quote [{source_id}]: \"{quote_text}\" ({location})")
             caveats = _string_list(claim.get("caveats"))
             if caveats:
-                lines.append(f"   - Caveats: {'; '.join(caveats)}")
+                lines.append(f"   - {'주의점' if is_ko else 'Caveats'}: {'; '.join(caveats)}")
     else:
-        lines.append("- No confirmed findings.")
+        lines.append(f"- {'확인된 내용이 없습니다.' if is_ko else 'No confirmed findings.'}")
+    lines.append("")
+
+    conflict_records = _conflict_records(excluded)
+    lines.append(f"## {'상충되는 근거' if is_ko else 'Conflicts'}")
+    if conflict_records:
+        for item in conflict_records:
+            lines.append(_excluded_line(item, sources_by_id=sources_by_id, prefix="상충" if is_ko else "Conflict"))
+    else:
+        lines.append(f"- {'상충되는 근거가 확인되지 않았습니다.' if is_ko else 'No conflicts recorded.'}")
+    lines.append("")
+
+    caveat_records = _caveat_records(included, excluded, language=language)
+    lines.append(f"## {'주의점과 남은 gap' if is_ko else 'Caveats And Gaps'}")
+    if caveat_records:
+        for record in caveat_records:
+            lines.append(record)
+    else:
+        lines.append(f"- {'확인된 주의점이나 남은 gap이 없습니다.' if is_ko else 'No caveats or gaps recorded.'}")
     lines.append("")
 
     if any(item["image_ids"] for item in included):
-        lines.append("## Visual Findings")
+        lines.append(f"## {'시각 근거' if is_ko else 'Visual Findings'}")
         for item in included:
             if not item["image_ids"]:
                 continue
@@ -377,7 +461,7 @@ def _render_report(
                 )
         lines.append("")
 
-        lines.append("## Image Appendix")
+        lines.append(f"## {'이미지 부록' if is_ko else 'Image Appendix'}")
         for image_id in _ordered_unique(image_id for item in included for image_id in item["image_ids"]):
             image = images_by_id.get(image_id, {})
             source_id = _string_value(image.get("source_id"), "unknown")
@@ -396,7 +480,7 @@ def _render_report(
                 lines.append(f"  - Observations: {_truncate('; '.join(observations), 220)}")
         lines.append("")
 
-    lines.append("## Citation And Evidence Mapping")
+    lines.append(f"## {'인용 및 근거 매핑' if is_ko else 'Citation And Evidence Mapping'}")
     if included:
         for item in included:
             claim = item["claim"]
@@ -409,9 +493,9 @@ def _render_report(
             if item["image_ids"]:
                 lines.append(f"  - Images: {', '.join(_image_refs(item['image_ids']))}")
     else:
-        lines.append("- No reportable claim mappings.")
+        lines.append(f"- {'보고 가능한 claim 매핑이 없습니다.' if is_ko else 'No reportable claim mappings.'}")
     lines.append("")
-    lines.append("## Sources")
+    lines.append(f"## {'출처' if is_ko else 'Sources'}")
     if any(item["source_ids"] for item in included):
         for source_id in _ordered_unique(source_id for item in included for source_id in item["source_ids"]):
             source = sources_by_id.get(source_id, {})
@@ -420,9 +504,9 @@ def _render_report(
             accessed_at = _string_value(source.get("accessed_at"), "unknown")
             lines.append(f"- [{source_id}] {title} - {url} (accessed {accessed_at})")
     else:
-        lines.append("- No sources cited.")
+        lines.append(f"- {'인용된 출처가 없습니다.' if is_ko else 'No sources cited.'}")
     lines.append("")
-    lines.append("## Excluded Or Caveated Evidence")
+    lines.append(f"## {'제외 또는 낮은 신뢰도 근거' if is_ko else 'Excluded Or Caveated Evidence'}")
     excluded_records = [
         item
         for item in excluded
@@ -431,18 +515,351 @@ def _render_report(
     ]
     if excluded_records:
         for item in excluded_records:
-            claim = item["claim"]
-            reasons = ", ".join(item["exclusion_reasons"]) or "not_report_eligible"
-            text = _claim_text_for_report(
-                claim,
-                item["source_ids"],
-                sources_by_id=sources_by_id,
-            )
-            lines.append(f"- Claim `{item['claim_id']}` excluded: {reasons}. {text}")
+            lines.append(_excluded_line(item, sources_by_id=sources_by_id, prefix="제외" if is_ko else "Claim"))
     else:
-        lines.append("- No excluded claims recorded.")
+        lines.append(f"- {'제외된 claim이 없습니다.' if is_ko else 'No excluded claims recorded.'}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _report_shape(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    question = _string_value(evidence.get("question"), "")
+    language = _report_language(question)
+    lower_question = f" {question.lower()} "
+    comparison = any(keyword in lower_question for keyword in COMPARISON_KEYWORDS)
+    recommendation = any(keyword in lower_question for keyword in RECOMMENDATION_KEYWORDS)
+    return {
+        "language": language,
+        "comparison": comparison,
+        "recommendation": recommendation,
+        "gap_requested": any(keyword in lower_question for keyword in {"gap", "gaps", "제한", "한계", "남은"}),
+        "visual_required": _visual_required(evidence),
+        "criteria": _comparison_criteria(question, language=language),
+    }
+
+
+def _report_language(question: str) -> str:
+    lower_question = question.lower()
+    if "in english" in lower_question or "english report" in lower_question or "영어로" in question:
+        return "en"
+    if "한국어" in question or "한글" in question or any("\uac00" <= char <= "\ud7a3" for char in question):
+        return "ko"
+    return "en"
+
+
+def _visual_required(evidence: Mapping[str, Any]) -> bool:
+    for route in _mapping_records(evidence.get("routing")):
+        if route.get("modality") == "visual_required":
+            return True
+    for source in _mapping_records(evidence.get("sources")):
+        if source.get("route") == "visual_required":
+            return True
+    for claim in _mapping_records(evidence.get("claims")):
+        if claim.get("verification_route") == "visual_required":
+            return True
+    return False
+
+
+def _comparison_criteria(question: str, *, language: str) -> list[str]:
+    criteria: list[str] = []
+    if language == "ko":
+        for phrase in ("자동화 범위", "제한", "남은 gap", "근거", "도입 판단"):
+            if phrase in question:
+                criteria.append(phrase)
+        return criteria or ["비교 기준", "근거", "주의점"]
+    lower_question = question.lower()
+    for phrase in ("automation scope", "limitations", "remaining gaps", "evidence", "adoption fit"):
+        if phrase in lower_question:
+            criteria.append(phrase)
+    return criteria or ["criterion", "finding", "caveat"]
+
+
+def _answer_lines(
+    included: Sequence[Mapping[str, Any]],
+    *,
+    report_shape: Mapping[str, Any],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    is_ko = report_shape.get("language") == "ko"
+    if not included:
+        return [
+            "직접 답변: 보고 요건을 충족한 확인 근거가 없어 결론을 내릴 수 없습니다."
+            if is_ko
+            else "Direct answer: No supported claims met the report evidence requirements."
+        ]
+
+    first = included[0]
+    first_refs = ", ".join(_citation_refs(first["source_ids"]) + _image_refs(first["image_ids"])) or "근거 없음"
+    if report_shape.get("recommendation"):
+        if is_ko:
+            return [
+                f"직접 답변: 현재 확인된 근거 {first_refs} 기준으로 판단했습니다. "
+                "아래 확인된 내용, 상충 근거, 주의점과 남은 gap을 함께 검토해야 합니다."
+            ]
+        first_text = _claim_text_for_report(
+            first["claim"],
+            first["source_ids"],
+            sources_by_id=sources_by_id,
+        )
+        return [f"Direct answer: Based on the verified evidence in this run, {first_text}"]
+    if report_shape.get("comparison"):
+        if is_ko:
+            return [f"직접 답변: 비교 질문에 대해 {len(included)}개의 확인된 근거를 기준별로 정리했습니다."]
+        return [f"Direct answer: The comparison below is based on {len(included)} confirmed finding(s)."]
+    if is_ko:
+        return [f"직접 답변: {len(included)}개의 확인된 근거가 보고 요건을 충족했습니다."]
+    return [f"Direct answer: {len(included)} supported claim(s) met the report evidence requirements."]
+
+
+def _evidence_text_for_report(value: str, *, language: str) -> str:
+    if language != "ko" or not _mostly_ascii(value):
+        return value
+    return f"원문 근거: {value}"
+
+
+def _mostly_ascii(value: str) -> bool:
+    letters = [char for char in value if char.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = [char for char in letters if char.isascii()]
+    return len(ascii_letters) / len(letters) >= 0.8
+
+
+def _comparison_table(
+    included: Sequence[Mapping[str, Any]],
+    *,
+    report_shape: Mapping[str, Any],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    is_ko = report_shape.get("language") == "ko"
+    if is_ko:
+        lines = ["## 비교표", "| 기준 | 확인된 내용 | 근거 | 주의점 |", "| --- | --- | --- | --- |"]
+    else:
+        lines = ["## Comparison Table", "| Criterion | Finding | Evidence | Caveats |", "| --- | --- | --- | --- |"]
+    if not included:
+        empty = "확인된 비교 근거 없음" if is_ko else "No confirmed comparison evidence"
+        lines.append(f"| {empty} | - | - | - |")
+        return lines
+
+    for index, item in enumerate(included, start=1):
+        claim = item["claim"]
+        claim_text = _claim_text_for_report(
+            claim,
+            item["source_ids"],
+            sources_by_id=sources_by_id,
+        )
+        claim_text = _evidence_text_for_report(
+            claim_text,
+            language=_string_value(report_shape.get("language"), "en"),
+        )
+        criterion = _criterion_for_claim(
+            claim_text,
+            index=index,
+            criteria=_string_list(report_shape.get("criteria")),
+            language=_string_value(report_shape.get("language"), "en"),
+        )
+        evidence_refs = ", ".join(_citation_refs(item["source_ids"]) + _image_refs(item["image_ids"])) or "-"
+        caveats = "; ".join(_string_list(claim.get("caveats"))) or ("없음" if is_ko else "None recorded")
+        lines.append(
+            "| "
+            + " | ".join(
+                _table_cell(value)
+                for value in (criterion, claim_text, evidence_refs, caveats)
+            )
+            + " |"
+        )
+    return lines
+
+
+def _criterion_for_claim(
+    claim_text: str,
+    *,
+    index: int,
+    criteria: Sequence[str],
+    language: str,
+) -> str:
+    lower_text = claim_text.lower()
+    if language == "ko":
+        if "자동" in claim_text or "범위" in claim_text:
+            return "자동화 범위"
+        if "제한" in claim_text or "한계" in claim_text:
+            return "제한"
+        if "gap" in lower_text or "남은" in claim_text:
+            return "남은 gap"
+        if criteria:
+            return criteria[(index - 1) % len(criteria)]
+        return f"기준 {index}"
+    if "automation" in lower_text or "scope" in lower_text:
+        return "Automation scope"
+    if "limit" in lower_text or "constraint" in lower_text:
+        return "Limitations"
+    if "gap" in lower_text or "missing" in lower_text:
+        return "Remaining gaps"
+    if "adopt" in lower_text or "production" in lower_text:
+        return "Adoption fit"
+    if criteria:
+        return criteria[(index - 1) % len(criteria)].title()
+    return f"Criterion {index}"
+
+
+def _conflict_records(excluded: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [
+        item
+        for item in excluded
+        if item["claim"].get("verification_status") in {"refuted", "disputed"}
+    ]
+
+
+def _caveat_records(
+    included: Sequence[Mapping[str, Any]],
+    excluded: Sequence[Mapping[str, Any]],
+    *,
+    language: str,
+) -> list[str]:
+    is_ko = language == "ko"
+    records: list[str] = []
+    for item in included:
+        caveats = _string_list(item["claim"].get("caveats"))
+        for caveat in caveats:
+            label = "주의점" if is_ko else "caveat"
+            records.append(f"- Claim `{item['claim_id']}` {label}: {caveat}")
+    for item in excluded:
+        reasons = set(item["exclusion_reasons"])
+        verification_status = item["claim"].get("verification_status")
+        if verification_status in {"insufficient_evidence", "needs_visual_evidence", "unverified"} or reasons.intersection(
+            {"missing_quote_source", "missing_image_evidence", "missing_resolved_evidence"}
+        ):
+            label = "gap" if is_ko else "gap"
+            records.append(f"- Claim `{item['claim_id']}` {label}: {', '.join(item['exclusion_reasons']) or verification_status}.")
+    return records
+
+
+def _excluded_line(
+    item: Mapping[str, Any],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+    prefix: str,
+) -> str:
+    claim = item["claim"]
+    reasons = ", ".join(item["exclusion_reasons"]) or "not_report_eligible"
+    text = _claim_text_for_report(
+        claim,
+        item["source_ids"],
+        sources_by_id=sources_by_id,
+    )
+    if prefix == "제외":
+        text = _evidence_text_for_report(text, language="ko")
+        return f"- Claim `{item['claim_id']}` 제외: {reasons}. {text}"
+    if prefix == "상충":
+        text = _evidence_text_for_report(text, language="ko")
+        return f"- Claim `{item['claim_id']}` 상충: {reasons}. {text}"
+    if prefix == "Conflict":
+        return f"- Claim `{item['claim_id']}` conflict: {reasons}. {text}"
+    return f"- Claim `{item['claim_id']}` excluded: {reasons}. {text}"
+
+
+def _usable_image_ids(
+    evidence: Mapping[str, Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    usable: list[str] = []
+    for claim in _mapping_records(evidence.get("claims")):
+        for image_id in _string_list(claim.get("supporting_images")):
+            image = images_by_id.get(image_id)
+            if not isinstance(image, Mapping):
+                continue
+            if _image_policy_blocks(image, claim=claim):
+                continue
+            if _has_visual_content(image):
+                usable.append(image_id)
+    return _ordered_unique(usable)
+
+
+def _has_visual_content(image: Mapping[str, Any]) -> bool:
+    if _string_value(image.get("ocr_text"), "").strip():
+        return True
+    return bool(_string_list(image.get("observations")) or _string_list(image.get("inferences")))
+
+
+def _is_boilerplate_claim(claim: Mapping[str, Any]) -> bool:
+    text = _string_value(claim.get("text"), "").strip()
+    if not text:
+        return True
+    normalized = " ".join(text.lower().split())
+    if normalized in BOILERPLATE_PATTERNS:
+        return True
+
+    tokens = [
+        word
+        for word in (
+            raw.strip(".,:;!?()[]{}\"'").lower()
+            for raw in normalized.replace("/", " ").replace("|", " ").split()
+        )
+        if word
+    ]
+    if len(tokens) > 10:
+        return False
+
+    if _is_label_only_navigation_text(tokens):
+        return True
+
+    boilerplate_token_count = sum(
+        1
+        for token in tokens
+        if token in {"about", "accept", "cookie", "cookies", "home", "login", "menu", "navigation", "privacy", "search", "sign", "skip", "subscribe", "terms"}
+    )
+    if tokens and boilerplate_token_count / len(tokens) >= 0.5:
+        return True
+
+    if _looks_like_navigation_list(normalized):
+        return True
+    return False
+
+
+def _looks_like_navigation_list(value: str) -> bool:
+    separators = value.count("|") + value.count(" / ") + value.count(" · ")
+    if separators < 2:
+        return False
+    return any(pattern in value for pattern in BOILERPLATE_PATTERNS)
+
+
+def _is_label_only_navigation_text(tokens: Sequence[str]) -> bool:
+    footer_label_tokens = {
+        "about",
+        "accept",
+        "contact",
+        "cookie",
+        "cookies",
+        "home",
+        "log",
+        "login",
+        "menu",
+        "navigation",
+        "policy",
+        "privacy",
+        "search",
+        "service",
+        "sign",
+        "skip",
+        "subscribe",
+        "terms",
+    }
+    filler_tokens = {"and", "in", "of", "to", "us"}
+    meaningful_tokens = [token for token in tokens if token not in filler_tokens]
+    if len(meaningful_tokens) < 2:
+        return False
+    return all(token in footer_label_tokens for token in meaningful_tokens)
+
+
+def _mapping_records(value: Any) -> Iterable[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip() or "-"
 
 
 def _status_claim_record(item: Mapping[str, Any], *, include_evidence: bool) -> dict[str, Any]:
