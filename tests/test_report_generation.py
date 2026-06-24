@@ -100,6 +100,7 @@ class ReportGenerationTests(unittest.TestCase):
         review_status: str = "auto_reviewed",
         promotion_status: str = "eligible",
         confidence: str = "high",
+        caveats: list[str] | None = None,
         include_in_final_report: bool | None = True,
     ) -> dict:
         claim = {
@@ -122,7 +123,7 @@ class ReportGenerationTests(unittest.TestCase):
             "review_status": review_status,
             "promotion_status": promotion_status,
             "confidence": confidence,
-            "caveats": [],
+            "caveats": caveats if caveats is not None else [],
         }
         if include_in_final_report is not None:
             claim["include_in_final_report"] = include_in_final_report
@@ -226,10 +227,12 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(status["claims_included"], 1)
         self.assertEqual(status["claims_excluded"], 3)
         self.assertIn("Supported claim remains.", report)
-        evidence_section = report.split("## Excluded Or Caveated Evidence")[0]
+        evidence_section = report.split("## Conflicts")[0]
         self.assertNotIn("Unsupported claim must not be a finding.", evidence_section)
         self.assertNotIn("Refuted claim must not be a finding.", evidence_section)
         self.assertNotIn("Policy-blocked claim must not be a finding.", evidence_section)
+        self.assertIn("## Conflicts", report)
+        self.assertIn("claim_refuted", report)
         excluded_ids = {item["claim_id"] for item in status["excluded_claims"]}
         self.assertEqual(
             excluded_ids,
@@ -398,6 +401,182 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(first_report, second_report)
         self.assertEqual(first_status, second_status)
         self.assertIn("2026-06-22T00:00:00Z", first_report.decode("utf-8"))
+
+    def test_korean_comparison_report_uses_korean_table_and_gap_sections(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = (
+            "Claude Code deep-research식 20~100개 병렬 조사 경험을 Codex plugin에서 구현하려면 "
+            "현재 가능한 자동화 범위와 제한을 표로 비교하고, 남은 gap을 알려줘."
+        )
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_automation_scope",
+                text="Codex plugin은 준비, 병렬 오케스트레이션, 검증, 합성 단계를 자동화할 수 있다.",
+                quote_spans=[
+                    {
+                        "source_id": "src_001",
+                        "quote": "병렬 오케스트레이션과 합성 단계가 실행된다.",
+                        "location": "fixture paragraph 1",
+                    }
+                ],
+            ),
+            self.claim(
+                claim_id="claim_limitations",
+                text="제한은 Codex 실행 신뢰 디렉터리, 인증, 비용 상한, child session 정리에 있다.",
+                caveats=["실사용 codex-exec 검증은 별도 gate가 필요하다."],
+                quote_spans=[
+                    {
+                        "source_id": "src_001",
+                        "quote": "신뢰 디렉터리와 비용 상한은 제한으로 남는다.",
+                        "location": "fixture paragraph 2",
+                    }
+                ],
+            ),
+            self.claim(
+                claim_id="claim_remaining_gap",
+                text="남은 gap은 fixture 성공과 real codex-exec 성공을 구분해 검증하는 것이다.",
+                quote_spans=[
+                    {
+                        "source_id": "src_001",
+                        "quote": "fixture 성공은 real E2E acceptance를 대체하지 않는다.",
+                        "location": "fixture paragraph 3",
+                    }
+                ],
+            ),
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["report_shape"]["language"], "ko")
+        self.assertTrue(status["report_shape"]["comparison"])
+        self.assertIn("## 결론", report)
+        self.assertIn("직접 답변:", report)
+        self.assertIn("## 비교표", report)
+        self.assertIn("| 기준 | 확인된 내용 | 근거 | 주의점 |", report)
+        self.assertIn("| 자동화 범위 |", report)
+        self.assertIn("| 제한 |", report)
+        self.assertIn("| 남은 gap |", report)
+        self.assertIn("## 확인된 내용", report)
+        self.assertIn("## 상충되는 근거", report)
+        self.assertIn("## 주의점과 남은 gap", report)
+        self.assertIn("## 제외 또는 낮은 신뢰도 근거", report)
+
+    def test_technical_adoption_report_starts_with_direct_answer_and_separates_evidence(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = (
+            "Python free-threading이 현재 프로덕션 도입에 적합한지 공식 문서와 "
+            "주요 패키지 호환성 근거로 판단해줘."
+        )
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_adoption_fit",
+                text="Python free-threading is not yet a default production adoption choice for all workloads.",
+                caveats=["Package compatibility must be checked per deployment."],
+            ),
+            self.claim(
+                claim_id="claim_package_gap",
+                text="Some package compatibility evidence remains incomplete.",
+                verification_status="insufficient_evidence",
+                review_status="needs_more_evidence",
+                promotion_status="not_eligible",
+                confidence="low",
+                include_in_final_report=False,
+            ),
+            self.claim(
+                claim_id="claim_refuted_package",
+                text="All Python packages are already free-threading safe.",
+                verification_status="refuted",
+                promotion_status="not_eligible",
+                confidence="low",
+                include_in_final_report=False,
+            ),
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["report_shape"]["language"], "ko")
+        answer = report.split("## 결론", 1)[1].split("## 확인된 내용", 1)[0]
+        self.assertIn("직접 답변:", answer)
+        self.assertIn("not yet a default production adoption choice", answer)
+        self.assertIn("## 확인된 내용", report)
+        self.assertIn("## 상충되는 근거", report)
+        self.assertIn("claim_refuted_package", report)
+        self.assertIn("## 주의점과 남은 gap", report)
+        self.assertIn("claim_package_gap", report)
+        self.assertIn("## 제외 또는 낮은 신뢰도 근거", report)
+
+    def test_boilerplate_supported_claim_is_downranked_from_confirmed_findings(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_boilerplate",
+                text="Skip to content navigation menu sign in privacy policy.",
+            ),
+            self.claim(
+                claim_id="claim_real_finding",
+                text="A substantive report finding remains visible.",
+            ),
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["claims_included"], 1)
+        self.assertEqual(status["excluded_claims"][0]["claim_id"], "claim_boilerplate")
+        self.assertIn("boilerplate_noise", status["excluded_claims"][0]["exclusion_reasons"])
+        confirmed = report.split("## Confirmed Findings", 1)[1].split("## Conflicts", 1)[0]
+        self.assertNotIn("Skip to content", confirmed)
+        self.assertIn("A substantive report finding remains visible.", confirmed)
+
+    def test_visual_required_report_fails_when_usable_image_evidence_is_unused(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["routing"] = [
+            {
+                "angle_id": "angle_visual",
+                "question": "Visual evidence required",
+                "modality": "visual_required",
+                "reason": "image evidence is necessary",
+                "search_queries": ["visual evidence"],
+                "visual_tasks": ["screenshot_compare"],
+                "max_images": 2,
+            }
+        ]
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_text_only",
+                text="A visual claim referenced available image evidence but did not link usable visual support.",
+                claim_type="mixed",
+                supporting_images=["img_001"],
+                verification_status="insufficient_evidence",
+                review_status="needs_more_evidence",
+                promotion_status="not_eligible",
+                confidence="low",
+                include_in_final_report=False,
+            )
+        ]
+        evidence["claims"][0]["visual_supports"] = [self.visual_support()]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["status"], "failed_visual_evidence_unused")
+        self.assertTrue(status["visual_evidence_unused"])
+        self.assertEqual(status["usable_images"], ["img_001"])
+        self.assertEqual(status["used_images"], [])
+        self.assertIn("visual-required report is not passing", report)
 
 
 if __name__ == "__main__":
