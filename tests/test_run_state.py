@@ -868,6 +868,122 @@ class RunStateTests(unittest.TestCase):
         self.assertGreaterEqual(len(final_stages["fetch_claims"]["history"]), 4)
         self.assertGreaterEqual(len(final_stages["ingest_vision"]["history"]), 4)
 
+    def test_fetch_claims_changed_artifact_resets_dependents_not_vision(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="visual text changed artifact state regression",
+            runs_dir=runs_dir,
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        source_path = run_dir / "sources" / "visual-text-source.html"
+        source_path.parent.mkdir(exist_ok=True)
+        first_source_html = b"""
+            <html>
+              <body>
+                <img src="/media/product.png" alt="Product detail" width="640" height="360">
+                <p>The first source body extracts a source linked claim.</p>
+              </body>
+            </html>
+            """
+        source_path.write_text(first_source_html.decode("utf-8"), encoding="utf-8")
+        self.write_search_results(
+            run_dir,
+            [
+                self.base_search_result(
+                    url="https://example.com/visual-text-source",
+                    title="Visual Text Source",
+                    route="visual_required",
+                )
+            ],
+        )
+
+        ingest = ingest_run(run=run_dir)
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["local_artifact_path"] = "sources/visual-text-source.html"
+        first_hash = "sha256:" + hashlib.sha256(first_source_html).hexdigest()
+        evidence["sources"][0]["input_content_sha256"] = first_hash
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        fetch_queue_path = run_dir / "fetch_queue.json"
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["input_content_sha256"] = first_hash
+        fetch_queue_path.write_text(json.dumps(fetch_queue), encoding="utf-8")
+
+        visual = acquire_visual_candidates(run=run_dir, screenshot_modes=("all",))
+        vision = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(
+                first_source_html,
+                url="https://example.com/visual-text-source",
+            ),
+        ):
+            fetch = fetch_claims(run=run_dir)
+        guardrails = enforce_guardrails(run=run_dir)
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+        completed = self.run_status_payload(runs_dir, prepared["run_id"])
+
+        self.assertEqual(ingest["status"], "ingested")
+        self.assertEqual(visual["status"], "visual_candidates_collected")
+        self.assertEqual(vision["status"], "visual_evidence_ingested")
+        self.assertEqual(fetch["status"], "completed")
+        self.assertEqual(guardrails["status"], "completed")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(completed["status"], "completed")
+
+        changed_source_html = b"""
+            <html>
+              <body>
+                <img src="/media/product.png" alt="Product detail" width="640" height="360">
+                <p>The changed source body extracts a different source linked claim.</p>
+              </body>
+            </html>
+            """
+        source_path.write_text(changed_source_html.decode("utf-8"), encoding="utf-8")
+        changed_hash = "sha256:" + hashlib.sha256(changed_source_html).hexdigest()
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["input_content_sha256"] = changed_hash
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["input_content_sha256"] = changed_hash
+        fetch_queue_path.write_text(json.dumps(fetch_queue), encoding="utf-8")
+
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(
+                changed_source_html,
+                url="https://example.com/visual-text-source",
+            ),
+        ):
+            changed_fetch = fetch_claims(run=run_dir)
+        state = self.run_status_payload(runs_dir, prepared["run_id"])
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+
+        self.assertEqual(changed_fetch["status"], "completed")
+        self.assertEqual(changed_fetch["sources_fetched"], 1)
+        self.assertEqual(changed_fetch["sources_reused"], 0)
+        self.assertEqual(state["status"], "in_progress")
+        self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
+        self.assertFalse(state["next_stage_retryable"])
+        self.assertEqual(stages["fetch_claims"]["status"], "completed")
+        self.assertEqual(stages["ingest_vision"]["status"], "completed")
+        self.assertNotIn("stale_reset", stages["ingest_vision"])
+        for stage in ("enforce_guardrails", "verify_claims", "synthesize"):
+            self.assertEqual(stages[stage]["status"], "pending")
+            self.assertEqual(
+                stages[stage]["stale_reset"]["upstream_stage"],
+                "fetch_claims",
+            )
+            self.assertEqual(
+                stages[stage]["stale_terminal_status"]["status"],
+                "completed",
+            )
+
     def test_completed_stage_rerun_is_retryable_before_trace_completion(self) -> None:
         prepared = prepare_run(
             question="state machine interrupted completed rerun",
