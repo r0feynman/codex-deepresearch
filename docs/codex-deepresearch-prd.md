@@ -1638,15 +1638,18 @@ Output:
 
 - docs and validation output that identify adapter type and evidence source
 - real E2E checklist distinct from fixture merge checks
-- `parallel_orchestration_status.json` and `merge_status.json` include an `evidence_source` object with `type`, `adapter`, `accepted_shards`, `fixture_only`, `manual_handoff`, `real_child_execution`, and `real_use_e2e_eligible`.
+- `parallel_orchestration_status.json` and `merge_status.json` include an `evidence_source` object with `type`, `adapter`, `accepted_shards`, `fixture_only`, `manual_handoff`, `attempted_real_child_execution`, `real_child_execution`, and `real_use_e2e_eligible`.
+- Zero accepted `codex-exec` shards are labeled `evidence_source.type=failed_real_child_execution`, not `real_child_execution`.
+- Failed and retryable child task diagnostics are preserved in `merge_status.json.failed_tasks`, `failure_counts`, and `diagnostics`.
 - `manual_ingest_status.json` includes `evidence_source.type=manual_handoff`.
 
 Real-use E2E checklist:
 
 - Run `orchestrate-parallel --adapter codex-exec --no-degrade` against a prepared real-use run when Codex auth/runtime is available.
 - Require `adapter=codex-exec`, `evidence_source.type=real_child_execution`, and `accepted_shards > 0`.
+- Require `--no-degrade` zero-shard real child runs to return `ok=false` and `status=failed_parallel_no_accepted_shards`.
 - Treat `adapter=fixture`, `evidence_source.fixture_only=true`, or deterministic `example.com` fixture evidence as fixture-only validation, never as real-use E2E success.
-- If the run degrades or fails, report `status`, `parallel_degraded`, `needs_serial_handoff`, `degraded_reason`, `evidence_source`, and rejected or blocked task diagnostics from `parallel_orchestration_status.json` and `merge_status.json`.
+- If the run degrades or fails, report `status`, `ok`, `parallel_degraded`, `needs_serial_handoff`, `degraded_reason`, `evidence_source`, `failure_counts`, `diagnostics`, and failed/rejected/blocked task diagnostics from `parallel_orchestration_status.json` and `merge_status.json`.
 - Interpret the result against the PRD Parallel status matrix and Report quality gate before claiming Phase 2 readiness.
 
 Acceptance tests:
@@ -1654,6 +1657,7 @@ Acceptance tests:
 - fixture tests remain documented as no-network merge mechanics tests.
 - real-use E2E requires `adapter=codex-exec` and `accepted_shards > 0` unless the run explicitly degrades or fails with actionable diagnostics.
 - validation output highlights whether evidence came from fixture, manual handoff, or real child execution.
+- fake-available `codex-exec --no-degrade` child failures with `accepted_shards=0` fail unambiguously and preserve task-level diagnostics.
 - fixture success cannot satisfy Phase 2 real-use `codex-exec` acceptance.
 
 ### Phase 3 WBS: Public Beta
