@@ -16,6 +16,14 @@ from urllib.parse import urljoin, urlparse
 from .cache_keys import normalize_url
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, SEARCH_ROUTES, validate_artifacts
 from .search_handoff import resolve_run_dir
+from .visual_artifacts import (
+    IMAGE_FETCH_STATUS_FILENAME,
+    VISUAL_ARTIFACT_SCHEMA_VERSION,
+    VISUAL_PROVIDER_STATUS_FILENAME,
+    VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+    VISUAL_SEARCH_PLAN_FILENAME,
+    validate_visual_artifacts,
+)
 
 
 VISUAL_ACQUISITION_SCHEMA_VERSION = "codex-deepresearch.visual-acquisition.v0"
@@ -44,6 +52,7 @@ class _VisualContext:
     run_dir: Path
     evidence: Mapping[str, Any]
     routes: tuple[Mapping[str, Any], ...]
+    visual_task_by_angle: Mapping[str, Mapping[str, Any]]
     source_by_id: Mapping[str, Mapping[str, Any]]
     created_at: str
     screenshot_modes: tuple[str, ...]
@@ -80,7 +89,8 @@ def acquire_visual_candidates(
         raise VisualAcquisitionError(f"missing evidence.json in run directory: {run_dir}")
 
     evidence = _read_json(evidence_path)
-    routes = _visual_routes(evidence)
+    visual_task_by_angle = _visual_task_by_angle(run_dir)
+    routes = _visual_routes(evidence, visual_task_by_angle=visual_task_by_angle)
     now = _utc_now()
     provider_names = _normalize_provider_names(providers)
     normalized_modes = _normalize_screenshot_modes(screenshot_modes)
@@ -101,6 +111,7 @@ def acquire_visual_candidates(
         run_dir=run_dir,
         evidence=evidence,
         routes=tuple(routes),
+        visual_task_by_angle=visual_task_by_angle,
         source_by_id=source_by_id,
         created_at=now,
         screenshot_modes=normalized_modes,
@@ -128,9 +139,41 @@ def acquire_visual_candidates(
         created_at=now,
     )
     visual_candidates_path = run_dir / "visual_candidates.jsonl"
+    visual_search_plan_path = run_dir / VISUAL_SEARCH_PLAN_FILENAME
+    image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
+    image_fetch_records = _image_fetch_records_from_candidates(candidate_records)
+    visual_search_plan = _visual_search_plan(
+        run_dir=run_dir,
+        evidence=evidence,
+        routes=routes,
+        provider_names=provider_names,
+        created_at=now,
+        selected_observations=len(selected),
+    )
+    visual_provider_status = _visual_provider_status(
+        run_dir=run_dir,
+        status="fixture_visual_provider",
+        ok=True,
+        terminal=False,
+        metric_classification="fixture_only_not_release_eligible",
+        provider_names=provider_names,
+        provider_statuses=provider_statuses,
+        candidate_records=candidate_records,
+        image_fetch_records=image_fetch_records,
+        observations=selected,
+        created_at=now,
+        actionable_cause=(
+            "deterministic fixture/manual visual providers validate mechanics; "
+            "records are excluded from real automatic visual release counts"
+        ),
+    )
+    _write_json(visual_search_plan_path, visual_search_plan)
     _write_jsonl(visual_candidates_path, candidate_records)
+    _write_jsonl(image_fetch_status_path, image_fetch_records)
     _write_jsonl(visual_observations_path, selected)
+    _write_json(visual_provider_status_path, visual_provider_status)
 
     candidate_counts = _candidate_counts(candidate_records)
     removal_counts = _removal_counts(candidate_records)
@@ -143,7 +186,10 @@ def acquire_visual_candidates(
         "providers": provider_statuses,
         "routes": route_summary,
         "candidate_records_path": "visual_candidates.jsonl",
+        "visual_search_plan_path": VISUAL_SEARCH_PLAN_FILENAME,
+        "image_fetch_status_path": IMAGE_FETCH_STATUS_FILENAME,
         "visual_observations_path": "visual_observations.jsonl",
+        "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
         "candidate_counts": candidate_counts,
         "removal_counts": removal_counts,
         "near_duplicate_groups": near_duplicate_groups,
@@ -172,6 +218,9 @@ def acquire_visual_candidates(
     if isinstance(handoff, dict):
         handoff["visual_observations_path"] = "visual_observations.jsonl"
         handoff["visual_candidates_path"] = "visual_candidates.jsonl"
+        handoff["visual_search_plan_path"] = VISUAL_SEARCH_PLAN_FILENAME
+        handoff["image_fetch_status_path"] = IMAGE_FETCH_STATUS_FILENAME
+        handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
         handoff["visual_status"] = "visual_candidates_collected"
     budget = evidence.get("budget")
     if isinstance(budget, dict):
@@ -181,6 +230,15 @@ def acquire_visual_candidates(
     validation = validate_artifacts(
         evidence_path=evidence_path,
         visual_observations_path=visual_observations_path,
+    )
+    visual_artifact_validation = validate_visual_artifacts(
+        run_dir=run_dir,
+        visual_search_plan_path=visual_search_plan_path,
+        visual_candidates_path=visual_candidates_path,
+        image_fetch_status_path=image_fetch_status_path,
+        visual_observations_path=visual_observations_path,
+        visual_provider_status_path=visual_provider_status_path,
+        evidence_path=None,
     )
     status = _base_status(run_dir, evidence, "visual_candidates_collected", now)
     status.update(
@@ -193,6 +251,7 @@ def acquire_visual_candidates(
             "near_duplicate_groups": near_duplicate_groups,
             "screenshot_capture": screenshot_capture,
             "validation": validation.to_dict(),
+            "visual_artifact_validation": visual_artifact_validation.to_dict(),
             "image_search_invocations": evidence["visual_acquisition"][
                 "image_search_invocations"
             ],
@@ -205,8 +264,11 @@ def acquire_visual_candidates(
             "external_vlm_call": False,
             "artifacts": {
                 "evidence": str(evidence_path),
+                "visual_search_plan": str(visual_search_plan_path),
                 "visual_candidates": str(visual_candidates_path),
+                "image_fetch_status": str(image_fetch_status_path),
                 "visual_observations": str(visual_observations_path),
+                "visual_provider_status": str(visual_provider_status_path),
                 "visual_acquisition_status": str(run_dir / "visual_acquisition_status.json"),
             },
         }
@@ -475,9 +537,27 @@ def _candidate(
     candidate_id = "cand_" + _safe_id(
         f"{provider}_{source.get('id')}_{candidate_class}_{local_artifact_path}"
     )
+    task_id = _string(route.get("task_id")) or f"task_visual_{_safe_id(str(route.get('id') or 'angle_001'))}"
+    provider_kind = _provider_kind(provider)
+    provider_run_id = _string(source.get("run_id")) or _string(route.get("run_id")) or "fixture-local"
     record = {
         "id": candidate_id,
+        "candidate_id": candidate_id,
+        "plan_id": f"plan_{task_id}",
+        "task_id": task_id,
         "provider": provider,
+        "provider_kind": provider_kind,
+        "provider_mode": "fixture",
+        "provider_run_id": provider_run_id,
+        "provider_provenance": {
+            "provider": provider,
+            "provider_kind": provider_kind,
+            "provider_mode": "fixture",
+            "provider_run_id": provider_run_id,
+            "fixture_only": True,
+            "external_network_call": False,
+            "external_vlm_call": False,
+        },
         "source_id": source["id"],
         "source_url": source.get("url"),
         "route": route["modality"],
@@ -503,7 +583,10 @@ def _candidate(
         "ocr_text": ocr_text,
         "ocr_outputs": [{"text": ocr_text, "provider": provider}] if ocr_text else [],
         "policy_flags": [],
+        "policy_decision": "allowed",
         "caveats": [],
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
     }
     if screenshot is not None:
         record["screenshot"] = dict(screenshot)
@@ -532,6 +615,7 @@ def _validate_and_select_candidates(
         record = dict(raw_candidate)
         record["rank"] = index
         record["acquired_at"] = created_at
+        _apply_phase3_candidate_defaults(record, evidence=evidence, run_dir=run_dir)
         if "status" not in record:
             artifact = _materialize_candidate_artifact(run_dir, record)
             record["local_artifact_path"] = artifact.relative_to(run_dir).as_posix()
@@ -653,25 +737,39 @@ def _validate_and_select_candidates(
             record["status"] = "removed"
             record["removal_reasons"] = removal_reasons
             record["analysis_status"] = "skipped"
+            if "budget_pruned" in removal_reasons:
+                record["candidate_status"] = "budget_pruned"
+                record["policy_decision"] = "budget_pruned"
+            else:
+                record["candidate_status"] = "rejected"
             record.setdefault("observations", [])
             record.setdefault("inferences", [])
         elif len(selected) >= max_selected:
             record["status"] = "removed"
             record["removal_reasons"] = ["budget_pruned"]
             record["analysis_status"] = "skipped"
+            record["candidate_status"] = "budget_pruned"
+            record["policy_decision"] = "budget_pruned"
         else:
             record["status"] = "accepted"
+            record["candidate_status"] = "analyzed"
             record["removal_reasons"] = []
             selected.append(_observation_from_candidate(record))
+        record["rejection_reason"] = (
+            record["removal_reasons"][0] if record.get("removal_reasons") else None
+        )
         records.append(_persistable_candidate(record))
 
     return selected, records, list(near_duplicate_groups.values())
 
 
 def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    image_id = "img_" + _safe_id(str(candidate["id"]).removeprefix("cand_"))
+    image_id = _image_id_for_candidate_id(str(candidate["candidate_id"]))
+    fetch_id = _fetch_id_for_candidate_id(str(candidate["candidate_id"]))
     observation = {
         "id": image_id,
+        "observation_id": "obs_" + _safe_id(str(candidate["candidate_id"]).removeprefix("cand_")),
+        "evidence_image_id": image_id,
         "source_id": candidate["source_id"],
         "origin": candidate["origin"],
         "image_url": candidate.get("image_url"),
@@ -703,14 +801,32 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "policy_flags": list(candidate.get("policy_flags", []))
         if isinstance(candidate.get("policy_flags"), list)
         else [],
+        "policy_decision": candidate.get("policy_decision", "allowed"),
         "caveats": list(candidate.get("caveats", []))
         if isinstance(candidate.get("caveats"), list)
         else [],
-        "candidate_id": candidate["id"],
+        "candidate_id": candidate["candidate_id"],
+        "fetch_id": fetch_id,
+        "task_id": candidate.get("task_id"),
         "candidate_class": candidate["candidate_class"],
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
         "visual_provider": candidate["provider"],
+        "provider": candidate["provider"],
+        "provider_kind": candidate.get("provider_kind"),
+        "provider_mode": candidate.get("provider_mode"),
+        "provider_run_id": candidate.get("provider_run_id"),
+        "provider_provenance": dict(candidate.get("provider_provenance", {}))
+        if isinstance(candidate.get("provider_provenance"), Mapping)
+        else {},
+        "model_or_tool": candidate["analysis_provider"],
+        "observation_status": candidate.get("analysis_status", "analyzed"),
+        "confidence": 1.0,
+        "verifier_links": [],
+        "report_links": [],
+        "estimated_cost_usd": candidate.get("estimated_cost_usd", 0.0),
+        "actual_cost_usd": candidate.get("actual_cost_usd", 0.0),
+        "created_at": candidate.get("acquired_at"),
         "visual_validation": dict(candidate.get("validation_checks", {})),
         "source_url": candidate.get("source_url"),
     }
@@ -723,6 +839,280 @@ def _persistable_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     record = dict(candidate)
     record.pop("content_seed", None)
     return record
+
+
+def _apply_phase3_candidate_defaults(
+    record: dict[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+    run_dir: Path,
+) -> None:
+    candidate_id = _string(record.get("candidate_id")) or _string(record.get("id"))
+    if not candidate_id:
+        candidate_id = "cand_" + _safe_id(str(record.get("local_artifact_path") or "visual"))
+        record["id"] = candidate_id
+    record["candidate_id"] = candidate_id
+    record.setdefault("id", candidate_id)
+    task_id = _string(record.get("task_id")) or _task_id_for_angle(record.get("angle_id"))
+    record["task_id"] = task_id
+    record.setdefault("plan_id", f"plan_{task_id}")
+    provider = _string(record.get("provider")) or "local-fixture"
+    provider_kind = _string(record.get("provider_kind")) or _provider_kind(provider)
+    provider_mode = _string(record.get("provider_mode")) or "fixture"
+    provider_run_id = _string(record.get("provider_run_id")) or str(
+        evidence.get("run_id") or run_dir.name
+    )
+    record["provider"] = provider
+    record["provider_kind"] = provider_kind
+    record["provider_mode"] = provider_mode
+    record["provider_run_id"] = provider_run_id
+    if not isinstance(record.get("provider_provenance"), Mapping):
+        record["provider_provenance"] = {
+            "provider": provider,
+            "provider_kind": provider_kind,
+            "provider_mode": provider_mode,
+            "provider_run_id": provider_run_id,
+            "fixture_only": provider_mode != "real",
+            "external_network_call": False,
+            "external_vlm_call": False,
+        }
+    record.setdefault("score", _score_from_rank(int(record.get("rank") or 0)))
+    record.setdefault("candidate_status", "discovered")
+    record.setdefault("policy_decision", "allowed")
+    record.setdefault("policy_flags", [])
+    record.setdefault("rejection_reason", None)
+    record.setdefault("estimated_cost_usd", 0.0)
+    record.setdefault("actual_cost_usd", 0.0)
+
+
+def _image_fetch_records_from_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for candidate in candidates:
+        candidate_id = str(candidate["candidate_id"])
+        status = _fetch_status_for_candidate(candidate)
+        fetched = status == "fetched"
+        records.append(
+            {
+                "fetch_id": _fetch_id_for_candidate_id(candidate_id),
+                "candidate_id": candidate_id,
+                "task_id": candidate.get("task_id"),
+                "angle_id": candidate.get("angle_id"),
+                "source_search_result_id": candidate.get("source_search_result_id"),
+                "provider": candidate.get("provider"),
+                "provider_kind": candidate.get("provider_kind"),
+                "provider_mode": candidate.get("provider_mode"),
+                "provider_run_id": candidate.get("provider_run_id"),
+                "provider_provenance": dict(candidate.get("provider_provenance", {}))
+                if isinstance(candidate.get("provider_provenance"), Mapping)
+                else {},
+                "fetch_status": status,
+                "http_status": None,
+                "mime_type": candidate.get("mime_type") if fetched else None,
+                "byte_size": candidate.get("artifact_size_bytes") if fetched else None,
+                "width": candidate.get("width") if fetched else None,
+                "height": candidate.get("height") if fetched else None,
+                "hash": candidate.get("hash") if fetched else None,
+                "phash": candidate.get("phash") if fetched else None,
+                "local_artifact_path": candidate.get("local_artifact_path") if fetched else None,
+                "evidence_image_id": _image_id_for_candidate_id(candidate_id) if fetched else None,
+                "policy_decision": candidate.get("policy_decision", "allowed"),
+                "policy_flags": list(candidate.get("policy_flags", []))
+                if isinstance(candidate.get("policy_flags"), list)
+                else [],
+                "failure_code": None if fetched else _failure_code(candidate),
+                "estimated_cost_usd": candidate.get("estimated_cost_usd", 0.0),
+                "actual_cost_usd": candidate.get("actual_cost_usd", 0.0),
+            }
+        )
+    return records
+
+
+def _visual_search_plan(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    routes: Sequence[Mapping[str, Any]],
+    provider_names: Sequence[str],
+    created_at: str,
+    selected_observations: int,
+) -> dict[str, Any]:
+    tasks = []
+    for route in routes:
+        task_id = _string(route.get("task_id")) or _task_id_for_angle(route.get("id"))
+        max_images = int(route.get("max_images") or selected_observations or 0)
+        tasks.append(
+            {
+                "plan_id": f"plan_{task_id}",
+                "task_id": task_id,
+                "angle_id": route.get("id"),
+                "route": route.get("modality"),
+                "target_evidence_type": "web_image",
+                "query": str(evidence.get("question") or ""),
+                "providers": list(provider_names),
+                "source_search_result_ids": [],
+                "caps": {
+                    "max_candidates": max(max_images, selected_observations),
+                    "max_fetches": max_images,
+                    "max_vlm_images": max_images,
+                    "max_cost_usd": _budget_cost_cap(evidence),
+                },
+                "policy_constraints": {
+                    "license_policy": "allowed",
+                    "robots_policy": "allowed",
+                    "policy_decision": "allowed",
+                },
+                "estimated_cost_usd": 0.0,
+                "state": "completed",
+            }
+        )
+    return {
+        "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
+        "run_id": str(evidence.get("run_id") or run_dir.name),
+        "created_at": created_at,
+        "tasks": tasks,
+    }
+
+
+def _visual_provider_status(
+    *,
+    run_dir: Path,
+    status: str,
+    ok: bool,
+    terminal: bool,
+    metric_classification: str,
+    provider_names: Sequence[str],
+    provider_statuses: Sequence[Mapping[str, Any]],
+    candidate_records: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+    created_at: str,
+    actionable_cause: str,
+) -> dict[str, Any]:
+    status_by_provider = {
+        str(item.get("provider")): item
+        for item in provider_statuses
+        if isinstance(item.get("provider"), str)
+    }
+    providers = []
+    for provider in provider_names:
+        provider_status = status_by_provider.get(provider, {})
+        provider_candidates = [
+            item for item in candidate_records if item.get("provider") == provider
+        ]
+        provider_fetches = [
+            item
+            for item in image_fetch_records
+            if item.get("provider") == provider and item.get("fetch_status") == "fetched"
+        ]
+        provider_observations = [
+            item for item in observations if item.get("provider") == provider
+        ]
+        invoked = provider_status.get("invoked")
+        providers.append(
+            {
+                "provider": provider,
+                "provider_kind": _provider_kind(provider),
+                "provider_mode": "fixture",
+                "configured": True,
+                "available": True,
+                "blocked_reason": None,
+                "invocations": 0 if invoked is False else 1,
+                "candidates_discovered": len(provider_candidates),
+                "artifacts_fetched": len(provider_fetches),
+                "vlm_images_analyzed": len(provider_observations),
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "last_error": None,
+            }
+        )
+    return {
+        "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "status": status,
+        "ok": ok,
+        "terminal": terminal,
+        "created_at": created_at,
+        "metric_classification": metric_classification,
+        "providers": providers,
+        "diagnostics": {"actionable_cause": actionable_cause},
+        "artifacts": {
+            "visual_search_plan": str(run_dir / VISUAL_SEARCH_PLAN_FILENAME),
+            "visual_candidates": str(run_dir / "visual_candidates.jsonl"),
+            "image_fetch_status": str(run_dir / IMAGE_FETCH_STATUS_FILENAME),
+            "visual_observations": str(run_dir / "visual_observations.jsonl"),
+            "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
+        },
+    }
+
+
+def _provider_kind(provider: str) -> str:
+    if provider == "local-page":
+        return "page_extractor"
+    if provider == "local-image-fixture":
+        return "web_image_search"
+    if provider == "local-screenshot-fixture":
+        return "screenshot"
+    if "screenshot" in provider:
+        return "screenshot"
+    if "pdf" in provider:
+        return "pdf_rasterizer"
+    if "manual" in provider:
+        return "manual"
+    if "fixture" in provider or provider.startswith("local-"):
+        return "fixture"
+    return "visual_acquisition"
+
+
+def _task_id_for_angle(angle_id: Any) -> str:
+    raw = _string(angle_id) or "angle_001"
+    suffix = raw.removeprefix("angle_")
+    return f"task_visual_{suffix}"
+
+
+def _fetch_id_for_candidate_id(candidate_id: str) -> str:
+    return "fetch_" + _safe_id(candidate_id.removeprefix("cand_"))
+
+
+def _image_id_for_candidate_id(candidate_id: str) -> str:
+    return "img_" + _safe_id(candidate_id.removeprefix("cand_"))
+
+
+def _score_from_rank(rank: int) -> float:
+    if rank < 1:
+        return 0.0
+    return round(1.0 / rank, 6)
+
+
+def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
+    if candidate.get("status") == "accepted":
+        return "fetched"
+    reasons = set(_string_list(candidate.get("removal_reasons")))
+    if "budget_pruned" in reasons:
+        return "budget_pruned"
+    if "unsupported_mime_type" in reasons:
+        return "unsupported_mime"
+    if "size_limit_exceeded" in reasons:
+        return "too_large"
+    if reasons & {"duplicate_image_url", "duplicate_content_hash", "near_duplicate"}:
+        return "deduped"
+    return "skipped"
+
+
+def _failure_code(candidate: Mapping[str, Any]) -> str | None:
+    reasons = _string_list(candidate.get("removal_reasons"))
+    return reasons[0] if reasons else None
+
+
+def _budget_cost_cap(evidence: Mapping[str, Any]) -> float:
+    budget = evidence.get("budget")
+    if isinstance(budget, Mapping):
+        value = budget.get("max_cost_usd")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return 0.0
 
 
 def _materialize_candidate_artifact(run_dir: Path, candidate: Mapping[str, Any]) -> Path:
@@ -809,9 +1199,45 @@ def _write_text_only_skip(
     created_at: str,
 ) -> dict[str, Any]:
     visual_candidates_path = run_dir / "visual_candidates.jsonl"
+    visual_search_plan_path = run_dir / VISUAL_SEARCH_PLAN_FILENAME
+    image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
+    visual_search_plan = {
+        "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
+        "run_id": str(evidence.get("run_id") or run_dir.name),
+        "created_at": created_at,
+        "tasks": [],
+    }
+    image_fetch_records: list[dict[str, Any]] = []
+    visual_provider_status = _visual_provider_status(
+        run_dir=run_dir,
+        status="no_visual_tasks",
+        ok=True,
+        terminal=False,
+        metric_classification="excluded_text_only",
+        provider_names=provider_names,
+        provider_statuses=[
+            {
+                "provider": name,
+                "candidates": 0,
+                "external_network_call": False,
+                "external_vlm_call": False,
+                "invoked": False,
+            }
+            for name in provider_names
+        ],
+        candidate_records=[],
+        image_fetch_records=image_fetch_records,
+        observations=[],
+        created_at=created_at,
+        actionable_cause="text_only route has no visual tasks",
+    )
+    _write_json(visual_search_plan_path, visual_search_plan)
     _write_jsonl(visual_candidates_path, [])
+    _write_jsonl(image_fetch_status_path, image_fetch_records)
     _write_jsonl(visual_observations_path, [])
+    _write_json(visual_provider_status_path, visual_provider_status)
     evidence["visual_acquisition"] = {
         "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
         "status": "no_visual_tasks",
@@ -832,16 +1258,31 @@ def _write_text_only_skip(
         "external_ocr_call": False,
         "external_vlm_call": False,
         "reason": "text_only route has no visual tasks",
+        "visual_search_plan_path": VISUAL_SEARCH_PLAN_FILENAME,
+        "image_fetch_status_path": IMAGE_FETCH_STATUS_FILENAME,
+        "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
     }
     handoff = evidence.get("handoff")
     if isinstance(handoff, dict):
         handoff["visual_observations_path"] = "visual_observations.jsonl"
         handoff["visual_candidates_path"] = "visual_candidates.jsonl"
+        handoff["visual_search_plan_path"] = VISUAL_SEARCH_PLAN_FILENAME
+        handoff["image_fetch_status_path"] = IMAGE_FETCH_STATUS_FILENAME
+        handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
         handoff["visual_status"] = "no_visual_tasks"
     _write_json(evidence_path, evidence)
     validation = validate_artifacts(
         evidence_path=evidence_path,
         visual_observations_path=visual_observations_path,
+    )
+    visual_artifact_validation = validate_visual_artifacts(
+        run_dir=run_dir,
+        visual_search_plan_path=visual_search_plan_path,
+        visual_candidates_path=visual_candidates_path,
+        image_fetch_status_path=image_fetch_status_path,
+        visual_observations_path=visual_observations_path,
+        visual_provider_status_path=visual_provider_status_path,
+        evidence_path=None,
     )
     status = _base_status(run_dir, evidence, "no_visual_tasks", created_at)
     status.update(
@@ -860,10 +1301,14 @@ def _write_text_only_skip(
             "external_ocr_call": False,
             "external_vlm_call": False,
             "validation": validation.to_dict(),
+            "visual_artifact_validation": visual_artifact_validation.to_dict(),
             "artifacts": {
                 "evidence": str(evidence_path),
+                "visual_search_plan": str(visual_search_plan_path),
                 "visual_candidates": str(visual_candidates_path),
+                "image_fetch_status": str(image_fetch_status_path),
                 "visual_observations": str(visual_observations_path),
+                "visual_provider_status": str(visual_provider_status_path),
                 "visual_acquisition_status": str(run_dir / "visual_acquisition_status.json"),
             },
         }
@@ -872,7 +1317,34 @@ def _write_text_only_skip(
     return status
 
 
-def _visual_routes(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _visual_task_by_angle(run_dir: Path) -> dict[str, Mapping[str, Any]]:
+    path = run_dir / "visual_tasks.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise VisualAcquisitionError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        return {}
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return {}
+    result: dict[str, Mapping[str, Any]] = {}
+    for task in tasks:
+        if not isinstance(task, Mapping):
+            continue
+        angle_id = task.get("angle_id")
+        if isinstance(angle_id, str) and angle_id:
+            result[angle_id] = task
+    return result
+
+
+def _visual_routes(
+    evidence: Mapping[str, Any],
+    *,
+    visual_task_by_angle: Mapping[str, Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
     routes = evidence.get("routing", [])
     if not isinstance(routes, list):
         return []
@@ -882,7 +1354,11 @@ def _visual_routes(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
             continue
         modality = route.get("modality")
         if modality in SEARCH_ROUTES and modality != "text_only" and int(route.get("max_images", 0)) > 0:
-            result.append(route)
+            enriched = dict(route)
+            visual_task = visual_task_by_angle.get(str(enriched.get("id") or ""))
+            if visual_task is not None:
+                enriched["task_id"] = visual_task.get("id")
+            result.append(enriched)
     return result
 
 

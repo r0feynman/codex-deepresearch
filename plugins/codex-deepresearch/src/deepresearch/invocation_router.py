@@ -21,12 +21,15 @@ from .parallel_orchestrator import (
 from .report_generation import ReportGenerationError, synthesize_report
 from .search_handoff import SearchHandoffError, prepare_run
 from .verification_matrix import VerificationMatrixError, verify_claims
+from .visual_artifacts import (
+    VISUAL_PROVIDER_STATUS_FILENAME,
+    VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+    build_visual_provider_status,
+)
 
 
 RUN_STATUS_SCHEMA_VERSION = "codex-deepresearch.run-status.v0"
 RUN_STATUS_FILENAME = "run_status.json"
-VISUAL_PROVIDER_STATUS_SCHEMA_VERSION = "codex-deepresearch.visual-provider-status.v0"
-VISUAL_PROVIDER_STATUS_FILENAME = "visual_provider_status.json"
 INVOCATION_MODES = ("full-runner", "quick-chat", "manual-handoff", "blocked")
 
 _QUICK_CHAT_MARKERS = (
@@ -575,38 +578,21 @@ def _visual_provider_status(
     blocked_reason: str | None,
     actionable_cause: str,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
-        "run_id": run_dir.name,
-        "run_dir": str(run_dir),
-        "status": status,
-        "ok": ok,
-        "terminal": terminal,
-        "created_at": _utc_now(),
-        "metric_classification": metric_classification,
-        "providers": [
-            {
-                "provider": provider,
-                "provider_kind": provider_kind,
-                "provider_mode": provider_mode,
-                "configured": configured,
-                "available": available,
-                "blocked_reason": blocked_reason,
-                "invocations": 0,
-                "candidates_discovered": 0,
-                "artifacts_fetched": 0,
-                "vlm_images_analyzed": 0,
-                "estimated_cost_usd": 0.0,
-                "actual_cost_usd": 0.0,
-                "last_error": blocked_reason,
-            }
-        ],
-        "diagnostics": {"actionable_cause": actionable_cause},
-        "artifacts": {
-            "run_status": str(run_dir / RUN_STATUS_FILENAME),
-            "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
-        },
-    }
+    return build_visual_provider_status(
+        run_dir=run_dir,
+        status=status,
+        ok=ok,
+        terminal=terminal,
+        metric_classification=metric_classification,
+        provider=provider,
+        provider_kind=provider_kind,
+        provider_mode=provider_mode,
+        configured=configured,
+        available=available,
+        blocked_reason=blocked_reason,
+        actionable_cause=actionable_cause,
+        created_at=_utc_now(),
+    )
 
 
 def _run_requires_visual_provider(run_dir: Path) -> bool:

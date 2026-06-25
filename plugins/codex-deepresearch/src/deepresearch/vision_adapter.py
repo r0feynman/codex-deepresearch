@@ -826,15 +826,29 @@ def _copy_optional_visual_metadata(
         "candidate_id",
         "candidate_class",
         "duplicate_of",
+        "fetch_id",
         "near_duplicate_group_id",
         "near_duplicate_of",
+        "observation_id",
+        "provider",
+        "provider_kind",
+        "provider_mode",
+        "provider_run_id",
+        "policy_decision",
         "removal_reason",
         "route",
+        "task_id",
         "visual_provider",
         "visual_acquisition_provider",
     )
     list_keys = ("removal_reasons",)
-    mapping_keys = ("visual_validation", "validation_checks", "screenshot")
+    number_keys = ("estimated_cost_usd", "actual_cost_usd")
+    mapping_keys = (
+        "provider_provenance",
+        "visual_validation",
+        "validation_checks",
+        "screenshot",
+    )
     for key in scalar_keys:
         value = _first_optional_string(record, key) or _first_optional_string(image, key)
         if value:
@@ -843,6 +857,12 @@ def _copy_optional_visual_metadata(
         values = _dedupe(_string_list(record, key) + _string_list(image, key))
         if values:
             visual[key] = values
+    for key in number_keys:
+        for container in (record, image):
+            value = container.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                visual[key] = value
+                break
     for key in mapping_keys:
         value = record.get(key)
         if not isinstance(value, Mapping):

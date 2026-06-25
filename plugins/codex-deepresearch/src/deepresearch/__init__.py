@@ -50,6 +50,18 @@ from .trace import (
 )
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
+from .visual_artifacts import (
+    IMAGE_FETCH_STATUS_FILENAME,
+    VISUAL_ARTIFACT_SCHEMA_VERSION,
+    VISUAL_CANDIDATES_FILENAME,
+    VISUAL_PROVIDER_STATUS_FILENAME,
+    VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+    VISUAL_SEARCH_PLAN_FILENAME,
+    automatic_visual_status_envelope,
+    is_real_automatic_visual_record,
+    real_automatic_visual_release_counts,
+    validate_visual_artifacts,
+)
 from .vision_adapter import VisionAdapterError, ingest_vision_observations
 
 __all__ = [
@@ -83,10 +95,16 @@ __all__ = [
     "ValidationError",
     "ValidationResult",
     "VisualAcquisitionError",
+    "VISUAL_ARTIFACT_SCHEMA_VERSION",
+    "VISUAL_CANDIDATES_FILENAME",
+    "VISUAL_PROVIDER_STATUS_FILENAME",
+    "VISUAL_PROVIDER_STATUS_SCHEMA_VERSION",
+    "VISUAL_SEARCH_PLAN_FILENAME",
     "VerificationMatrixError",
     "VisionAdapterError",
     "add_budget_estimate_artifact",
     "acquire_visual_candidates",
+    "automatic_visual_status_envelope",
     "begin_stage",
     "budget_estimate_path",
     "enforce_guardrails",
@@ -96,6 +114,7 @@ __all__ = [
     "ingest_manual_sources",
     "ingest_vision_observations",
     "inspect_run_state",
+    "is_real_automatic_visual_record",
     "merge_evidence_shards",
     "plan_research_tasks",
     "prepare_run",
@@ -113,6 +132,9 @@ __all__ = [
     "validate_trace_file",
     "validate_trace_record",
     "read_trace_records",
+    "real_automatic_visual_release_counts",
     "verify_claims",
+    "validate_visual_artifacts",
     "write_budget_estimate",
+    "IMAGE_FETCH_STATUS_FILENAME",
 ]
