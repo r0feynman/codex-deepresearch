@@ -169,7 +169,7 @@ References: Brave Search API FAQ, https://brave.com/search/api/; Brave Search AP
 
 ## Vision Adapter
 
-Use `ingest-vision` after visual tasks have produced a JSONL handoff artifact. The command is a dry adapter: it reads local observation records and normalizes them into `VisualEvidence` without calling Codex interactive VLM, OpenAI, or any external network service.
+Use `ingest-vision` after visual tasks have produced a JSONL handoff artifact. By default it reads local observation records and normalizes them into `VisualEvidence` without calling Codex interactive VLM, OpenAI, or any external network service.
 
 ```bash
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision \
@@ -178,7 +178,7 @@ plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision \
   --observations ./path/to/visual-observations.jsonl
 ```
 
-`--provider` must be one of `codex-interactive`, `openai-responses-vision`, or `manual-visual-review`. `codex-interactive` observations are expected to come from explicit JSONL written by the Codex-side agent. `openai-responses-vision` can ingest a deterministic response fixture or artifact and records `analysis_provider=openai-responses-vision`; it does not perform a real API call. `manual-visual-review` records human-entered observations with `analysis_provider=manual-visual-review`.
+`--provider` must be one of `codex-interactive`, `openai-responses-vision`, or `manual-visual-review`. `codex-interactive` observations are expected to come from explicit JSONL written by the Codex-side agent. `openai-responses-vision` can ingest a deterministic response fixture or, when `--observations` is omitted, analyze fetched `visual_candidates.jsonl` / `image_fetch_status.jsonl` artifacts through the Responses API only when `--provider-mode real`, `--allow-real-vlm` or `CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_ALLOW_REAL=1`, and `OPENAI_API_KEY` or `CODEX_DEEPRESEARCH_OPENAI_API_KEY` are configured. If the VLM path is unavailable, the command writes `blocked_missing_vlm_provider` and preserves fetched visual artifacts. `manual-visual-review` records human-entered observations with `analysis_provider=manual-visual-review`.
 
 When `--observations` is omitted, the command reads `visual_observations.jsonl` inside the run directory. If a `visual_required` route has no visual result, the command appends a low-confidence visual claim with `verification_status=needs_visual_evidence` so the gap remains schema-valid and explicit.
 

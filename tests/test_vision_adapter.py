@@ -13,7 +13,16 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import ingest_vision_observations, prepare_run, validate_artifacts
+from deepresearch import (
+    ingest_vision_observations,
+    prepare_run,
+    validate_artifacts,
+    validate_visual_artifacts,
+)
+from deepresearch.vision_adapter import (
+    OpenAIResponsesVisionResult,
+    _openai_result_from_response_payload,
+)
 
 
 PNG_1X1 = (
@@ -22,6 +31,139 @@ PNG_1X1 = (
     b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00\xef\xbf\xa7\xdb"
     b"\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+
+class FakeOpenAIResponsesVisionClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def analyze_image(self, *, image_input, mime_type, prompt, config, metadata):
+        self.calls.append(
+            {
+                "image_input": image_input,
+                "mime_type": mime_type,
+                "prompt": prompt,
+                "model": config.model,
+                "metadata": dict(metadata),
+            }
+        )
+        return OpenAIResponsesVisionResult(
+            observations=(
+                "The screenshot visibly contains a checkout button.",
+                "The visible OCR text says Pay now.",
+            ),
+            inferences=("The UI is likely ready for checkout submission.",),
+            caveats=("Small text may be approximate.",),
+            ocr_text="Pay now",
+            confidence=0.82,
+            response_id="resp_fake_vision",
+            model=config.model,
+            usage={"input_tokens": 123, "api_key": "redaction-sentinel"},
+            raw_provider_metadata={
+                "response_id": "resp_fake_vision",
+                "authorization": "Bearer redaction-sentinel",
+                "endpoint": config.endpoint,
+                "benign_exact_secret": f"echoed {config.api_key}",
+                "credential_hint": "credential-secret-value",
+                "credentials_blob": "credentials-secret-value",
+                "benign_bearer_text": "Authorization: Bearer bearer-secret-value",
+                "source_path": "/home/user/private/source.png",
+                "nested": {
+                    "api_key": "redaction-sentinel",
+                    "items": [
+                        "Authorization: Bearer nested-token-value",
+                        {"path": "/home/user/private/nested-source.png"},
+                    ],
+                },
+            },
+            actual_cost_usd=0.004,
+        )
+
+
+class FreeFormOpenAIResponsesVisionClient:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.calls: list[dict] = []
+
+    def analyze_image(self, *, image_input, mime_type, prompt, config, metadata):
+        self.calls.append({"image_input": image_input, "metadata": dict(metadata)})
+        return _openai_result_from_response_payload(
+            {
+                "id": "resp_freeform",
+                "model": config.model,
+                "output_text": self.text,
+                "usage": {"input_tokens": 22},
+            },
+            fallback_model=config.model,
+            elapsed_ms=7,
+            mime_type=mime_type,
+            metadata=metadata,
+        )
+
+
+class HostileOpenAIResponsesVisionClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def analyze_image(self, *, image_input, mime_type, prompt, config, metadata):
+        self.calls.append({"image_input": image_input, "metadata": dict(metadata)})
+        return OpenAIResponsesVisionResult(
+            observations=(
+                "Visible safe label; credential_hint=credential-secret-value",
+                f"Configured exact secret echoed as {config.api_key}",
+            ),
+            inferences=(
+                "credentials_blob: 'credentials-secret-value' while preserving safe inference",
+            ),
+            caveats=(
+                "Authorization: Bearer bearer-secret-value",
+                "Source path /home/user/private/source.png is not public",
+            ),
+            ocr_text="OCR token=nested-token-value and safe OCR text",
+            confidence=0.66,
+            response_id="resp_hostile_vision",
+            model=config.model,
+            usage={
+                "input_tokens": 12,
+                "note": "access_token=usage-token-value",
+            },
+            raw_provider_metadata={
+                "note": (
+                    "credential_hint=credential-secret-value "
+                    "credentials_blob=credentials-secret-value "
+                    "Authorization: Bearer raw-bearer-value "
+                    "/home/user/private/source.png"
+                ),
+                "nested": [
+                    "auth: nested-auth-value",
+                    {"safe_key_name_but_private_path": "/home/user/private/nested-source.png"},
+                ],
+            },
+            actual_cost_usd=0.001,
+        )
+
+
+class FailingSecondOpenAIResponsesVisionClient(FakeOpenAIResponsesVisionClient):
+    def analyze_image(self, *, image_input, mime_type, prompt, config, metadata):
+        if len(self.calls) >= 1:
+            self.calls.append(
+                {
+                    "image_input": image_input,
+                    "mime_type": mime_type,
+                    "prompt": prompt,
+                    "model": config.model,
+                    "metadata": dict(metadata),
+                    "failed": True,
+                }
+            )
+            raise RuntimeError("provider request failed after first image")
+        return super().analyze_image(
+            image_input=image_input,
+            mime_type=mime_type,
+            prompt=prompt,
+            config=config,
+            metadata=metadata,
+        )
 
 
 class VisionAdapterTests(unittest.TestCase):
@@ -75,6 +217,155 @@ class VisionAdapterTests(unittest.TestCase):
         self.write_json(run_dir / "evidence.json", evidence)
         self.write_json(sources_dir / "src_checkout.json", source)
         return run_dir
+
+    def write_openai_vlm_handoff(
+        self,
+        run_dir: Path,
+        *,
+        fetch_evidence_image_id: str | None = "img_checkout_001",
+    ) -> None:
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["mode"] = "automated-cli"
+        evidence["vlm_provider"] = "openai-responses-vision"
+        self.write_json(run_dir / "evidence.json", evidence)
+        created_at = "2026-06-25T00:00:00Z"
+        task_id = "task_visual_001"
+        angle_id = "angle_001"
+        candidate_id = "cand_checkout_001"
+        fetch_id = "fetch_checkout_001"
+        evidence_image_id = "img_checkout_001"
+        provider_provenance = {
+            "provider": "browser-screenshot",
+            "provider_kind": "screenshot",
+            "provider_mode": "real",
+            "provider_run_id": "browser-screenshot:test",
+            "external_network_call": False,
+            "external_vlm_call": False,
+        }
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": created_at,
+                "tasks": [
+                    {
+                        "plan_id": f"plan_{task_id}",
+                        "task_id": task_id,
+                        "angle_id": angle_id,
+                        "route": "visual_required",
+                        "target_evidence_type": "screenshot",
+                        "query": "checkout screenshot",
+                        "providers": ["browser-screenshot"],
+                        "source_search_result_ids": [],
+                        "caps": {
+                            "max_candidates": 1,
+                            "max_fetches": 1,
+                            "max_vlm_images": 1,
+                            "max_cost_usd": 0.25,
+                        },
+                        "policy_constraints": {"policy_decision": "allowed"},
+                        "estimated_cost_usd": 0.01,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "plan_id": f"plan_{task_id}",
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:test",
+                    "provider_provenance": provider_provenance,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "page_url": "https://example.com/checkout",
+                    "image_url": None,
+                    "rank": 1,
+                    "score": 1.0,
+                    "candidate_class": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "hash": "sha256:fixture-checkout",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "fetched",
+                    "rejection_reason": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                    "visual_tasks": ["layout_review", "ocr"],
+                    "requires_vlm_observation": True,
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": fetch_id,
+                    "candidate_id": candidate_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:test",
+                    "provider_provenance": provider_provenance,
+                    "fetch_status": "fetched",
+                    "http_status": 200,
+                    "mime_type": "image/png",
+                    "byte_size": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": "sha256:fixture-checkout",
+                    "phash": "checkout-phash",
+                    "local_artifact_path": "images/checkout.png",
+                    "evidence_image_id": fetch_evidence_image_id,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "failure_code": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                }
+            ],
+        )
+        self.write_json(
+            run_dir / "visual_provider_status.json",
+            {
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_dir.name,
+                "status": "real_image_search_candidates_collected",
+                "ok": True,
+                "terminal": False,
+                "metric_classification": "real_provider_candidate_discovery",
+                "providers": [
+                    {
+                        "provider": "browser-screenshot",
+                        "provider_kind": "screenshot",
+                        "provider_mode": "real",
+                        "configured": True,
+                        "available": True,
+                        "blocked_reason": None,
+                        "invocations": 1,
+                        "candidates_discovered": 1,
+                        "artifacts_fetched": 1,
+                        "vlm_images_analyzed": 0,
+                        "estimated_cost_usd": 0.01,
+                        "actual_cost_usd": 0.01,
+                        "last_error": None,
+                    }
+                ],
+            },
+        )
 
     def assert_valid_run(self, run_dir: Path) -> dict:
         result = validate_artifacts(
@@ -232,6 +523,538 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(image["analysis_provider"], "openai-responses-vision")
         self.assertIn("The image contains a checkout button.", image["observations"])
         self.assertEqual(image["inferences"], ["The UI state is visually inspectable."])
+
+    def test_openai_responses_vision_analyzes_local_artifact_with_real_provider_mode(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir, fetch_evidence_image_id=None)
+        client = FakeOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={
+                "api_key": "redaction-sentinel",
+                "model": "gpt-4.1-mini",
+                "estimated_cost_usd_per_image": 0.006,
+            },
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["provider_mode"], "real")
+        self.assertEqual(result["vlm_images_analyzed"], 1)
+        self.assertEqual(result["estimated_cost_usd"], 0.006)
+        self.assertEqual(result["actual_cost_usd"], 0.004)
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(client.calls[0]["image_input"].startswith("data:image/png;base64,"))
+        evidence = self.assert_valid_run(run_dir)
+        image = evidence["images"][0]
+        self.assertEqual(image["id"], "img_checkout_001")
+        self.assertEqual(image["candidate_id"], "cand_checkout_001")
+        self.assertEqual(image["fetch_id"], "fetch_checkout_001")
+        self.assertEqual(image["task_id"], "task_visual_001")
+        self.assertEqual(image["angle_id"], "angle_001")
+        self.assertEqual(image["provider_mode"], "real")
+        self.assertEqual(image["provider_kind"], "vlm")
+        self.assertIn("The screenshot visibly contains a checkout button.", image["observations"])
+        self.assertEqual(image["inferences"], ["The UI is likely ready for checkout submission."])
+        self.assertTrue(any("model-generated" in caveat for caveat in image["caveats"]))
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(observations[0]["provider_mode"], "real")
+        self.assertEqual(observations[0]["provider_kind"], "vlm")
+        self.assertEqual(observations[0]["candidate_id"], "cand_checkout_001")
+        self.assertEqual(observations[0]["fetch_id"], "fetch_checkout_001")
+        self.assertEqual(observations[0]["estimated_cost_usd"], 0.006)
+        self.assertEqual(observations[0]["actual_cost_usd"], 0.004)
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["providers"][-1]["provider"], "openai-responses-vision")
+        self.assertEqual(provider_status["providers"][-1]["provider_mode"], "real")
+        self.assertEqual(provider_status["providers"][-1]["vlm_images_analyzed"], 1)
+        self.assertEqual(provider_status["run_dir"], run_dir.name)
+        self.assertEqual(provider_status["artifacts"]["visual_observations"], "visual_observations.jsonl")
+        self.assertNotIn(str(run_dir), json.dumps(provider_status, sort_keys=True))
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(fetches[0]["evidence_image_id"], "img_checkout_001")
+        self.assertEqual(result["fetch_lineage_records_reconciled"], 1)
+        serialized = json.dumps(
+            {
+                "evidence": evidence,
+                "observations": observations,
+                "provider_status": provider_status,
+            },
+            sort_keys=True,
+        )
+        self.assertNotIn("redaction-sentinel", serialized)
+        self.assertIn("[REDACTED]", serialized)
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_openai_responses_vision_requires_explicit_real_provider_mode(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        client = FakeOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(result["provider_mode"], "fixture")
+        self.assertEqual(result["blocked_reason"], "openai_responses_vision_mode_not_real")
+        self.assertFalse(result["external_vlm_call"])
+        self.assertEqual(client.calls, [])
+
+    def test_openai_responses_vision_redacts_sensitive_endpoint_diagnostics(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        client = FakeOpenAIResponsesVisionClient()
+        endpoint = (
+            "https://user:pass@proxy.example/v1/responses?"
+            "key=credential-value&api_key=api-key-value&access_token=token-value&"
+            "password=password-value&debug=1"
+        )
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={
+                "api_key": "redaction-sentinel",
+                "endpoint": endpoint,
+            },
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        status_payloads = {
+            "result": result,
+            "evidence": self.load_json(run_dir / "evidence.json"),
+            "vision_ingest_status": self.load_json(run_dir / "vision_ingest_status.json"),
+            "visual_provider_status": self.load_json(run_dir / "visual_provider_status.json"),
+            "run_trace": (run_dir / "run_trace.jsonl").read_text(encoding="utf-8"),
+            "visual_observations": (run_dir / "visual_observations.jsonl").read_text(
+                encoding="utf-8"
+            ),
+            "openai_observations": (run_dir / "openai_responses_vision_observations.jsonl")
+            .read_text(encoding="utf-8"),
+        }
+        serialized = json.dumps(status_payloads, sort_keys=True)
+        for sensitive in (
+            "user:pass",
+            "credential-value",
+            "api-key-value",
+            "token-value",
+            "password-value",
+            "redaction-sentinel",
+            "credential-secret-value",
+            "credentials-secret-value",
+            "bearer-secret-value",
+            "nested-token-value",
+            "/home/user/private/source.png",
+            "/home/user/private/nested-source.png",
+        ):
+            self.assertNotIn(sensitive, serialized)
+        self.assertIn("https://proxy.example/v1/responses", serialized)
+        self.assertIn("key=[REDACTED]", serialized)
+        self.assertIn("api_key=[REDACTED]", serialized)
+        self.assertIn("access_token=[REDACTED]", serialized)
+        self.assertIn("password=[REDACTED]", serialized)
+        self.assertIn("debug=1", serialized)
+
+    def test_openai_responses_vision_hostile_provider_text_is_redacted(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        client = HostileOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        artifacts = {
+            "result": result,
+            "evidence": self.load_json(run_dir / "evidence.json"),
+            "vision_ingest_status": self.load_json(run_dir / "vision_ingest_status.json"),
+            "visual_provider_status": self.load_json(run_dir / "visual_provider_status.json"),
+            "run_trace": (run_dir / "run_trace.jsonl").read_text(encoding="utf-8"),
+            "visual_observations": (run_dir / "visual_observations.jsonl").read_text(
+                encoding="utf-8"
+            ),
+            "openai_observations": (run_dir / "openai_responses_vision_observations.jsonl")
+            .read_text(encoding="utf-8"),
+        }
+        serialized = json.dumps(artifacts, sort_keys=True)
+        for sensitive in (
+            "redaction-sentinel",
+            "credential-secret-value",
+            "credentials-secret-value",
+            "bearer-secret-value",
+            "raw-bearer-value",
+            "nested-token-value",
+            "usage-token-value",
+            "nested-auth-value",
+            "/home/user/private/source.png",
+            "/home/user/private/nested-source.png",
+        ):
+            self.assertNotIn(sensitive, serialized)
+        self.assertIn("Visible safe label", serialized)
+        self.assertIn("safe inference", serialized)
+        self.assertIn("safe OCR text", serialized)
+        self.assertIn("credential_hint=[REDACTED]", serialized)
+        self.assertIn("credentials_blob: [REDACTED]", serialized)
+
+    def test_openai_responses_vision_freeform_response_is_caveated_inference(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        client = FreeFormOpenAIResponsesVisionClient(
+            "The checkout flow is probably ready because the button is prominent."
+        )
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        evidence = self.assert_valid_run(run_dir)
+        image = evidence["images"][0]
+        self.assertEqual(image["observations"], [])
+        self.assertEqual(
+            image["inferences"],
+            ["The checkout flow is probably ready because the button is prominent."],
+        )
+        self.assertTrue(any("not promoted to observations" in caveat for caveat in image["caveats"]))
+
+    def test_openai_responses_vision_analyzes_image_url_with_fetch_lineage(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidates[0].pop("source_id", None)
+        candidates[0].update(
+            {
+                "provider": "real-image-search",
+                "provider_kind": "web_image_search",
+                "provider_run_id": "real-image-search:test",
+                "provider_provenance": {
+                    "provider": "real-image-search",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "provider_run_id": "real-image-search:test",
+                    "external_network_call": True,
+                    "external_vlm_call": False,
+                },
+                "origin": "image_search",
+                "image_url": "https://example.com/checkout.png",
+                "page_url": None,
+                "local_artifact_path": None,
+                "candidate_status": "fetched",
+                "requires_vlm_observation": True,
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", [])
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        provider_status["providers"][0].update(
+            {
+                "provider": "real-image-search",
+                "provider_kind": "web_image_search",
+                "provider_run_id": "real-image-search:test",
+            }
+        )
+        self.write_json(run_dir / "visual_provider_status.json", provider_status)
+        client = FakeOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(client.calls[0]["image_input"], "https://example.com/checkout.png")
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0]["fetch_id"], "fetch_checkout_001")
+        self.assertEqual(fetches[0]["evidence_image_id"], "img_checkout_001")
+        self.assertEqual(fetches[0]["provider_kind"], "web_image_search")
+        self.assertEqual(result["fetch_lineage_records_reconciled"], 1)
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"][0]["source_id"], "src_checkout_001")
+        source_ids = {source["id"] for source in evidence["sources"]}
+        self.assertEqual(source_ids, {"src_checkout", "src_checkout_001"})
+        generated_source = next(source for source in evidence["sources"] if source["id"] == "src_checkout_001")
+        self.assertEqual(generated_source["url"], "https://example.com/checkout.png")
+        self.assertTrue((run_dir / generated_source["local_artifact_path"]).is_file())
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_openai_responses_vision_skips_rejected_image_url_candidates(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidates[0].update(
+            {
+                "provider": "real-image-search",
+                "provider_kind": "web_image_search",
+                "provider_run_id": "real-image-search:test",
+                "origin": "image_search",
+                "image_url": "https://example.com/duplicate-checkout.png",
+                "local_artifact_path": None,
+                "candidate_status": "rejected",
+                "status": "removed",
+                "removal_reasons": ["duplicate_image_url"],
+                "rejection_reason": "duplicate_image_url",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", [])
+        client = FakeOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(result["blocked_reason"], "no_fetched_visual_artifacts")
+        self.assertEqual(client.calls, [])
+        observations_text = (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(observations_text, "")
+
+    def test_openai_responses_vision_empty_placeholder_files_remain_no_visual_tasks(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="Summarize a text-only topic",
+            runs_dir=runs_dir,
+            route="text_only",
+            vlm_provider="openai-responses-vision",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", [])
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", [])
+        self.write_jsonl(run_dir / "visual_observations.jsonl", [])
+        client = FakeOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "no_visual_tasks")
+        self.assertFalse(result["external_vlm_call"])
+        self.assertEqual(client.calls, [])
+
+    def test_openai_responses_vision_missing_credentials_blocks_and_preserves_artifacts(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        first_client = FakeOpenAIResponsesVisionClient()
+        first_result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": "redaction-sentinel"},
+            openai_client=first_client,
+        )
+        self.assertEqual(first_result["status"], "visual_evidence_ingested")
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual([image["id"] for image in evidence["images"]], ["img_checkout_001"])
+        evidence["claims"] = [
+            {
+                "id": "claim_checkout_visual",
+                "text": "The checkout button is visible.",
+                "claim_type": "visual",
+                "supporting_sources": ["src_checkout"],
+                "supporting_images": ["img_checkout_001"],
+                "quote_spans": [],
+                "votes": [],
+                "verification_status": "unverified",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "low",
+                "caveats": [],
+                "visual_supports": [
+                    {
+                        "image_id": "img_checkout_001",
+                        "observation_ref": "images.img_checkout_001.observations[0]",
+                        "observation_index": 0,
+                        "observation_text": "The screenshot visibly contains a checkout button.",
+                        "relation_type": "direct_visual_support",
+                        "provider": "openai-responses-vision",
+                        "rationale": "Regression fixture for stale OpenAI visual evidence cleanup.",
+                        "confidence": 0.8,
+                    }
+                ],
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": "stale_pre_vlm",
+                    "observation_status": "analyzed",
+                    "observations": ["stale acquisition observation"],
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={"api_key": None},
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(result["blocked_reason"], "missing_openai_api_key")
+        self.assertTrue((run_dir / "images" / "checkout.png").is_file())
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(fetches[0]["fetch_status"], "fetched")
+        self.assertEqual(fetches[0]["local_artifact_path"], "images/checkout.png")
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "blocked_missing_vlm_provider")
+        self.assertFalse(provider_status["ok"])
+        self.assertTrue(provider_status["terminal"])
+        self.assertEqual(provider_status["providers"][-1]["blocked_reason"], "missing_openai_api_key")
+        self.assertTrue(provider_status["providers"][-1]["diagnostics"]["stale_visual_observations_cleared"])
+        self.assertEqual(provider_status["providers"][-1]["diagnostics"]["stale_openai_images_cleared"], 1)
+        self.assertEqual(
+            provider_status["providers"][-1]["diagnostics"]["stale_openai_visual_supports_cleared"],
+            1,
+        )
+        self.assertEqual((run_dir / "visual_observations.jsonl").read_text(encoding="utf-8"), "")
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+        self.assertEqual(evidence["claims"][0]["supporting_images"], [])
+        self.assertEqual(evidence["claims"][0]["visual_supports"], [])
+        self.assertEqual(evidence["vision_adapter"]["status"], "blocked_missing_vlm_provider")
+
+    def test_openai_responses_vision_partial_provider_failure_records_attempted_costs(self) -> None:
+        run_dir = self.prepared_visual_run(provider="openai-responses-vision")
+        self.write_openai_vlm_handoff(run_dir)
+        (run_dir / "images" / "checkout-2.png").write_bytes(PNG_1X1)
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        second_candidate = dict(candidates[0])
+        second_candidate.update(
+            {
+                "candidate_id": "cand_checkout_002",
+                "local_artifact_path": "images/checkout-2.png",
+                "page_url": "https://example.com/checkout-2",
+            }
+        )
+        candidates.append(second_candidate)
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        second_fetch = dict(fetches[0])
+        second_fetch.update(
+            {
+                "fetch_id": "fetch_checkout_002",
+                "candidate_id": "cand_checkout_002",
+                "local_artifact_path": "images/checkout-2.png",
+                "evidence_image_id": "img_checkout_002",
+            }
+        )
+        fetches.append(second_fetch)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        client = FailingSecondOpenAIResponsesVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="openai-responses-vision",
+            provider_mode="real",
+            allow_real_vlm=True,
+            openai_config={
+                "api_key": "redaction-sentinel",
+                "estimated_cost_usd_per_image": 0.006,
+            },
+            openai_client=client,
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(result["blocked_reason"], "provider_request_failed")
+        self.assertTrue(result["external_vlm_call"])
+        self.assertEqual(result["vlm_images_analyzed"], 1)
+        self.assertEqual(result["estimated_cost_usd"], 0.012)
+        self.assertEqual(result["actual_cost_usd"], 0.004)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual((run_dir / "visual_observations.jsonl").read_text(encoding="utf-8"), "")
+        partial_records = [
+            json.loads(line)
+            for line in (run_dir / "openai_responses_vision_observations.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(partial_records), 1)
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][-1]
+        self.assertTrue(provider["invoked"])
+        self.assertEqual(provider["invocations"], 2)
+        self.assertEqual(provider["vlm_images_analyzed"], 1)
+        self.assertEqual(provider["estimated_cost_usd"], 0.012)
+        self.assertEqual(provider["actual_cost_usd"], 0.004)
+        self.assertTrue(provider["external_vlm_call"])
 
     def test_manual_visual_review_emits_visual_evidence_schema(self) -> None:
         run_dir = self.prepared_visual_run(provider="manual-visual-review")
