@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -212,6 +213,8 @@ def run_automated_visual_e2e(
     results: dict[str, Any] = {
         "schema_version": AUTOMATED_VISUAL_E2E_SCHEMA_VERSION,
         "status": status,
+        "generated_at": _utc_now(),
+        "release_gate_passed": status == "passed",
         "suite_id": suite_id,
         "suite_dir": str(suite_dir.resolve()),
         "scenario_prompts": [
@@ -1269,6 +1272,10 @@ def _provider_preflight() -> dict[str, Any]:
 
 def _env_true(name: str) -> bool:
     return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:

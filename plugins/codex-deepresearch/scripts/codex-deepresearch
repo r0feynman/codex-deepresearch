@@ -25,7 +25,11 @@ from deepresearch import (
     DEFAULT_SCENARIO_TIMEOUT_SECONDS,
     EvidenceReviewError,
     FreshSessionE2EError,
+    DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
+    PublicBetaValidationError,
     parse_scenario_run,
+    parse_public_beta_gate_result,
+    parse_public_beta_run,
     resolve_config,
     inspect_evidence,
     list_reusable_claims,
@@ -33,6 +37,7 @@ from deepresearch import (
     run_automated_visual_e2e,
     run_fresh_session_e2e,
     run_fresh_session_visual_e2e,
+    run_public_beta_validation,
     run_skill_invocation,
     validate_artifacts,
 )
@@ -860,6 +865,41 @@ def run_fresh_session_visual_e2e_command(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 2
 
 
+def run_public_beta_validation_command(args: argparse.Namespace) -> int:
+    prompt_runs = {}
+    gate_results = {}
+    try:
+        for value in args.run or []:
+            prompt_id, run_dir = parse_public_beta_run(value)
+            prompt_runs[prompt_id] = resolve_repo_path(str(run_dir))
+        for value in args.gate_result or []:
+            gate_id, results_path = parse_public_beta_gate_result(value)
+            gate_results[gate_id] = resolve_repo_path(str(results_path))
+        result = run_public_beta_validation(
+            runs_dir=resolve_repo_path(args.runs_dir),
+            suite_id=args.suite_id,
+            clean=args.clean,
+            prompt_manifest=resolve_repo_path(args.prompt_manifest),
+            prompt_runs=prompt_runs,
+            gate_results=gate_results,
+        )
+    except (PublicBetaValidationError, OSError, json.JSONDecodeError) as exc:
+        results_path = getattr(exc, "results_path", None)
+        if results_path and Path(results_path).is_file():
+            payload = json.loads(Path(results_path).read_text(encoding="utf-8"))
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            if payload.get("status") == "blocked" and args.allow_blocked:
+                return 0
+            return 2
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if results_path:
+            print(f"Results: {results_path}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["status"] == "passed" else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-deepresearch",
@@ -1066,6 +1106,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-scenario subprocess timeout for fixture and blocked visual paths.",
     )
     fresh_session_visual.set_defaults(func=run_fresh_session_visual_e2e_command)
+
+    public_beta = subparsers.add_parser(
+        "public-beta-validation",
+        help="Classify the Phase 3 Public Beta real-use validation prompt set.",
+    )
+    public_beta.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for Public Beta validation artifacts, relative to the repo root by default.",
+    )
+    public_beta.add_argument(
+        "--suite-id",
+        default="public-beta-validation",
+        help="Subdirectory name under --runs-dir for this validation suite.",
+    )
+    public_beta.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove an existing suite directory before writing new artifacts.",
+    )
+    public_beta.add_argument(
+        "--prompt-manifest",
+        default=str(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST.relative_to(REPO_ROOT)),
+        help="Curated public-safe prompt manifest to validate.",
+    )
+    public_beta.add_argument(
+        "--run",
+        action="append",
+        help=(
+            "Sanitized real run directory in the form prompt_id=run_dir. Repeat for "
+            "each public beta prompt. Missing prompts are recorded as explicit "
+            "blocked diagnostics and never as passes."
+        ),
+    )
+    public_beta.add_argument(
+        "--gate-result",
+        action="append",
+        help=(
+            "Existing gate result JSON in the form gate_id=results_json. Supported "
+            "gate ids are fresh_session_full_runner_artifact_handoff, "
+            "codex_plugin_interactive_visual_e2e, automated_cli_real_provider_visual_e2e, "
+            "and automatic_web_visual_e2e."
+        ),
+    )
+    public_beta.add_argument(
+        "--allow-blocked",
+        action="store_true",
+        help=(
+            "Exit zero when the validation records explicit blocked diagnostics. "
+            "Useful for public CI where real provider credentials are intentionally absent."
+        ),
+    )
+    public_beta.set_defaults(func=run_public_beta_validation_command)
 
     resolve = subparsers.add_parser(
         "resolve-config",
