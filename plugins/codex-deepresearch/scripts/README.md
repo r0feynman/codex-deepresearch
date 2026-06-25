@@ -48,6 +48,35 @@ The gate scenarios cover fixture full-runner completion, serial fallback as an e
 
 The CLI default is public-safe `--real-codex-exec=skip`. Use `--real-codex-exec=auto` to attempt real child execution when Codex CLI is available. Real and fixture scenarios are bounded by `--scenario-timeout-seconds` (default `120`); auto mode records a timeout as an explicit blocked diagnostic, while require mode fails unless real execution completes with accepted shards.
 
+## Automated Visual E2E
+
+`automated-visual-e2e` is the P3-AV9 automated-cli real-provider visual release gate. It validates existing no-user-image visual-required runs for product/image discovery, UI screenshot comparison, public chart/report visual extraction, and public PDF/paper figure extraction. Passing runs must use real acquisition provider artifacts plus `openai-responses-vision`, reach `completed_auto_visual`, include at least 10 real image-centric candidates, include at least 3 real VLM-analyzed images, and cite at least one supported visual or mixed claim in `report.md`.
+
+Credential-free environments can record blocked diagnostics without making provider calls:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch automated-visual-e2e \
+  --runs-dir /tmp/codex-deepresearch-automated-visual-e2e \
+  --suite-id automated-visual-e2e \
+  --clean \
+  --allow-blocked
+```
+
+To run the strict gate after producing real scenario artifacts, pass each scenario run explicitly:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch automated-visual-e2e \
+  --runs-dir /tmp/codex-deepresearch-automated-visual-e2e \
+  --suite-id automated-visual-e2e \
+  --clean \
+  --scenario-run product_image_discovery=/path/to/product-run \
+  --scenario-run ui_screenshot_comparison=/path/to/screenshot-run \
+  --scenario-run public_chart_report_visual_extraction=/path/to/chart-run \
+  --scenario-run public_pdf_paper_figure_extraction=/path/to/pdf-run
+```
+
+The results file classifies provider, fetch, policy, VLM, contradiction, and report-linkage failures. Fixture, local test, manual-review, and user-provided-only visual evidence are reported but excluded from release numerator counts.
+
 ## Resolve Config
 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:

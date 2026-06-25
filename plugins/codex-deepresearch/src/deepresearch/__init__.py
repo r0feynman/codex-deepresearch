@@ -10,6 +10,13 @@ from .budget_estimator import (
     estimate_budget,
     write_budget_estimate,
 )
+from .automated_visual_e2e import (
+    AUTOMATED_VISUAL_E2E_SCHEMA_VERSION,
+    AutomatedVisualE2EError,
+    evaluate_automated_visual_run,
+    parse_scenario_run,
+    run_automated_visual_e2e,
+)
 from .evidence_schema import ValidationError, ValidationResult, validate_artifacts
 from .evidence_review import (
     EVIDENCE_REVIEW_SCHEMA_VERSION,
@@ -101,6 +108,8 @@ __all__ = [
     "BUDGET_ESTIMATE_SCHEMA_VERSION",
     "BudgetCaps",
     "BudgetEstimateError",
+    "AUTOMATED_VISUAL_E2E_SCHEMA_VERSION",
+    "AutomatedVisualE2EError",
     "AdapterUnavailable",
     "CodexExecAdapter",
     "ConfigResolutionError",
@@ -154,6 +163,7 @@ __all__ = [
     "cancel_run",
     "enforce_guardrails",
     "estimate_budget",
+    "evaluate_automated_visual_run",
     "extract_and_fetch_page_images",
     "extract_page_image_candidates",
     "FetchResponse",
@@ -167,6 +177,7 @@ __all__ = [
     "inspect_run_state",
     "is_real_automatic_visual_record",
     "merge_evidence_shards",
+    "parse_scenario_run",
     "plan_research_tasks",
     "prepare_run",
     "pause_run",
@@ -177,6 +188,7 @@ __all__ = [
     "resolve_run_dir",
     "run_control_path",
     "run_steps_path",
+    "run_automated_visual_e2e",
     "run_mvp_smoke",
     "run_parallel_orchestration",
     "run_skill_invocation",
