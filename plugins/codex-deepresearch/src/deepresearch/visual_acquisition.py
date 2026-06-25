@@ -17,6 +17,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
+from .browser_screenshot import (
+    BrowserScreenshotTransport,
+    collect_browser_screenshot_candidates,
+)
 from .cache_keys import normalize_url
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, SEARCH_ROUTES, validate_artifacts
 from .search_handoff import resolve_run_dir
@@ -137,14 +141,15 @@ def acquire_visual_candidates(
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
     real_image_search_transport: _BraveImageSearchTransport | None = None,
     real_image_search_config: Mapping[str, Any] | None = None,
+    browser_transport: BrowserScreenshotTransport | None = None,
 ) -> dict[str, Any]:
     """Collect visual candidates for visual routes.
 
     The default local providers remain deterministic and never call live web,
-    browser automation, OCR services, VLMs, or external APIs. Selecting a real
-    provider such as ``brave-image-search`` uses the configured provider adapter
-    and writes candidate discovery records only; image fetch and VLM analysis
-    stay separate stages.
+    OCR services, VLMs, or external APIs. Selecting a configured provider such
+    as ``brave-image-search`` or ``browser-screenshot`` uses the provider
+    adapter but still keeps image fetch, VLM analysis, and verifier linkage as
+    separate stages.
     """
 
     if max_image_bytes < 1:
@@ -177,6 +182,7 @@ def acquire_visual_candidates(
         provider_names,
         real_image_search_transport=real_image_search_transport,
         real_image_search_config=real_image_search_config,
+        browser_transport=browser_transport,
         evidence=evidence,
     )
     real_provider_requested = any(_is_real_provider_name(provider.name) for provider in provider_instances)
@@ -628,6 +634,32 @@ class _LocalScreenshotFixtureProvider:
                 )
             )
         return records
+
+
+class _BrowserScreenshotProvider:
+    name = "browser-screenshot"
+
+    def __init__(self, transport: BrowserScreenshotTransport | None = None) -> None:
+        self._transport = transport
+        self.last_status: dict[str, Any] = _default_provider_status(
+            self.name,
+            candidates=0,
+            invoked=False,
+        )
+
+    def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
+        collection = collect_browser_screenshot_candidates(
+            run_dir=context.run_dir,
+            evidence=context.evidence,
+            sources=tuple(context.source_by_id.values()),
+            routes=context.routes,
+            screenshot_modes=context.screenshot_modes,
+            created_at=context.created_at,
+            transport=self._transport,
+            provider=self.name,
+        )
+        self.last_status = collection.provider_status
+        return collection.candidates
 
 
 class _HttpBraveImageSearchTransport:
@@ -1213,9 +1245,35 @@ def _validate_and_select_candidates(
             record["status"] = "removed"
             record["removal_reasons"] = removal_reasons
             record["analysis_status"] = "skipped"
+            policy_block_reasons = {
+                "access_denied",
+                "access_controlled",
+                "captcha",
+                "captcha_protected",
+                "captcha_required",
+                "copyright_restricted",
+                "license_policy_blocked",
+                "login_gated",
+                "login_required",
+                "paywall",
+                "paywalled",
+                "pii_detected",
+                "policy_blocked",
+                "policy_decision_blocked",
+                "requires_login",
+                "robots_blocked",
+                "robots_disallowed",
+            }
             if "budget_pruned" in removal_reasons:
                 record["candidate_status"] = "budget_pruned"
                 record["policy_decision"] = "budget_pruned"
+            elif record.get("policy_decision") == "blocked" or (
+                set(removal_reasons) & policy_block_reasons
+            ):
+                record["candidate_status"] = "policy_blocked"
+                record["policy_decision"] = "blocked"
+            elif record.get("candidate_status") == "fetch_failed":
+                record["candidate_status"] = "fetch_failed"
             else:
                 record["candidate_status"] = "rejected"
             record.setdefault("observations", [])
@@ -1228,9 +1286,17 @@ def _validate_and_select_candidates(
             record["policy_decision"] = "budget_pruned"
         else:
             record["status"] = "accepted"
-            record["candidate_status"] = "analyzed"
             record["removal_reasons"] = []
-            selected.append(_observation_from_candidate(record))
+            if record.get("requires_vlm_observation") is True:
+                record["candidate_status"] = "fetched"
+                record["analysis_status"] = "skipped"
+                record["supportable_evidence"] = False
+                record.setdefault("caveats", []).append(
+                    "requires_vlm_observation_and_verifier_linkage"
+                )
+            else:
+                record["candidate_status"] = "analyzed"
+                selected.append(_observation_from_candidate(record))
         record["rejection_reason"] = (
             record["removal_reasons"][0] if record.get("removal_reasons") else None
         )
@@ -1409,6 +1475,7 @@ def _image_fetch_records_from_candidates(
         candidate_id = str(candidate["candidate_id"])
         status = _fetch_status_for_candidate(candidate)
         fetched = status == "fetched"
+        requires_vlm_observation = candidate.get("requires_vlm_observation") is True
         records.append(
             {
                 "fetch_id": _fetch_id_for_candidate_id(candidate_id),
@@ -1424,7 +1491,7 @@ def _image_fetch_records_from_candidates(
                 if isinstance(candidate.get("provider_provenance"), Mapping)
                 else {},
                 "fetch_status": status,
-                "http_status": None,
+                "http_status": candidate.get("http_status"),
                 "mime_type": candidate.get("mime_type") if fetched else None,
                 "byte_size": candidate.get("artifact_size_bytes") if fetched else None,
                 "width": candidate.get("width") if fetched else None,
@@ -1432,7 +1499,9 @@ def _image_fetch_records_from_candidates(
                 "hash": candidate.get("hash") if fetched else None,
                 "phash": candidate.get("phash") if fetched else None,
                 "local_artifact_path": candidate.get("local_artifact_path") if fetched else None,
-                "evidence_image_id": _image_id_for_candidate_id(candidate_id) if fetched else None,
+                "evidence_image_id": _image_id_for_candidate_id(candidate_id)
+                if fetched and not requires_vlm_observation
+                else None,
                 "policy_decision": candidate.get("policy_decision", "allowed"),
                 "policy_flags": list(candidate.get("policy_flags", []))
                 if isinstance(candidate.get("policy_flags"), list)
@@ -1456,6 +1525,11 @@ def _visual_search_plan(
     state: str,
 ) -> dict[str, Any]:
     tasks = []
+    target_evidence_type = (
+        "screenshot"
+        if provider_names and all(_provider_kind(provider) == "screenshot" for provider in provider_names)
+        else "web_image"
+    )
     for route in routes:
         task_id = _string(route.get("task_id")) or _task_id_for_angle(route.get("id"))
         max_images = int(route.get("max_images") or selected_observations or 0)
@@ -1465,7 +1539,7 @@ def _visual_search_plan(
                 "task_id": task_id,
                 "angle_id": route.get("id"),
                 "route": route.get("modality"),
-                "target_evidence_type": "web_image",
+                "target_evidence_type": target_evidence_type,
                 "query": str(evidence.get("question") or ""),
                 "providers": list(provider_names),
                 "source_search_result_ids": [],
@@ -1635,9 +1709,36 @@ def _score_from_rank(rank: int) -> float:
 
 
 def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
+    reasons = set(_string_list(candidate.get("removal_reasons")))
+    policy_block_reasons = {
+        "access_denied",
+        "access_controlled",
+        "captcha",
+        "captcha_protected",
+        "captcha_required",
+        "copyright_restricted",
+        "license_policy_blocked",
+        "login_gated",
+        "login_required",
+        "paywall",
+        "paywalled",
+        "pii_detected",
+        "policy_blocked",
+        "policy_decision_blocked",
+        "requires_login",
+        "robots_blocked",
+        "robots_disallowed",
+    }
+    if (
+        candidate.get("policy_decision") == "blocked"
+        or candidate.get("candidate_status") == "policy_blocked"
+        or reasons & policy_block_reasons
+    ):
+        return "policy_blocked"
     if candidate.get("status") == "accepted":
         return "fetched"
-    reasons = set(_string_list(candidate.get("removal_reasons")))
+    if candidate.get("candidate_status") == "fetch_failed":
+        return "failed"
     if "budget_pruned" in reasons:
         return "budget_pruned"
     if "unsupported_mime_type" in reasons:
@@ -1646,6 +1747,8 @@ def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
         return "too_large"
     if reasons & {"duplicate_image_url", "duplicate_content_hash", "near_duplicate"}:
         return "deduped"
+    if reasons & {"browser_transport_unavailable", "capture_failed", "retrieval_failed"}:
+        return "failed"
     return "skipped"
 
 
@@ -2630,6 +2733,7 @@ def _providers(
     *,
     real_image_search_transport: _BraveImageSearchTransport | None,
     real_image_search_config: Mapping[str, Any] | None,
+    browser_transport: BrowserScreenshotTransport | None,
     evidence: Mapping[str, Any],
 ) -> list[_VisualProvider]:
     providers: list[_VisualProvider] = []
@@ -2644,6 +2748,8 @@ def _providers(
             providers.append(_LocalImageFixtureProvider())
         elif name == "local-screenshot-fixture":
             providers.append(_LocalScreenshotFixtureProvider())
+        elif name == "browser-screenshot":
+            providers.append(_BrowserScreenshotProvider(transport=browser_transport))
         elif name == BRAVE_IMAGE_PROVIDER:
             providers.append(
                 _BraveImageSearchProvider(

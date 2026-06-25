@@ -1279,7 +1279,8 @@ def build_parser() -> argparse.ArgumentParser:
             "local-page, local-image-fixture, local-screenshot-fixture. Use "
             "brave-image-search for the credential- and storage-confirmation-gated "
             "real web image search adapter. Use page-image-extractor alone to "
-            "run the page image fetch/cache provider."
+            "run the page image fetch/cache provider, or browser-screenshot for "
+            "Playwright browser screenshots when available."
         ),
     )
     acquire_visual.add_argument(
