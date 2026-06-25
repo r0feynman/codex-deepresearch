@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from urllib.request import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
+RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresearch"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import (  # noqa: E402
@@ -439,6 +441,171 @@ class PageImageExtractionTests(unittest.TestCase):
         self.assertEqual(fetches[0]["failure_code"], "local_url_from_remote_page")
         self.assertFalse((run_dir / "images").exists())
 
+    def test_local_fixture_page_file_url_outside_run_is_policy_blocked_without_local_read(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Reject local page outside file image",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        secret_dir = self.temp_runs_dir()
+        secret_image = secret_dir / "private-chart.png"
+        secret_image.write_bytes(PNG_1X1 + b"private")
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "local-page.html"
+        page.write_text(
+            f'<html><body><img src="{secret_image.resolve().as_uri()}" alt="Private"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_local_page",
+                "type": "fixture",
+                "url": page.resolve().as_uri(),
+                "title": "Local page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/local-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(content=secret_image.read_bytes(), mime_type="image/png")
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["images_linked"], 0)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
+        self.assertEqual(fetches[0]["failure_code"], "local_file_outside_run")
+        self.assertFalse((run_dir / "images").exists())
+
+    def test_hard_source_policy_flags_block_image_fetch_without_transport(self) -> None:
+        prepared = prepare_run(
+            question="Policy blocked source should not fetch page images",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "policy-page.html"
+        page.write_text(
+            '<html><body><img src="https://img.example.test/policy.png" alt="Policy"></body></html>',
+            encoding="utf-8",
+        )
+        hard_flags = [
+            "access_controlled",
+            "captcha_protected",
+            "login_gated",
+            "paywall",
+            "pii_detected",
+        ]
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_policy_page",
+                "type": "web",
+                "url": "https://example.test/policy/",
+                "title": "Policy page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/policy-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": hard_flags,
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(content=PNG_1X1, mime_type="image/png", status_code=200)
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["images_linked"], 0)
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(candidates[0]["policy_decision"], "blocked")
+        self.assertTrue(set(hard_flags).issubset(set(candidates[0]["policy_flags"])))
+        self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
+        self.assertEqual(fetches[0]["failure_code"], "policy_blocked")
+
+    def test_manual_review_policy_flags_skip_image_fetch_without_transport(self) -> None:
+        prepared = prepare_run(
+            question="Manual review source should not fetch page images",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "manual-review-page.html"
+        page.write_text(
+            '<html><body><img src="https://img.example.test/manual-review.png" alt="Manual"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_manual_review_page",
+                "type": "web",
+                "url": "https://example.test/manual-review/",
+                "title": "Manual review page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/manual-review-page.html",
+                "license_policy": "manual_review",
+                "robots_policy": "manual_review",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(content=PNG_1X1, mime_type="image/png", status_code=200)
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["images_linked"], 0)
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(candidates[0]["policy_decision"], "manual_review")
+        self.assertIn("copyright_manual_review", candidates[0]["policy_flags"])
+        self.assertIn("robots_manual_review", candidates[0]["policy_flags"])
+        self.assertEqual(fetches[0]["fetch_status"], "skipped")
+        self.assertEqual(fetches[0]["failure_code"], "policy_manual_review")
+
     def test_remote_page_private_network_url_is_policy_blocked(self) -> None:
         prepared = prepare_run(
             question="Reject remote page private network image",
@@ -482,6 +649,120 @@ class PageImageExtractionTests(unittest.TestCase):
         result = extract_and_fetch_page_images(run=run_dir, transport=transport)
 
         self.assertEqual(calls, [])
+        self.assertEqual(result["images_linked"], 0)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
+        self.assertEqual(fetches[0]["failure_code"], "private_network_url_from_remote_page")
+
+    def test_remote_page_obvious_internal_hosts_are_policy_blocked_without_transport(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Reject remote page obvious internal image hosts",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        urls = [
+            "http://metadata.google.internal/latest.png",
+            "http://host.docker.internal/private.png",
+            "http://intranet/private.png",
+        ]
+        page = run_dir / "sources" / "remote-page.html"
+        page.write_text(
+            "<html><body>"
+            + "".join(f'<img src="{url}" alt="Private">' for url in urls)
+            + "</body></html>",
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_remote_page",
+                "type": "web",
+                "url": "https://example.test/remote/",
+                "title": "Remote page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/remote-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(content=PNG_1X1, mime_type="image/png", status_code=200)
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["images_linked"], 0)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(len(fetches), len(urls))
+        self.assertEqual({record["fetch_status"] for record in fetches}, {"policy_blocked"})
+        self.assertEqual(
+            {record["failure_code"] for record in fetches},
+            {"private_network_url_from_remote_page"},
+        )
+
+    def test_remote_page_dns_resolved_private_host_is_policy_blocked_without_fetch(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Reject DNS-resolved private image host",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "remote-page.html"
+        page.write_text(
+            '<html><body><img src="http://public-name.example.test/private.png" alt="Private"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_remote_page",
+                "type": "web",
+                "url": "https://example.test/remote/",
+                "title": "Remote page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/remote-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        original_getaddrinfo = page_images.socket.getaddrinfo
+
+        def fake_getaddrinfo(host: str, port: int, *args: object, **kwargs: object) -> list[tuple]:
+            self.assertEqual(host, "public-name.example.test")
+            return [(page_images.socket.AF_INET, page_images.socket.SOCK_STREAM, 6, "", ("10.0.0.4", port))]
+
+        page_images.socket.getaddrinfo = fake_getaddrinfo
+        try:
+            result = extract_and_fetch_page_images(run=run_dir)
+        finally:
+            page_images.socket.getaddrinfo = original_getaddrinfo
+
         self.assertEqual(result["images_linked"], 0)
         fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
         self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
@@ -717,6 +998,66 @@ class PageImageExtractionTests(unittest.TestCase):
         statuses = [record["fetch_status"] for record in fetches]
         self.assertEqual(statuses.count("unsupported_mime"), 2)
         self.assertEqual(statuses.count("budget_pruned"), 2)
+
+    def test_duplicate_failed_url_is_attempted_once_and_deduped(self) -> None:
+        prepared = prepare_run(
+            question="Duplicate failed image URL should not be retried",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        image_url = "https://img.example.test/fails-once.png"
+        page = run_dir / "sources" / "duplicate-fail-page.html"
+        page.write_text(
+            "<html><body>"
+            + "".join(f'<img src="{image_url}" alt="Duplicate {index}">' for index in range(3))
+            + "</body></html>",
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_duplicate_fail_page",
+                "type": "web",
+                "url": "https://example.test/duplicate-fail/",
+                "title": "Duplicate failed page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/duplicate-fail-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(
+                content=None,
+                mime_type=None,
+                status_code=503,
+                final_url=url,
+                error_code="http_503",
+            )
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [image_url])
+        self.assertEqual(result["images_linked"], 0)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual([record["fetch_status"] for record in fetches], ["failed", "deduped", "deduped"])
+        first_fetch_id = fetches[0]["fetch_id"]
+        for record in fetches[1:]:
+            self.assertEqual(record["failure_code"], "duplicate_image_url")
+            self.assertEqual(record["dedupe_target_fetch_id"], first_fetch_id)
 
     def test_data_url_decoding_is_capped_by_max_image_bytes(self) -> None:
         prepared = prepare_run(
@@ -974,6 +1315,69 @@ class PageImageExtractionTests(unittest.TestCase):
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertEqual(evidence["page_image_extraction"]["max_fetches"], 12)
         self.assertEqual(result["images_linked"], 5)
+
+    def test_cli_acquire_visual_page_image_extractor_provider_fetches_page_images(self) -> None:
+        prepared = prepare_run(
+            question="CLI page image extraction provider should fetch page images",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        payload = base64.b64encode(PNG_1X1 + b"cli").decode("ascii")
+        page = run_dir / "sources" / "cli-page.html"
+        page.write_text(
+            f'<html><body><img src="data:image/png;base64,{payload}" alt="CLI image"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_cli_page",
+                "type": "fixture",
+                "url": page.resolve().as_uri(),
+                "title": "CLI page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/cli-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        command = subprocess.run(
+            [
+                str(RUNNER),
+                "acquire-visual",
+                "--run",
+                str(run_dir),
+                "--provider",
+                "page-image-extractor",
+                "--max-fetches",
+                "1",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(command.returncode, 0, command.stderr)
+        payload = json.loads(command.stdout)
+        self.assertEqual(payload["status"], "page_images_processed")
+        self.assertEqual(payload["images_linked"], 1)
+        self.assertTrue((run_dir / VISUAL_CANDIDATES_FILENAME).is_file())
+        self.assertTrue((run_dir / IMAGE_FETCH_STATUS_FILENAME).is_file())
+        self.assertTrue((run_dir / "page_image_extraction_status.json").is_file())
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"][0]["provider"], "page-image-extractor")
 
 
 if __name__ == "__main__":

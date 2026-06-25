@@ -37,6 +37,11 @@ from deepresearch.parallel_orchestrator import (
     plan_research_tasks,
     run_parallel_orchestration,
 )
+from deepresearch.page_image_extraction import (
+    PROVIDER_NAME as PAGE_IMAGE_EXTRACTOR_PROVIDER,
+    PageImageExtractionError,
+    extract_and_fetch_page_images,
+)
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
 from deepresearch.run_state import RunStepStateError, inspect_run_state
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
@@ -414,14 +419,33 @@ def run_ingest_vision(args: argparse.Namespace) -> int:
 
 def run_acquire_visual(args: argparse.Namespace) -> int:
     try:
-        result = acquire_visual_candidates(
-            run=args.run,
-            runs_dir=resolve_repo_path(args.runs_dir),
-            providers=args.provider,
-            screenshot_modes=args.screenshot_mode,
-            max_image_bytes=args.max_image_bytes,
-        )
-    except (VisualAcquisitionError, SearchHandoffError, OSError) as exc:
+        providers = normalize_acquire_visual_providers(args.provider)
+        if PAGE_IMAGE_EXTRACTOR_PROVIDER in providers:
+            if providers != (PAGE_IMAGE_EXTRACTOR_PROVIDER,):
+                raise VisualAcquisitionError(
+                    f"{PAGE_IMAGE_EXTRACTOR_PROVIDER} cannot be combined with fixture providers"
+                )
+            result = extract_and_fetch_page_images(
+                run=args.run,
+                runs_dir=resolve_repo_path(args.runs_dir),
+                max_image_bytes=args.max_image_bytes,
+                max_fetches=args.max_fetches,
+                provider_mode="real",
+            )
+        else:
+            result = acquire_visual_candidates(
+                run=args.run,
+                runs_dir=resolve_repo_path(args.runs_dir),
+                providers=args.provider,
+                screenshot_modes=args.screenshot_mode,
+                max_image_bytes=args.max_image_bytes,
+            )
+    except (
+        PageImageExtractionError,
+        VisualAcquisitionError,
+        SearchHandoffError,
+        OSError,
+    ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -430,6 +454,17 @@ def run_acquire_visual(args: argparse.Namespace) -> int:
     if isinstance(validation, dict) and validation.get("valid") is False:
         return 2
     return 0
+
+
+def normalize_acquire_visual_providers(providers: list[str] | None) -> tuple[str, ...]:
+    raw = providers or []
+    normalized: list[str] = []
+    for provider in raw:
+        for item in str(provider).split(","):
+            name = item.strip().lower().replace("_", "-")
+            if name:
+                normalized.append(name)
+    return tuple(dict.fromkeys(normalized))
 
 
 def run_verify_claims(args: argparse.Namespace) -> int:
@@ -1239,7 +1274,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help=(
             "Local/test visual provider. Repeatable or comma-separated. "
-            "Defaults to local-page, local-image-fixture, local-screenshot-fixture."
+            "Defaults to local-page, local-image-fixture, local-screenshot-fixture. "
+            "Use page-image-extractor alone to run the page image fetch/cache provider."
         ),
     )
     acquire_visual.add_argument(
@@ -1255,6 +1291,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1_000_000,
         help="Maximum allowed image artifact size in bytes before candidate removal.",
+    )
+    acquire_visual.add_argument(
+        "--max-fetches",
+        type=int,
+        default=None,
+        help="Maximum image fetch attempts for --provider page-image-extractor.",
     )
     acquire_visual.set_defaults(func=run_acquire_visual)
 

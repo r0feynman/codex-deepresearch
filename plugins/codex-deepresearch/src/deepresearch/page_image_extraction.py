@@ -38,6 +38,43 @@ DEFAULT_MAX_IMAGE_BYTES = 5_000_000
 DEFAULT_TIMEOUT_SECONDS = 10.0
 SUPPORTED_IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 PROVIDER_NAME = "page-image-extractor"
+SOURCE_IMAGE_FETCH_BLOCKING_POLICY_FLAGS = {
+    "access_controlled",
+    "captcha_protected",
+    "copyright_restricted",
+    "login_gated",
+    "paywall",
+    "pii_detected",
+    "robots_disallowed",
+}
+SOURCE_IMAGE_FETCH_MANUAL_REVIEW_POLICY_FLAGS = {
+    "copyright_manual_review",
+    "robots_manual_review",
+}
+_POLICY_BLOCKED_RETRIEVAL_ERROR_PREFIXES = ("guardrail_", "policy_")
+_POLICY_BLOCKING_FETCH_REASONS = {
+    "local_file_outside_run",
+    "local_url_from_remote_page",
+    "private_network_url_from_remote_page",
+}
+_INTERNAL_HOST_EXACT_MATCHES = {
+    "localhost",
+    "metadata",
+    "metadata.google.internal",
+    "metadata.goog",
+    "host.docker.internal",
+}
+_INTERNAL_HOST_SUFFIXES = (
+    ".localhost",
+    ".local",
+    ".internal",
+    ".lan",
+    ".home",
+    ".corp",
+    ".svc",
+    ".cluster.local",
+    ".docker.internal",
+)
 
 
 class PageImageExtractionError(ValueError):
@@ -607,11 +644,15 @@ def _fetch_candidates(
             )
             continue
         normalized_url = normalize_url(image_url)
-        fetch_block_reason = _image_url_fetch_block_reason(image_url, source)
-        if fetch_block_reason in {
-            "local_url_from_remote_page",
-            "private_network_url_from_remote_page",
-        }:
+        source_html_path = _source_html_path(run_dir, source)
+        fetch_block_reason = _image_url_fetch_block_reason(
+            image_url,
+            source,
+            run_dir=run_dir,
+            source_html_path=source_html_path,
+            resolve_hosts=transport is None,
+        )
+        if fetch_block_reason in _POLICY_BLOCKING_FETCH_REASONS:
             candidate["candidate_status"] = "policy_blocked"
             candidate["policy_decision"] = "blocked"
             candidate["rejection_reason"] = fetch_block_reason
@@ -669,6 +710,13 @@ def _fetch_candidates(
             )
             continue
         fetch_attempt_count += 1
+        seen_urls[normalized_url] = {
+            "candidate_id": candidate.get("candidate_id"),
+            "fetch_id": fetch_id,
+            "evidence_image_id": None,
+            "hash": None,
+            "phash": None,
+        }
         response = _fetch_image(
             image_url,
             transport=transport,
@@ -1028,6 +1076,8 @@ def _default_fetch_image(
             final_url=path.resolve().as_uri(),
         )
     if parsed.scheme in {"http", "https"}:
+        if _is_private_or_reserved_http_url(url, resolve_host=True):
+            raise ValueError("private_network_url")
         request = Request(url, headers={"User-Agent": "codex-deepresearch/0"})
         opener = build_opener(_PrivateNetworkBlockingRedirectHandler())
         with opener.open(request, timeout=timeout_seconds) as response:
@@ -1097,7 +1147,7 @@ class _PrivateNetworkBlockingRedirectHandler(HTTPRedirectHandler):
         newurl: str,
     ) -> Request | None:
         redirect_url = urljoin(req.full_url, newurl)
-        if _is_private_or_reserved_http_url(redirect_url):
+        if _is_private_or_reserved_http_url(redirect_url, resolve_host=True):
             raise ValueError("private_network_redirect")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -1298,19 +1348,31 @@ def _source_policy(source: Mapping[str, Any]) -> tuple[str, list[str]]:
     robots_policy = _string(source.get("robots_policy")) or "unknown"
     if robots_policy == "disallowed":
         flags.append("robots_disallowed")
+    elif robots_policy == "manual_review":
+        flags.append("robots_manual_review")
     if license_policy == "restricted":
         flags.append("copyright_restricted")
-    if license_policy == "manual_review" or robots_policy == "manual_review":
-        return "manual_review", _dedupe(flags)
+    elif license_policy == "manual_review":
+        flags.append("copyright_manual_review")
+    flags.extend(_source_metadata_policy_flags(source))
+    flags = _dedupe(flags)
     if (
         source_decision == "blocked"
-        or license_policy == "restricted"
-        or robots_policy == "disallowed"
+        or bool(set(flags).intersection(SOURCE_IMAGE_FETCH_BLOCKING_POLICY_FLAGS))
+        or (
+            source.get("retrieval_status") == "failed"
+            and str(source.get("retrieval_error", "")).startswith(
+                _POLICY_BLOCKED_RETRIEVAL_ERROR_PREFIXES
+            )
+        )
     ):
         return "blocked", _dedupe(flags or ["policy_blocked"])
-    if source_decision == "manual_review":
-        return "manual_review", _dedupe(flags)
-    return "allowed", _dedupe(flags)
+    if (
+        source_decision == "manual_review"
+        or bool(set(flags).intersection(SOURCE_IMAGE_FETCH_MANUAL_REVIEW_POLICY_FLAGS))
+    ):
+        return "manual_review", flags
+    return "allowed", flags
 
 
 def _write_image_artifact(
@@ -1487,7 +1549,14 @@ def _dedupe_target(
     }
 
 
-def _image_url_fetch_block_reason(url: str, source: Mapping[str, Any]) -> str | None:
+def _image_url_fetch_block_reason(
+    url: str,
+    source: Mapping[str, Any],
+    *,
+    run_dir: Path,
+    source_html_path: Path | None,
+    resolve_hosts: bool,
+) -> str | None:
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -1496,20 +1565,39 @@ def _image_url_fetch_block_reason(url: str, source: Mapping[str, Any]) -> str | 
         if (
             parsed.scheme in {"http", "https"}
             and _source_is_remote_page(source)
-            and _is_private_or_reserved_http_url(url)
+            and _is_private_or_reserved_http_url(url, resolve_host=resolve_hosts)
         ):
             return "private_network_url_from_remote_page"
         return None
     if parsed.scheme == "file":
-        if _source_allows_local_image_references(source):
+        if (
+            _source_allows_local_image_references(source)
+            and _local_image_path_is_allowed(
+                Path(unquote(parsed.path)),
+                run_dir=run_dir,
+                source_html_path=source_html_path,
+            )
+        ):
             return None
-        return "local_url_from_remote_page"
+        if _source_is_remote_page(source):
+            return "local_url_from_remote_page"
+        return "local_file_outside_run"
     if parsed.scheme:
         return "unsupported_url_scheme"
-    if Path(url).is_file():
-        if _source_allows_local_image_references(source):
+    path = Path(url)
+    if path.is_file():
+        if (
+            _source_allows_local_image_references(source)
+            and _local_image_path_is_allowed(
+                path,
+                run_dir=run_dir,
+                source_html_path=source_html_path,
+            )
+        ):
             return None
-        return "local_url_from_remote_page"
+        if _source_is_remote_page(source):
+            return "local_url_from_remote_page"
+        return "local_file_outside_run"
     return "unsupported_url_scheme"
 
 
@@ -1529,7 +1617,31 @@ def _source_is_remote_page(source: Mapping[str, Any]) -> bool:
     return scheme in {"http", "https"} and source_type not in {"local", "fixture"}
 
 
-def _is_private_or_reserved_http_url(url: str) -> bool:
+def _local_image_path_is_allowed(
+    path: Path,
+    *,
+    run_dir: Path,
+    source_html_path: Path | None,
+) -> bool:
+    try:
+        resolved_path = path.resolve(strict=False)
+    except OSError:
+        return False
+    roots = [run_dir.resolve()]
+    if source_html_path is not None:
+        roots.append(source_html_path.parent.resolve())
+    return any(_path_is_relative_to(resolved_path, root) for root in roots)
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_private_or_reserved_http_url(url: str, *, resolve_host: bool = False) -> bool:
     try:
         parsed = urlparse(url)
         scheme = parsed.scheme
@@ -1540,7 +1652,7 @@ def _is_private_or_reserved_http_url(url: str) -> bool:
         return False
     if not host:
         return True
-    if host == "localhost" or host.endswith(".localhost"):
+    if _is_obvious_internal_hostname(host):
         return True
     try:
         address = ipaddress.ip_address(host)
@@ -1548,8 +1660,20 @@ def _is_private_or_reserved_http_url(url: str) -> bool:
         for address in _numeric_hostname_addresses(host):
             if _address_is_private_or_reserved(address):
                 return True
+        if resolve_host and _hostname_resolves_to_private_or_reserved(host, parsed.port):
+            return True
         return False
     return _address_is_private_or_reserved(address)
+
+
+def _is_obvious_internal_hostname(host: str) -> bool:
+    if host in _INTERNAL_HOST_EXACT_MATCHES:
+        return True
+    if any(host.endswith(suffix) for suffix in _INTERNAL_HOST_SUFFIXES):
+        return True
+    if "." not in host:
+        return True
+    return False
 
 
 def _safe_join_url(page_url: str, image_url: str) -> str | None:
@@ -1581,6 +1705,27 @@ def _numeric_hostname_addresses(host: str) -> list[ipaddress.IPv4Address | ipadd
         except ValueError:
             continue
     return addresses
+
+
+def _hostname_resolves_to_private_or_reserved(host: str, port: int | None) -> bool:
+    try:
+        addrinfo = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    except OSError:
+        return True
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for item in addrinfo:
+        sockaddr = item[4]
+        if not sockaddr:
+            continue
+        try:
+            addresses.append(ipaddress.ip_address(str(sockaddr[0])))
+        except ValueError:
+            return True
+    if not addresses:
+        return True
+    return any(_address_is_private_or_reserved(address) for address in addresses)
 
 
 def _address_is_private_or_reserved(
@@ -1669,6 +1814,62 @@ def _string(value: Any) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _source_metadata_policy_flags(source: Mapping[str, Any]) -> list[str]:
+    flags: list[str] = []
+    if _truthy_metadata(source, "login_gated", "login_required", "auth_required"):
+        flags.append("login_gated")
+    if _truthy_metadata(source, "captcha", "captcha_required", "captcha_protected"):
+        flags.append("captcha_protected")
+    if _truthy_metadata(source, "access_controlled", "access_restricted"):
+        flags.append("access_controlled")
+    if _truthy_metadata(source, "paywall", "paywalled", "is_paywalled") or _metadata_contains(
+        source, "paywall"
+    ):
+        flags.append("paywall")
+    if _truthy_metadata(source, "contains_pii", "pii_detected") or _metadata_contains(
+        source, "pii"
+    ):
+        flags.append("pii_detected")
+    return flags
+
+
+def _truthy_metadata(record: Mapping[str, Any], *keys: str) -> bool:
+    metadata = record.get("raw_provider_metadata")
+    for key in keys:
+        if _is_truthy(record.get(key)):
+            return True
+        if isinstance(metadata, Mapping) and _is_truthy(metadata.get(key)):
+            return True
+    return False
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _metadata_contains(record: Mapping[str, Any], needle: str) -> bool:
+    metadata = record.get("raw_provider_metadata")
+    if not isinstance(metadata, Mapping):
+        return False
+    lowered = needle.lower()
+    values: list[Any] = list(metadata.values())
+    while values:
+        value = values.pop()
+        if isinstance(value, Mapping):
+            values.extend(value.values())
+        elif isinstance(value, list):
+            values.extend(value)
+        elif lowered in str(value).lower():
+            return True
+    return False
 
 
 def _safe_id(value: str) -> str:
