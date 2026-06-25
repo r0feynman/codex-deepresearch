@@ -216,6 +216,37 @@ The command applies the PRD verifier matrix without external model, VLM, web, or
 
 Budget-pruned claims are not voted again. They keep `verification_status=budget_pruned` and receive `include_in_final_report=false` plus `report_exclusion_reason=budget_pruned` for the M10 report renderer to consume.
 
+## Evidence Review
+
+Use `browse-evidence` after verification and optional synthesis to inspect the local provenance graph for claims:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch browse-evidence \
+  --run <run_id_or_path> \
+  --claim-id <claim_id>
+```
+
+The JSON output links each claim to source records, quote spans, image artifacts, visual observations, verifier votes, report status entries, and reuse blockers. It reads only local artifacts and does not call models or the network.
+
+Use `review-claim` to persist a local human decision:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch review-claim \
+  --run <run_id_or_path> \
+  --claim-id <claim_id> \
+  --decision accepted
+```
+
+Supported decisions are `accepted`, `rejected`, and `needs_more_evidence`. The command writes claim fields in `evidence.json` plus `review_status.json`. Accepted claims become reuse-eligible only when `verification_status=supported` and guardrail/source/image policy blockers are absent. Guardrail-blocked claims cannot be accepted or promoted; rejected claims are excluded from later synthesis for the reviewed evidence version.
+
+Use `reuse-evidence` to list claims currently eligible for downstream Codex reuse or promotion:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch reuse-evidence --run <run_id_or_path>
+```
+
+Human review decisions store a `review_evidence_cache_key`. If supporting source, image, quote, or visual-support inputs change, a later `verify-claims` run can mark the old human review stale and re-evaluate the claim.
+
 ## Synthesize Report
 
 Use `synthesize` after claims have been verified:

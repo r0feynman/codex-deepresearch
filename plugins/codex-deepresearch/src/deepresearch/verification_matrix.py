@@ -186,7 +186,13 @@ def verify_claims(
         claim["verification_cache_key"] = current_claim_cache_key
         claim["verified_at"] = now
         _update_vote_reference_fields(claim, claim_votes)
-        _update_claim_state(claim, route=route, votes=claim_votes, images_by_id=images_by_id)
+        _update_claim_state(
+            claim,
+            route=route,
+            votes=claim_votes,
+            images_by_id=images_by_id,
+            current_cache_key=current_claim_cache_key,
+        )
         all_votes.extend(claim_votes)
         claim_statuses.append(_claim_status_record(claim, route, len(generated_votes)))
 
@@ -399,9 +405,14 @@ def _update_claim_state(
     route: str,
     votes: Sequence[Mapping[str, Any]],
     images_by_id: Mapping[str, Mapping[str, Any]],
+    current_cache_key: str,
 ) -> None:
     incoming_review_status = claim.get("review_status")
     incoming_promotion_status = claim.get("promotion_status")
+    human_review_current = _human_review_matches_current_evidence(
+        claim,
+        current_cache_key=current_cache_key,
+    )
     refute_count = sum(1 for vote in votes if vote.get("vote") == "refute")
     support_by_type: dict[str, int] = {}
     blocked_count = 0
@@ -443,20 +454,27 @@ def _update_claim_state(
         promotion_status = "not_eligible"
         confidence = "low"
 
-    if incoming_review_status == "human_rejected":
+    if incoming_review_status == "human_rejected" and human_review_current:
         review_status = "human_rejected"
         if incoming_promotion_status == "promotion_rejected":
             promotion_status = "promotion_rejected"
         else:
             promotion_status = "not_eligible"
-    elif incoming_promotion_status == "promotion_rejected":
+    elif incoming_promotion_status == "promotion_rejected" and human_review_current:
         if incoming_review_status == "human_accepted" and status == "supported":
             review_status = "human_accepted"
         elif review_status == "auto_reviewed":
             review_status = "needs_more_evidence"
         promotion_status = "promotion_rejected"
-    elif incoming_review_status == "human_accepted" and status == "supported":
+    elif incoming_review_status == "human_accepted" and status == "supported" and human_review_current:
         review_status = "human_accepted"
+
+    if incoming_review_status in {"human_accepted", "human_rejected"}:
+        claim["review_stale"] = not human_review_current
+        if human_review_current:
+            claim.pop("review_stale_reason", None)
+        else:
+            claim["review_stale_reason"] = "evidence_changed_since_review"
 
     claim["verification_status"] = status
     claim["review_status"] = review_status
@@ -513,6 +531,17 @@ def _apply_current_policy_block(claim: dict[str, Any]) -> None:
     claim["promotion_status"] = "not_eligible"
     claim["confidence"] = "low"
     _update_report_eligibility(claim)
+
+
+def _human_review_matches_current_evidence(
+    claim: Mapping[str, Any],
+    *,
+    current_cache_key: str,
+) -> bool:
+    review_cache_key = claim.get("review_evidence_cache_key")
+    if not isinstance(review_cache_key, str) or not review_cache_key:
+        return True
+    return review_cache_key == current_cache_key
 
 
 def _has_required_support(
