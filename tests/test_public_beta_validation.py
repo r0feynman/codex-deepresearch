@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +73,18 @@ class PublicBetaValidationTests(unittest.TestCase):
             {"blocked": 20, "excluded": 0, "failed": 0, "passed": 0},
         )
         self.assertEqual(payload["classification_counts"]["excluded_blocked"], 20)
-        self.assertTrue(all(payload["acceptance"].values()), payload["acceptance"])
+        self.assertFalse(payload["release_gate_ready"])
+        self.assertFalse(payload["issue_75_completion_ready"])
+        self.assertEqual(payload["validation_mode"], "diagnostic_harness")
+        self.assertFalse(
+            payload["acceptance"]["all_prompt_runs_are_supplied_sanitized_real_runs"]
+        )
+        harness_checks = {
+            key: value
+            for key, value in payload["acceptance"].items()
+            if key != "all_prompt_runs_are_supplied_sanitized_real_runs"
+        }
+        self.assertTrue(all(harness_checks.values()), payload["acceptance"])
         self.assertTrue(Path(payload["artifacts"]["summary"]).is_file())
         self.assertTrue(
             all(run["failure_category"] for run in payload["runs"] if run["status"] != "passed")
@@ -83,14 +96,28 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(Path(visual["status_artifacts"]["visual_provider_status"]).is_file())
 
     def test_supplied_runs_count_pass_fail_and_blocked_metric_buckets(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
         runs_dir = self.temp_dir()
-        passing_run = self.write_text_run(runs_dir / "passing", status="completed_parallel")
-        failed_run = self.write_text_run(runs_dir / "failed", status="failed_synthesis", ok=False)
+        suite_id = "public-beta-supplied"
+        passing_run = self.write_text_run(
+            runs_dir / "passing",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_parallel",
+        )
+        failed_run = self.write_text_run(
+            runs_dir / "failed",
+            prompt=prompts["pb-text-002"],
+            suite_id=suite_id,
+            status="failed_synthesis",
+            ok=False,
+        )
 
         with self.assertRaises(PublicBetaValidationError) as raised:
             run_public_beta_validation(
                 runs_dir=self.temp_dir(),
-                suite_id="public-beta-supplied",
+                suite_id=suite_id,
                 clean=True,
                 prompt_runs={
                     "pb-text-001": passing_run,
@@ -131,27 +158,81 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(result["metric_classification"], "included_failure")
         self.assertEqual(result["failure_category"], "provider_failure")
 
+    def test_visual_prompt_rejects_shallow_completed_placeholder_files(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "visual-placeholder",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+            release_grade=False,
+        )
+
+        result = evaluate_public_beta_prompt_run(prompt, run_dir)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("non_fixture_visual_acquisition_evidence", checks)
+        self.assertIn("vlm_analyzed_observations", checks)
+        self.assertIn("report_cited_visual_or_mixed_claim", checks)
+
+    def test_supplied_run_must_match_prompt_suite_and_fresh_timestamp(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        reused_run = self.write_text_run(
+            self.temp_dir() / "reused",
+            prompt=prompts["pb-text-002"],
+            suite_id="other-suite",
+            status="completed_parallel",
+            created_at="2020-01-01T00:00:00Z",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompts["pb-text-001"],
+            reused_run,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        failures = result["supplied_run_binding"]["failures"]
+        self.assertTrue(any("prompt_id" in failure for failure in failures), failures)
+        self.assertTrue(any("suite_id" in failure for failure in failures), failures)
+        self.assertTrue(any("older than" in failure for failure in failures), failures)
+
     def test_missing_external_gate_results_prevent_release_ready(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
+        suite_id = "missing-external-gates"
         prompt_runs = {}
         for prompt in manifest["prompts"]:
             if prompt["route"] in {"visual_required", "visual_optional"}:
                 prompt_runs[prompt["id"]] = self.write_visual_run(
                     runs_dir / prompt["id"],
+                    prompt=prompt,
+                    suite_id=suite_id,
                     run_status="completed_auto_visual",
                     provider_status="completed_auto_visual",
                 )
             else:
                 prompt_runs[prompt["id"]] = self.write_text_run(
                     runs_dir / prompt["id"],
+                    prompt=prompt,
+                    suite_id=suite_id,
                     status="completed_parallel",
                 )
 
         with self.assertRaises(PublicBetaValidationError) as raised:
             run_public_beta_validation(
                 runs_dir=self.temp_dir(),
-                suite_id="missing-external-gates",
+                suite_id=suite_id,
                 clean=True,
                 prompt_runs=prompt_runs,
             )
@@ -165,6 +246,83 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(
             any("External gate result artifacts were not supplied" in gap for gap in payload["remaining_gaps"])
         )
+
+    def test_spoofed_external_gate_results_cannot_default_zero_to_ready(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        runs_dir = self.temp_dir()
+        suite_id = "spoofed-external-gates"
+        prompt_runs = {}
+        for prompt in manifest["prompts"]:
+            if prompt["route"] in {"visual_required", "visual_optional"}:
+                prompt_runs[prompt["id"]] = self.write_visual_run(
+                    runs_dir / prompt["id"],
+                    prompt=prompt,
+                    suite_id=suite_id,
+                    run_status="completed_auto_visual",
+                    provider_status="completed_auto_visual",
+                )
+            else:
+                prompt_runs[prompt["id"]] = self.write_text_run(
+                    runs_dir / prompt["id"],
+                    prompt=prompt,
+                    suite_id=suite_id,
+                    status="completed_parallel",
+                )
+        spoofed_gate = runs_dir / "spoofed_gate.json"
+        self.write_json(
+            spoofed_gate,
+            {
+                "status": "passed",
+                "public_safe": True,
+                "outcome_counts": {},
+            },
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs=prompt_runs,
+                gate_results={
+                    "automated_cli_real_provider_visual_e2e": spoofed_gate,
+                },
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        gate = payload["external_gate_results"]["automated_cli_real_provider_visual_e2e"]
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(payload["release_gate_ready"])
+        self.assertEqual(gate["status"], "failed")
+        self.assertTrue(any("schema_version" in failure for failure in gate["failures"]))
+        self.assertTrue(any("release_gate" in failure for failure in gate["failures"]))
+        self.assertTrue(any("outcome_counts.passed" in failure for failure in gate["failures"]))
+
+    def test_summary_redacts_private_absolute_run_paths(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        suite_id = "summary-redaction"
+        private_shaped_run = self.write_text_run(
+            self.temp_dir() / "Users" / "alice" / "public-beta-run",
+            prompt=prompt,
+            suite_id=suite_id,
+            status="completed_parallel",
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={prompt["id"]: private_shaped_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        summary = Path(payload["artifacts"]["summary"]).read_text(encoding="utf-8")
+        self.assertNotIn(str(private_shaped_run), summary)
+        self.assertNotIn("/Users/alice", summary)
+        self.assertIn(f"supplied-run:{prompt['id']}", summary)
+        self.assertTrue(payload["acceptance"]["summary_artifact_public_safe"])
 
     def test_cli_allow_blocked_outputs_sanitized_results_and_exits_zero(self) -> None:
         runs_dir = self.temp_dir()
@@ -191,17 +349,35 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertFalse(payload["raw_run_bundles_copied"])
         self.assertTrue(Path(payload["artifacts"]["results"]).is_file())
         self.assertTrue(Path(payload["artifacts"]["summary"]).is_file())
+        self.assertFalse(payload["issue_75_completion_ready"])
 
-    def write_text_run(self, run_dir: Path, *, status: str, ok: bool = True) -> Path:
+    def write_text_run(
+        self,
+        run_dir: Path,
+        *,
+        prompt: dict[str, Any],
+        suite_id: str,
+        status: str,
+        ok: bool = True,
+        created_at: str | None = None,
+    ) -> Path:
         run_dir.mkdir(parents=True)
         terminal = True
+        timestamp = created_at or self.now()
         self.write_json(
             run_dir / "run_status.json",
             {
                 "schema_version": "codex-deepresearch.run-status.v0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "question": prompt["prompt"],
                 "status": status,
                 "ok": ok,
                 "terminal": terminal,
+                "created_at": timestamp,
+                "completed_at": timestamp,
                 "selected_mode": "codex-plugin",
                 "adapter": "codex-exec",
             },
@@ -209,11 +385,25 @@ class PublicBetaValidationTests(unittest.TestCase):
         if status.startswith("completed"):
             self.write_json(
                 run_dir / "evidence.json",
-                {"schema_version": "0.1.0", "mode": "codex-plugin"},
+                {
+                    "schema_version": "0.1.0",
+                    "run_id": run_dir.name,
+                    "prompt_id": prompt["id"],
+                    "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                    "suite_id": suite_id,
+                    "question": prompt["prompt"],
+                    "created_at": timestamp,
+                    "mode": "codex-plugin",
+                },
             )
             self.write_json(
                 run_dir / "report_status.json",
-                {"schema_version": "codex-deepresearch.report-status.v0", "used_images": []},
+                {
+                    "schema_version": "codex-deepresearch.report-status.v0",
+                    "run_id": run_dir.name,
+                    "status": "completed",
+                    "used_images": [],
+                },
             )
             (run_dir / "report.md").write_text("# Public-safe report\n", encoding="utf-8")
         return run_dir
@@ -222,44 +412,127 @@ class PublicBetaValidationTests(unittest.TestCase):
         self,
         run_dir: Path,
         *,
+        prompt: dict[str, Any] | None = None,
+        suite_id: str = "public-beta-validation",
         run_status: str,
         provider_status: str,
+        release_grade: bool = True,
     ) -> Path:
         run_dir.mkdir(parents=True)
+        prompt = prompt or next(
+            prompt
+            for prompt in load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)["prompts"]
+            if prompt["route"] == "visual_required"
+        )
+        timestamp = self.now()
         self.write_json(
             run_dir / "run_status.json",
             {
                 "schema_version": "codex-deepresearch.run-status.v0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "question": prompt["prompt"],
                 "status": run_status,
                 "ok": run_status == "completed_auto_visual",
                 "terminal": True,
+                "created_at": timestamp,
+                "completed_at": timestamp,
                 "selected_mode": "automated-cli",
             },
         )
+        image_id = "img_real_001"
+        candidate = self.visual_candidate_record()
+        fetch = self.visual_fetch_record(candidate, image_id=image_id)
+        observation = self.visual_observation_record(candidate, fetch, image_id=image_id)
         self.write_json(
             run_dir / "evidence.json",
-            {"schema_version": "0.1.0", "mode": "automated-cli"},
+            {
+                "schema_version": "0.1.0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "question": prompt["prompt"],
+                "created_at": timestamp,
+                "mode": "automated-cli",
+                "images": [
+                    {
+                        "id": image_id,
+                        "candidate_id": candidate["candidate_id"],
+                        "fetch_id": fetch["fetch_id"],
+                        "local_artifact_path": f"images/{image_id}.png",
+                        "provider": candidate["provider"],
+                        "provider_kind": candidate["provider_kind"],
+                        "provider_mode": "real",
+                        "provider_provenance": candidate["provider_provenance"],
+                        "policy_decision": "allowed",
+                    }
+                ]
+                if release_grade
+                else [],
+                "claims": [
+                    {
+                        "id": "claim_visual_001",
+                        "text": "The real visual provider image supports the claim.",
+                        "claim_type": "visual",
+                        "supporting_sources": [],
+                        "supporting_images": [image_id],
+                        "visual_supports": [
+                            {
+                                "image_id": image_id,
+                                "observation_ref": f"images.{image_id}.observations[0]",
+                            }
+                        ],
+                        "verification_status": "supported",
+                        "confidence": "high",
+                    }
+                ]
+                if release_grade
+                else [],
+            },
         )
         self.write_json(
             run_dir / "report_status.json",
-            {"schema_version": "codex-deepresearch.report-status.v0", "used_images": ["img_001"]},
+            {
+                "schema_version": "codex-deepresearch.report-generation.v0",
+                "run_id": run_dir.name,
+                "status": "completed",
+                "used_images": [image_id] if release_grade else ["img_001"],
+            },
         )
         self.write_json(
             run_dir / "visual_provider_status.json",
             {
                 "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_dir.name,
                 "status": provider_status,
                 "ok": provider_status == "completed_auto_visual",
                 "terminal": True,
                 "providers": [
+                    {
+                        "provider": "real-screenshot",
+                        "provider_kind": "screenshot",
+                        "provider_mode": "real",
+                        "configured": provider_status == "completed_auto_visual",
+                        "available": provider_status == "completed_auto_visual",
+                        "invocations": 1 if provider_status == "completed_auto_visual" else 0,
+                        "candidates_discovered": 1 if release_grade else 0,
+                        "artifacts_fetched": 1 if release_grade else 0,
+                        "vlm_images_analyzed": 0,
+                    },
                     {
                         "provider": "openai-responses-vision",
                         "provider_kind": "vlm",
                         "provider_mode": "real",
                         "configured": provider_status == "completed_auto_visual",
                         "available": provider_status == "completed_auto_visual",
-                        "vlm_images_analyzed": 3 if provider_status == "completed_auto_visual" else 0,
-                    }
+                        "invocations": 1 if provider_status == "completed_auto_visual" else 0,
+                        "candidates_discovered": 0,
+                        "artifacts_fetched": 1 if release_grade else 0,
+                        "vlm_images_analyzed": 1 if release_grade else 0,
+                    },
                 ],
             },
         )
@@ -267,11 +540,116 @@ class PublicBetaValidationTests(unittest.TestCase):
             run_dir / "visual_search_plan.json",
             {"schema_version": "codex-deepresearch.visual-artifacts.v0", "tasks": []},
         )
-        (run_dir / "visual_candidates.jsonl").write_text("{}\n", encoding="utf-8")
-        (run_dir / "image_fetch_status.jsonl").write_text("{}\n", encoding="utf-8")
-        (run_dir / "visual_observations.jsonl").write_text("{}\n", encoding="utf-8")
-        (run_dir / "report.md").write_text("# Public-safe visual report\n", encoding="utf-8")
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", [candidate] if release_grade else [{}])
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", [fetch] if release_grade else [{}])
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [observation] if release_grade else [{}],
+        )
+        self.write_jsonl(run_dir / "verifier_votes.jsonl", [{"id": "vote_visual_001"}])
+        report = (
+            "Claim `claim_visual_001` is supported by Image `img_real_001`.\n"
+            if release_grade
+            else "# Public-safe visual report\n"
+        )
+        (run_dir / "report.md").write_text(report, encoding="utf-8")
         return run_dir
+
+    def write_jsonl(self, path: Path, records: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+    def visual_candidate_record(self) -> dict[str, Any]:
+        return {
+            "candidate_id": "cand_real_001",
+            "task_id": "task_visual_001",
+            "angle_id": "angle_001",
+            "provider": "real-screenshot",
+            "provider_kind": "screenshot",
+            "provider_mode": "real",
+            "provider_run_id": "run_real_001",
+            "provider_provenance": {
+                "provider": "real-screenshot",
+                "provider_kind": "screenshot",
+                "provider_mode": "real",
+                "external_network_call": True,
+            },
+            "origin": "screenshot",
+            "policy_decision": "allowed",
+            "candidate_status": "analyzed",
+        }
+
+    def visual_fetch_record(self, candidate: dict[str, Any], *, image_id: str) -> dict[str, Any]:
+        return {
+            "fetch_id": "fetch_real_001",
+            "candidate_id": candidate["candidate_id"],
+            "task_id": candidate["task_id"],
+            "angle_id": candidate["angle_id"],
+            "provider": candidate["provider"],
+            "provider_kind": candidate["provider_kind"],
+            "provider_mode": "real",
+            "provider_run_id": candidate["provider_run_id"],
+            "provider_provenance": candidate["provider_provenance"],
+            "origin": candidate["origin"],
+            "fetch_status": "fetched",
+            "evidence_image_id": image_id,
+            "local_artifact_path": f"images/{image_id}.png",
+            "policy_decision": "allowed",
+        }
+
+    def visual_observation_record(
+        self,
+        candidate: dict[str, Any],
+        fetch: dict[str, Any],
+        *,
+        image_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "observation_id": "obs_real_001",
+            "evidence_image_id": image_id,
+            "task_id": candidate["task_id"],
+            "angle_id": candidate["angle_id"],
+            "candidate_id": candidate["candidate_id"],
+            "fetch_id": fetch["fetch_id"],
+            "provider": "openai-responses-vision",
+            "provider_kind": "vlm",
+            "provider_mode": "real",
+            "provider_run_id": "openai-real-001",
+            "provider_provenance": {
+                "provider": "openai-responses-vision",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "external_vlm_call": True,
+            },
+            "observation_status": "analyzed",
+            "observations": ["The image contains visible evidence."],
+            "inferences": ["The image supports the visual claim."],
+            "policy_decision": "allowed",
+            "verifier_links": [
+                {
+                    "claim_id": "claim_visual_001",
+                    "visual_support_ref": f"images.{image_id}.observations[0]",
+                    "verifier_vote_id": "vote_visual_001",
+                }
+            ],
+            "report_links": [
+                {
+                    "claim_id": "claim_visual_001",
+                    "report_section_id": "findings",
+                    "citation_id": f"img:{image_id}",
+                }
+            ],
+        }
+
+    def prompt_hash(self, prompt: str) -> str:
+        normalized = " ".join(prompt.strip().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def now(self) -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 if __name__ == "__main__":

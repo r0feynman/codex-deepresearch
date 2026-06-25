@@ -408,6 +408,10 @@ def run_public_beta_validation(runner: Path) -> None:
         fail("runner public-beta-validation without real runs must honestly report blocked")
     if payload.get("release_gate_ready") is not False:
         fail("public beta validation must not claim release readiness without real runs")
+    if payload.get("issue_75_completion_ready") is not False:
+        fail("public beta validation must not claim issue #75 completion without real runs")
+    if payload.get("validation_mode") != "diagnostic_harness":
+        fail("public beta validation without real runs must stay in diagnostic harness mode")
     if payload.get("raw_run_bundles_copied") is not False:
         fail("public beta validation must not copy raw run bundles")
     coverage = payload.get("prompt_coverage", {})
@@ -421,7 +425,16 @@ def run_public_beta_validation(runner: Path) -> None:
     if outcome_counts.get("failed", 0) != 0:
         fail("public beta validation must keep blocked runs separate from failed runs")
     acceptance = payload.get("acceptance")
-    if not isinstance(acceptance, dict) or not all(acceptance.values()):
+    if not isinstance(acceptance, dict):
+        fail("public beta validation acceptance checks must be present")
+    if acceptance.get("all_prompt_runs_are_supplied_sanitized_real_runs") is not False:
+        fail("public beta validation must not mark missing real runs as supplied")
+    harness_acceptance = {
+        key: value
+        for key, value in acceptance.items()
+        if key != "all_prompt_runs_are_supplied_sanitized_real_runs"
+    }
+    if not all(harness_acceptance.values()):
         fail("public beta validation acceptance checks did not all pass")
     summary = payload.get("artifacts", {}).get("summary")
     if not summary:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -138,6 +139,7 @@ def run_fresh_session_e2e(
 
     acceptance = _acceptance(scenarios)
     runner_artifact_gate = _runner_artifact_gate(scenarios)
+    outcome_counts = _outcome_counts(scenarios)
     if runner_artifact_gate["status"] != "passed":
         failures.append(
             {
@@ -157,6 +159,10 @@ def run_fresh_session_e2e(
     results: dict[str, Any] = {
         "schema_version": FRESH_SESSION_E2E_SCHEMA_VERSION,
         "status": "passed" if not failures else "failed",
+        "generated_at": _utc_now(),
+        "release_gate_passed": (
+            not failures and outcome_counts.get("completed_real_parallel", 0) > 0
+        ),
         "suite_id": suite_id,
         "suite_dir": str(suite_dir.resolve()),
         "invocation": invocation,
@@ -165,7 +171,7 @@ def run_fresh_session_e2e(
         "skill_transcript_gate": skill_transcript_gate,
         "runner_artifact_gate": runner_artifact_gate,
         "scenarios": scenarios,
-        "outcome_counts": _outcome_counts(scenarios),
+        "outcome_counts": outcome_counts,
         "acceptance": acceptance,
         "failures": failures,
         "artifacts": {"results": str(results_path.resolve())},
@@ -287,6 +293,7 @@ def run_fresh_session_visual_e2e(
     results: dict[str, Any] = {
         "schema_version": FRESH_SESSION_VISUAL_E2E_SCHEMA_VERSION,
         "status": "passed" if not failures else "failed",
+        "generated_at": _utc_now(),
         "release_gate_status": release_gate_status,
         "release_gate_passed": acceptance["release_gate_passed"],
         "suite_id": suite_id,
@@ -1960,6 +1967,10 @@ def _timeout_text(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")[:500]
     return str(value)[:500]
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _scenario_command_args(
