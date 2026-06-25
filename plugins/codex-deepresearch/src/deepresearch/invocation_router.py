@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,10 +35,31 @@ _QUICK_CHAT_MARKERS = (
     "quick-chat",
     "chat only",
     "chat-only",
-    "do not run full pipeline",
-    "don't run full pipeline",
-    "no full pipeline",
-    "without full pipeline",
+)
+_FULL_RUNNER_INTENT_MARKERS = (
+    "instead run full pipeline",
+    "instead run the full pipeline",
+    "run full pipeline",
+    "run the full pipeline",
+    "full pipeline",
+    "full runner",
+    "full-runner",
+    "produce evidence",
+    "produce an evidence",
+    "produce evidence bundle",
+    "create evidence bundle",
+    "create an evidence bundle",
+    "evidence bundle",
+    "durable artifacts",
+    "run_status.json",
+)
+_NEGATION_PATTERNS = (
+    r"\bdo\s+not\b",
+    r"\bdon't\b",
+    r"\bnot\b",
+    r"\bnever\b",
+    r"\bwithout\s+quick\b",
+    r"\bno\s+quick\b",
 )
 _PARALLEL_SYNTHESIS_STATUSES = {
     "completed_parallel",
@@ -729,7 +751,17 @@ def _question_from_invocation(invocation: str) -> str:
 
 def _has_quick_chat_marker(invocation: str) -> bool:
     normalized = invocation.strip().lower()
+    if _has_full_runner_intent(normalized) or _has_negation(normalized):
+        return False
     return any(marker in normalized for marker in _QUICK_CHAT_MARKERS)
+
+
+def _has_full_runner_intent(normalized_invocation: str) -> bool:
+    return any(marker in normalized_invocation for marker in _FULL_RUNNER_INTENT_MARKERS)
+
+
+def _has_negation(normalized_invocation: str) -> bool:
+    return any(re.search(pattern, normalized_invocation) for pattern in _NEGATION_PATTERNS)
 
 
 def _manual_provenance(manual_status: Mapping[str, Any]) -> dict[str, Any]:

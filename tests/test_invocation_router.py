@@ -66,6 +66,37 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertIn("no DeepResearch evidence bundle was produced", result["response_notice"])
         self.assertEqual(result["artifacts"], {})
 
+    def test_negated_quick_answer_with_full_pipeline_intent_runs_full_runner(self) -> None:
+        result = run_skill_invocation(
+            "$deep-research: do not give me a quick answer about cache eviction; run the full pipeline",
+            runs_dir=self.temp_runs_dir(),
+            adapter_name="fixture",
+            route="text_only",
+            budget_preset="quick",
+            min_tasks=1,
+            max_tasks=1,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["selected_mode"], "full-runner")
+        self.assertEqual(result["status"], "completed_fixture")
+        self.assertIn("run_status", result["artifacts"])
+        self.assertIn("evidence", result["artifacts"])
+        self.assertIn("report_status", result["artifacts"])
+
+    def test_quick_chat_flag_overrides_negated_text_marker(self) -> None:
+        result = run_skill_invocation(
+            "$deep-research: do not give me a quick answer about cache eviction; run the full pipeline",
+            runs_dir=self.temp_runs_dir(),
+            quick_chat=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["selected_mode"], "quick-chat")
+        self.assertEqual(result["status"], "quick_chat_only")
+        self.assertTrue(result["no_evidence_bundle"])
+
     def test_blocked_preflight_writes_terminal_run_status(self) -> None:
         with mock.patch("deepresearch.invocation_router.shutil.which", return_value=None):
             result = run_skill_invocation(
