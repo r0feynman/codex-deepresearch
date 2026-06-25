@@ -35,12 +35,14 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
     "plugins/codex-deepresearch/src/deepresearch/mvp_smoke.py",
     "plugins/codex-deepresearch/src/deepresearch/parallel_orchestrator.py",
+    "plugins/codex-deepresearch/src/deepresearch/public_beta_validation.py",
     "plugins/codex-deepresearch/src/deepresearch/report_generation.py",
     "plugins/codex-deepresearch/src/deepresearch/run_state.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/src/deepresearch/verification_matrix.py",
     "plugins/codex-deepresearch/src/deepresearch/vision_adapter.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
+    "plugins/codex-deepresearch/validation/public_beta_prompts.json",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
     "tests/fixtures/evidence_schema/valid_evidence.json",
@@ -56,6 +58,7 @@ REQUIRED_FILES = [
     "tests/test_modality_router.py",
     "tests/test_mvp_smoke.py",
     "tests/test_parallel_orchestrator.py",
+    "tests/test_public_beta_validation.py",
     "tests/test_report_generation.py",
     "tests/test_run_state.py",
     "tests/test_search_handoff.py",
@@ -369,6 +372,74 @@ def run_fresh_session_visual_e2e_validation(runner: Path) -> None:
         fail("fresh-session visual blocked scenario did not expose provider status artifact")
 
 
+def run_public_beta_validation(runner: Path) -> None:
+    """Validate the CI-safe P3-E2E1 public beta classification gate."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="codex-deepresearch-public-beta-validation-",
+        dir="/tmp",
+    ) as runs_dir:
+        suite_id = "validate-public-beta-suite"
+        result = subprocess.run(
+            [
+                str(runner),
+                "public-beta-validation",
+                "--runs-dir",
+                runs_dir,
+                "--suite-id",
+                suite_id,
+                "--clean",
+                "--allow-blocked",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        results_path = Path(runs_dir) / suite_id / "public_beta_validation_results.json"
+        if result.returncode != 0:
+            fail("runner public-beta-validation CI-safe gate must exit 0 with --allow-blocked")
+        raw_payload = result.stdout.strip() or results_path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        fail(f"runner public-beta-validation must output valid JSON: {exc}")
+    if payload.get("status") != "blocked":
+        fail("runner public-beta-validation without real runs must honestly report blocked")
+    if payload.get("release_gate_ready") is not False:
+        fail("public beta validation must not claim release readiness without real runs")
+    if payload.get("raw_run_bundles_copied") is not False:
+        fail("public beta validation must not copy raw run bundles")
+    coverage = payload.get("prompt_coverage", {})
+    if coverage.get("total_prompts", 0) < 20:
+        fail("public beta validation must cover at least 20 prompts")
+    if coverage.get("visual_prompts", 0) < 8:
+        fail("public beta validation must cover at least 8 visual prompts")
+    outcome_counts = payload.get("outcome_counts", {})
+    if outcome_counts.get("blocked", 0) < 20:
+        fail("public beta validation must record missing real runs as blocked diagnostics")
+    if outcome_counts.get("failed", 0) != 0:
+        fail("public beta validation must keep blocked runs separate from failed runs")
+    acceptance = payload.get("acceptance")
+    if not isinstance(acceptance, dict) or not all(acceptance.values()):
+        fail("public beta validation acceptance checks did not all pass")
+    summary = payload.get("artifacts", {}).get("summary")
+    if not summary:
+        fail("public beta validation did not report summary artifact")
+    runs = payload.get("runs", [])
+    if not runs:
+        fail("public beta validation did not report prompt runs")
+    for run in runs:
+        if not run.get("run_dir"):
+            fail("public beta validation run is missing run_dir")
+        if not run.get("status_artifacts"):
+            fail("public beta validation run is missing status artifacts")
+        if not run.get("provider_provenance"):
+            fail("public beta validation run is missing provider provenance")
+        if run.get("status") != "passed" and not run.get("failure_category"):
+            fail("public beta validation non-passing run is missing failure_category")
+
+
 def main() -> None:
     for relative_path in REQUIRED_FILES:
         if not (ROOT / relative_path).exists():
@@ -452,6 +523,7 @@ def main() -> None:
     run_parallel_orchestration_validation(runner)
     run_fresh_session_e2e_validation(runner)
     run_fresh_session_visual_e2e_validation(runner)
+    run_public_beta_validation(runner)
 
     with tempfile.TemporaryDirectory() as manual_runs_dir:
         manual_result = subprocess.run(

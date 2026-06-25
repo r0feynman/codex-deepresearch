@@ -1,0 +1,344 @@
+{
+  "created_for_issue": "#75",
+  "description": "Public-safe Phase 3 beta validation prompt set for real-use DeepResearch gates.",
+  "name": "phase-3-public-beta-real-use-validation",
+  "prompts": [
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-001",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Compare public approaches for deterministic software release validation and cite evidence-quality tradeoffs.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public project documentation and release engineering articles only.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-002",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Research public guidance on robots.txt, copyright, and citation handling for automated research tools.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public policy and documentation pages; no account or user data.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-003",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Compare public API rate-limit handling guidance across three developer APIs.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public API documentation and avoids credentials or tenant data.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-004",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Summarize public outage postmortem structures used by major cloud providers and identify evidence patterns.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public postmortems and status reports only.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-005",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Compare Python packaging reproducibility recommendations from public documentation and standards discussions.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public standards, packaging docs, and changelogs.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-006",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Research public recommendations for preventing cache poisoning in GitHub Actions workflows.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public security documentation and example workflows.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-007",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Compare public schema choices for linking report claims to source evidence in research or evaluation tools.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public documentation and open schema examples.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-008",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Analyze public browser automation guidance for producing stable website screenshots in CI.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public browser automation documentation and examples.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-009",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Compare public incident report templates for software reliability investigations.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public templates and documentation.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "fresh_session_full_runner_artifact_handoff"
+      ],
+      "id": "pb-text-010",
+      "mode_targets": [
+        "codex-plugin"
+      ],
+      "prompt": "Research public guidance on validating generated reports against source-backed claims.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public evaluation and documentation sources only.",
+      "route": "text_only"
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-001",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Compare above-the-fold public documentation screenshots for Python, Node.js, and Rust and cite visible layout differences.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public documentation pages and generated screenshots only.",
+      "route": "visual_required",
+      "visual_provider_requirements": [
+        "screenshot",
+        "codex-interactive",
+        "openai-responses-vision"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-002",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Compare visible product page imagery for three public code editor products and cite image-backed differences.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public product pages and image metadata only.",
+      "route": "visual_required",
+      "visual_provider_requirements": [
+        "web_image_search",
+        "page_extractor",
+        "openai-responses-vision"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-003",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Extract a supported visual claim from a public chart on an international organization or open-data report page.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public chart/report pages and avoids personal datasets.",
+      "route": "visual_required",
+      "visual_provider_requirements": [
+        "page_extractor",
+        "screenshot",
+        "openai-responses-vision"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-004",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Extract and cite one figure-level claim from a public open-access research paper PDF.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public open-access papers and generated figure/page artifacts only.",
+      "route": "visual_required",
+      "visual_provider_requirements": [
+        "pdf_rasterizer",
+        "openai-responses-vision"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-005",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Compare public dashboard screenshots from observability product documentation and cite layout or chart differences.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public documentation screenshots and product pages only.",
+      "route": "visual_required",
+      "visual_provider_requirements": [
+        "web_image_search",
+        "page_extractor",
+        "openai-responses-vision"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-006",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Compare visual evidence from public accessibility contrast examples and cite the image-backed observations.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public accessibility documentation and examples.",
+      "route": "visual_required",
+      "visual_provider_requirements": [
+        "page_extractor",
+        "screenshot",
+        "openai-responses-vision"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-007",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Research public plugin marketplace examples and optionally compare listing screenshots for onboarding cues.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public marketplace pages and screenshots only.",
+      "route": "visual_optional",
+      "visual_provider_requirements": [
+        "screenshot",
+        "page_extractor"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-008",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Compare public map visualization examples and optionally cite visual differences in legends or color scales.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public map examples and screenshots; no private location history.",
+      "route": "visual_optional",
+      "visual_provider_requirements": [
+        "page_extractor",
+        "screenshot"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-009",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Research public design-system documentation and optionally compare component screenshots for navigation patterns.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public design-system documentation and screenshots only.",
+      "route": "visual_optional",
+      "visual_provider_requirements": [
+        "page_extractor",
+        "screenshot"
+      ]
+    },
+    {
+      "gate_tags": [
+        "automatic_web_visual_e2e",
+        "codex_plugin_interactive_visual_e2e",
+        "automated_cli_real_provider_visual_e2e"
+      ],
+      "id": "pb-visual-010",
+      "mode_targets": [
+        "codex-plugin",
+        "automated-cli"
+      ],
+      "prompt": "Research public changelog pages and optionally compare embedded screenshots for feature announcement evidence.",
+      "public_safe": true,
+      "public_safe_justification": "Uses public changelogs and screenshots; no private release notes.",
+      "route": "visual_optional",
+      "visual_provider_requirements": [
+        "page_extractor",
+        "web_image_search"
+      ]
+    }
+  ],
+  "public_safe": true,
+  "schema_version": "codex-deepresearch.public-beta-prompts.v0"
+}

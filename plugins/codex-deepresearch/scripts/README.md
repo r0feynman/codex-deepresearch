@@ -91,6 +91,20 @@ plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-visual-e2e \
 
 The default `skip` mode is deterministic and CI-safe: the command exits successfully when the harness, transcript artifact exposure, fixture exclusion, and blocked-provider diagnostics are valid, but the result remains `release_gate_passed=false` with `release_gate_status=blocked_public_safe`. Use `--completed-auto-visual-run <run-dir-or-run_status.json>` with `--real-codex-interactive=require` for a strict local gate that fails unless real Codex-interactive visual capability produces validated `completed_auto_visual` artifacts.
 
+## Public Beta Validation
+
+`public-beta-validation` is the P3-E2E1 real-use validation classifier. It loads the curated public-safe prompt manifest at `plugins/codex-deepresearch/validation/public_beta_prompts.json`, verifies that it covers at least 20 prompts with at least 8 visual-required or visual-optional prompts, and writes sanitized `public_beta_validation_results.json` plus `public_beta_validation_summary.md`.
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch public-beta-validation \
+  --runs-dir /tmp/codex-deepresearch-public-beta-validation \
+  --suite-id public-beta-validation \
+  --clean \
+  --allow-blocked
+```
+
+When real provider runs are unavailable, the command records explicit blocked diagnostics and exits zero only with `--allow-blocked`; blocked runs are counted separately from failed non-blocked runs and never satisfy release readiness. To classify sanitized real runs, pass repeated `--run prompt_id=/path/to/run-dir` values. To attach existing gate artifacts from `fresh-session-e2e`, `fresh-session-visual-e2e`, or `automated-visual-e2e`, pass repeated `--gate-result gate_id=/path/to/results.json` values. The classifier stores prompt IDs, status artifact paths, provider provenance summaries, failure categories, release-gate readiness, and remaining gaps; it does not copy raw evidence bundles, credentials, non-public screenshots, or personal data.
+
 ## Resolve Config
 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:
