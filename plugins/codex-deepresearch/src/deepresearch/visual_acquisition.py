@@ -1594,13 +1594,13 @@ def _real_provider_succeeded(
             status.get("candidates_discovered")
         ) > 0:
             return True
-        if provider_kind == "screenshot" and _int_or_zero(
-            status.get("captures_succeeded")
-        ) > 0:
-            return True
     return any(
         record.get("provider_kind") == "screenshot"
         and record.get("fetch_status") == "fetched"
+        and isinstance(record.get("local_artifact_path"), str)
+        and bool(record.get("local_artifact_path"))
+        and isinstance(record.get("hash"), str)
+        and bool(record.get("hash"))
         for record in image_fetch_records
     )
 

@@ -26,10 +26,12 @@ class FakeBrowserTransport:
         available: bool = True,
         http_status: int = 200,
         capture_error: str | None = None,
+        write_artifact: bool = True,
     ) -> None:
         self._available = available
         self._http_status = http_status
         self._capture_error = capture_error
+        self._write_artifact = write_artifact
         self.calls: list[dict[str, Any]] = []
 
     def availability(self) -> tuple[bool, str | None]:
@@ -59,11 +61,12 @@ class FakeBrowserTransport:
             from deepresearch.browser_screenshot import BrowserScreenshotError
 
             raise BrowserScreenshotError(self._capture_error)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(
-            b"\x89PNG\r\n\x1a\n"
-            + f"{url}|{output_path.name}|{full_page}".encode("utf-8")
-        )
+        if self._write_artifact:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                + f"{url}|{output_path.name}|{full_page}".encode("utf-8")
+            )
         return BrowserScreenshotCapture(
             width=int(viewport["width"]),
             height=1800 if full_page else int(viewport["height"]),
@@ -154,6 +157,8 @@ class BrowserScreenshotTests(unittest.TestCase):
         plan = self.read_json(run_dir / "visual_search_plan.json")
 
         self.assertEqual(provider_status["status"], "real_image_search_candidates_collected")
+        self.assertTrue(provider_status["ok"])
+        self.assertFalse(provider_status["terminal"])
         self.assertEqual(plan["tasks"][0]["target_evidence_type"], "screenshot")
         self.assertEqual({candidate["candidate_status"] for candidate in candidates}, {"fetched"})
         self.assertEqual({fetch["fetch_status"] for fetch in fetches}, {"fetched"})
@@ -300,6 +305,41 @@ class BrowserScreenshotTests(unittest.TestCase):
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertFalse(evidence["visual_acquisition"]["external_network_call"])
 
+    def test_capture_metadata_without_artifact_is_not_successful_acquisition(self) -> None:
+        run_dir = self.prepared_visual_run()
+        transport = FakeBrowserTransport(write_artifact=False)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=("browser-screenshot",),
+            screenshot_modes=("first_viewport",),
+            browser_transport=transport,
+        )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(result["candidate_records"], 1)
+        self.assertEqual(result["selected_observations"], 0)
+        self.assertTrue(result["external_network_call"])
+        self.assertTrue(result["visual_artifact_validation"]["valid"])
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(candidates[0]["status"], "removed")
+        self.assertIn("missing_content_hash", candidates[0]["removal_reasons"])
+        self.assertNotEqual(candidates[0]["candidate_status"], "fetched")
+        self.assertNotEqual(fetches[0]["fetch_status"], "fetched")
+        self.assertIsNone(fetches[0]["local_artifact_path"])
+        self.assertIsNone(fetches[0]["hash"])
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertFalse(provider_status["ok"])
+        self.assertTrue(provider_status["terminal"])
+        self.assertEqual(provider["artifacts_fetched"], 0)
+        self.assertEqual(result["providers"][0]["captures_succeeded"], 1)
+
     def test_access_denied_http_status_after_navigation_is_policy_blocked(self) -> None:
         run_dir = self.prepared_visual_run()
         transport = FakeBrowserTransport(http_status=403)
@@ -323,6 +363,10 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertIn("access_denied", candidates[0]["removal_reasons"])
         self.assertEqual(candidates[0]["http_status"], 403)
         self.assertEqual(candidates[0]["screenshot"]["http_status"], 403)
+        self.assertEqual(candidates[0]["screenshot"]["policy_decision"], "blocked")
+        self.assertIn("access_denied", candidates[0]["screenshot"]["policy_flags"])
+        self.assertEqual(candidates[0]["screenshot"]["candidate_status"], "policy_blocked")
+        self.assertEqual(candidates[0]["screenshot"]["failure_code"], "access_denied")
         self.assertFalse((run_dir / candidates[0]["local_artifact_path"]).exists())
         self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
         self.assertEqual(fetches[0]["http_status"], 403)

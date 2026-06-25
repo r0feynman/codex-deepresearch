@@ -491,11 +491,21 @@ def _removed_record(
 ) -> dict[str, Any]:
     updated = dict(record)
     screenshot = dict(updated["screenshot"])
-    screenshot.update({"supported": False, "unsupported_reason": unsupported_reason})
     decision = policy_decision or str(updated.get("policy_decision") or "allowed")
     flags = _dedupe([*_string_list(updated.get("policy_flags")), *policy_flags])
     if decision == "blocked":
         candidate_status = "policy_blocked"
+    screenshot.update(
+        {
+            "supported": False,
+            "unsupported_reason": unsupported_reason,
+            "policy_decision": decision,
+            "policy_flags": flags,
+            "candidate_status": candidate_status,
+            "rejection_reason": reason,
+            "failure_code": reason,
+        }
+    )
     updated.update(
         {
             "status": "removed",
