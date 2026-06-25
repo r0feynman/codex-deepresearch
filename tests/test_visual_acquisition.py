@@ -21,6 +21,39 @@ from deepresearch import (  # noqa: E402
     validate_artifacts,
     verify_claims,
 )
+from deepresearch.visual_acquisition import _BraveImageSearchResponse  # noqa: E402
+
+
+class FakeBraveImageTransport:
+    def __init__(self, *, count: int = 12) -> None:
+        self.count = count
+        self.calls: list[dict] = []
+
+    def fetch(self, **kwargs) -> _BraveImageSearchResponse:
+        self.calls.append(kwargs)
+        results = []
+        for index in range(1, self.count + 1):
+            results.append(
+                {
+                    "title": f"Provider image result {index}",
+                    "url": f"https://example.com/source/page-{index}",
+                    "thumbnail": {"src": f"https://images.example.com/result-{index}.jpg"},
+                    "properties": {
+                        "url": f"https://images.example.com/result-{index}.jpg",
+                        "width": 800 + index,
+                        "height": 450 + index,
+                    },
+                }
+            )
+        return _BraveImageSearchResponse(
+            status_code=200,
+            payload={"type": "images", "results": results, "extra": {}},
+            headers={
+                "x-ratelimit-limit": "100",
+                "x-ratelimit-remaining": "99",
+            },
+            elapsed_ms=7,
+        )
 
 
 class VisualAcquisitionTests(unittest.TestCase):
@@ -286,6 +319,177 @@ class VisualAcquisitionTests(unittest.TestCase):
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertEqual(evidence["images"], [])
         self.assertEqual(evidence["visual_acquisition"]["status"], "no_visual_tasks")
+
+    def test_real_brave_image_search_provider_normalizes_candidates(self) -> None:
+        prepared = prepare_run(
+            question="Find image evidence for a public product interface",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        transport = FakeBraveImageTransport(count=12)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["brave-image-search"],
+            real_image_search_transport=transport,
+            real_image_search_config={
+                "brave_api_key": "test-secret-token",
+                "brave_image_count": 12,
+                "brave_estimated_cost_usd": 0.006,
+            },
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"]["errors"],
+        )
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(result["candidate_records"], 12)
+        self.assertEqual(result["selected_observations"], 0)
+        self.assertEqual(result["image_search_invocations"], 1)
+        self.assertTrue(result["external_network_call"])
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(len(candidates), 12)
+        first = candidates[0]
+        self.assertEqual(first["provider"], "brave-image-search")
+        self.assertEqual(first["provider_kind"], "web_image_search")
+        self.assertEqual(first["provider_mode"], "real")
+        self.assertEqual(first["origin"], "image_search")
+        self.assertEqual(first["candidate_status"], "ranked")
+        self.assertEqual(first["rank"], 1)
+        self.assertGreater(first["score"], 0)
+        self.assertEqual(first["policy_decision"], "allowed")
+        self.assertTrue(first["page_url"].startswith("https://example.com/source/"))
+        self.assertTrue(first["image_url"].startswith("https://images.example.com/"))
+        self.assertFalse(first["provider_provenance"]["fixture_only"])
+        self.assertTrue(first["provider_provenance"]["external_network_call"])
+        self.assertIn("provider_diagnostics", first)
+        self.assertGreater(first["estimated_cost_usd"], 0)
+        self.assertEqual(first["actual_cost_usd"], 0.0)
+        self.assertEqual(self.read_jsonl(run_dir / "visual_observations.jsonl"), [])
+        self.assertTrue(all(not (run_dir / f"images/result-{index}.jpg").exists() for index in range(1, 13)))
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider_status["status"], "real_image_search_candidates_collected")
+        self.assertTrue(provider_status["ok"])
+        self.assertFalse(provider_status["terminal"])
+        self.assertEqual(provider["provider"], "brave-image-search")
+        self.assertEqual(provider["provider_mode"], "real")
+        self.assertTrue(provider["configured"])
+        self.assertTrue(provider["available"])
+        self.assertEqual(provider["invocations"], 1)
+        self.assertEqual(provider["candidates_discovered"], 12)
+        self.assertEqual(provider["artifacts_fetched"], 0)
+        self.assertEqual(provider["vlm_images_analyzed"], 0)
+        self.assertGreater(provider["estimated_cost_usd"], 0)
+        self.assertEqual(provider["actual_cost_usd"], 0.0)
+        self.assertNotIn(
+            "test-secret-token",
+            json.dumps(
+                {
+                    "result": result,
+                    "candidates": candidates,
+                    "provider_status": provider_status,
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def test_real_brave_missing_config_blocks_without_fixture_candidates(self) -> None:
+        prepared = prepare_run(
+            question="Find image evidence but no provider credentials are configured",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["brave-image-search"],
+            real_image_search_config={"brave_api_key": ""},
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_visual_provider")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["candidate_records"], 0)
+        self.assertEqual(result["selected_observations"], 0)
+        self.assertEqual(self.read_jsonl(run_dir / "visual_candidates.jsonl"), [])
+        self.assertEqual(self.read_jsonl(run_dir / "visual_observations.jsonl"), [])
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider_status["status"], "blocked_missing_visual_provider")
+        self.assertFalse(provider_status["ok"])
+        self.assertTrue(provider_status["terminal"])
+        self.assertEqual(provider["provider"], "brave-image-search")
+        self.assertEqual(provider["provider_kind"], "web_image_search")
+        self.assertEqual(provider["provider_mode"], "real")
+        self.assertFalse(provider["configured"])
+        self.assertFalse(provider["available"])
+        self.assertEqual(provider["blocked_reason"], "missing_brave_search_api_key")
+        self.assertEqual(provider["invocations"], 0)
+
+    def test_real_provider_request_ignores_fixture_provider_candidates(self) -> None:
+        prepared = prepare_run(
+            question="Find image evidence with mixed provider input",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        transport = FakeBraveImageTransport(count=10)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["local-image-fixture", "brave-image-search"],
+            real_image_search_transport=transport,
+            real_image_search_config={
+                "brave_api_key": "test-secret-token",
+                "brave_image_count": 10,
+            },
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(len(candidates), 10)
+        self.assertEqual({candidate["provider"] for candidate in candidates}, {"brave-image-search"})
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(
+            {provider["provider"] for provider in provider_status["providers"]},
+            {"brave-image-search"},
+        )
+        self.assertEqual(provider_status["providers"][0]["invocations"], 1)
+
+    def test_text_only_route_does_not_call_real_image_search_provider(self) -> None:
+        prepared = prepare_run(
+            question="Text-only route should not call real image search",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        transport = FakeBraveImageTransport(count=12)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["brave-image-search"],
+            real_image_search_transport=transport,
+            real_image_search_config={"brave_api_key": "test-secret-token"},
+        )
+
+        self.assertEqual(result["status"], "no_visual_tasks")
+        self.assertEqual(len(transport.calls), 0)
+        self.assertEqual(result["candidate_records"], 0)
+        self.assertEqual(result["image_search_invocations"], 0)
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider["provider"], "brave-image-search")
+        self.assertEqual(provider["provider_mode"], "real")
+        self.assertEqual(provider["invocations"], 0)
 
     def test_cli_acquire_visual_outputs_machine_readable_status(self) -> None:
         run_dir = self.prepared_visual_run_with_html_source()
