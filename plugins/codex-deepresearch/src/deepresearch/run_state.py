@@ -11,7 +11,11 @@ from typing import Any, Mapping
 
 
 RUN_STEPS_SCHEMA_VERSION = "codex-deepresearch.run-steps.v0"
+RUN_CONTROL_SCHEMA_VERSION = "codex-deepresearch.run-control.v0"
 RUN_STEPS_FILENAME = "run_steps.json"
+RUN_CONTROL_FILENAME = "run_control.json"
+RUN_STATUS_FILENAME = "run_status.json"
+_RUN_STATUS_SCHEMA_VERSION = "codex-deepresearch.run-status.v0"
 _RUN_TRACE_FILENAME = "run_trace.jsonl"
 
 RUN_STAGE_ORDER = (
@@ -186,12 +190,26 @@ def run_steps_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / RUN_STEPS_FILENAME
 
 
+def run_control_path(run_dir: str | Path) -> Path:
+    """Return the canonical run control artifact path."""
+
+    return Path(run_dir) / RUN_CONTROL_FILENAME
+
+
 def add_run_steps_artifact(payload: dict[str, Any], run_dir: str | Path) -> None:
     """Add the canonical run step artifact link to a status/result payload."""
 
     artifacts = payload.setdefault("artifacts", {})
     if isinstance(artifacts, dict):
         artifacts["run_steps"] = str(run_steps_path(run_dir))
+
+
+def add_run_control_artifact(payload: dict[str, Any], run_dir: str | Path) -> None:
+    """Add the canonical run control artifact link to a status/result payload."""
+
+    artifacts = payload.setdefault("artifacts", {})
+    if isinstance(artifacts, dict):
+        artifacts["run_control"] = str(run_control_path(run_dir))
 
 
 def initialize_run_steps(
@@ -214,9 +232,11 @@ def initialize_run_steps(
         if reconstruct_missing:
             _reconstruct_state_from_artifacts(state, run_dir, timestamp=now)
         changed = True
+    changed = _overlay_durable_run_artifacts(state, run_dir, timestamp=now) or changed
+    state = _with_resume_summary(state)
     if changed:
         _write_state(path, state)
-    return _with_resume_summary(state)
+    return state
 
 
 def begin_stage(
@@ -237,6 +257,7 @@ def begin_stage(
             stage=stage,
         )
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=started_at)
+    _raise_if_control_blocks_stage(state, stage)
     record = _stage_record(state, stage)
     current = _status(record)
     if current in TERMINAL_STEP_STATUSES:
@@ -287,6 +308,7 @@ def transition_stage(
     run_dir = Path(run_dir)
     path = run_steps_path(run_dir)
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=timestamp)
+    _raise_if_control_blocks_stage(state, stage)
     _apply_stage_transition(
         state,
         stage,
@@ -425,7 +447,7 @@ def inspect_run_state(run_dir: str | Path, *, run_id: str | None = None) -> dict
     """Return a machine-readable resume summary for a run directory."""
 
     state = initialize_run_steps(run_dir, run_id=run_id)
-    return {
+    payload = {
         "schema_version": RUN_STEPS_SCHEMA_VERSION,
         "run_id": state["run_id"],
         "run_dir": state["run_dir"],
@@ -441,6 +463,181 @@ def inspect_run_state(run_dir: str | Path, *, run_id: str | None = None) -> dict
             "run_steps": str(run_steps_path(run_dir)),
         },
     }
+    control = state.get("control")
+    if isinstance(control, Mapping):
+        payload["control"] = dict(control)
+        payload["artifacts"]["run_control"] = str(run_control_path(run_dir))
+    terminal_run_status = state.get("terminal_run_status")
+    if isinstance(terminal_run_status, Mapping):
+        payload["terminal_run_status"] = dict(terminal_run_status)
+        payload["artifacts"]["run_status"] = str(Path(run_dir) / RUN_STATUS_FILENAME)
+    return payload
+
+
+def pause_run(
+    run_dir: str | Path,
+    *,
+    reason: str | None = None,
+    requested_by: str = "cli",
+    timestamp: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist a durable paused control state for an inspectable run."""
+
+    run_dir = Path(run_dir)
+    _raise_if_persisted_terminal_run_status_blocks_control(run_dir, action="pause")
+    now = timestamp or _utc_now()
+    state = initialize_run_steps(run_dir, run_id=run_id, created_at=now)
+    control_status = _control_status(state)
+    if control_status == "cancelled":
+        raise RunStepStateError(
+            code="run_cancelled",
+            message="cancelled runs cannot be paused",
+        )
+    if state.get("status") == "completed":
+        raise RunStepStateError(
+            code="run_completed",
+            message="completed runs cannot be paused",
+        )
+    if control_status == "paused":
+        control = _mapping_value(state.get("control"))
+        control_artifact = _write_control_artifact(run_dir, state, control)
+        return _control_result(state, control_artifact)
+
+    control = _build_control_payload(
+        run_dir,
+        state,
+        status="paused",
+        action="pause",
+        requested_at=now,
+        requested_by=requested_by,
+        reason=reason or "user_requested_pause",
+        terminal=False,
+        diagnostics={
+            "actionable_cause": (
+                "run pause requested; existing artifacts were left intact and "
+                "new stage starts are blocked until resume-run is used"
+            )
+        },
+    )
+    _apply_control_payload(state, control)
+    _mark_running_stages_interrupted(state, control)
+    state = _with_resume_summary(state)
+    _write_state(run_steps_path(run_dir), state)
+    control_artifact = _write_control_artifact(run_dir, state, control)
+    _write_control_run_status(run_dir, control, state)
+    return _control_result(state, control_artifact)
+
+
+def resume_run(
+    run_dir: str | Path,
+    *,
+    reason: str | None = None,
+    requested_by: str = "cli",
+    timestamp: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Clear a paused control gate and report the next safe stage."""
+
+    run_dir = Path(run_dir)
+    _raise_if_persisted_terminal_run_status_blocks_control(run_dir, action="resume")
+    now = timestamp or _utc_now()
+    state = initialize_run_steps(run_dir, run_id=run_id, created_at=now)
+    control_status = _control_status(state)
+    if control_status == "cancelled":
+        raise RunStepStateError(
+            code="run_cancelled",
+            message="cancelled runs cannot be resumed",
+        )
+    _raise_if_resume_blocked_by_terminal_run(run_dir, state, control_status)
+    if control_status == "paused":
+        reason_value = reason or "user_requested_resume"
+        actionable_cause = (
+            "run resume requested; continue from next_safe_stage without "
+            "rerunning completed stages"
+        )
+    else:
+        reason_value = reason or "resume_requested_for_unpaused_run"
+        actionable_cause = "run was not paused; no control gate changed"
+
+    control = _build_control_payload(
+        run_dir,
+        state,
+        status="active",
+        action="resume",
+        requested_at=now,
+        requested_by=requested_by,
+        reason=reason_value,
+        terminal=False,
+        diagnostics={"actionable_cause": actionable_cause},
+    )
+    _apply_control_payload(state, control)
+    state = _with_resume_summary(state)
+    _write_state(run_steps_path(run_dir), state)
+    control_artifact = _write_control_artifact(run_dir, state, control)
+    _write_control_run_status(run_dir, control, state, status_override="resumed")
+    return _control_result(state, control_artifact)
+
+
+def cancel_run(
+    run_dir: str | Path,
+    *,
+    reason: str | None = None,
+    requested_by: str = "cli",
+    cleanup_children: bool = True,
+    timestamp: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist terminal cancellation diagnostics without deleting artifacts."""
+
+    run_dir = Path(run_dir)
+    _raise_if_persisted_terminal_run_status_blocks_control(run_dir, action="cancel")
+    now = timestamp or _utc_now()
+    state = initialize_run_steps(run_dir, run_id=run_id, created_at=now)
+    if _control_status(state) == "cancelled":
+        control = _mapping_value(state.get("control"))
+        control_artifact = _write_control_artifact(run_dir, state, control)
+        return _control_result(state, control_artifact)
+    if state.get("status") == "completed":
+        raise RunStepStateError(
+            code="run_completed",
+            message="completed runs cannot be cancelled",
+        )
+
+    child_contexts = _known_child_contexts(run_dir)
+    close_records = _child_context_close_records(
+        child_contexts,
+        requested=cleanup_children,
+        timestamp=now,
+    )
+    diagnostics = {
+        "actionable_cause": _cancellation_actionable_cause(
+            child_contexts,
+            cleanup_children,
+        ),
+        "child_contexts_known": len(child_contexts),
+        "child_context_close_requested": cleanup_children,
+        "child_context_close_records": close_records,
+    }
+    control = _build_control_payload(
+        run_dir,
+        state,
+        status="cancelled",
+        action="cancel",
+        requested_at=now,
+        requested_by=requested_by,
+        reason=reason or "user_requested_cancel",
+        terminal=True,
+        diagnostics=diagnostics,
+    )
+    control["known_child_contexts"] = child_contexts
+    _apply_control_payload(state, control)
+    _mark_running_stages_interrupted(state, control)
+    state = _with_resume_summary(state)
+    _write_state(run_steps_path(run_dir), state)
+    control_artifact = _write_control_artifact(run_dir, state, control)
+    _write_control_run_status(run_dir, control, state)
+    return _control_result(state, control_artifact)
 
 
 def _ensure_state_shape(
@@ -574,6 +771,105 @@ def _reconstruct_state_from_artifacts(
             "at": timestamp,
             "sources": _unique_strings(sources),
         }
+
+
+def _overlay_durable_run_artifacts(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> bool:
+    changed = False
+    changed = (
+        _overlay_run_control_artifact(state, run_dir, timestamp=timestamp)
+        or changed
+    )
+    changed = _overlay_terminal_run_status_artifact(state, run_dir) or changed
+    return changed
+
+
+def _overlay_run_control_artifact(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> bool:
+    control = _read_json_artifact(run_control_path(run_dir))
+    if control is None:
+        return False
+    status = _string_value(control.get("status"))
+    if status not in {"active", "paused", "cancelled"}:
+        return False
+
+    payload = dict(control)
+    payload["run_id"] = str(
+        payload.get("run_id")
+        or state.get("run_id")
+        or _resolve_run_id(run_dir)
+    )
+    payload["run_dir"] = str(run_dir.resolve())
+    changed = False
+    if state.get("control") != payload:
+        state["control"] = payload
+        changed = True
+
+    history = control.get("history")
+    if isinstance(history, list):
+        control_history = [dict(item) for item in history if isinstance(item, Mapping)]
+        if control_history and state.get("control_history") != control_history:
+            state["control_history"] = control_history
+            changed = True
+
+    if changed:
+        state["updated_at"] = _string_value(control.get("requested_at")) or timestamp
+    return changed
+
+
+def _overlay_terminal_run_status_artifact(
+    state: dict[str, Any],
+    run_dir: Path,
+) -> bool:
+    run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME)
+    if run_status is None:
+        if "terminal_run_status" in state:
+            state.pop("terminal_run_status", None)
+            return True
+        return False
+
+    persisted_status = _string_value(run_status.get("status")) or "terminal"
+    if (
+        run_status.get("terminal") is not True
+        and not _is_terminal_run_status_name(persisted_status)
+    ):
+        if "terminal_run_status" in state:
+            state.pop("terminal_run_status", None)
+            return True
+        return False
+
+    terminal = {
+        "status": persisted_status,
+        "ok": run_status.get("ok"),
+        "terminal": True,
+        "updated_at": _payload_timestamp(run_status),
+        "artifacts": _string_artifacts(run_status.get("artifacts")),
+    }
+    diagnostics = run_status.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        terminal["diagnostics"] = dict(diagnostics)
+    control = run_status.get("control")
+    if isinstance(control, Mapping):
+        terminal["control"] = dict(control)
+    provenance = run_status.get("provenance")
+    if isinstance(provenance, Mapping):
+        terminal["provenance"] = dict(provenance)
+
+    if state.get("terminal_run_status") == terminal:
+        return False
+    state["terminal_run_status"] = terminal
+    updated_at = terminal.get("updated_at")
+    if isinstance(updated_at, str) and updated_at:
+        state["updated_at"] = updated_at
+    return True
 
 
 def _replay_trace_artifact(
@@ -1280,11 +1576,545 @@ def _completed_stage_changed_downstream_inputs(record: Mapping[str, Any]) -> boo
     return True
 
 
+def _control_status(state: Mapping[str, Any]) -> str | None:
+    control = state.get("control")
+    if not isinstance(control, Mapping):
+        return None
+    status = control.get("status")
+    return status if status in {"active", "paused", "cancelled"} else None
+
+
+def _terminal_run_status_payload(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    terminal = state.get("terminal_run_status")
+    if not isinstance(terminal, Mapping):
+        return None
+    status = _string_value(terminal.get("status"))
+    if terminal.get("terminal") is True or _is_terminal_run_status_name(status):
+        return terminal
+    return None
+
+
+def _raise_if_control_blocks_stage(state: Mapping[str, Any], stage: str) -> None:
+    terminal = _terminal_run_status_payload(state)
+    if terminal is not None:
+        persisted_status = _string_value(terminal.get("status")) or "terminal"
+        raise RunStepStateError(
+            code=_terminal_run_status_error_code(persisted_status),
+            message="terminal runs cannot start another stage",
+            stage=stage,
+            from_status=persisted_status,
+            to_status="running",
+        )
+    status = _control_status(state)
+    if status == "paused":
+        raise RunStepStateError(
+            code="run_paused",
+            message=(
+                "run is paused; use resume-run before starting another stage"
+            ),
+            stage=stage,
+        )
+    if status == "cancelled":
+        raise RunStepStateError(
+            code="run_cancelled",
+            message="run is cancelled and cannot start another stage",
+            stage=stage,
+        )
+
+
+def _build_control_payload(
+    run_dir: Path,
+    state: Mapping[str, Any],
+    *,
+    status: str,
+    action: str,
+    requested_at: str,
+    requested_by: str,
+    reason: str,
+    terminal: bool,
+    diagnostics: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": RUN_CONTROL_SCHEMA_VERSION,
+        "run_id": str(state.get("run_id") or _resolve_run_id(run_dir)),
+        "run_dir": str(run_dir.resolve()),
+        "status": status,
+        "action": action,
+        "requested_at": requested_at,
+        "requested_by": requested_by,
+        "reason": reason,
+        "terminal": terminal,
+        "resume_next_safe_stage": state.get("next_safe_stage"),
+        "next_stage_retryable": bool(state.get("next_stage_retryable")),
+        "diagnostics": dict(diagnostics),
+        "artifacts": _control_artifact_paths(run_dir),
+    }
+    return payload
+
+
+def _apply_control_payload(state: dict[str, Any], control: Mapping[str, Any]) -> None:
+    state["control"] = dict(control)
+    state["updated_at"] = str(control.get("requested_at") or _utc_now())
+    history = state.setdefault("control_history", [])
+    if isinstance(history, list):
+        history.append(
+            {
+                "at": control.get("requested_at"),
+                "action": control.get("action"),
+                "status": control.get("status"),
+                "reason": control.get("reason"),
+                "requested_by": control.get("requested_by"),
+                "resume_next_safe_stage": control.get("resume_next_safe_stage"),
+                "terminal": bool(control.get("terminal")),
+            }
+        )
+
+
+def _mark_running_stages_interrupted(
+    state: dict[str, Any],
+    control: Mapping[str, Any],
+) -> None:
+    stages = state.get("stages")
+    if not isinstance(stages, Mapping):
+        return
+    marker = {
+        "action": control.get("action"),
+        "status": control.get("status"),
+        "at": control.get("requested_at"),
+        "reason": control.get("reason"),
+    }
+    for record in stages.values():
+        if isinstance(record, dict) and record.get("status") == "running":
+            record["interrupted_by_control"] = dict(marker)
+
+
+def _control_result(
+    state: Mapping[str, Any],
+    control_artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": RUN_CONTROL_SCHEMA_VERSION,
+        "run_id": state.get("run_id"),
+        "run_dir": state.get("run_dir"),
+        "status": control_artifact.get("status"),
+        "action": control_artifact.get("action"),
+        "terminal": control_artifact.get("terminal"),
+        "next_safe_stage": state.get("next_safe_stage"),
+        "next_stage_retryable": bool(state.get("next_stage_retryable")),
+        "diagnostics": dict(control_artifact.get("diagnostics", {}))
+        if isinstance(control_artifact.get("diagnostics"), Mapping)
+        else {},
+        "artifacts": dict(control_artifact.get("artifacts", {}))
+        if isinstance(control_artifact.get("artifacts"), Mapping)
+        else {},
+    }
+
+
+def _write_control_artifact(
+    run_dir: Path,
+    state: Mapping[str, Any],
+    control: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = dict(control)
+    payload["run_id"] = str(state.get("run_id") or _resolve_run_id(run_dir))
+    payload["run_dir"] = str(run_dir.resolve())
+    payload["next_safe_stage"] = state.get("next_safe_stage")
+    payload["next_stage_retryable"] = bool(state.get("next_stage_retryable"))
+    history = state.get("control_history")
+    if isinstance(history, list):
+        payload["history"] = [item for item in history if isinstance(item, Mapping)]
+    payload["artifacts"] = _control_artifact_paths(run_dir)
+    _write_json_artifact(run_control_path(run_dir), payload)
+    return payload
+
+
+def _raise_if_persisted_terminal_run_status_blocks_control(
+    run_dir: Path,
+    *,
+    action: str,
+) -> None:
+    run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
+    persisted_status = _string_value(run_status.get("status")) or "terminal"
+    if (
+        run_status.get("terminal") is not True
+        and not _is_terminal_run_status_name(persisted_status)
+    ):
+        return
+    raise RunStepStateError(
+        code=_terminal_run_status_error_code(persisted_status),
+        message=f"terminal runs cannot be controlled with {action}-run",
+        from_status=persisted_status,
+        to_status=_control_action_target_status(action),
+    )
+
+
+def _raise_if_resume_blocked_by_terminal_run(
+    run_dir: Path,
+    state: Mapping[str, Any],
+    control_status: str | None,
+) -> None:
+    state_status = _string_value(state.get("status"))
+    if state_status == "completed":
+        raise RunStepStateError(
+            code="run_completed",
+            message="completed runs cannot be resumed",
+            from_status=state_status,
+            to_status="resumed",
+        )
+    if state_status == "cancelled":
+        raise RunStepStateError(
+            code="run_cancelled",
+            message="cancelled runs cannot be resumed",
+            from_status=state_status,
+            to_status="resumed",
+        )
+
+    run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
+    if run_status.get("terminal") is not True:
+        if control_status == "paused":
+            return
+        return
+    persisted_status = _string_value(run_status.get("status")) or "terminal"
+    raise RunStepStateError(
+        code=_terminal_run_status_error_code(persisted_status),
+        message="terminal runs cannot be resumed unless they are paused",
+        from_status=persisted_status,
+        to_status="resumed",
+    )
+
+
+def _is_terminal_run_status_name(status: str) -> bool:
+    return status.startswith(("completed", "cancelled", "failed"))
+
+
+def _terminal_run_status_error_code(status: str) -> str:
+    if status.startswith("completed"):
+        return "run_completed"
+    if status.startswith("cancelled"):
+        return "run_cancelled"
+    return "run_terminal"
+
+
+def _control_action_target_status(action: str) -> str:
+    return {
+        "pause": "paused",
+        "resume": "resumed",
+        "cancel": "cancelled",
+    }.get(action, action)
+
+
+def _write_control_run_status(
+    run_dir: Path,
+    control: Mapping[str, Any],
+    state: Mapping[str, Any],
+    *,
+    status_override: str | None = None,
+) -> None:
+    existing = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
+    evidence = _read_json_artifact(run_dir / "evidence.json") or {}
+    control_diagnostics = (
+        dict(control.get("diagnostics", {}))
+        if isinstance(control.get("diagnostics"), Mapping)
+        else {}
+    )
+    diagnostics = (
+        dict(existing.get("diagnostics", {}))
+        if isinstance(existing.get("diagnostics"), Mapping)
+        else {}
+    )
+    previous_actionable_cause = diagnostics.get("actionable_cause")
+    diagnostics.update(control_diagnostics)
+    control_actionable_cause = control_diagnostics.get("actionable_cause")
+    if (
+        isinstance(previous_actionable_cause, str)
+        and previous_actionable_cause
+        and previous_actionable_cause != control_actionable_cause
+    ):
+        diagnostics.setdefault("previous_actionable_cause", previous_actionable_cause)
+
+    artifacts = _control_artifact_paths(run_dir)
+    if isinstance(existing.get("artifacts"), Mapping):
+        artifacts = {str(key): value for key, value in existing["artifacts"].items()}
+        artifacts.update(_control_artifact_paths(run_dir))
+
+    status = status_override or str(control.get("status") or "unknown")
+    payload = dict(existing)
+    payload.update({
+        "schema_version": _RUN_STATUS_SCHEMA_VERSION,
+        "run_id": str(state.get("run_id") or _resolve_run_id(run_dir)),
+        "run_dir": str(run_dir.resolve()),
+        "invocation": str(existing.get("invocation") or ""),
+        "question": str(existing.get("question") or evidence.get("question") or ""),
+        "selected_mode": str(existing.get("selected_mode") or "full-runner"),
+        "status": status,
+        "ok": False if control.get("status") == "cancelled" else True,
+        "terminal": bool(control.get("terminal")),
+        "updated_at": str(control.get("requested_at") or _utc_now()),
+        "provenance": _control_provenance(existing, control),
+        "diagnostics": diagnostics,
+        "control": {
+            "status": control.get("status"),
+            "action": control.get("action"),
+            "requested_at": control.get("requested_at"),
+            "requested_by": control.get("requested_by"),
+            "reason": control.get("reason"),
+            "resume_next_safe_stage": control.get("resume_next_safe_stage"),
+        },
+        "artifacts": artifacts,
+    })
+    artifact_handoff = (
+        dict(existing.get("artifact_handoff", {}))
+        if isinstance(existing.get("artifact_handoff"), Mapping)
+        else {}
+    )
+    handoff_artifact_paths = (
+        {
+            str(key): value
+            for key, value in artifact_handoff["artifact_paths"].items()
+        }
+        if isinstance(artifact_handoff.get("artifact_paths"), Mapping)
+        else {}
+    )
+    handoff_artifact_paths.update(artifacts)
+    artifact_handoff.update({
+        "run_dir": payload["run_dir"],
+        "status": status,
+        "ok": payload["ok"],
+        "terminal": payload["terminal"],
+        "artifact_paths": handoff_artifact_paths,
+        "diagnostics": dict(diagnostics),
+    })
+    payload["artifact_handoff"] = artifact_handoff
+    _write_json_artifact(run_dir / RUN_STATUS_FILENAME, payload)
+
+
+def _control_provenance(
+    existing: Mapping[str, Any],
+    control: Mapping[str, Any],
+) -> dict[str, Any]:
+    provenance = (
+        dict(existing.get("provenance", {}))
+        if isinstance(existing.get("provenance"), Mapping)
+        else {}
+    )
+    provenance["control_action"] = control.get("action")
+    provenance["control_status"] = control.get("status")
+    if control.get("status") == "cancelled":
+        provenance["type"] = "cancelled"
+    elif "type" not in provenance:
+        provenance["type"] = "full_runner"
+    return provenance
+
+
+def _control_artifact_paths(run_dir: Path) -> dict[str, str]:
+    known_files = {
+        "run_control": RUN_CONTROL_FILENAME,
+        "run_steps": RUN_STEPS_FILENAME,
+        "run_status": RUN_STATUS_FILENAME,
+        "run_trace": _RUN_TRACE_FILENAME,
+        "planning_status": "status.json",
+        "evidence": "evidence.json",
+        "budget_estimate": "budget_estimate.json",
+        "research_tasks": "research_tasks.json",
+        "search_tasks": "search_tasks.json",
+        "search_results": "search_results.jsonl",
+        "fetch_queue": "fetch_queue.json",
+        "visual_tasks": "visual_tasks.json",
+        "visual_observations": "visual_observations.jsonl",
+        "subagent_assignments": "subagent_assignments.jsonl",
+        "parallel_orchestration_status": "parallel_orchestration_status.json",
+        "merge_status": "merge_status.json",
+        "visual_acquisition_status": "visual_acquisition_status.json",
+        "visual_provider_status": "visual_provider_status.json",
+        "image_fetch_status": "image_fetch_status.jsonl",
+        "ingest_status": "ingest_status.json",
+        "manual_ingest_status": "manual_ingest_status.json",
+        "fetch_claims_status": "fetch_claims_status.json",
+        "vision_ingest_status": "vision_ingest_status.json",
+        "guardrails_status": "guardrails_status.json",
+        "verification_matrix_status": "verification_matrix_status.json",
+        "report": "report.md",
+        "report_status": "report_status.json",
+    }
+    artifacts: dict[str, str] = {}
+    for key, filename in known_files.items():
+        path = run_dir / filename
+        if path.exists() or key in {"run_control", "run_steps", "run_status"}:
+            artifacts[key] = str(path)
+    return artifacts
+
+
+def _known_child_contexts(run_dir: Path) -> list[dict[str, Any]]:
+    contexts: dict[str, dict[str, Any]] = {}
+
+    def add_context(
+        child_id: Any,
+        *,
+        source: str,
+        task_id: Any = None,
+        status: Any = None,
+        stage: Any = None,
+        event_type: Any = None,
+        observed_at: Any = None,
+    ) -> None:
+        if not isinstance(child_id, str) or not child_id.strip():
+            return
+        key = child_id.strip()
+        record = contexts.setdefault(
+            key,
+            {
+                "child_context_id": key,
+                "sources": [],
+                "task_id": None,
+                "last_status": None,
+                "last_stage": None,
+                "last_event_type": None,
+                "last_observed_at": None,
+                "close_observed": False,
+            },
+        )
+        if source not in record["sources"]:
+            record["sources"].append(source)
+        if isinstance(task_id, str) and task_id.strip():
+            record["task_id"] = task_id.strip()
+        if isinstance(status, str) and status.strip():
+            record["last_status"] = status.strip()
+        if isinstance(stage, str) and stage.strip():
+            record["last_stage"] = stage.strip()
+        if isinstance(event_type, str) and event_type.strip():
+            record["last_event_type"] = event_type.strip()
+            if event_type.strip() == "close_agent":
+                record["close_observed"] = True
+        if isinstance(observed_at, str) and observed_at.strip():
+            previous = record.get("last_observed_at")
+            if not isinstance(previous, str) or _timestamp_is_after(observed_at, previous):
+                record["last_observed_at"] = observed_at.strip()
+
+    for assignment in _read_jsonl_records(run_dir / "subagent_assignments.jsonl"):
+        child_id = assignment.get("child_thread_id") or assignment.get("assigned_subagent_id")
+        add_context(
+            child_id,
+            source="subagent_assignments",
+            task_id=assignment.get("task_id") or assignment.get("id"),
+            status=assignment.get("state") or assignment.get("status"),
+            observed_at=assignment.get("timestamp"),
+        )
+
+    for event in _read_jsonl_records(run_dir / _RUN_TRACE_FILENAME):
+        child_id = event.get("child_thread_id") or event.get("assigned_subagent_id")
+        add_context(
+            child_id,
+            source="run_trace",
+            task_id=event.get("task_id"),
+            status=event.get("child_status") or event.get("status"),
+            stage=event.get("stage"),
+            event_type=event.get("event_type"),
+            observed_at=event.get("timestamp"),
+        )
+
+    research_tasks = _read_json_artifact(run_dir / "research_tasks.json") or {}
+    tasks = research_tasks.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                continue
+            add_context(
+                task.get("last_child_thread_id"),
+                source="research_tasks",
+                task_id=task.get("id"),
+                status=task.get("state"),
+            )
+
+    return [
+        contexts[key]
+        for key in sorted(contexts)
+    ]
+
+
+def _child_context_close_records(
+    child_contexts: list[dict[str, Any]],
+    *,
+    requested: bool,
+    timestamp: str,
+) -> list[dict[str, Any]]:
+    records = []
+    for context in child_contexts:
+        already_closed = bool(context.get("close_observed")) or context.get("last_status") in {
+            "closed",
+            "completed",
+            "failed",
+            "blocked",
+        }
+        if already_closed:
+            result = "already_closed"
+            attempted = False
+        elif not requested:
+            result = "not_requested"
+            attempted = False
+        else:
+            result = "no_local_child_context_closer"
+            attempted = False
+        records.append(
+            {
+                "child_context_id": context["child_context_id"],
+                "task_id": context.get("task_id"),
+                "requested": requested and not already_closed,
+                "attempted": attempted,
+                "result": result,
+                "recorded_at": timestamp,
+            }
+        )
+    return records
+
+
+def _cancellation_actionable_cause(
+    child_contexts: list[dict[str, Any]],
+    cleanup_children: bool,
+) -> str:
+    if not child_contexts:
+        return (
+            "run cancellation requested; no known child contexts were recorded "
+            "in run artifacts"
+        )
+    if not cleanup_children:
+        return (
+            "run cancellation requested; child context cleanup was explicitly "
+            "not requested"
+        )
+    return (
+        "run cancellation requested; known child contexts were enumerated, but "
+        "the local CLI has no deterministic child-context closer, so close "
+        "records were persisted for operator follow-up"
+    )
+
+
+def _mapping_value(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
 def _with_resume_summary(state: dict[str, Any]) -> dict[str, Any]:
     stages = state.get("stages")
     if not isinstance(stages, dict):
         return state
     next_stage = _next_retryable_optional_stage(stages) or _next_ordered_stage(stages)
+    control_status = _control_status(state)
+    if control_status == "cancelled":
+        state["status"] = "cancelled"
+        state["next_safe_stage"] = None
+        state["next_stage_retryable"] = False
+        return state
+    terminal = _terminal_run_status_payload(state)
+    if terminal is not None:
+        persisted_status = _string_value(terminal.get("status")) or "terminal"
+        if persisted_status.startswith("cancelled"):
+            state["status"] = "cancelled"
+        elif persisted_status.startswith("completed"):
+            state["status"] = "completed"
+        else:
+            state["status"] = persisted_status
+        state["next_safe_stage"] = None
+        state["next_stage_retryable"] = False
+        return state
     if next_stage is None:
         state["status"] = "completed"
         state["next_safe_stage"] = None
@@ -1292,6 +2122,11 @@ def _with_resume_summary(state: dict[str, Any]) -> dict[str, Any]:
         return state
     next_record = stages[next_stage]
     next_status = _status(next_record)
+    if control_status == "paused":
+        state["status"] = "paused"
+        state["next_safe_stage"] = next_stage
+        state["next_stage_retryable"] = next_status in RETRYABLE_STEP_STATUSES
+        return state
     state["status"] = "needs_retry" if next_status in RETRYABLE_STEP_STATUSES else "in_progress"
     state["next_safe_stage"] = next_stage
     state["next_stage_retryable"] = next_status in RETRYABLE_STEP_STATUSES
@@ -1608,6 +2443,11 @@ def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
 def _write_state(path: Path, state: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_json_artifact(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _resolve_run_id(run_dir: Path, run_id: str | None = None) -> str:

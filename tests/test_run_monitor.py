@@ -19,6 +19,7 @@ from deepresearch.run_monitor import (  # noqa: E402
     render_run_detail,
     render_run_list,
 )
+from deepresearch.run_state import cancel_run, pause_run  # noqa: E402
 
 
 class RunMonitorTests(unittest.TestCase):
@@ -57,6 +58,109 @@ class RunMonitorTests(unittest.TestCase):
             },
         )
         return run_dir
+
+    def test_interrupted_controls_are_visible_in_list_and_detail(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        paused_dir = self.make_run(runs_dir, "run-paused-001")
+        pause_run(
+            paused_dir,
+            reason="monitor_pause",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+
+        paused_detail = inspect_run_monitor(paused_dir)
+        paused_list = list_run_monitors(runs_dir)
+        rendered_paused_detail = render_run_detail(paused_detail)
+        rendered_paused_list = render_run_list(paused_list)
+
+        self.assertEqual(paused_detail["status"], "paused")
+        self.assertFalse(paused_detail["terminal"])
+        self.assertEqual(paused_detail["phase"]["stage"], "paused")
+        self.assertEqual(paused_detail["control"]["status"], "paused")
+        self.assertIn("Control: status=paused", rendered_paused_detail)
+        self.assertIn("paused", rendered_paused_list)
+
+        cancelled_dir = self.make_run(runs_dir, "run-cancelled-001")
+        self.write_json(
+            cancelled_dir / "research_tasks.json",
+            {
+                "run_id": "run-cancelled-001",
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task_001",
+                        "state": "running",
+                        "last_child_thread_id": "codex-task_001-attempt-1",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            cancelled_dir / "subagent_assignments.jsonl",
+            [
+                {
+                    "task_id": "task_001",
+                    "state": "assigned",
+                    "child_thread_id": "codex-task_001-attempt-1",
+                    "timestamp": "2026-06-25T00:00:05Z",
+                }
+            ],
+        )
+        cancel_run(
+            cancelled_dir,
+            reason="monitor_cancel",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+
+        cancelled_detail = inspect_run_monitor(cancelled_dir)
+        rendered_cancelled_detail = render_run_detail(cancelled_detail)
+        rendered_cancelled_list = render_run_list(list_run_monitors(runs_dir))
+
+        self.assertEqual(cancelled_detail["status"], "cancelled")
+        self.assertTrue(cancelled_detail["terminal"])
+        self.assertEqual(cancelled_detail["phase"]["stage"], "cancelled")
+        self.assertEqual(cancelled_detail["control"]["status"], "cancelled")
+        self.assertEqual(cancelled_detail["control"]["child_close_records"], 1)
+        self.assertIn("Control: status=cancelled", rendered_cancelled_detail)
+        self.assertIn("cancelled", rendered_cancelled_list)
+
+    def test_terminal_run_status_takes_precedence_over_paused_control(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        run_dir = self.make_run(runs_dir, "run-paused-terminal-001")
+        pause_run(
+            run_dir,
+            reason="monitor_paused_terminal",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        run_status = json.loads(
+            (run_dir / "run_status.json").read_text(encoding="utf-8")
+        )
+        run_status["status"] = "completed_fixture"
+        run_status["ok"] = True
+        run_status["terminal"] = True
+        run_status["updated_at"] = "2026-06-25T00:00:30Z"
+        run_status["diagnostics"] = {
+            "actionable_cause": "completed fixture should win over stale paused control"
+        }
+        run_status["artifact_handoff"]["status"] = "completed_fixture"
+        run_status["artifact_handoff"]["ok"] = True
+        run_status["artifact_handoff"]["terminal"] = True
+        run_status["artifact_handoff"]["diagnostics"] = dict(
+            run_status["diagnostics"]
+        )
+        self.write_json(run_dir / "run_status.json", run_status)
+
+        detail = inspect_run_monitor(run_dir)
+        rendered = render_run_detail(detail)
+
+        self.assertEqual(detail["status"], "completed_fixture")
+        self.assertTrue(detail["terminal"])
+        self.assertEqual(detail["phase"]["stage"], "completed")
+        self.assertEqual(detail["phase"]["status"], "completed_fixture")
+        self.assertEqual(detail["phase"]["source"], "run_status")
+        self.assertEqual(detail["control"]["status"], "paused")
+        self.assertIn("Status: completed_fixture", rendered)
+        self.assertIn("terminal=yes", rendered)
 
     def test_detail_classifies_shards_serial_fallback_budget_and_paths(self) -> None:
         runs_dir = self.temp_runs_dir()

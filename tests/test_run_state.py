@@ -21,14 +21,18 @@ from deepresearch import (  # noqa: E402
     RunStepStateError,
     acquire_visual_candidates,
     begin_stage,
+    cancel_run,
     enforce_guardrails,
     fetch_claims,
     ingest_manual_sources,
     ingest_run,
     ingest_vision_observations,
     inspect_run_state,
+    pause_run,
     prepare_run,
     read_trace_records,
+    resume_run,
+    run_control_path,
     run_steps_path,
     synthesize_report,
     transition_stage,
@@ -79,6 +83,19 @@ class RunStateTests(unittest.TestCase):
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    def write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+    def relative_files(self, path: Path) -> set[str]:
+        return {
+            item.relative_to(path).as_posix()
+            for item in path.rglob("*")
+            if item.is_file()
+        }
 
     def set_status_timestamps(
         self,
@@ -143,6 +160,105 @@ class RunStateTests(unittest.TestCase):
     def write_search_results(self, run_dir: Path, records: list[dict]) -> None:
         payload = "\n".join(json.dumps(record) for record in records) + "\n"
         (run_dir / "search_results.jsonl").write_text(payload, encoding="utf-8")
+
+    def write_full_runner_handoff_status(
+        self,
+        run_dir: Path,
+        run_id: str,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        artifact_files = {
+            "planning_status": "status.json",
+            "search_tasks": "search_tasks.json",
+            "search_results": "search_results.jsonl",
+            "visual_tasks": "visual_tasks.json",
+            "visual_observations": "visual_observations.jsonl",
+            "budget_estimate": "budget_estimate.json",
+            "fetch_claims_status": "fetch_claims_status.json",
+            "vision_ingest_status": "vision_ingest_status.json",
+            "guardrails_status": "guardrails_status.json",
+            "verification_matrix_status": "verification_matrix_status.json",
+            "custom_handoff_artifact": "custom_handoff.json",
+        }
+        for filename in artifact_files.values():
+            path = run_dir / filename
+            if filename.endswith(".jsonl") or filename.endswith(".md"):
+                path.write_text("", encoding="utf-8")
+            else:
+                self.write_json(path, {"fixture": filename})
+        artifacts = {
+            "run_status": str(run_dir / "run_status.json"),
+            "evidence": str(run_dir / "evidence.json"),
+            **{
+                key: str(run_dir / filename)
+                for key, filename in artifact_files.items()
+            },
+        }
+        handoff_only_artifacts = {
+            "handoff_only_custom": str(run_dir / "handoff_only_custom.json"),
+        }
+        self.write_json(
+            run_dir / "handoff_only_custom.json",
+            {"fixture": "handoff_only_custom.json"},
+        )
+        payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "invocation": "$deep-research: handoff preservation",
+            "question": "handoff preservation",
+            "selected_mode": "full-runner",
+            "status": "running",
+            "ok": True,
+            "terminal": False,
+            "updated_at": "2026-06-25T00:00:00Z",
+            "provenance": {"type": "full_runner", "adapter": "fixture"},
+            "diagnostics": {
+                "actionable_cause": "existing handoff diagnostics",
+                "missing_required_artifacts": ["report_status"],
+            },
+            "shard_summary": {"accepted": 2},
+            "fallback": {"needs_serial_handoff": False},
+            "artifacts": artifacts,
+            "artifact_handoff": {
+                "run_dir": str(run_dir),
+                "status": "running",
+                "ok": True,
+                "terminal": False,
+                "artifact_paths": {**artifacts, **handoff_only_artifacts},
+                "missing_required_artifacts": ["report_status"],
+                "shards": {"accepted": 2},
+                "fallback": {"needs_serial_handoff": False},
+                "diagnostics": {
+                    "actionable_cause": "existing handoff diagnostics",
+                    "missing_required_artifacts": ["report_status"],
+                },
+            },
+        }
+        self.write_json(run_dir / "run_status.json", payload)
+        return artifacts, handoff_only_artifacts
+
+    def assert_handoff_artifacts_preserved(
+        self,
+        run_dir: Path,
+        expected_artifacts: dict[str, str],
+        expected_handoff_only_artifacts: dict[str, str],
+    ) -> dict:
+        run_status = self.read_json(run_dir / "run_status.json")
+        for key, value in expected_artifacts.items():
+            self.assertEqual(run_status["artifacts"][key], value)
+            self.assertEqual(run_status["artifact_handoff"]["artifact_paths"][key], value)
+        for key, value in expected_handoff_only_artifacts.items():
+            self.assertNotIn(key, run_status["artifacts"])
+            self.assertEqual(run_status["artifact_handoff"]["artifact_paths"][key], value)
+        self.assertIn("run_control", run_status["artifacts"])
+        self.assertIn("run_control", run_status["artifact_handoff"]["artifact_paths"])
+        self.assertEqual(
+            run_status["artifact_handoff"]["missing_required_artifacts"],
+            ["report_status"],
+        )
+        self.assertEqual(run_status["shard_summary"], {"accepted": 2})
+        self.assertEqual(run_status["fallback"], {"needs_serial_handoff": False})
+        return run_status
 
     def run_status_payload(self, runs_dir: Path, run_id: str) -> dict:
         command = subprocess.run(
@@ -321,6 +437,616 @@ class RunStateTests(unittest.TestCase):
         )
         trace = read_trace_records(run_dir / "run_trace.jsonl")
         self.assertIn("run_steps", trace[0]["artifacts"])
+
+    def test_pause_resume_preserves_artifacts_and_next_safe_stage(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="pause resume control state",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+        evidence_before = self.read_json(run_dir / "evidence.json")
+        files_before_pause = self.relative_files(run_dir)
+
+        paused = pause_run(
+            run_dir,
+            reason="test_pause",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        paused_state = inspect_run_state(run_dir)
+
+        self.assertEqual(paused["status"], "paused")
+        self.assertTrue(run_control_path(run_dir).is_file())
+        self.assertEqual(paused_state["status"], "paused")
+        self.assertEqual(paused_state["next_safe_stage"], "fetch_claims")
+        self.assertEqual(paused_state["control"]["status"], "paused")
+        self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
+        self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+        with self.assertRaises(RunStepStateError) as paused_error:
+            begin_stage(run_dir, "fetch_claims")
+        self.assertEqual(paused_error.exception.to_dict()["code"], "run_paused")
+
+        resumed = resume_run(
+            run_dir,
+            reason="test_resume",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+        resumed_state = inspect_run_state(run_dir)
+        control = self.read_json(run_control_path(run_dir))
+
+        self.assertEqual(resumed["status"], "active")
+        self.assertEqual(resumed_state["status"], "in_progress")
+        self.assertEqual(resumed_state["next_safe_stage"], "fetch_claims")
+        self.assertEqual(resumed_state["control"]["status"], "active")
+        self.assertEqual(control["history"][-2]["action"], "pause")
+        self.assertEqual(control["history"][-1]["action"], "resume")
+        self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
+        self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+
+    def test_pause_resume_cancel_preserve_existing_run_status_artifacts(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="control artifact preservation",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (
+            expected_artifacts,
+            expected_handoff_only_artifacts,
+        ) = self.write_full_runner_handoff_status(
+            run_dir,
+            prepared["run_id"],
+        )
+
+        pause_run(
+            run_dir,
+            reason="preserve_pause",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        paused_status = self.assert_handoff_artifacts_preserved(
+            run_dir,
+            expected_artifacts,
+            expected_handoff_only_artifacts,
+        )
+        self.assertEqual(paused_status["status"], "paused")
+        self.assertFalse(paused_status["terminal"])
+
+        resume_run(
+            run_dir,
+            reason="preserve_resume",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+        resumed_status = self.assert_handoff_artifacts_preserved(
+            run_dir,
+            expected_artifacts,
+            expected_handoff_only_artifacts,
+        )
+        self.assertEqual(resumed_status["status"], "resumed")
+        self.assertFalse(resumed_status["terminal"])
+
+        cancel_run(
+            run_dir,
+            reason="preserve_cancel",
+            timestamp="2026-06-25T00:02:00Z",
+        )
+        cancelled_status = self.assert_handoff_artifacts_preserved(
+            run_dir,
+            expected_artifacts,
+            expected_handoff_only_artifacts,
+        )
+        self.assertEqual(cancelled_status["status"], "cancelled")
+        self.assertTrue(cancelled_status["terminal"])
+        self.assertFalse(cancelled_status["ok"])
+
+    def test_terminal_run_status_blocks_pause_resume_cancel_without_mutation(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        for persisted_status, expected_code, ok in (
+            ("completed_fixture", "run_completed", True),
+            ("cancelled", "run_cancelled", False),
+            ("failed_synthesis", "run_terminal", False),
+        ):
+            with self.subTest(persisted_status=persisted_status):
+                prepared = prepare_run(
+                    question=f"terminal {persisted_status} control rejection",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                terminal_status = {
+                    "schema_version": "codex-deepresearch.run-status.v0",
+                    "run_id": prepared["run_id"],
+                    "run_dir": str(run_dir),
+                    "invocation": "$deep-research: terminal control",
+                    "question": f"terminal {persisted_status} control rejection",
+                    "selected_mode": "fixture",
+                    "status": persisted_status,
+                    "ok": ok,
+                    "terminal": True,
+                    "updated_at": "2026-06-25T00:00:00Z",
+                    "provenance": {"type": "fixture"},
+                    "diagnostics": {},
+                    "artifacts": {"run_status": str(run_dir / "run_status.json")},
+                }
+                self.write_json(run_dir / "run_status.json", terminal_status)
+                run_steps_before = self.read_json(run_steps_path(run_dir))
+
+                for control_action in (pause_run, resume_run, cancel_run):
+                    with self.assertRaises(RunStepStateError) as control_error:
+                        control_action(run_dir, timestamp="2026-06-25T00:01:00Z")
+                    self.assertEqual(
+                        control_error.exception.to_dict()["code"],
+                        expected_code,
+                    )
+                    self.assertEqual(
+                        self.read_json(run_dir / "run_status.json"),
+                        terminal_status,
+                    )
+                    self.assertEqual(
+                        self.read_json(run_steps_path(run_dir)),
+                        run_steps_before,
+                    )
+                    self.assertFalse(run_control_path(run_dir).exists())
+
+    def test_resume_rejects_completed_terminal_run_status_without_mutation(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="terminal completed resume rejection",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        terminal_status = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": prepared["run_id"],
+            "run_dir": str(run_dir),
+            "invocation": "$deep-research: completed",
+            "question": "terminal completed resume rejection",
+            "selected_mode": "fixture",
+            "status": "completed_fixture",
+            "ok": True,
+            "terminal": True,
+            "updated_at": "2026-06-25T00:00:00Z",
+            "provenance": {"type": "fixture"},
+            "diagnostics": {},
+            "artifacts": {"run_status": str(run_dir / "run_status.json")},
+        }
+        self.write_json(run_dir / "run_status.json", terminal_status)
+        run_steps_before = self.read_json(run_steps_path(run_dir))
+
+        with self.assertRaises(RunStepStateError) as resume_error:
+            resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+
+        self.assertEqual(resume_error.exception.to_dict()["code"], "run_completed")
+        self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
+        self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
+        self.assertFalse(run_control_path(run_dir).exists())
+
+        for persisted_status, expected_code in (
+            ("cancelled", "run_cancelled"),
+            ("failed_synthesis", "run_terminal"),
+        ):
+            with self.subTest(persisted_status=persisted_status):
+                prepared = prepare_run(
+                    question=f"terminal {persisted_status} resume rejection",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                terminal_status = {
+                    "schema_version": "codex-deepresearch.run-status.v0",
+                    "run_id": prepared["run_id"],
+                    "run_dir": str(run_dir),
+                    "invocation": "$deep-research: terminal",
+                    "question": f"terminal {persisted_status} resume rejection",
+                    "selected_mode": "fixture",
+                    "status": persisted_status,
+                    "ok": False,
+                    "terminal": True,
+                    "updated_at": "2026-06-25T00:00:00Z",
+                    "provenance": {"type": "fixture"},
+                    "diagnostics": {},
+                    "artifacts": {"run_status": str(run_dir / "run_status.json")},
+                }
+                self.write_json(run_dir / "run_status.json", terminal_status)
+                run_steps_before = self.read_json(run_steps_path(run_dir))
+
+                with self.assertRaises(RunStepStateError) as resume_error:
+                    resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+
+                self.assertEqual(resume_error.exception.to_dict()["code"], expected_code)
+                self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
+                self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
+                self.assertFalse(run_control_path(run_dir).exists())
+
+    def test_resume_rejects_terminal_run_status_with_paused_control_without_mutation(
+        self,
+    ) -> None:
+        runs_dir = self.temp_runs_dir()
+        for persisted_status, expected_code, ok in (
+            ("completed_fixture", "run_completed", True),
+            ("cancelled", "run_cancelled", False),
+            ("failed_synthesis", "run_terminal", False),
+        ):
+            with self.subTest(persisted_status=persisted_status):
+                prepared = prepare_run(
+                    question=f"paused terminal {persisted_status} resume rejection",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                pause_run(
+                    run_dir,
+                    reason="paused_terminal_guard",
+                    timestamp="2026-06-25T00:00:00Z",
+                )
+                terminal_status = self.read_json(run_dir / "run_status.json")
+                terminal_status["status"] = persisted_status
+                terminal_status["ok"] = ok
+                terminal_status["terminal"] = True
+                terminal_status["updated_at"] = "2026-06-25T00:00:30Z"
+                terminal_status["diagnostics"] = {
+                    "actionable_cause": f"terminal {persisted_status} fixture"
+                }
+                terminal_status["artifact_handoff"]["status"] = persisted_status
+                terminal_status["artifact_handoff"]["ok"] = ok
+                terminal_status["artifact_handoff"]["terminal"] = True
+                terminal_status["artifact_handoff"]["diagnostics"] = dict(
+                    terminal_status["diagnostics"]
+                )
+                self.write_json(run_dir / "run_status.json", terminal_status)
+                run_steps_before = self.read_json(run_steps_path(run_dir))
+                run_control_before = self.read_json(run_control_path(run_dir))
+
+                with self.assertRaises(RunStepStateError) as resume_error:
+                    resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+
+                self.assertEqual(resume_error.exception.to_dict()["code"], expected_code)
+                self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
+                self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
+                self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
+
+    def test_resume_continue_does_not_duplicate_completed_evidence(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="resume continue no duplicate evidence",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        page = runs_dir / "resume-source.html"
+        page.write_text(
+            (
+                "<html><body><p>The resume continue test extracts a "
+                "source linked claim.</p></body></html>"
+            ),
+            encoding="utf-8",
+        )
+        self.write_search_results(
+            run_dir,
+            [self.base_search_result(title="Resume Source")],
+        )
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["url"] = page.resolve().as_uri()
+        self.write_json(evidence_path, evidence)
+        fetch_queue_path = run_dir / "fetch_queue.json"
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["url"] = page.resolve().as_uri()
+        self.write_json(fetch_queue_path, fetch_queue)
+        sources_before = [source["id"] for source in evidence["sources"]]
+        files_before_pause = self.relative_files(run_dir)
+
+        pause_run(run_dir, timestamp="2026-06-25T00:00:00Z")
+        resume = resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+        self.assertEqual(resume["next_safe_stage"], "fetch_claims")
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(
+                page.read_bytes(),
+                url=page.resolve().as_uri(),
+            ),
+        ):
+            fetch = fetch_claims(run=run_dir)
+
+        continued = self.read_json(evidence_path)
+        self.assertEqual(fetch["status"], "completed")
+        self.assertEqual([source["id"] for source in continued["sources"]], sources_before)
+        self.assertEqual(len(continued["sources"]), 1)
+        self.assertEqual(len(continued["claims"]), 1)
+        self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+
+    def test_cancel_records_terminal_diagnostics_and_child_close_records(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="cancel control state",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence_before = self.read_json(run_dir / "evidence.json")
+        files_before_cancel = self.relative_files(run_dir)
+        transition_stage(
+            run_dir,
+            "parallel_orchestration",
+            "running",
+            reason="test_child_context_active",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "run_id": prepared["run_id"],
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task_001",
+                        "state": "running",
+                        "last_child_thread_id": "codex-task_001-attempt-1",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "subagent_assignments.jsonl",
+            [
+                {
+                    "task_id": "task_001",
+                    "state": "assigned",
+                    "child_thread_id": "codex-task_001-attempt-1",
+                    "timestamp": "2026-06-25T00:00:05Z",
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "run_trace.jsonl",
+            [
+                {
+                    "stage": "parallel_orchestration",
+                    "event_type": "spawn_agent",
+                    "status": "running",
+                    "child_status": "running",
+                    "task_id": "task_001",
+                    "child_thread_id": "codex-task_001-attempt-1",
+                    "timestamp": "2026-06-25T00:00:10Z",
+                }
+            ],
+        )
+
+        cancelled = cancel_run(
+            run_dir,
+            reason="test_cancel",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+        cancelled_state = inspect_run_state(run_dir)
+        control = self.read_json(run_control_path(run_dir))
+        run_status = self.read_json(run_dir / "run_status.json")
+        close_records = control["diagnostics"]["child_context_close_records"]
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled_state["status"], "cancelled")
+        self.assertIsNone(cancelled_state["next_safe_stage"])
+        self.assertTrue(cancelled_state["control"]["terminal"])
+        self.assertTrue(run_status["terminal"])
+        self.assertFalse(run_status["ok"])
+        self.assertEqual(run_status["status"], "cancelled")
+        self.assertEqual(control["diagnostics"]["child_contexts_known"], 1)
+        self.assertEqual(len(close_records), 1)
+        self.assertTrue(close_records[0]["requested"])
+        self.assertFalse(close_records[0]["attempted"])
+        self.assertEqual(close_records[0]["result"], "no_local_child_context_closer")
+        self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
+        self.assertTrue(files_before_cancel.issubset(self.relative_files(run_dir)))
+        with self.assertRaises(RunStepStateError) as cancelled_error:
+            begin_stage(run_dir, "fetch_claims")
+        self.assertEqual(cancelled_error.exception.to_dict()["code"], "run_cancelled")
+
+    def test_pause_survives_deleted_run_steps_reconstruction_and_blocks_ingest(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="pause reconstruction durable gate",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        pause_run(
+            run_dir,
+            reason="pause_reconstruction_regression",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        run_status_before = self.read_json(run_dir / "run_status.json")
+        run_control_before = self.read_json(run_control_path(run_dir))
+        run_steps_path(run_dir).unlink()
+
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        run_steps_before_ingest = self.read_json(run_steps_path(run_dir))
+        ingest = subprocess.run(
+            [
+                str(RUNNER),
+                "ingest",
+                "--run",
+                prepared["run_id"],
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(reconstructed["status"], "paused")
+        self.assertEqual(reconstructed["next_safe_stage"], "ingest")
+        self.assertEqual(reconstructed["control"]["status"], "paused")
+        self.assertEqual(ingest.returncode, 2)
+        self.assertEqual(json.loads(ingest.stderr)["code"], "run_paused")
+        self.assertFalse((run_dir / "ingest_status.json").exists())
+        self.assertEqual(self.read_json(run_dir / "run_status.json"), run_status_before)
+        self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
+        self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before_ingest)
+
+    def test_cancel_survives_deleted_run_steps_reconstruction_and_blocks_ingest(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="cancel reconstruction durable gate",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        cancel_run(
+            run_dir,
+            reason="cancel_reconstruction_regression",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        run_status_before = self.read_json(run_dir / "run_status.json")
+        run_control_before = self.read_json(run_control_path(run_dir))
+        run_steps_path(run_dir).unlink()
+
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        run_steps_before_ingest = self.read_json(run_steps_path(run_dir))
+        ingest = subprocess.run(
+            [
+                str(RUNNER),
+                "ingest",
+                "--run",
+                prepared["run_id"],
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(reconstructed["status"], "cancelled")
+        self.assertIsNone(reconstructed["next_safe_stage"])
+        self.assertEqual(reconstructed["control"]["status"], "cancelled")
+        self.assertEqual(
+            reconstructed["terminal_run_status"]["status"],
+            "cancelled",
+        )
+        self.assertEqual(ingest.returncode, 2)
+        self.assertEqual(json.loads(ingest.stderr)["code"], "run_cancelled")
+        self.assertFalse((run_dir / "ingest_status.json").exists())
+        self.assertEqual(self.read_json(run_dir / "run_status.json"), run_status_before)
+        self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
+        self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before_ingest)
+
+    def test_transition_stage_rejects_reconstructed_paused_and_cancelled_runs_without_reopening(
+        self,
+    ) -> None:
+        runs_dir = self.temp_runs_dir()
+        for control_action, expected_status, expected_code in (
+            (pause_run, "paused", "run_paused"),
+            (cancel_run, "cancelled", "run_cancelled"),
+        ):
+            with self.subTest(expected_status=expected_status):
+                prepared = prepare_run(
+                    question=f"{expected_status} transition reconstruction gate",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                control_action(
+                    run_dir,
+                    reason="transition_reconstruction_guard",
+                    timestamp="2026-06-25T00:00:00Z",
+                )
+                run_status_before = self.read_json(run_dir / "run_status.json")
+                run_control_before = self.read_json(run_control_path(run_dir))
+                run_steps_path(run_dir).unlink()
+
+                with self.assertRaises(RunStepStateError) as transition_error:
+                    transition_stage(
+                        run_dir,
+                        "ingest",
+                        "running",
+                        reason="direct_public_transition",
+                        timestamp="2026-06-25T00:01:00Z",
+                    )
+
+                reconstructed = self.read_json(run_steps_path(run_dir))
+                stages = reconstructed["stages"]
+                self.assertEqual(
+                    transition_error.exception.to_dict()["code"],
+                    expected_code,
+                )
+                self.assertEqual(reconstructed["status"], expected_status)
+                self.assertEqual(stages["ingest"]["status"], "pending")
+                self.assertEqual(
+                    self.read_json(run_dir / "run_status.json"),
+                    run_status_before,
+                )
+                self.assertEqual(
+                    self.read_json(run_control_path(run_dir)),
+                    run_control_before,
+                )
+
+    def test_transition_stage_rejects_reconstructed_terminal_run_status_before_paused_control(
+        self,
+    ) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="terminal transition reconstruction gate",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        pause_run(
+            run_dir,
+            reason="paused_terminal_transition_guard",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        terminal_status = self.read_json(run_dir / "run_status.json")
+        terminal_status["status"] = "completed_fixture"
+        terminal_status["ok"] = True
+        terminal_status["terminal"] = True
+        terminal_status["updated_at"] = "2026-06-25T00:00:30Z"
+        terminal_status["diagnostics"] = {
+            "actionable_cause": "completed fixture should win over paused control"
+        }
+        terminal_status["artifact_handoff"]["status"] = "completed_fixture"
+        terminal_status["artifact_handoff"]["ok"] = True
+        terminal_status["artifact_handoff"]["terminal"] = True
+        terminal_status["artifact_handoff"]["diagnostics"] = dict(
+            terminal_status["diagnostics"]
+        )
+        self.write_json(run_dir / "run_status.json", terminal_status)
+        run_control_before = self.read_json(run_control_path(run_dir))
+        run_steps_path(run_dir).unlink()
+
+        with self.assertRaises(RunStepStateError) as transition_error:
+            transition_stage(
+                run_dir,
+                "ingest",
+                "running",
+                reason="direct_public_transition",
+                timestamp="2026-06-25T00:01:00Z",
+            )
+
+        reconstructed = self.read_json(run_steps_path(run_dir))
+        stages = reconstructed["stages"]
+        self.assertEqual(transition_error.exception.to_dict()["code"], "run_completed")
+        self.assertEqual(reconstructed["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "pending")
+        self.assertEqual(
+            self.read_json(run_dir / "run_status.json"),
+            terminal_status,
+        )
+        self.assertEqual(
+            self.read_json(run_control_path(run_dir)),
+            run_control_before,
+        )
 
     def test_run_status_reconstructs_deleted_run_steps_from_trace(self) -> None:
         runs_dir = self.temp_runs_dir()
