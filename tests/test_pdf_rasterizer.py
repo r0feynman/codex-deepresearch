@@ -21,6 +21,7 @@ from deepresearch import (  # noqa: E402
     validate_artifacts,
     validate_visual_artifacts,
 )
+from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
 from deepresearch import pdf_rasterizer  # noqa: E402
 from deepresearch import visual_acquisition  # noqa: E402
 
@@ -168,7 +169,7 @@ class PdfRasterizerTests(unittest.TestCase):
             providers=["local-pdf-rasterizer"],
         )
 
-        self.assertEqual(result["status"], "visual_candidates_collected")
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
         self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
         self.assertTrue(result["visual_artifact_validation"]["valid"], result["visual_artifact_validation"]["errors"])
         self.assertEqual(result["candidate_counts"], {"pdf_page": 1, "pdf_figure": 1})
@@ -300,6 +301,141 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(evidence["images"], [])
         self.assertFalse((run_dir / "images" / "pdf").exists())
 
+    def test_mixed_real_browser_and_pdf_keeps_pdf_diagnostics_active(self) -> None:
+        class FakeBrowserTransport:
+            name = "fake-browser"
+            provider_mode = "real"
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def availability(self) -> tuple[bool, str | None]:
+                return True, None
+
+            def capture(
+                self,
+                *,
+                url: str,
+                output_path: Path,
+                viewport: dict,
+                full_page: bool,
+                timeout_ms: int,
+            ) -> BrowserScreenshotCapture:
+                self.calls.append(
+                    {
+                        "url": url,
+                        "output_path": output_path,
+                        "viewport": dict(viewport),
+                        "full_page": full_page,
+                        "timeout_ms": timeout_ms,
+                    }
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(visual_acquisition.PNG_1X1 + b"\nmixed-browser\n")
+                return BrowserScreenshotCapture(
+                    width=int(viewport["width"]),
+                    height=int(viewport["height"]),
+                    http_status=200,
+                    final_url=url,
+                    external_network_call=False,
+                    provider_metadata={"fixture": "mixed-real-browser"},
+                )
+
+        prepared = prepare_run(
+            question="Mixed browser screenshot and PDF rasterization",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=4,
+        )
+        run_dir = Path(prepared["run_dir"])
+        pdf_path = self.write_pdf(run_dir, "mixed-provider.pdf")
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_browser_mixed",
+                "type": "web",
+                "url": "https://example.test/mixed-browser",
+                "title": "Mixed browser page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/mixed-browser.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "route": "visual_required",
+                "angle_id": "angle_001",
+            },
+            self.pdf_source(run_dir, "src_pdf_mixed", pdf_path),
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        browser_transport = FakeBrowserTransport()
+
+        with mock.patch.object(pdf_rasterizer, "_load_pdfium", return_value=None):
+            result = acquire_visual_candidates(
+                run=run_dir,
+                providers=["browser-screenshot", "local-pdf-rasterizer"],
+                screenshot_modes=["first_viewport"],
+                browser_transport=browser_transport,
+            )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        self.assertEqual(len(browser_transport.calls), 1)
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(
+            {candidate["provider"] for candidate in candidates},
+            {"browser-screenshot", "local-pdf-rasterizer"},
+        )
+        browser_candidates = [
+            candidate for candidate in candidates if candidate["provider"] == "browser-screenshot"
+        ]
+        pdf_candidates = [
+            candidate for candidate in candidates if candidate["provider"] == "local-pdf-rasterizer"
+        ]
+        self.assertEqual(len(browser_candidates), 1)
+        self.assertEqual(len(pdf_candidates), 1)
+        self.assertEqual(browser_candidates[0]["candidate_status"], "fetched")
+        self.assertEqual(browser_candidates[0]["provider_mode"], "real")
+        self.assertTrue((run_dir / browser_candidates[0]["local_artifact_path"]).is_file())
+        self.assertEqual(pdf_candidates[0]["provider_kind"], "pdf_rasterizer")
+        self.assertEqual(pdf_candidates[0]["provider_mode"], "manual")
+        self.assertEqual(pdf_candidates[0]["candidate_status"], "fetch_failed")
+        self.assertEqual(pdf_candidates[0]["rejection_reason"], "renderer_unavailable_pdf")
+        self.assertEqual(
+            pdf_candidates[0]["pdf_diagnostic"]["reason"],
+            "renderer_unavailable_pdf",
+        )
+
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        fetch_by_provider = {fetch["provider"]: fetch for fetch in fetches}
+        self.assertEqual(fetch_by_provider["browser-screenshot"]["fetch_status"], "fetched")
+        self.assertEqual(fetch_by_provider["local-pdf-rasterizer"]["fetch_status"], "failed")
+        self.assertEqual(
+            fetch_by_provider["local-pdf-rasterizer"]["failure_code"],
+            "renderer_unavailable_pdf",
+        )
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        providers = {provider["provider"]: provider for provider in provider_status["providers"]}
+        self.assertEqual(set(providers), {"browser-screenshot", "local-pdf-rasterizer"})
+        self.assertEqual(providers["browser-screenshot"]["provider_mode"], "real")
+        self.assertEqual(providers["browser-screenshot"]["artifacts_fetched"], 1)
+        self.assertEqual(providers["local-pdf-rasterizer"]["provider_kind"], "pdf_rasterizer")
+        self.assertEqual(providers["local-pdf-rasterizer"]["provider_mode"], "manual")
+        self.assertFalse(providers["local-pdf-rasterizer"]["available"])
+        self.assertEqual(
+            providers["local-pdf-rasterizer"]["blocked_reason"],
+            "renderer_unavailable_pdf",
+        )
+        self.assertEqual(providers["local-pdf-rasterizer"]["pdf_pages_skipped"], 1)
+        self.assertEqual(providers["local-pdf-rasterizer"]["artifacts_fetched"], 0)
+        self.assertEqual(
+            result["pdf_rasterization"]["diagnostics"][0]["failure_code"],
+            "renderer_unavailable_pdf",
+        )
+
     @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
     def test_pdf_render_failure_records_diagnostics_without_crashing(self) -> None:
         prepared = prepare_run(
@@ -325,7 +461,7 @@ class PdfRasterizerTests(unittest.TestCase):
                 providers=["local-pdf-rasterizer"],
             )
 
-        self.assertEqual(result["status"], "visual_candidates_collected")
+        self.assertEqual(result["status"], "partial_auto_visual")
         self.assertEqual(result["selected_observations"], 0)
         self.assertTrue((run_dir / "visual_candidates.jsonl").is_file())
         self.assertTrue((run_dir / "image_fetch_status.jsonl").is_file())

@@ -176,6 +176,7 @@ def acquire_visual_candidates(
     visual_task_by_angle = _visual_task_by_angle(run_dir)
     routes = _visual_routes(evidence, visual_task_by_angle=visual_task_by_angle)
     now = _utc_now()
+    explicit_provider_request = bool(providers)
     provider_names = _normalize_provider_names(providers)
     normalized_modes = _normalize_screenshot_modes(screenshot_modes)
 
@@ -197,11 +198,22 @@ def acquire_visual_candidates(
         browser_transport=browser_transport,
         evidence=evidence,
     )
-    real_provider_requested = any(_is_real_provider_name(provider.name) for provider in provider_instances)
+    real_provider_requested = any(
+        _is_real_provider_request_name(
+            provider.name,
+            explicit_provider_request=explicit_provider_request,
+        )
+        for provider in provider_instances
+    )
     active_provider_names = provider_names
     if real_provider_requested:
         provider_instances = [
-            provider for provider in provider_instances if _is_real_provider_name(provider.name)
+            provider
+            for provider in provider_instances
+            if _is_real_provider_request_name(
+                provider.name,
+                explicit_provider_request=explicit_provider_request,
+            )
         ]
         active_provider_names = tuple(provider.name for provider in provider_instances)
         preflight_statuses = [_initial_provider_status(provider) for provider in provider_instances]
@@ -240,8 +252,10 @@ def acquire_visual_candidates(
         candidates.extend(provider_candidates)
         provider_statuses.append(_collection_provider_status(provider, provider_candidates))
 
-    if real_provider_requested and not any(
-        status.get("available") is True for status in provider_statuses
+    if (
+        real_provider_requested
+        and not any(status.get("available") is True for status in provider_statuses)
+        and not candidates
     ):
         return _write_blocked_missing_visual_provider(
             run_dir,
@@ -1832,6 +1846,7 @@ def _requires_local_artifact_validation(candidate: Mapping[str, Any]) -> bool:
     return (
         candidate.get("provider") == BROWSER_SCREENSHOT_PROVIDER
         or candidate.get("provider_kind") == "screenshot"
+        or candidate.get("provider_kind") == "pdf_rasterizer"
         or candidate.get("origin") == "screenshot"
     )
 
@@ -1902,7 +1917,7 @@ def _real_provider_succeeded(
         ) > 0:
             return True
     return any(
-        record.get("provider_kind") == "screenshot"
+        record.get("provider_kind") in {"screenshot", "pdf_rasterizer"}
         and record.get("fetch_status") == "fetched"
         and isinstance(record.get("local_artifact_path"), str)
         and bool(record.get("local_artifact_path"))
@@ -3143,7 +3158,21 @@ def _sanitized_result_metadata(
 
 
 def _is_real_provider_name(provider: str) -> bool:
-    return provider in {BRAVE_IMAGE_PROVIDER, BROWSER_SCREENSHOT_PROVIDER}
+    return provider in {
+        BRAVE_IMAGE_PROVIDER,
+        BROWSER_SCREENSHOT_PROVIDER,
+        DEFAULT_PDF_RASTERIZER_PROVIDER,
+    }
+
+
+def _is_real_provider_request_name(
+    provider: str,
+    *,
+    explicit_provider_request: bool,
+) -> bool:
+    if provider == DEFAULT_PDF_RASTERIZER_PROVIDER:
+        return explicit_provider_request
+    return _is_real_provider_name(provider)
 
 
 def _uses_fixture_sources(provider_names: Sequence[str]) -> bool:
