@@ -39,26 +39,26 @@
     {
       "id": "item_58",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Done`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Done`.\n",
         "number": 58,
-        "state": "OPEN",
+        "state": "CLOSED",
         "title": "[P3-UX1] Skill full-runner invocation router",
         "type": "Issue",
         "url": "https://github.com/r0feynman/codex-deepresearch/issues/58"
       },
       "labels": ["type:task", "component:skill", "priority:P1"],
       "milestone": {"title": "Phase 3 - Public Beta"},
-      "status": "Todo",
+      "status": "Done",
       "phase": "Phase 3 - Public Beta",
       "work Type": "Task",
       "component": "Skill",
       "priority": "P1",
-      "workflow Status": "Ready"
+      "workflow Status": "Done"
     },
     {
       "id": "item_59",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
         "number": 59,
         "state": "OPEN",
         "title": "[P3-UX2] Final response artifact handoff",
@@ -72,12 +72,12 @@
       "work Type": "Task",
       "component": "Skill",
       "priority": "P1",
-      "workflow Status": "Backlog"
+      "workflow Status": "Ready"
     },
     {
       "id": "item_60",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
         "number": 60,
         "state": "OPEN",
         "title": "[P3-UX3] Fresh-session skill E2E gate",
@@ -91,7 +91,7 @@
       "work Type": "Task",
       "component": "Skill",
       "priority": "P1",
-      "workflow Status": "Backlog"
+      "workflow Status": "Ready"
     },
     {
       "id": "item_61",
@@ -134,26 +134,26 @@
     {
       "id": "item_63",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Done`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Done`.\n",
         "number": 63,
-        "state": "OPEN",
+        "state": "CLOSED",
         "title": "[P3-AV1] Visual artifact schema and status states",
         "type": "Issue",
         "url": "https://github.com/r0feynman/codex-deepresearch/issues/63"
       },
       "labels": ["type:task", "component:visual", "priority:P1"],
       "milestone": {"title": "Phase 3 - Public Beta"},
-      "status": "Todo",
+      "status": "Done",
       "phase": "Phase 3 - Public Beta",
       "work Type": "Task",
       "component": "Visual",
       "priority": "P1",
-      "workflow Status": "Ready"
+      "workflow Status": "Done"
     },
     {
       "id": "item_64",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- Blocked by #63 (`P3-AV1`).\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- Blocked by #63 (`P3-AV1`).\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
         "number": 64,
         "state": "OPEN",
         "title": "[P3-AV2] Real image search provider adapter",
@@ -167,12 +167,12 @@
       "work Type": "Task",
       "component": "Visual",
       "priority": "P1",
-      "workflow Status": "Backlog"
+      "workflow Status": "Ready"
     },
     {
       "id": "item_65",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
         "number": 65,
         "state": "OPEN",
         "title": "[P3-AV3] Page image extraction and fetch/cache",
@@ -186,12 +186,12 @@
       "work Type": "Task",
       "component": "Visual",
       "priority": "P1",
-      "workflow Status": "Backlog"
+      "workflow Status": "Ready"
     },
     {
       "id": "item_66",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
         "number": 66,
         "state": "OPEN",
         "title": "[P3-AV4] Browser screenshot collector",
@@ -205,12 +205,12 @@
       "work Type": "Task",
       "component": "Visual",
       "priority": "P1",
-      "workflow Status": "Backlog"
+      "workflow Status": "Ready"
     },
     {
       "id": "item_67",
       "content": {
-        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Backlog`.\n",
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Ready`.\n",
         "number": 67,
         "state": "OPEN",
         "title": "[P3-AV5] PDF figure and page rasterizer",
@@ -224,7 +224,7 @@
       "work Type": "Task",
       "component": "Visual",
       "priority": "P2",
-      "workflow Status": "Backlog"
+      "workflow Status": "Ready"
     },
     {
       "id": "item_68",

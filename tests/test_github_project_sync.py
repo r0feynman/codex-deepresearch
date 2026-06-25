@@ -199,12 +199,12 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
     def test_open_issue_with_unresolved_blocker_cannot_be_ready(self) -> None:
         with self.copy_fixture() as tmp:
             fixture_dir = Path(tmp)
-            self.mutate_project_item(fixture_dir, 64, **{"workflow Status": "Ready"})
+            self.mutate_project_item(fixture_dir, 69, **{"workflow Status": "Ready"})
             policy, state = self.load_state(fixture_dir)
             findings = common.verify_project_state(state, policy)
             self.assertTrue(
                 any(
-                    finding.issue_number == 64
+                    finding.issue_number == 69
                     and finding.field_name == "Workflow Status"
                     and finding.expected == "Backlog"
                     and finding.safe_fix
@@ -304,9 +304,9 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
     def test_policy_listed_issue_missing_from_project_is_detected(self) -> None:
         with self.copy_fixture() as tmp:
             fixture_dir = Path(tmp)
-            self.remove_project_item(fixture_dir, 58)
+            self.remove_project_item(fixture_dir, 59)
             checks = self.finding_checks(fixture_dir)
-            self.assertIn(("policy_issue_missing_from_project", 58), checks)
+            self.assertIn(("policy_issue_missing_from_project", 59), checks)
 
     def test_intentionally_blank_phase_and_component_are_supported(self) -> None:
         with self.copy_fixture() as tmp:
