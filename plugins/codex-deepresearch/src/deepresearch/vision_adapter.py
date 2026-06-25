@@ -143,6 +143,12 @@ def ingest_vision_observations(
 
     images_reused = 0
     if normalized_images:
+        phase3_observations = _phase3_observation_records(
+            records,
+            normalized_images,
+            provider=normalized_provider,
+            now=now,
+        )
         normalized_images, images_reused = _reuse_completed_images(
             evidence["images"],
             normalized_images,
@@ -162,7 +168,7 @@ def ingest_vision_observations(
                 )
             )
         ] + normalized_images
-        _write_jsonl(visual_observations_path, normalized_images)
+        _write_jsonl(visual_observations_path, phase3_observations)
         linkage_count = _link_visual_evidence_to_claims(evidence)
         adapter_status = "visual_evidence_ingested"
     else:
@@ -869,6 +875,184 @@ def _copy_optional_visual_metadata(
             value = image.get(key)
         if isinstance(value, Mapping):
             visual[key] = dict(value)
+
+
+def _phase3_observation_records(
+    records: Sequence[Any],
+    images: Sequence[Mapping[str, Any]],
+    *,
+    provider: str,
+    now: str,
+) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for index, image in enumerate(images):
+        raw = records[index] if index < len(records) and isinstance(records[index], Mapping) else {}
+        image_id = _first_optional_string(raw, "evidence_image_id") or str(image["id"])
+        candidate_id = (
+            _first_optional_string(raw, "candidate_id")
+            or _first_optional_string(image, "candidate_id")
+            or f"cand_{_sanitize_identifier(image_id)}"
+        )
+        angle_id = (
+            _first_optional_string(raw, "angle_id")
+            or _first_optional_string(image, "angle_id")
+            or "angle_001"
+        )
+        task_id = (
+            _first_optional_string(raw, "task_id")
+            or _first_optional_string(image, "task_id")
+            or f"task_visual_{_sanitize_identifier(angle_id.removeprefix('angle_'))}"
+        )
+        provider_name = (
+            _first_optional_string(raw, "provider")
+            or _first_optional_string(image, "provider", "visual_provider")
+            or provider
+        )
+        provider_kind = (
+            _first_optional_string(raw, "provider_kind")
+            or _first_optional_string(image, "provider_kind")
+            or "vlm"
+        )
+        provider_mode = (
+            _first_optional_string(raw, "provider_mode")
+            or _first_optional_string(image, "provider_mode")
+            or "fixture"
+        )
+        provider_run_id = (
+            _first_optional_string(raw, "provider_run_id")
+            or _first_optional_string(image, "provider_run_id")
+            or "vision-adapter-local"
+        )
+        phase3 = {
+            "id": image["id"],
+            "observation_id": _first_optional_string(raw, "observation_id")
+            or _first_optional_string(image, "observation_id")
+            or f"obs_{_sanitize_identifier(image_id)}",
+            "evidence_image_id": image_id,
+            "source_id": image["source_id"],
+            "origin": image["origin"],
+            "image_url": image.get("image_url"),
+            "page_url": image.get("page_url"),
+            "local_artifact_path": image["local_artifact_path"],
+            "mime_type": image["mime_type"],
+            "artifact_size_bytes": image.get("artifact_size_bytes"),
+            "width": image["width"],
+            "height": image["height"],
+            "hash": image.get("hash"),
+            "phash": image.get("phash"),
+            "ocr_text": image.get("ocr_text"),
+            "ocr_outputs": list(image.get("ocr_outputs", []))
+            if isinstance(image.get("ocr_outputs"), list)
+            else [],
+            "observations": list(image.get("observations", []))
+            if isinstance(image.get("observations"), list)
+            else [],
+            "inferences": list(image.get("inferences", []))
+            if isinstance(image.get("inferences"), list)
+            else [],
+            "vlm_visual_summary": image.get("vlm_visual_summary"),
+            "vlm_visual_description": image.get("vlm_visual_description"),
+            "visual_tasks": list(image.get("visual_tasks", []))
+            if isinstance(image.get("visual_tasks"), list)
+            else [],
+            "analysis_provider": image["analysis_provider"],
+            "analysis_status": image["analysis_status"],
+            "policy_flags": _dedupe(
+                _string_list(raw, "policy_flags") + _string_list(image, "policy_flags")
+            ),
+            "caveats": list(image.get("caveats", []))
+            if isinstance(image.get("caveats"), list)
+            else [],
+            "candidate_id": candidate_id,
+            "fetch_id": _first_optional_string(raw, "fetch_id")
+            or _first_optional_string(image, "fetch_id")
+            or f"fetch_{_sanitize_identifier(candidate_id)}",
+            "task_id": task_id,
+            "candidate_class": image.get("candidate_class"),
+            "angle_id": angle_id,
+            "route": image.get("route"),
+            "visual_provider": image.get("visual_provider") or provider_name,
+            "provider": provider_name,
+            "provider_kind": provider_kind,
+            "provider_mode": provider_mode,
+            "provider_run_id": provider_run_id,
+            "provider_provenance": _provider_provenance(
+                raw,
+                image,
+                provider=provider_name,
+                provider_kind=provider_kind,
+                provider_mode=provider_mode,
+                provider_run_id=provider_run_id,
+            ),
+            "model_or_tool": _first_optional_string(raw, "model_or_tool") or provider,
+            "observation_status": _first_optional_string(raw, "observation_status")
+            or image.get("analysis_status", "analyzed"),
+            "confidence": _first_number(raw, image, "confidence", default=1.0),
+            "policy_decision": _first_optional_string(raw, "policy_decision")
+            or _first_optional_string(image, "policy_decision")
+            or "allowed",
+            "verifier_links": _mapping_list(raw.get("verifier_links")),
+            "report_links": _mapping_list(raw.get("report_links")),
+            "estimated_cost_usd": _first_number(
+                raw, image, "estimated_cost_usd", default=0.0
+            ),
+            "actual_cost_usd": _first_number(raw, image, "actual_cost_usd", default=0.0),
+            "created_at": _first_optional_string(raw, "created_at") or now,
+            "visual_validation": dict(image.get("visual_validation", {}))
+            if isinstance(image.get("visual_validation"), Mapping)
+            else {},
+            "source_url": image.get("source_url"),
+        }
+        if isinstance(image.get("screenshot"), Mapping):
+            phase3["screenshot"] = dict(image["screenshot"])
+        observations.append(phase3)
+    return observations
+
+
+def _provider_provenance(
+    record: Mapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    provider: str,
+    provider_kind: str,
+    provider_mode: str,
+    provider_run_id: str,
+) -> dict[str, Any]:
+    for container in (record, image):
+        value = container.get("provider_provenance")
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {
+        "provider": provider,
+        "provider_kind": provider_kind,
+        "provider_mode": provider_mode,
+        "provider_run_id": provider_run_id,
+    }
+
+
+def _mapping_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _first_number(
+    record: Mapping[str, Any],
+    image: Mapping[str, Any],
+    key: str,
+    *,
+    default: float,
+) -> float | int:
+    for container in (record, image):
+        value = container.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return default
+
+
+def _sanitize_identifier(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_").lower()
+    return normalized or "visual"
 
 
 def _number(record: Mapping[str, Any], image: Mapping[str, Any], key: str) -> int | float:

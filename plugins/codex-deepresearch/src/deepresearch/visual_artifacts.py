@@ -24,22 +24,27 @@ AUTOMATIC_VISUAL_TERMINAL_STATUSES = (
     "policy_blocked_visual",
     "budget_pruned_visual",
 )
-PROVIDER_KINDS = (
+CANDIDATE_PROVIDER_KINDS = (
     "web_image_search",
     "page_extractor",
     "screenshot",
     "pdf_rasterizer",
     "manual",
     "fixture",
+)
+OBSERVATION_PROVIDER_KINDS = CANDIDATE_PROVIDER_KINDS + ("vlm",)
+STATUS_PROVIDER_KINDS = CANDIDATE_PROVIDER_KINDS + (
     "visual_acquisition",
     "vlm",
 )
-REAL_AUTOMATIC_PROVIDER_KINDS = (
+REAL_ACQUISITION_PROVIDER_KINDS = (
     "web_image_search",
     "page_extractor",
     "screenshot",
     "pdf_rasterizer",
     "visual_acquisition",
+)
+REAL_OBSERVATION_PROVIDER_KINDS = REAL_ACQUISITION_PROVIDER_KINDS + (
     "vlm",
 )
 PROVIDER_MODES = ("real", "fixture", "manual", "user_provided")
@@ -112,6 +117,7 @@ class _VisualContext:
         self.verifier_vote_ids: set[str] = set()
         self.search_result_ids: set[str] = set()
         self.observation_links_by_image_claim: set[tuple[str, str, str]] = set()
+        self.report_used_image_ids: set[str] = set()
 
 
 def automatic_visual_status_envelope(
@@ -162,7 +168,21 @@ def is_real_automatic_visual_record(record: Mapping[str, Any]) -> bool:
 
     return (
         record.get("provider_mode") == "real"
-        and record.get("provider_kind") in REAL_AUTOMATIC_PROVIDER_KINDS
+        and record.get("provider_kind") in REAL_OBSERVATION_PROVIDER_KINDS
+    )
+
+
+def _is_real_acquisition_record(record: Mapping[str, Any]) -> bool:
+    return (
+        record.get("provider_mode") == "real"
+        and record.get("provider_kind") in REAL_ACQUISITION_PROVIDER_KINDS
+    )
+
+
+def _is_real_observation_record(record: Mapping[str, Any]) -> bool:
+    return (
+        record.get("provider_mode") == "real"
+        and record.get("provider_kind") in REAL_OBSERVATION_PROVIDER_KINDS
     )
 
 
@@ -177,15 +197,15 @@ def real_automatic_visual_release_counts(
 
     providers = visual_provider_status.get("providers", []) if visual_provider_status else []
     provider_records = [item for item in providers if isinstance(item, Mapping)]
-    real_providers = [item for item in provider_records if is_real_automatic_visual_record(item)]
+    real_providers = [item for item in provider_records if _is_real_acquisition_record(item)]
     excluded_providers = [
-        item for item in provider_records if not is_real_automatic_visual_record(item)
+        item for item in provider_records if not _is_real_acquisition_record(item)
     ]
     return {
-        "real_candidates": sum(1 for item in candidates if is_real_automatic_visual_record(item)),
-        "real_fetches": sum(1 for item in fetches if is_real_automatic_visual_record(item)),
+        "real_candidates": sum(1 for item in candidates if _is_real_acquisition_record(item)),
+        "real_fetches": sum(1 for item in fetches if _is_real_acquisition_record(item)),
         "real_observations": sum(
-            1 for item in observations if is_real_automatic_visual_record(item)
+            1 for item in observations if _is_real_observation_record(item)
         ),
         "real_provider_invocations": sum(_int(item.get("invocations")) for item in real_providers),
         "real_candidates_discovered": sum(
@@ -279,19 +299,31 @@ def validate_visual_artifacts(
 
     base = Path(run_dir) if run_dir is not None else None
     visual_search_plan_path = _default_path(
-        base, visual_search_plan_path, VISUAL_SEARCH_PLAN_FILENAME
+        base,
+        visual_search_plan_path,
+        VISUAL_SEARCH_PLAN_FILENAME,
+        required=base is not None,
     )
     visual_candidates_path = _default_path(
-        base, visual_candidates_path, VISUAL_CANDIDATES_FILENAME
+        base,
+        visual_candidates_path,
+        VISUAL_CANDIDATES_FILENAME,
+        required=base is not None,
     )
     image_fetch_status_path = _default_path(
-        base, image_fetch_status_path, IMAGE_FETCH_STATUS_FILENAME
+        base,
+        image_fetch_status_path,
+        IMAGE_FETCH_STATUS_FILENAME,
+        required=base is not None,
     )
     visual_observations_path = _default_path(
         base, visual_observations_path, "visual_observations.jsonl"
     )
     visual_provider_status_path = _default_path(
-        base, visual_provider_status_path, VISUAL_PROVIDER_STATUS_FILENAME
+        base,
+        visual_provider_status_path,
+        VISUAL_PROVIDER_STATUS_FILENAME,
+        required=base is not None,
     )
     evidence_path = _default_path(base, evidence_path, "evidence.json")
     research_tasks_path = _default_path(base, research_tasks_path, "research_tasks.json")
@@ -367,6 +399,15 @@ def validate_visual_artifacts(
         )
     if isinstance(report_status, Mapping):
         _validate_report_status(report_status, context, collector)
+    if isinstance(provider_status, Mapping):
+        _validate_completed_auto_visual_prerequisites(
+            provider_status=provider_status,
+            candidates=candidates or (),
+            fetches=fetches or (),
+            observations=observations or (),
+            context=context,
+            collector=collector,
+        )
     _validate_candidate_fetch_lineage(context, collector)
     _validate_claim_observation_report_lineage(context, collector)
     return _result(collector)
@@ -496,7 +537,12 @@ def _validate_visual_candidates(
                 "dangling_reference",
                 f"candidate references unknown plan_id '{plan_id}'",
             )
-        _validate_provider_fields(record, path, collector)
+        _validate_provider_fields(
+            record,
+            path,
+            collector,
+            allowed_kinds=CANDIDATE_PROVIDER_KINDS,
+        )
         _check_enum(record, "origin", VISUAL_ORIGINS, path, collector)
         _check_nullable_string(record, "page_url", path, collector)
         _check_nullable_string(record, "image_url", path, collector)
@@ -580,7 +626,12 @@ def _validate_image_fetch_status(
                     ("task_id", "angle_id", "provider_mode", "provider_run_id"),
                     collector,
                 )
-        _validate_provider_fields(record, path, collector)
+        _validate_provider_fields(
+            record,
+            path,
+            collector,
+            allowed_kinds=CANDIDATE_PROVIDER_KINDS,
+        )
         _check_enum(record, "fetch_status", FETCH_STATUSES, path, collector)
         _check_nullable_number(record, "http_status", path, collector)
         _check_nullable_string(record, "mime_type", path, collector)
@@ -654,7 +705,12 @@ def _validate_phase3_visual_observations(
                 )
             seen.add(observation_id)
         _validate_task_reference(record, path, context, collector)
-        _validate_provider_fields(record, path, collector)
+        _validate_provider_fields(
+            record,
+            path,
+            collector,
+            allowed_kinds=OBSERVATION_PROVIDER_KINDS,
+        )
         _check_string(record, "model_or_tool", path, collector)
         _check_enum(record, "observation_status", OBSERVATION_STATUSES, path, collector)
         _check_string_list(record, "observations", path, collector)
@@ -759,7 +815,13 @@ def _validate_visual_provider_status(
             ),
             collector,
         )
-        _validate_provider_fields(provider, provider_path, collector, require_run_id=False)
+        _validate_provider_fields(
+            provider,
+            provider_path,
+            collector,
+            require_run_id=False,
+            allowed_kinds=STATUS_PROVIDER_KINDS,
+        )
         _check_bool(provider, "configured", provider_path, collector)
         _check_bool(provider, "available", provider_path, collector)
         _check_nullable_string(provider, "blocked_reason", provider_path, collector)
@@ -800,6 +862,75 @@ def _validate_report_status(
                 "dangling_reference",
                 f"report status references unknown image '{image_id}'",
             )
+        else:
+            context.report_used_image_ids.add(image_id)
+
+
+def _validate_completed_auto_visual_prerequisites(
+    *,
+    provider_status: Mapping[str, Any],
+    candidates: Sequence[Any],
+    fetches: Sequence[Any],
+    observations: Sequence[Any],
+    context: _VisualContext,
+    collector: _Collector,
+) -> None:
+    if provider_status.get("status") != "completed_auto_visual":
+        return
+    providers = provider_status.get("providers", [])
+    provider_records = [item for item in providers if isinstance(item, Mapping)]
+    candidate_records = [item for item in candidates if isinstance(item, Mapping)]
+    fetch_records = [item for item in fetches if isinstance(item, Mapping)]
+    observation_records = [item for item in observations if isinstance(item, Mapping)]
+    real_acquisition_ran = any(_is_real_acquisition_record(item) for item in provider_records)
+    real_fetched_artifact = any(
+        _is_real_acquisition_record(item)
+        and item.get("fetch_status") == "fetched"
+        and isinstance(item.get("evidence_image_id"), str)
+        and item.get("evidence_image_id")
+        for item in fetch_records
+    )
+    real_vlm_observation = any(
+        item.get("provider_mode") == "real"
+        and item.get("provider_kind") == "vlm"
+        and item.get("observation_status") == "analyzed"
+        for item in observation_records
+    )
+    report_cited_supported_claim = _has_report_cited_supported_visual_claim(context)
+    missing: list[str] = []
+    if not real_acquisition_ran:
+        missing.append("real_non_fixture_visual_provider")
+    if fetch_records and not real_fetched_artifact:
+        missing.append("real_fetched_visual_artifact")
+    if observation_records and not real_vlm_observation:
+        missing.append("real_vlm_observation")
+    if context.claim_by_id and context.report_used_image_ids and not report_cited_supported_claim:
+        missing.append("report_cited_supported_visual_claim")
+    if missing:
+        collector.add(
+            "$.visual_provider_status.status",
+            "completed_auto_visual_prerequisites",
+            "completed_auto_visual requires: " + ", ".join(missing),
+        )
+
+
+def _has_report_cited_supported_visual_claim(context: _VisualContext) -> bool:
+    if not context.claim_by_id or not context.report_used_image_ids:
+        return False
+    for claim in context.claim_by_id.values():
+        if claim.get("verification_status") != "supported":
+            continue
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+        supporting_images = claim.get("supporting_images", [])
+        if not isinstance(supporting_images, list):
+            continue
+        if any(
+            isinstance(image_id, str) and image_id in context.report_used_image_ids
+            for image_id in supporting_images
+        ):
+            return True
+    return False
 
 
 def _collect_tasks(
@@ -921,9 +1052,10 @@ def _validate_provider_fields(
     collector: _Collector,
     *,
     require_run_id: bool = True,
+    allowed_kinds: tuple[str, ...] = STATUS_PROVIDER_KINDS,
 ) -> None:
     _check_string(record, "provider", path, collector)
-    _check_enum(record, "provider_kind", PROVIDER_KINDS, path, collector)
+    _check_enum(record, "provider_kind", allowed_kinds, path, collector)
     _check_enum(record, "provider_mode", PROVIDER_MODES, path, collector)
     if require_run_id:
         _check_string(record, "provider_run_id", path, collector)
@@ -1150,12 +1282,20 @@ def _validate_matching_lineage(
             )
 
 
-def _default_path(base: Path | None, value: str | Path | None, filename: str) -> Path | None:
+def _default_path(
+    base: Path | None,
+    value: str | Path | None,
+    filename: str,
+    *,
+    required: bool = False,
+) -> Path | None:
     if value is not None:
         return Path(value)
     if base is None:
         return None
     candidate = base / filename
+    if required:
+        return candidate
     return candidate if candidate.exists() else None
 
 

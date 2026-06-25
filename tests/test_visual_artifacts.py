@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import acquire_visual_candidates, prepare_run  # noqa: E402
+from deepresearch import (  # noqa: E402
+    acquire_visual_candidates,
+    ingest_vision_observations,
+    prepare_run,
+)
 from deepresearch.visual_artifacts import (  # noqa: E402
     IMAGE_FETCH_STATUS_FILENAME,
     VISUAL_CANDIDATES_FILENAME,
@@ -96,6 +100,32 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertEqual(counts["real_fetches"], 0)
         self.assertEqual(counts["real_observations"], 0)
 
+    def test_ingest_vision_preserves_phase3_visual_observations(self) -> None:
+        prepared = prepare_run(
+            question="Inspect deterministic visual artifacts after ingest",
+            runs_dir=self.temp_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        acquire_visual_candidates(run=run_dir)
+
+        ingest = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+        observation = self.read_jsonl(run_dir / "visual_observations.jsonl")[0]
+        for field in (
+            "evidence_image_id",
+            "model_or_tool",
+            "observation_status",
+            "confidence",
+            "verifier_links",
+            "report_links",
+            "created_at",
+        ):
+            self.assertIn(field, observation)
+
     def test_valid_phase3_visual_lineage_and_non_real_modes_validate(self) -> None:
         run_dir = self.write_phase3_fixture(include_non_real=True)
 
@@ -112,6 +142,92 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertEqual(counts["real_fetches"], 1)
         self.assertEqual(counts["real_observations"], 1)
         self.assertGreaterEqual(counts["excluded_non_real_provider_records"], 3)
+
+    def test_run_dir_validation_requires_phase3_visual_artifacts(self) -> None:
+        for filename, expected_path in (
+            (VISUAL_SEARCH_PLAN_FILENAME, "$.visual_search_plan"),
+            (VISUAL_CANDIDATES_FILENAME, "$.visual_candidates"),
+            (IMAGE_FETCH_STATUS_FILENAME, "$.image_fetch_status"),
+            (VISUAL_PROVIDER_STATUS_FILENAME, "$.visual_provider_status"),
+        ):
+            with self.subTest(filename=filename):
+                run_dir = self.write_phase3_fixture()
+                (run_dir / filename).unlink()
+
+                result = validate_visual_artifacts(run_dir=run_dir)
+
+                self.assertFalse(result.valid)
+                errors = {error.path: error.code for error in result.errors}
+                self.assertEqual(errors.get(expected_path), "missing_file")
+
+    def test_run_dir_with_only_evidence_fails_required_visual_artifacts(self) -> None:
+        run_dir = self.temp_dir() / "dr_missing_visual_artifacts"
+        run_dir.mkdir()
+        self.write_json(run_dir / "evidence.json", {"schema_version": "0.1.0"})
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        missing_paths = {
+            "$.visual_search_plan",
+            "$.visual_candidates",
+            "$.image_fetch_status",
+            "$.visual_provider_status",
+        }
+        self.assertTrue(missing_paths.issubset({error.path for error in result.errors}))
+
+    def test_explicit_single_file_validation_does_not_require_run_dir_artifacts(self) -> None:
+        run_dir = self.write_phase3_fixture()
+
+        result = validate_visual_artifacts(
+            visual_provider_status_path=run_dir / VISUAL_PROVIDER_STATUS_FILENAME
+        )
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+
+    def test_completed_auto_visual_requires_real_non_fixture_prerequisites(self) -> None:
+        run_dir = self.write_phase3_fixture()
+        provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        provider_status["providers"] = [
+            {
+                **provider,
+                "provider_kind": "fixture",
+                "provider_mode": "fixture",
+            }
+            for provider in provider_status["providers"]
+        ]
+        self.write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, provider_status)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "completed_auto_visual_prerequisites",
+            {error.code for error in result.errors},
+        )
+
+    def test_candidate_provider_kind_rejects_vlm_and_counts_do_not_inflate(self) -> None:
+        run_dir = self.write_phase3_fixture()
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        candidates[0]["provider_kind"] = "vlm"
+        self.write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, candidates)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        self.assertIn("$.visual_candidates[0].provider_kind", {error.path for error in result.errors})
+
+        counts = real_automatic_visual_release_counts(
+            candidates=[{"provider_kind": "vlm", "provider_mode": "real"}],
+            fetches=[{"provider_kind": "vlm", "provider_mode": "real"}],
+            observations=[{"provider_kind": "vlm", "provider_mode": "real"}],
+            visual_provider_status={
+                "providers": [{"provider_kind": "vlm", "provider_mode": "real"}]
+            },
+        )
+        self.assertEqual(counts["real_candidates"], 0)
+        self.assertEqual(counts["real_fetches"], 0)
+        self.assertEqual(counts["real_observations"], 1)
 
     def test_validation_rejects_missing_required_automatic_fields(self) -> None:
         cases = (
