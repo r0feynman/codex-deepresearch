@@ -24,6 +24,8 @@ from .verification_matrix import VerificationMatrixError, verify_claims
 
 RUN_STATUS_SCHEMA_VERSION = "codex-deepresearch.run-status.v0"
 RUN_STATUS_FILENAME = "run_status.json"
+VISUAL_PROVIDER_STATUS_SCHEMA_VERSION = "codex-deepresearch.visual-provider-status.v0"
+VISUAL_PROVIDER_STATUS_FILENAME = "visual_provider_status.json"
 INVOCATION_MODES = ("full-runner", "quick-chat", "manual-handoff", "blocked")
 
 _QUICK_CHAT_MARKERS = (
@@ -41,6 +43,16 @@ _PARALLEL_SYNTHESIS_STATUSES = {
     "completed_parallel",
     "completed_partial_parallel",
     "completed_fixture",
+}
+_STAGE_OK_STATUSES = {
+    "completed",
+    "completed_fixture",
+    "completed_parallel",
+    "completed_partial_parallel",
+    "manual_sources_ingested",
+    "skipped",
+    "visual_candidates_collected",
+    "visual_evidence_ingested",
 }
 
 
@@ -161,6 +173,38 @@ def run_skill_invocation(
             artifacts=_artifact_paths(run_dir, prepared.get("artifacts")),
         ),
     )
+    visual_provider_status = _visual_provider_preflight_status(
+        run_dir=run_dir,
+        adapter_name=adapter_name,
+    )
+    if visual_provider_status is not None:
+        _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, visual_provider_status)
+        if visual_provider_status.get("ok") is not True:
+            status = _base_run_status(
+                invocation=normalized_invocation,
+                question=question,
+                selected_mode="full-runner",
+                run_dir=run_dir,
+                status="blocked_missing_visual_provider",
+                ok=False,
+                terminal=True,
+                provenance={
+                    "type": "blocked_missing_visual_provider",
+                    "adapter": adapter_name,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "real_child_execution": False,
+                    "real_use_e2e_eligible": False,
+                },
+                diagnostics={
+                    "actionable_cause": str(
+                        visual_provider_status["diagnostics"]["actionable_cause"]
+                    )
+                },
+                artifacts=_artifact_paths(run_dir),
+            )
+            status["visual_provider"] = _stage_summary(visual_provider_status)
+            return _write_run_status(run_dir, status)
 
     try:
         parallel_status = run_parallel_orchestration(
@@ -433,6 +477,127 @@ def _terminal_from_parallel(
     return status
 
 
+def _visual_provider_preflight_status(
+    *,
+    run_dir: Path,
+    adapter_name: str,
+) -> dict[str, Any] | None:
+    if not _run_requires_visual_provider(run_dir):
+        return None
+    normalized_adapter = adapter_name.strip().lower().replace("_", "-")
+    if normalized_adapter == "fixture":
+        return _visual_provider_status(
+            run_dir=run_dir,
+            status="fixture_visual_provider",
+            ok=True,
+            terminal=False,
+            metric_classification="fixture_only_not_release_eligible",
+            provider="fixture",
+            provider_kind="fixture",
+            provider_mode="fixture",
+            configured=True,
+            available=True,
+            blocked_reason=None,
+            actionable_cause=(
+                "visual-required route is using deterministic fixture visual evidence; "
+                "this is not eligible for real-use release metrics"
+            ),
+        )
+    actionable_cause = (
+        "visual_required route needs an explicit real visual acquisition provider; "
+        "none is configured for the invocation router"
+    )
+    return _visual_provider_status(
+        run_dir=run_dir,
+        status="blocked_missing_visual_provider",
+        ok=False,
+        terminal=True,
+        metric_classification="excluded_blocked",
+        provider="automatic-web-visual",
+        provider_kind="visual_acquisition",
+        provider_mode="real",
+        configured=False,
+        available=False,
+        blocked_reason="missing_real_visual_acquisition_provider",
+        actionable_cause=actionable_cause,
+    )
+
+
+def _visual_provider_status(
+    *,
+    run_dir: Path,
+    status: str,
+    ok: bool,
+    terminal: bool,
+    metric_classification: str,
+    provider: str,
+    provider_kind: str,
+    provider_mode: str,
+    configured: bool,
+    available: bool,
+    blocked_reason: str | None,
+    actionable_cause: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "status": status,
+        "ok": ok,
+        "terminal": terminal,
+        "created_at": _utc_now(),
+        "metric_classification": metric_classification,
+        "providers": [
+            {
+                "provider": provider,
+                "provider_kind": provider_kind,
+                "provider_mode": provider_mode,
+                "configured": configured,
+                "available": available,
+                "blocked_reason": blocked_reason,
+                "invocations": 0,
+                "candidates_discovered": 0,
+                "artifacts_fetched": 0,
+                "vlm_images_analyzed": 0,
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "last_error": blocked_reason,
+            }
+        ],
+        "diagnostics": {"actionable_cause": actionable_cause},
+        "artifacts": {
+            "run_status": str(run_dir / RUN_STATUS_FILENAME),
+            "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
+        },
+    }
+
+
+def _run_requires_visual_provider(run_dir: Path) -> bool:
+    visual_tasks_path = run_dir / "visual_tasks.json"
+    if visual_tasks_path.exists():
+        try:
+            visual_tasks = _read_json(visual_tasks_path)
+        except (OSError, json.JSONDecodeError):
+            visual_tasks = {}
+        tasks = visual_tasks.get("tasks") if isinstance(visual_tasks, Mapping) else None
+        if isinstance(tasks, list):
+            return any(
+                isinstance(task, Mapping) and task.get("route") == "visual_required"
+                for task in tasks
+            )
+    try:
+        evidence = _read_json(run_dir / "evidence.json")
+    except (OSError, json.JSONDecodeError):
+        return False
+    routing = evidence.get("routing")
+    if not isinstance(routing, list):
+        return False
+    return any(
+        isinstance(route, Mapping) and route.get("modality") == "visual_required"
+        for route in routing
+    )
+
+
 def _quick_chat_status(invocation: str, question: str) -> dict[str, Any]:
     return {
         "schema_version": RUN_STATUS_SCHEMA_VERSION,
@@ -620,9 +785,10 @@ def _parallel_summary(parallel_status: Mapping[str, Any]) -> dict[str, Any]:
 def _stage_summary(stage_status: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(stage_status, Mapping):
         return {"status": None}
+    raw_status = stage_status.get("status")
     return {
-        "status": stage_status.get("status"),
-        "ok": stage_status.get("ok", stage_status.get("status") in {"completed", "skipped"}),
+        "status": raw_status,
+        "ok": stage_status.get("ok", raw_status in _STAGE_OK_STATUSES),
         "artifacts": dict(stage_status.get("artifacts", {}))
         if isinstance(stage_status.get("artifacts"), Mapping)
         else {},
@@ -660,6 +826,10 @@ def _create_status_run_dir(runs_dir: Path) -> Path:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _utc_now() -> str:

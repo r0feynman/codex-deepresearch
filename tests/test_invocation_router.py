@@ -106,6 +106,42 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertFalse(result["provenance"]["real_use_e2e_eligible"])
         self.assertIn("run_status", result["artifacts"])
         self.assertIn("manual_ingest_status", result["artifacts"])
+        self.assertTrue(result["manual_handoff"]["ok"])
+
+    def test_visual_required_without_provider_blocks_with_visual_status_artifact(self) -> None:
+        result = run_skill_invocation(
+            "$deep-research: inspect product screenshots for evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            budget_preset="quick",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["status"], "blocked_missing_visual_provider")
+        self.assertIn("actionable_cause", result["diagnostics"])
+        self.assertIn("explicit real visual acquisition provider", result["diagnostics"]["actionable_cause"])
+        self.assertIn("run_status", result["artifacts"])
+        self.assertIn("visual_provider_status", result["artifacts"])
+
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        self.assertFalse(run_status["ok"])
+        self.assertTrue(run_status["terminal"])
+        self.assertEqual(run_status["status"], "blocked_missing_visual_provider")
+        self.assertEqual(
+            run_status["diagnostics"]["actionable_cause"],
+            result["diagnostics"]["actionable_cause"],
+        )
+
+        visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
+        self.assertFalse(visual_provider_status["ok"])
+        self.assertTrue(visual_provider_status["terminal"])
+        self.assertEqual(visual_provider_status["status"], "blocked_missing_visual_provider")
+        self.assertEqual(
+            visual_provider_status["diagnostics"]["actionable_cause"],
+            result["diagnostics"]["actionable_cause"],
+        )
+        self.assertFalse(visual_provider_status["providers"][0]["configured"])
 
     def test_serial_fallback_provenance_is_distinguishable_when_no_shards_are_accepted(self) -> None:
         result = run_skill_invocation(
