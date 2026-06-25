@@ -353,6 +353,30 @@ class VisualArtifactTests(unittest.TestCase):
             (
                 "visual_observations.jsonl",
                 0,
+                "task_id",
+                "$.visual_observations[0].task_id",
+            ),
+            (
+                "visual_observations.jsonl",
+                0,
+                "candidate_id",
+                "$.visual_observations[0].candidate_id",
+            ),
+            (
+                "visual_observations.jsonl",
+                0,
+                "fetch_id",
+                "$.visual_observations[0].fetch_id",
+            ),
+            (
+                "visual_observations.jsonl",
+                0,
+                "evidence_image_id",
+                "$.visual_observations[0].evidence_image_id",
+            ),
+            (
+                "visual_observations.jsonl",
+                0,
                 "actual_cost_usd",
                 "$.visual_observations[0].actual_cost_usd",
             ),

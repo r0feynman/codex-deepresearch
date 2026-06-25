@@ -397,6 +397,8 @@ def run_ingest_vision(args: argparse.Namespace) -> int:
             runs_dir=resolve_repo_path(args.runs_dir),
             provider=args.provider,
             observations=args.observations,
+            provider_mode=args.provider_mode,
+            allow_real_vlm=args.allow_real_vlm,
         )
     except (VisionAdapterError, SearchHandoffError, OSError) as exc:
         trace_cli_failure(
@@ -410,6 +412,8 @@ def run_ingest_vision(args: argparse.Namespace) -> int:
 
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["status"] in {"failed_normalization", "failed_validation"}:
+        return 2
+    if result["status"] == "blocked_missing_vlm_provider":
         return 2
     validation = result.get("validation")
     if isinstance(validation, dict) and validation.get("valid") is False:
@@ -1254,6 +1258,23 @@ def build_parser() -> argparse.ArgumentParser:
             "JSONL observations artifact. Defaults to visual_observations.jsonl "
             "inside the run directory; an empty artifact records needs_visual_evidence "
             "for visual_required routes."
+        ),
+    )
+    ingest_vision.add_argument(
+        "--provider-mode",
+        choices=("real", "fixture", "manual", "user_provided"),
+        help=(
+            "Provider mode for automated openai-responses-vision analysis. "
+            "Real mode is required for API-backed analysis."
+        ),
+    )
+    ingest_vision.add_argument(
+        "--allow-real-vlm",
+        action="store_true",
+        default=None,
+        help=(
+            "Permit the openai-responses-vision adapter to make a real Responses API "
+            "vision call when OPENAI_API_KEY or CODEX_DEEPRESEARCH_OPENAI_API_KEY is set."
         ),
     )
     ingest_vision.set_defaults(func=run_ingest_vision)

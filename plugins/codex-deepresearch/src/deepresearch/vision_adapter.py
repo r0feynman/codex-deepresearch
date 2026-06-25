@@ -2,29 +2,162 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import mimetypes
+import os
 import re
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-from urllib.parse import unquote, urlparse
+from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 from .cache_keys import image_cache_key
 from .evidence_schema import VLM_PROVIDERS, validate_artifacts
 from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import resolve_run_dir
 from .trace import record_stage_trace
+from .visual_artifacts import (
+    IMAGE_FETCH_STATUS_FILENAME,
+    VISUAL_PROVIDER_STATUS_FILENAME,
+    VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+    automatic_visual_status_envelope,
+    validate_visual_artifacts,
+)
 
 
 VISION_ADAPTER_SCHEMA_VERSION = "codex-deepresearch.vision-adapter.v0"
 MISSING_VISUAL_STAGE = "vision_adapter_missing_visual"
 VISION_ADAPTER_STAGE = "vision_adapter"
+OPENAI_RESPONSES_VISION_PROVIDER = "openai-responses-vision"
+OPENAI_RESPONSES_VISION_MODEL = "gpt-4.1-mini"
+OPENAI_RESPONSES_VISION_ENDPOINT = "https://api.openai.com/v1/responses"
+OPENAI_RESPONSES_VISION_ALLOW_ENV = "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_ALLOW_REAL"
+OPENAI_RESPONSES_VISION_MODE_ENV = "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_MODE"
+OPENAI_RESPONSES_VISION_MODEL_ENV = "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_MODEL"
+OPENAI_RESPONSES_VISION_DETAIL_ENV = "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_DETAIL"
+OPENAI_RESPONSES_VISION_MAX_IMAGES_ENV = "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_MAX_IMAGES"
+OPENAI_RESPONSES_VISION_ESTIMATED_COST_ENV = (
+    "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_ESTIMATED_COST_USD"
+)
+OPENAI_RESPONSES_VISION_ACTUAL_COST_ENV = (
+    "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_ACTUAL_COST_USD"
+)
+OPENAI_RESPONSES_VISION_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_TIMEOUT_SECONDS"
+OPENAI_RESPONSES_VISION_RESPONSE_FILENAME = "openai_responses_vision_observations.jsonl"
+OPENAI_RESPONSES_VISION_SUPPORTED_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
+TRUE_CONFIG_VALUES = {"1", "true", "yes", "on"}
+SENSITIVE_INLINE_KEY_PATTERN = (
+    r"[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|authorization|bearer|token|"
+    r"secret|credential|credentials|password|key|auth)[A-Za-z0-9_.-]*"
+)
+SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)\b("
+    + SENSITIVE_INLINE_KEY_PATTERN
+    + r")(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;}\]\)]+)"
+)
+SECRET_JSON_FIELD_PATTERN = re.compile(
+    r"(?i)([\"']?(?:"
+    + SENSITIVE_INLINE_KEY_PATTERN
+    + r")[\"']?\s*:\s*[\"'])([^\"']+)([\"'])"
+)
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
+BEARER_VALUE_PATTERN = re.compile(r"(?i)\b(Bearer)\s+([^\s,;}\]\)]+)")
+PRIVATE_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w.-])/(?:home|Users)/[^\s\"'<>:,;}\]\)]+"
+)
+SENSITIVE_PROVIDER_KEY_PATTERN = re.compile(r"(?i)" + SENSITIVE_INLINE_KEY_PATTERN)
+SENSITIVE_URL_QUERY_KEYS = {
+    "access-token",
+    "access_token",
+    "apikey",
+    "api-key",
+    "api_key",
+    "auth",
+    "authorization",
+    "bearer",
+    "client-secret",
+    "client_secret",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "refresh-token",
+    "refresh_token",
+    "secret",
+    "session-token",
+    "session_token",
+    "token",
+}
 
 
 class VisionAdapterError(ValueError):
     """Raised when visual observations cannot be normalized."""
+
+
+@dataclass(frozen=True)
+class OpenAIResponsesVisionConfig:
+    """Resolved configuration for the real Responses API vision adapter."""
+
+    api_key: str | None
+    endpoint: str
+    model: str
+    detail: str
+    timeout_seconds: float
+    allow_real_vlm: bool
+    provider_mode: str
+    max_images: int | None
+    estimated_cost_usd_per_image: float
+    actual_cost_usd_per_image: float
+
+
+@dataclass(frozen=True)
+class OpenAIResponsesVisionResult:
+    """Provider response shape consumed by the adapter."""
+
+    observations: tuple[str, ...]
+    inferences: tuple[str, ...]
+    caveats: tuple[str, ...]
+    ocr_text: str | None = None
+    confidence: float = 0.7
+    response_id: str | None = None
+    model: str | None = None
+    usage: Mapping[str, Any] | None = None
+    raw_provider_metadata: Mapping[str, Any] | None = None
+    actual_cost_usd: float | None = None
+
+
+class OpenAIResponsesVisionClient(Protocol):
+    def analyze_image(
+        self,
+        *,
+        image_input: str,
+        mime_type: str,
+        prompt: str,
+        config: OpenAIResponsesVisionConfig,
+        metadata: Mapping[str, Any],
+    ) -> OpenAIResponsesVisionResult:
+        """Analyze one image input and return separated observations/inferences."""
+
+
+@dataclass(frozen=True)
+class _AutomatedVisionAnalysis:
+    records: tuple[dict[str, Any], ...]
+    observations_path: Path
+    provider_status: dict[str, Any]
+    estimated_cost_usd: float
+    actual_cost_usd: float
+    model: str
+    provider_mode: str
 
 
 def ingest_vision_observations(
@@ -33,11 +166,16 @@ def ingest_vision_observations(
     provider: str,
     observations: str | Path | None = None,
     runs_dir: str | Path | None = None,
+    provider_mode: str | None = None,
+    allow_real_vlm: bool | None = None,
+    openai_config: Mapping[str, Any] | None = None,
+    openai_client: OpenAIResponsesVisionClient | None = None,
 ) -> dict[str, Any]:
     """Normalize provider-specific visual observations into run evidence.
 
-    The adapter is intentionally dry: it reads already-produced artifacts and
-    never calls a VLM, Codex hidden API, or external network service.
+    Explicit observation ingestion is dry. The openai-responses-vision provider
+    only calls the Responses API when no observations file is supplied and the
+    real-provider gates are satisfied.
     """
 
     normalized_provider = _normalize_provider(provider)
@@ -70,6 +208,7 @@ def ingest_vision_observations(
     evidence = _read_json(evidence_path)
     records, input_path = _read_observation_records(run_dir, observations)
     now = _utc_now()
+    automated_analysis: _AutomatedVisionAnalysis | None = None
 
     evidence["vlm_provider"] = normalized_provider
     evidence.setdefault("images", [])
@@ -80,8 +219,29 @@ def ingest_vision_observations(
         raise VisionAdapterError("evidence.claims must be a list")
 
     visual_observations_path = run_dir / "visual_observations.jsonl"
+    if (
+        normalized_provider == OPENAI_RESPONSES_VISION_PROVIDER
+        and observations is None
+        and _has_openai_vision_handoff(run_dir)
+    ):
+        automated_result = _run_openai_responses_vision_analysis(
+            run_dir=run_dir,
+            evidence=evidence,
+            now=now,
+            provider_mode=provider_mode,
+            allow_real_vlm=allow_real_vlm,
+            openai_config=openai_config,
+            openai_client=openai_client,
+        )
+        if isinstance(automated_result, dict):
+            return automated_result
+        automated_analysis = automated_result
+        records = list(automated_analysis.records)
+        input_path = automated_analysis.observations_path
+
     errors: list[dict[str, Any]] = []
     normalized_images: list[dict[str, Any]] = []
+    fetch_lineage_records_reconciled = 0
     existing_image_ids = _existing_ids(evidence["images"])
     used_image_ids: set[str] = set()
     sources_by_id = _sources_by_id(evidence.get("sources", []))
@@ -169,6 +329,11 @@ def ingest_vision_observations(
             )
         ] + normalized_images
         _write_jsonl(visual_observations_path, phase3_observations)
+        if automated_analysis is not None:
+            fetch_lineage_records_reconciled = _reconcile_openai_fetch_lineage(
+                run_dir,
+                phase3_observations,
+            )
         linkage_count = _link_visual_evidence_to_claims(evidence)
         adapter_status = "visual_evidence_ingested"
     else:
@@ -198,12 +363,26 @@ def ingest_vision_observations(
                 and claim.get("extraction_stage") == MISSING_VISUAL_STAGE
             ]
         ),
-        "external_vlm_call": False,
+        "external_vlm_call": automated_analysis is not None,
     }
+    if automated_analysis is not None:
+        evidence["vision_adapter"].update(
+            {
+                "provider_mode": automated_analysis.provider_mode,
+                "model_or_tool": automated_analysis.model,
+                "vlm_images_analyzed": len(automated_analysis.records),
+                "estimated_cost_usd": automated_analysis.estimated_cost_usd,
+                "actual_cost_usd": automated_analysis.actual_cost_usd,
+                "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
+                "fetch_lineage_records_reconciled": fetch_lineage_records_reconciled,
+            }
+        )
     handoff = evidence.get("handoff")
     if isinstance(handoff, dict):
         handoff["visual_observations_path"] = "visual_observations.jsonl"
         handoff["visual_status"] = adapter_status
+        if automated_analysis is not None:
+            handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
 
     _write_json(evidence_path, evidence)
     validation = validate_artifacts(
@@ -232,6 +411,36 @@ def ingest_vision_observations(
             "external_vlm_call": False,
         }
     )
+    if automated_analysis is not None:
+        status.update(
+            {
+                "provider_mode": automated_analysis.provider_mode,
+                "model_or_tool": automated_analysis.model,
+                "vlm_images_analyzed": len(automated_analysis.records),
+                "estimated_cost_usd": automated_analysis.estimated_cost_usd,
+                "actual_cost_usd": automated_analysis.actual_cost_usd,
+                "external_vlm_call": True,
+                "fetch_lineage_records_reconciled": fetch_lineage_records_reconciled,
+            }
+        )
+        status["artifacts"]["visual_provider_status"] = str(
+            run_dir / VISUAL_PROVIDER_STATUS_FILENAME
+        )
+        _write_openai_visual_provider_status(
+            run_dir=run_dir,
+            provider_status=automated_analysis.provider_status,
+            status="openai_responses_vision_analyzed",
+            ok=True,
+            terminal=False,
+            metric_classification="vlm_analysis",
+            actionable_cause="openai-responses-vision analyzed fetched visual artifacts",
+            created_at=now,
+        )
+        visual_artifact_validation = validate_visual_artifacts(
+            run_dir=run_dir,
+            evidence_path=None,
+        )
+        status["visual_artifact_validation"] = visual_artifact_validation.to_dict()
     record_stage_trace(
         run_dir,
         stage="ingest_vision",
@@ -242,6 +451,1568 @@ def ingest_vision_observations(
     )
     _write_json(run_dir / "vision_ingest_status.json", status)
     return status
+
+
+class _HttpOpenAIResponsesVisionClient:
+    def analyze_image(
+        self,
+        *,
+        image_input: str,
+        mime_type: str,
+        prompt: str,
+        config: OpenAIResponsesVisionConfig,
+        metadata: Mapping[str, Any],
+    ) -> OpenAIResponsesVisionResult:
+        if not config.api_key:
+            raise VisionAdapterError("missing OpenAI API key")
+        started = time.monotonic()
+        payload = {
+            "model": config.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": image_input,
+                            "detail": config.detail,
+                        },
+                    ],
+                }
+            ],
+            "max_output_tokens": 900,
+        }
+        request = Request(
+            config.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {config.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "codex-deepresearch/0.1",
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=config.timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        try:
+            response_payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise VisionAdapterError(f"OpenAI Responses API returned invalid JSON: {exc}") from exc
+        if not isinstance(response_payload, Mapping):
+            raise VisionAdapterError("OpenAI Responses API returned a non-object payload")
+        return _openai_result_from_response_payload(
+            response_payload,
+            fallback_model=config.model,
+            elapsed_ms=elapsed_ms,
+            mime_type=mime_type,
+            metadata=metadata,
+        )
+
+
+def _openai_result_from_response_payload(
+    payload: Mapping[str, Any],
+    *,
+    fallback_model: str,
+    elapsed_ms: int,
+    mime_type: str,
+    metadata: Mapping[str, Any],
+) -> OpenAIResponsesVisionResult:
+    output_text = _first_optional_string(payload, "output_text") or _response_output_text(payload)
+    parsed = _parse_openai_response_text(output_text)
+    usage = payload.get("usage")
+    raw_metadata = {
+        "response_id": _first_optional_string(payload, "id"),
+        "model": _first_optional_string(payload, "model") or fallback_model,
+        "usage": dict(usage) if isinstance(usage, Mapping) else {},
+        "elapsed_ms": elapsed_ms,
+        "mime_type": mime_type,
+        "lineage": {
+            key: metadata.get(key)
+            for key in ("candidate_id", "fetch_id", "task_id", "angle_id", "evidence_image_id")
+            if metadata.get(key) is not None
+        },
+    }
+    if not parsed["observations"] and not parsed["inferences"] and output_text:
+        parsed["inferences"] = [output_text]
+        parsed["caveats"].append(
+            "Provider returned text without separated observations; adapter preserved it as a caveated inference."
+        )
+    return OpenAIResponsesVisionResult(
+        observations=tuple(parsed["observations"]),
+        inferences=tuple(parsed["inferences"]),
+        caveats=tuple(parsed["caveats"]),
+        ocr_text=parsed["ocr_text"],
+        confidence=parsed["confidence"],
+        response_id=_first_optional_string(payload, "id"),
+        model=_first_optional_string(payload, "model") or fallback_model,
+        usage=dict(usage) if isinstance(usage, Mapping) else {},
+        raw_provider_metadata=raw_metadata,
+        actual_cost_usd=None,
+    )
+
+
+def _parse_openai_response_text(text: str | None) -> dict[str, Any]:
+    result = {
+        "observations": [],
+        "inferences": [],
+        "caveats": [],
+        "ocr_text": None,
+        "confidence": 0.7,
+    }
+    if not text:
+        result["caveats"].append("Provider response had no output_text.")
+        return result
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        result["inferences"].append(stripped)
+        result["caveats"].append(
+            "Provider response was not JSON; free-form text was not promoted to observations."
+        )
+        return result
+    if not isinstance(parsed, Mapping):
+        result["inferences"].append(stripped)
+        result["caveats"].append(
+            "Provider JSON was not an object; free-form text was not promoted to observations."
+        )
+        return result
+    result["observations"] = _dedupe(_string_list(parsed, "observations"))
+    result["inferences"] = _dedupe(_string_list(parsed, "inferences"))
+    result["caveats"] = _dedupe(_string_list(parsed, "caveats"))
+    result["ocr_text"] = _first_optional_string(parsed, "ocr_text", "text_in_image")
+    confidence = parsed.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        result["confidence"] = max(0.0, min(1.0, float(confidence)))
+    elif isinstance(confidence, str) and confidence.strip():
+        try:
+            result["confidence"] = max(0.0, min(1.0, float(confidence)))
+        except ValueError:
+            result["caveats"].append(f"Unparsed provider confidence: {confidence}")
+    return result
+
+
+def _response_output_text(payload: Mapping[str, Any]) -> str | None:
+    output = payload.get("output")
+    parts: list[str] = []
+    if not isinstance(output, list):
+        return None
+    for item in output:
+        if not isinstance(item, Mapping):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            text = _first_optional_string(part, "text")
+            if text:
+                parts.append(text)
+    return "\n".join(parts) if parts else None
+
+
+def _run_openai_responses_vision_analysis(
+    *,
+    run_dir: Path,
+    evidence: dict[str, Any],
+    now: str,
+    provider_mode: str | None,
+    allow_real_vlm: bool | None,
+    openai_config: Mapping[str, Any] | None,
+    openai_client: OpenAIResponsesVisionClient | None,
+) -> _AutomatedVisionAnalysis | dict[str, Any]:
+    config = _openai_responses_vision_config(
+        overrides=openai_config,
+        provider_mode=provider_mode,
+        allow_real_vlm=allow_real_vlm,
+        evidence=evidence,
+    )
+    tasks = _openai_vision_tasks(run_dir=run_dir, evidence=evidence, max_images=config.max_images)
+    if not tasks:
+        return _write_blocked_missing_vlm_provider(
+            run_dir=run_dir,
+            evidence=evidence,
+            status_reason="no_fetched_visual_artifacts",
+            configured=bool(config.api_key),
+            available=False,
+            provider_mode=config.provider_mode,
+            model=config.model,
+            created_at=now,
+            task_count=0,
+        )
+    block_reason = _openai_vlm_block_reason(config)
+    if block_reason is not None:
+        return _write_blocked_missing_vlm_provider(
+            run_dir=run_dir,
+            evidence=evidence,
+            status_reason=block_reason,
+            configured=bool(config.api_key),
+            available=False,
+            provider_mode=config.provider_mode,
+            model=config.model,
+            created_at=now,
+            task_count=len(tasks),
+        )
+    _ensure_openai_task_sources(run_dir, evidence, tasks, created_at=now)
+
+    client = openai_client or _HttpOpenAIResponsesVisionClient()
+    records: list[dict[str, Any]] = []
+    total_estimated = 0.0
+    total_actual = 0.0
+    provider_run_id = f"openai-responses-vision:{run_dir.name}:{_sanitize_identifier(now)}"
+    for index, task in enumerate(tasks, start=1):
+        image_input = _openai_image_input(run_dir, task)
+        prompt = _openai_vision_prompt(task)
+        estimated_cost = _estimated_cost_for_task(task, config=config)
+        metadata = {
+            "candidate_id": task["candidate_id"],
+            "fetch_id": task["fetch_id"],
+            "task_id": task["task_id"],
+            "angle_id": task["angle_id"],
+            "evidence_image_id": task["evidence_image_id"],
+        }
+        try:
+            result = client.analyze_image(
+                image_input=image_input,
+                mime_type=str(task["mime_type"]),
+                prompt=prompt,
+                config=config,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            partial_observations_path = None
+            if records:
+                partial_observations_path = run_dir / OPENAI_RESPONSES_VISION_RESPONSE_FILENAME
+                _write_jsonl(partial_observations_path, records)
+            return _write_blocked_missing_vlm_provider(
+                run_dir=run_dir,
+                evidence=evidence,
+                status_reason="provider_request_failed",
+                configured=True,
+                available=False,
+                provider_mode=config.provider_mode,
+                model=config.model,
+                created_at=now,
+                task_count=len(tasks),
+                last_error=_redact_provider_text(str(exc) or exc.__class__.__name__, config=config),
+                provider_run_id=provider_run_id,
+                invocations=index,
+                vlm_images_analyzed=len(records),
+                estimated_cost_usd=round(total_estimated + float(estimated_cost), 8),
+                actual_cost_usd=round(total_actual, 8),
+                external_vlm_call=True,
+                partial_observations_path=partial_observations_path,
+            )
+        actual_cost = (
+            result.actual_cost_usd
+            if result.actual_cost_usd is not None
+            else config.actual_cost_usd_per_image
+        )
+        total_estimated += float(estimated_cost)
+        total_actual += float(actual_cost)
+        records.append(
+            _openai_observation_record(
+                task,
+                result=result,
+                config=config,
+                provider_run_id=provider_run_id,
+                provider_mode=config.provider_mode,
+                model=config.model,
+                estimated_cost_usd=estimated_cost,
+                actual_cost_usd=actual_cost,
+                created_at=now,
+                sequence=index,
+            )
+        )
+
+    observations_path = run_dir / OPENAI_RESPONSES_VISION_RESPONSE_FILENAME
+    _write_jsonl(observations_path, records)
+    provider_status = {
+        "provider": OPENAI_RESPONSES_VISION_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": config.provider_mode,
+        "provider_run_id": provider_run_id,
+        "configured": True,
+        "available": True,
+        "blocked_reason": None,
+        "invoked": True,
+        "invocations": len(records),
+        "candidates_discovered": 0,
+        "artifacts_fetched": len(tasks),
+        "vlm_images_analyzed": len(records),
+        "estimated_cost_usd": round(total_estimated, 8),
+        "actual_cost_usd": round(total_actual, 8),
+        "last_error": None,
+        "external_network_call": True,
+        "external_vlm_call": True,
+        "diagnostics": {
+            "model": config.model,
+            "detail": config.detail,
+            "endpoint": _sanitize_provider_url(config.endpoint),
+            "allow_env": OPENAI_RESPONSES_VISION_ALLOW_ENV,
+            "mode_env": OPENAI_RESPONSES_VISION_MODE_ENV,
+            "records_written": len(records),
+        },
+    }
+    return _AutomatedVisionAnalysis(
+        records=tuple(records),
+        observations_path=observations_path,
+        provider_status=provider_status,
+        estimated_cost_usd=round(total_estimated, 8),
+        actual_cost_usd=round(total_actual, 8),
+        model=config.model,
+        provider_mode=config.provider_mode,
+    )
+
+
+def _openai_responses_vision_config(
+    *,
+    overrides: Mapping[str, Any] | None,
+    provider_mode: str | None,
+    allow_real_vlm: bool | None,
+    evidence: Mapping[str, Any],
+) -> OpenAIResponsesVisionConfig:
+    mode = (
+        provider_mode
+        or _config_string(overrides, "provider_mode", env_names=(OPENAI_RESPONSES_VISION_MODE_ENV,))
+        or "fixture"
+    )
+    normalized_mode = mode.strip().lower().replace("_", "-")
+    if normalized_mode not in {"real", "fixture", "manual", "user-provided"}:
+        raise VisionAdapterError(
+            "provider_mode must be one of: real, fixture, manual, user_provided"
+        )
+    if normalized_mode == "user-provided":
+        normalized_mode = "user_provided"
+    configured_allow = (
+        allow_real_vlm
+        if allow_real_vlm is not None
+        else _config_bool(
+            overrides,
+            "allow_real_vlm",
+            env_names=(OPENAI_RESPONSES_VISION_ALLOW_ENV,),
+            default=False,
+        )
+    )
+    max_images = _config_int(
+        overrides,
+        "max_images",
+        env_names=(OPENAI_RESPONSES_VISION_MAX_IMAGES_ENV,),
+        default=None,
+    )
+    if max_images is None:
+        budget = evidence.get("budget")
+        if isinstance(budget, Mapping):
+            value = budget.get("max_images")
+            if isinstance(value, int) and value > 0:
+                max_images = value
+    return OpenAIResponsesVisionConfig(
+        api_key=_config_string(
+            overrides,
+            "api_key",
+            env_names=("CODEX_DEEPRESEARCH_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        ),
+        endpoint=_config_string(
+            overrides,
+            "endpoint",
+            env_names=("CODEX_DEEPRESEARCH_OPENAI_RESPONSES_ENDPOINT",),
+            default=OPENAI_RESPONSES_VISION_ENDPOINT,
+        )
+        or OPENAI_RESPONSES_VISION_ENDPOINT,
+        model=_config_string(
+            overrides,
+            "model",
+            env_names=(OPENAI_RESPONSES_VISION_MODEL_ENV,),
+            default=OPENAI_RESPONSES_VISION_MODEL,
+        )
+        or OPENAI_RESPONSES_VISION_MODEL,
+        detail=_config_string(
+            overrides,
+            "detail",
+            env_names=(OPENAI_RESPONSES_VISION_DETAIL_ENV,),
+            default="auto",
+        )
+        or "auto",
+        timeout_seconds=_config_float(
+            overrides,
+            "timeout_seconds",
+            env_names=(OPENAI_RESPONSES_VISION_TIMEOUT_ENV,),
+            default=60.0,
+        ),
+        allow_real_vlm=bool(configured_allow),
+        provider_mode=normalized_mode,
+        max_images=max_images,
+        estimated_cost_usd_per_image=_config_float(
+            overrides,
+            "estimated_cost_usd_per_image",
+            env_names=(OPENAI_RESPONSES_VISION_ESTIMATED_COST_ENV,),
+            default=0.0,
+        ),
+        actual_cost_usd_per_image=_config_float(
+            overrides,
+            "actual_cost_usd_per_image",
+            env_names=(OPENAI_RESPONSES_VISION_ACTUAL_COST_ENV,),
+            default=0.0,
+        ),
+    )
+
+
+def _openai_vlm_block_reason(config: OpenAIResponsesVisionConfig) -> str | None:
+    if config.provider_mode != "real":
+        return "openai_responses_vision_mode_not_real"
+    if not config.allow_real_vlm:
+        return "real_vlm_not_allowed"
+    if not config.api_key:
+        return "missing_openai_api_key"
+    return None
+
+
+def _openai_vision_tasks(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    max_images: int | None,
+) -> list[dict[str, Any]]:
+    candidates = [
+        item
+        for item in _read_jsonl(run_dir / "visual_candidates.jsonl")
+        if isinstance(item, Mapping)
+    ]
+    fetches = [
+        item
+        for item in _read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        if isinstance(item, Mapping)
+    ]
+    candidates_by_id = {
+        str(candidate.get("candidate_id") or candidate.get("id")): candidate
+        for candidate in candidates
+        if candidate.get("candidate_id") or candidate.get("id")
+    }
+    fetches_by_candidate_id: dict[str, list[Mapping[str, Any]]] = {}
+    for fetch in fetches:
+        candidate_id = _first_optional_string(fetch, "candidate_id")
+        if candidate_id:
+            fetches_by_candidate_id.setdefault(candidate_id, []).append(fetch)
+    tasks: list[dict[str, Any]] = []
+    for fetch in fetches:
+        if fetch.get("fetch_status") != "fetched":
+            continue
+        if fetch.get("policy_decision") in {"blocked", "budget_pruned"}:
+            continue
+        candidate_id = _first_optional_string(fetch, "candidate_id")
+        candidate = candidates_by_id.get(candidate_id or "")
+        task = _task_from_fetch(run_dir, fetch, candidate, evidence=evidence)
+        if task is not None:
+            tasks.append(task)
+    fetched_candidate_ids = {task["candidate_id"] for task in tasks}
+    for candidate in candidates:
+        candidate_id = _first_optional_string(candidate, "candidate_id", "id")
+        if not candidate_id or candidate_id in fetched_candidate_ids:
+            continue
+        if candidate.get("policy_decision") in {"blocked", "budget_pruned"}:
+            continue
+        if not _candidate_allows_openai_url_analysis(
+            candidate,
+            fetches=fetches_by_candidate_id.get(candidate_id, []),
+        ):
+            continue
+        task = _task_from_url_candidate(run_dir, candidate, evidence=evidence)
+        if task is not None:
+            tasks.append(task)
+    return tasks[:max_images] if max_images is not None and max_images > 0 else tasks
+
+
+def _candidate_allows_openai_url_analysis(
+    candidate: Mapping[str, Any],
+    *,
+    fetches: Sequence[Mapping[str, Any]],
+) -> bool:
+    if fetches:
+        return False
+    status = _first_optional_string(candidate, "candidate_status") or "discovered"
+    if status not in {"discovered", "ranked", "selected", "fetched"}:
+        return False
+    if _first_optional_string(candidate, "status") == "removed":
+        return False
+    if _string_list(candidate, "removal_reasons"):
+        return False
+    return True
+
+
+def _task_from_fetch(
+    run_dir: Path,
+    fetch: Mapping[str, Any],
+    candidate: Mapping[str, Any] | None,
+    *,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    candidate_id = _first_optional_string(fetch, "candidate_id")
+    if not candidate_id:
+        return None
+    local_artifact_path = _first_optional_string(fetch, "local_artifact_path")
+    artifact_file = (
+        _resolve_run_relative_path(run_dir, local_artifact_path)
+        if local_artifact_path
+        else None
+    )
+    if artifact_file is None or not artifact_file.is_file():
+        return None
+    mime_type = _first_optional_string(fetch, "mime_type") or _first_optional_string(
+        candidate or {},
+        "mime_type",
+    )
+    if mime_type not in OPENAI_RESPONSES_VISION_SUPPORTED_MIME_TYPES:
+        return None
+    evidence_image_id = _first_optional_string(fetch, "evidence_image_id") or _image_id_for_candidate_id(
+        candidate_id
+    )
+    return _base_openai_task(
+        run_dir=run_dir,
+        candidate=candidate,
+        fetch=fetch,
+        evidence=evidence,
+        candidate_id=candidate_id,
+        fetch_id=_first_optional_string(fetch, "fetch_id")
+        or _fetch_id_for_candidate_id(candidate_id),
+        evidence_image_id=evidence_image_id,
+        local_artifact_path=local_artifact_path,
+        image_url=_first_optional_string(candidate or {}, "image_url"),
+        page_url=_first_optional_string(candidate or {}, "page_url"),
+        mime_type=mime_type,
+        width=_task_number(fetch, candidate, "width"),
+        height=_task_number(fetch, candidate, "height"),
+        artifact_size_bytes=_task_number(fetch, candidate, "byte_size", "artifact_size_bytes"),
+        image_hash=_first_optional_string(fetch, "hash") or _first_optional_string(
+            candidate or {},
+            "hash",
+        ),
+        phash=_first_optional_string(fetch, "phash") or _first_optional_string(
+            candidate or {},
+            "phash",
+        ),
+    )
+
+
+def _task_from_url_candidate(
+    run_dir: Path,
+    candidate: Mapping[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    candidate_id = _first_optional_string(candidate, "candidate_id", "id")
+    image_url = _first_optional_string(candidate, "image_url")
+    if not candidate_id or not image_url:
+        return None
+    parsed = urlparse(image_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return _base_openai_task(
+        run_dir=run_dir,
+        candidate=candidate,
+        fetch=None,
+        evidence=evidence,
+        candidate_id=candidate_id,
+        fetch_id=_fetch_id_for_candidate_id(candidate_id),
+        evidence_image_id=_image_id_for_candidate_id(candidate_id),
+        local_artifact_path=None,
+        image_url=image_url,
+        page_url=_first_optional_string(candidate, "page_url"),
+        mime_type=_first_optional_string(candidate, "mime_type") or "image/unknown",
+        width=_task_number(candidate, None, "width"),
+        height=_task_number(candidate, None, "height"),
+        artifact_size_bytes=_task_number(candidate, None, "artifact_size_bytes", "byte_size"),
+        image_hash=_first_optional_string(candidate, "hash"),
+        phash=_first_optional_string(candidate, "phash"),
+    )
+
+
+def _base_openai_task(
+    *,
+    run_dir: Path,
+    candidate: Mapping[str, Any] | None,
+    fetch: Mapping[str, Any] | None,
+    evidence: Mapping[str, Any],
+    candidate_id: str,
+    fetch_id: str,
+    evidence_image_id: str,
+    local_artifact_path: str | None,
+    image_url: str | None,
+    page_url: str | None,
+    mime_type: str,
+    width: int | float,
+    height: int | float,
+    artifact_size_bytes: int | float,
+    image_hash: str | None,
+    phash: str | None,
+) -> dict[str, Any]:
+    source_id = _first_optional_string(candidate or {}, "source_id") or _first_optional_string(
+        fetch or {},
+        "source_id",
+    )
+    angle_id = _first_optional_string(fetch or {}, "angle_id") or _first_optional_string(
+        candidate or {},
+        "angle_id",
+    ) or "angle_001"
+    task_id = _first_optional_string(fetch or {}, "task_id") or _first_optional_string(
+        candidate or {},
+        "task_id",
+    ) or f"task_visual_{_sanitize_identifier(angle_id.removeprefix('angle_'))}"
+    return {
+        "candidate_id": candidate_id,
+        "fetch_id": fetch_id,
+        "evidence_image_id": evidence_image_id,
+        "source_id": source_id,
+        "origin": _first_optional_string(candidate or {}, "origin") or "image_search",
+        "image_url": image_url,
+        "page_url": page_url,
+        "local_artifact_path": local_artifact_path,
+        "mime_type": mime_type,
+        "width": width,
+        "height": height,
+        "artifact_size_bytes": artifact_size_bytes,
+        "hash": image_hash,
+        "phash": phash,
+        "task_id": task_id,
+        "angle_id": angle_id,
+        "route": _first_optional_string(candidate or {}, "route"),
+        "candidate_class": _first_optional_string(candidate or {}, "candidate_class"),
+        "visual_tasks": _dedupe(_string_list(candidate or {}, "visual_tasks")),
+        "policy_decision": _first_optional_string(fetch or {}, "policy_decision")
+        or _first_optional_string(candidate or {}, "policy_decision")
+        or "allowed",
+        "policy_flags": _dedupe(
+            _string_list(fetch or {}, "policy_flags")
+            + _string_list(candidate or {}, "policy_flags")
+        ),
+        "visual_validation": dict(candidate.get("validation_checks", {}))
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("validation_checks"), Mapping)
+        else {},
+        "source_url": _source_url_for_task(evidence, source_id),
+        "raw_candidate": dict(candidate) if isinstance(candidate, Mapping) else {},
+        "raw_fetch": dict(fetch) if isinstance(fetch, Mapping) else {},
+        "run_dir": str(run_dir),
+    }
+
+
+def _openai_image_input(run_dir: Path, task: Mapping[str, Any]) -> str:
+    local_path = _first_optional_string(task, "local_artifact_path")
+    if local_path:
+        artifact = _resolve_run_relative_path(run_dir, local_path)
+        if artifact.is_file():
+            mime_type = _first_optional_string(task, "mime_type") or "image/png"
+            encoded = base64.b64encode(artifact.read_bytes()).decode("ascii")
+            return f"data:{mime_type};base64,{encoded}"
+    image_url = _first_optional_string(task, "image_url")
+    if image_url:
+        return image_url
+    raise VisionAdapterError("openai-responses-vision task requires local_artifact_path or image_url")
+
+
+def _openai_vision_prompt(task: Mapping[str, Any]) -> str:
+    visual_tasks = ", ".join(_string_list(task, "visual_tasks")) or "visual observation"
+    return (
+        "Analyze the image for a research evidence record. Return only JSON with keys "
+        "observations, inferences, ocr_text, caveats, and confidence. "
+        "Put directly visible facts, OCR text, chart values, and layout/object descriptions "
+        "in observations[]. Put interpretations, likely implications, and claim alignment in "
+        "inferences[]. Caveat uncertainty, approximate counts, unreadable text, and any limits. "
+        f"Visual task focus: {visual_tasks}."
+    )
+
+
+def _ensure_openai_task_sources(
+    run_dir: Path,
+    evidence: dict[str, Any],
+    tasks: Sequence[dict[str, Any]],
+    *,
+    created_at: str,
+) -> None:
+    sources = evidence.setdefault("sources", [])
+    if not isinstance(sources, list):
+        raise VisionAdapterError("evidence.sources must be a list")
+    source_ids = _existing_ids(sources)
+    for task in tasks:
+        if _first_optional_string(task, "source_id"):
+            continue
+        source_url = _first_optional_string(task, "page_url") or _first_optional_string(
+            task,
+            "image_url",
+        )
+        if not source_url:
+            continue
+        source_id = _openai_generated_source_id(task, source_ids)
+        task["source_id"] = source_id
+        task["source_url"] = source_url
+        source_ids.add(source_id)
+        local_artifact_path = f"sources/{source_id}.json"
+        source = {
+            "id": source_id,
+            "type": "web" if _first_optional_string(task, "page_url") else "image",
+            "url": source_url,
+            "title": f"Visual candidate {task['candidate_id']}",
+            "published_at": None,
+            "accessed_at": created_at,
+            "quality": "unknown",
+            "retrieval_status": "manual",
+            "local_artifact_path": local_artifact_path,
+            "license_policy": "manual_review",
+            "robots_policy": "manual_review",
+            "policy_decision": "manual_review",
+            "policy_flags": ["openai_vision_generated_source"],
+        }
+        sources.append(source)
+        metadata = {
+            "schema_version": VISION_ADAPTER_SCHEMA_VERSION,
+            "source_id": source_id,
+            "candidate_id": task["candidate_id"],
+            "fetch_id": task["fetch_id"],
+            "image_url": task.get("image_url"),
+            "page_url": task.get("page_url"),
+            "created_at": created_at,
+            "note": "Generated source metadata for URL-only openai-responses-vision analysis.",
+        }
+        source_path = run_dir / local_artifact_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(source_path, metadata)
+
+
+def _openai_generated_source_id(
+    task: Mapping[str, Any],
+    existing_ids: set[str],
+) -> str:
+    raw_candidate_id = str(task.get("candidate_id") or "visual")
+    base = "src_" + _sanitize_identifier(raw_candidate_id.removeprefix("cand_"))
+    candidate = base
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _openai_observation_record(
+    task: Mapping[str, Any],
+    *,
+    result: OpenAIResponsesVisionResult,
+    config: OpenAIResponsesVisionConfig,
+    provider_run_id: str,
+    provider_mode: str,
+    model: str,
+    estimated_cost_usd: float,
+    actual_cost_usd: float,
+    created_at: str,
+    sequence: int,
+) -> dict[str, Any]:
+    observations = _dedupe(
+        [
+            _redact_provider_text(str(item).strip(), config=config)
+            for item in result.observations
+            if str(item).strip()
+        ]
+    )
+    inferences = _dedupe(
+        [
+            _redact_provider_text(str(item).strip(), config=config)
+            for item in result.inferences
+            if str(item).strip()
+        ]
+    )
+    caveats = _dedupe(
+        [
+            "OpenAI Responses vision output is model-generated; use observations as extracted visual evidence and treat inferences as interpretation.",
+            *[
+                _redact_provider_text(str(item).strip(), config=config)
+                for item in result.caveats
+                if str(item).strip()
+            ],
+        ]
+    )
+    raw_metadata = (
+        _redact_provider_value(result.raw_provider_metadata, config=config)
+        if isinstance(result.raw_provider_metadata, Mapping)
+        else {}
+    )
+    ocr_text = (
+        _redact_provider_text(result.ocr_text, config=config)
+        if isinstance(result.ocr_text, str)
+        else None
+    )
+    image_record = {
+        "id": task["evidence_image_id"],
+        "source_id": task.get("source_id"),
+        "origin": task.get("origin") or "image_search",
+        "image_url": task.get("image_url"),
+        "page_url": task.get("page_url"),
+        "mime_type": task.get("mime_type") or "image/unknown",
+        "width": task.get("width", 0),
+        "height": task.get("height", 0),
+        "artifact_size_bytes": task.get("artifact_size_bytes"),
+        "hash": task.get("hash"),
+        "phash": task.get("phash"),
+        "source_url": task.get("source_url"),
+    }
+    if task.get("local_artifact_path"):
+        image_record["local_artifact_path"] = task.get("local_artifact_path")
+    return {
+        "id": str(task["evidence_image_id"]),
+        "image_id": str(task["evidence_image_id"]),
+        "observation_id": f"obs_{_sanitize_identifier(str(task['evidence_image_id']))}_{sequence:03d}",
+        "evidence_image_id": str(task["evidence_image_id"]),
+        "source_id": task.get("source_id"),
+        "origin": task.get("origin") or "image_search",
+        "image": image_record,
+        "observations": observations,
+        "inferences": inferences,
+        "ocr_text": ocr_text,
+        "ocr_outputs": [{"text": ocr_text, "provider": OPENAI_RESPONSES_VISION_PROVIDER}]
+        if ocr_text
+        else [],
+        "visual_tasks": _string_list(task, "visual_tasks"),
+        "analysis_status": "analyzed" if observations or inferences else "needs_manual_review",
+        "policy_flags": _string_list(task, "policy_flags"),
+        "caveats": caveats,
+        "candidate_id": task["candidate_id"],
+        "fetch_id": task["fetch_id"],
+        "task_id": task["task_id"],
+        "candidate_class": task.get("candidate_class"),
+        "angle_id": task["angle_id"],
+        "route": task.get("route"),
+        "visual_provider": OPENAI_RESPONSES_VISION_PROVIDER,
+        "provider": OPENAI_RESPONSES_VISION_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": provider_mode,
+        "provider_run_id": provider_run_id,
+        "provider_provenance": {
+            "provider": OPENAI_RESPONSES_VISION_PROVIDER,
+            "provider_kind": "vlm",
+            "provider_mode": provider_mode,
+            "provider_run_id": provider_run_id,
+            "external_network_call": True,
+            "external_vlm_call": True,
+        },
+        "model_or_tool": result.model or model,
+        "observation_status": "analyzed" if observations or inferences else "needs_manual_review",
+        "confidence": result.confidence,
+        "policy_decision": task.get("policy_decision") or "allowed",
+        "verifier_links": [],
+        "report_links": [],
+        "estimated_cost_usd": float(estimated_cost_usd),
+        "actual_cost_usd": float(actual_cost_usd),
+        "created_at": created_at,
+        "visual_validation": dict(task.get("visual_validation", {}))
+        if isinstance(task.get("visual_validation"), Mapping)
+        else {},
+        "source_url": task.get("source_url"),
+        "raw_provider_metadata": raw_metadata,
+        "cost_counters": {
+            "estimated_cost_usd": float(estimated_cost_usd),
+            "actual_cost_usd": float(actual_cost_usd),
+            "usage": _redact_provider_value(
+                dict(result.usage) if isinstance(result.usage, Mapping) else {},
+                config=config,
+            ),
+        },
+    }
+
+
+def _reconcile_openai_fetch_lineage(
+    run_dir: Path,
+    observations: Sequence[Mapping[str, Any]],
+) -> int:
+    """Keep fetch lineage consistent after VLM analysis creates image ids."""
+
+    if not observations:
+        return 0
+    fetch_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    fetches = [
+        dict(item)
+        for item in _read_jsonl(fetch_path)
+        if isinstance(item, Mapping)
+    ]
+    candidates_by_id = {
+        str(candidate.get("candidate_id") or candidate.get("id")): candidate
+        for candidate in _read_jsonl(run_dir / "visual_candidates.jsonl")
+        if isinstance(candidate, Mapping)
+        and (candidate.get("candidate_id") or candidate.get("id"))
+    }
+    fetches_by_id = {
+        str(fetch.get("fetch_id")): fetch
+        for fetch in fetches
+        if isinstance(fetch.get("fetch_id"), str) and fetch.get("fetch_id")
+    }
+    changed = 0
+    for observation in observations:
+        fetch_id = _first_optional_string(observation, "fetch_id")
+        evidence_image_id = _first_optional_string(observation, "evidence_image_id")
+        candidate_id = _first_optional_string(observation, "candidate_id")
+        if not fetch_id or not evidence_image_id or not candidate_id:
+            continue
+        existing = fetches_by_id.get(fetch_id)
+        if existing is not None:
+            if not _first_optional_string(existing, "evidence_image_id"):
+                existing["evidence_image_id"] = evidence_image_id
+                changed += 1
+            continue
+        candidate = candidates_by_id.get(candidate_id)
+        if not isinstance(candidate, Mapping):
+            continue
+        fetch = _openai_synthetic_fetch_record(
+            observation,
+            candidate=candidate,
+            fetch_id=fetch_id,
+            evidence_image_id=evidence_image_id,
+            candidate_id=candidate_id,
+        )
+        fetches.append(fetch)
+        fetches_by_id[fetch_id] = fetch
+        changed += 1
+    if changed:
+        _write_jsonl(fetch_path, fetches)
+    return changed
+
+
+def _openai_synthetic_fetch_record(
+    observation: Mapping[str, Any],
+    *,
+    candidate: Mapping[str, Any],
+    fetch_id: str,
+    evidence_image_id: str,
+    candidate_id: str,
+) -> dict[str, Any]:
+    provider_provenance = candidate.get("provider_provenance")
+    return {
+        "fetch_id": fetch_id,
+        "candidate_id": candidate_id,
+        "task_id": _first_optional_string(observation, "task_id")
+        or _first_optional_string(candidate, "task_id"),
+        "angle_id": _first_optional_string(observation, "angle_id")
+        or _first_optional_string(candidate, "angle_id"),
+        "source_search_result_id": _first_optional_string(
+            candidate,
+            "source_search_result_id",
+        ),
+        "provider": _first_optional_string(candidate, "provider") or "visual-provider",
+        "provider_kind": _first_optional_string(candidate, "provider_kind") or "web_image_search",
+        "provider_mode": _first_optional_string(candidate, "provider_mode") or "real",
+        "provider_run_id": _first_optional_string(candidate, "provider_run_id")
+        or "openai-responses-vision-url",
+        "provider_provenance": dict(provider_provenance)
+        if isinstance(provider_provenance, Mapping)
+        else {
+            "provider": _first_optional_string(candidate, "provider") or "visual-provider",
+            "provider_kind": _first_optional_string(candidate, "provider_kind")
+            or "web_image_search",
+            "provider_mode": _first_optional_string(candidate, "provider_mode") or "real",
+            "provider_run_id": _first_optional_string(candidate, "provider_run_id")
+            or "openai-responses-vision-url",
+        },
+        "fetch_status": "fetched",
+        "http_status": _first_number_value(candidate, "http_status"),
+        "mime_type": _first_optional_string(observation, "mime_type")
+        or _first_optional_string(candidate, "mime_type"),
+        "byte_size": _first_number_value(observation, "artifact_size_bytes", "byte_size"),
+        "width": _first_number_value(observation, "width"),
+        "height": _first_number_value(observation, "height"),
+        "hash": _first_optional_string(observation, "hash")
+        or _first_optional_string(candidate, "hash"),
+        "phash": _first_optional_string(observation, "phash")
+        or _first_optional_string(candidate, "phash"),
+        "local_artifact_path": _first_optional_string(observation, "local_artifact_path"),
+        "evidence_image_id": evidence_image_id,
+        "policy_decision": _first_optional_string(observation, "policy_decision")
+        or _first_optional_string(candidate, "policy_decision")
+        or "allowed",
+        "policy_flags": _dedupe(
+            _string_list(candidate, "policy_flags") + _string_list(observation, "policy_flags")
+        ),
+        "failure_code": None,
+        "estimated_cost_usd": _first_number_value(candidate, "estimated_cost_usd") or 0.0,
+        "actual_cost_usd": _first_number_value(candidate, "actual_cost_usd") or 0.0,
+    }
+
+
+def _first_number_value(container: Mapping[str, Any], *keys: str) -> int | float | None:
+    for key in keys:
+        value = container.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _write_blocked_missing_vlm_provider(
+    *,
+    run_dir: Path,
+    evidence: dict[str, Any],
+    status_reason: str,
+    configured: bool,
+    available: bool,
+    provider_mode: str,
+    model: str,
+    created_at: str,
+    task_count: int,
+    last_error: str | None = None,
+    provider_run_id: str | None = None,
+    invocations: int = 0,
+    vlm_images_analyzed: int = 0,
+    estimated_cost_usd: float = 0.0,
+    actual_cost_usd: float = 0.0,
+    external_vlm_call: bool = False,
+    partial_observations_path: Path | None = None,
+) -> dict[str, Any]:
+    visual_observations_path = run_dir / "visual_observations.jsonl"
+    _write_jsonl(visual_observations_path, [])
+    stale_counts = _remove_openai_visual_evidence(evidence)
+    provider_status = {
+        "provider": OPENAI_RESPONSES_VISION_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": provider_mode,
+        "provider_run_id": provider_run_id,
+        "configured": configured,
+        "available": available,
+        "blocked_reason": status_reason,
+        "invoked": invocations > 0,
+        "invocations": invocations,
+        "candidates_discovered": 0,
+        "artifacts_fetched": task_count,
+        "vlm_images_analyzed": vlm_images_analyzed,
+        "estimated_cost_usd": float(estimated_cost_usd),
+        "actual_cost_usd": float(actual_cost_usd),
+        "last_error": last_error or status_reason,
+        "external_network_call": external_vlm_call,
+        "external_vlm_call": external_vlm_call,
+        "diagnostics": {
+            "model": model,
+            "allow_env": OPENAI_RESPONSES_VISION_ALLOW_ENV,
+            "mode_env": OPENAI_RESPONSES_VISION_MODE_ENV,
+            "blocked_reason": status_reason,
+            "fetched_artifacts_preserved": True,
+            "stale_visual_observations_cleared": True,
+            "stale_openai_images_cleared": stale_counts["images"],
+            "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
+        },
+    }
+    _write_openai_visual_provider_status(
+        run_dir=run_dir,
+        provider_status=provider_status,
+        status="blocked_missing_vlm_provider",
+        ok=False,
+        terminal=True,
+        metric_classification="excluded_blocked",
+        actionable_cause=f"openai-responses-vision is unavailable: {status_reason}",
+        created_at=created_at,
+    )
+    evidence["vision_adapter"] = {
+        "schema_version": VISION_ADAPTER_SCHEMA_VERSION,
+        "status": "blocked_missing_vlm_provider",
+        "provider": OPENAI_RESPONSES_VISION_PROVIDER,
+        "provider_mode": provider_mode,
+        "model_or_tool": model,
+        "ingested_at": created_at,
+        "visual_observations_path": "visual_observations.jsonl",
+        "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
+        "images_ingested": 0,
+        "vlm_images_analyzed": vlm_images_analyzed,
+        "estimated_cost_usd": float(estimated_cost_usd),
+        "actual_cost_usd": float(actual_cost_usd),
+        "blocked_reason": status_reason,
+        "external_vlm_call": external_vlm_call,
+        "stale_openai_images_cleared": stale_counts["images"],
+        "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
+    }
+    handoff = evidence.get("handoff")
+    if isinstance(handoff, dict):
+        handoff["visual_observations_path"] = "visual_observations.jsonl"
+        handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
+        handoff["visual_status"] = "blocked_missing_vlm_provider"
+    _write_json(run_dir / "evidence.json", evidence)
+    validation = validate_artifacts(
+        evidence_path=run_dir / "evidence.json",
+        visual_observations_path=visual_observations_path,
+    )
+    visual_artifact_validation = validate_visual_artifacts(run_dir=run_dir, evidence_path=None)
+    status = _base_status(run_dir, evidence, "blocked_missing_vlm_provider")
+    status.update(
+        {
+            "ok": False,
+            "terminal": True,
+            "provider": OPENAI_RESPONSES_VISION_PROVIDER,
+            "provider_mode": provider_mode,
+            "model_or_tool": model,
+            "blocked_reason": status_reason,
+            "images_ingested": 0,
+            "vlm_images_analyzed": vlm_images_analyzed,
+            "estimated_cost_usd": float(estimated_cost_usd),
+            "actual_cost_usd": float(actual_cost_usd),
+            "validation": validation.to_dict(),
+            "visual_artifact_validation": visual_artifact_validation.to_dict(),
+            "external_vlm_call": external_vlm_call,
+            "stale_openai_images_cleared": stale_counts["images"],
+            "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
+            "artifacts": {
+                "evidence": str(run_dir / "evidence.json"),
+                "visual_observations": str(visual_observations_path),
+                "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
+                "vision_ingest_status": str(run_dir / "vision_ingest_status.json"),
+            },
+        }
+    )
+    if partial_observations_path is not None:
+        status["artifacts"]["partial_openai_responses_vision_observations"] = str(
+            partial_observations_path
+        )
+        evidence["vision_adapter"]["partial_observations_path"] = _relative_or_string(
+            run_dir,
+            partial_observations_path,
+        )
+        _write_json(run_dir / "evidence.json", evidence)
+    record_stage_trace(
+        run_dir,
+        stage="ingest_vision",
+        agent_role="vision_adapter",
+        status_payload=status,
+        prompt_summary="Analyze fetched visual artifacts with openai-responses-vision.",
+        tool_call_summary="Blocked before VLM call; fetched visual artifacts and lineage files were preserved.",
+    )
+    _write_json(run_dir / "vision_ingest_status.json", status)
+    return status
+
+
+def _write_openai_visual_provider_status(
+    *,
+    run_dir: Path,
+    provider_status: Mapping[str, Any],
+    status: str,
+    ok: bool,
+    terminal: bool,
+    metric_classification: str,
+    actionable_cause: str,
+    created_at: str,
+) -> None:
+    envelope = (
+        automatic_visual_status_envelope(status)
+        if status in {"blocked_missing_vlm_provider"}
+        else {"ok": ok, "terminal": terminal, "metric_classification": metric_classification}
+    )
+    providers = _existing_visual_provider_records(run_dir)
+    providers = [
+        provider
+        for provider in providers
+        if provider.get("provider") != OPENAI_RESPONSES_VISION_PROVIDER
+    ]
+    providers.append(dict(provider_status))
+    payload = {
+        "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+        "run_id": run_dir.name,
+        "run_dir": run_dir.name,
+        "status": status,
+        "ok": envelope["ok"],
+        "terminal": envelope["terminal"],
+        "created_at": created_at,
+        "metric_classification": envelope["metric_classification"],
+        "providers": providers,
+        "diagnostics": {"actionable_cause": actionable_cause},
+        "artifacts": {
+            "visual_candidates": "visual_candidates.jsonl",
+            "image_fetch_status": IMAGE_FETCH_STATUS_FILENAME,
+            "visual_observations": "visual_observations.jsonl",
+            "visual_provider_status": VISUAL_PROVIDER_STATUS_FILENAME,
+        },
+    }
+    _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, _redact_provider_value(payload, config=None))
+
+
+def _has_openai_vision_handoff(run_dir: Path) -> bool:
+    candidates_path = run_dir / "visual_candidates.jsonl"
+    fetch_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    return any(
+        isinstance(item, Mapping)
+        for path in (candidates_path, fetch_path)
+        for item in _read_jsonl(path)
+    )
+
+
+def _read_jsonl(path: Path) -> list[Any]:
+    if not path.exists():
+        return []
+    records: list[Any] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise VisionAdapterError(f"invalid JSONL record in {path} line {line_number}: {exc}") from exc
+    return records
+
+
+def _existing_visual_provider_records(run_dir: Path) -> list[dict[str, Any]]:
+    path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("providers"), list):
+        return []
+    return [dict(item) for item in payload["providers"] if isinstance(item, Mapping)]
+
+
+def _config_string(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str] = (),
+    default: str | None = None,
+) -> str | None:
+    if overrides is not None and key in overrides:
+        value = overrides.get(key)
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def _config_bool(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str] = (),
+    default: bool,
+) -> bool:
+    if overrides is not None and key in overrides:
+        value = overrides.get(key)
+        if isinstance(value, bool):
+            return value
+        if value is not None:
+            return str(value).strip().lower() in TRUE_CONFIG_VALUES
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return value.strip().lower() in TRUE_CONFIG_VALUES
+    return default
+
+
+def _config_int(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str] = (),
+    default: int | None,
+) -> int | None:
+    if overrides is not None and key in overrides:
+        return _parse_optional_int(overrides.get(key), default=default)
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return _parse_optional_int(value, default=default)
+    return default
+
+
+def _config_float(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str] = (),
+    default: float,
+) -> float:
+    if overrides is not None and key in overrides:
+        return _parse_float(overrides.get(key), default=default)
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return _parse_float(value, default=default)
+    return default
+
+
+def _parse_optional_int(value: Any, *, default: int | None) -> int | None:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, float) and value.is_integer():
+        integer = int(value)
+        return integer if integer > 0 else default
+    if isinstance(value, str) and value.strip():
+        try:
+            integer = int(float(value))
+        except ValueError:
+            return default
+        return integer if integer > 0 else default
+    return default
+
+
+def _parse_float(value: Any, *, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _task_number(
+    primary: Mapping[str, Any],
+    secondary: Mapping[str, Any] | None,
+    *keys: str,
+) -> int | float:
+    for key in keys:
+        for container in (primary, secondary or {}):
+            value = container.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str) and value.strip():
+                try:
+                    numeric = float(value)
+                except ValueError:
+                    continue
+                return int(numeric) if numeric.is_integer() else numeric
+    return 0
+
+
+def _estimated_cost_for_task(
+    task: Mapping[str, Any],
+    *,
+    config: OpenAIResponsesVisionConfig,
+) -> float:
+    if config.estimated_cost_usd_per_image > 0:
+        return config.estimated_cost_usd_per_image
+    width = _numeric_or_zero(task.get("width"))
+    height = _numeric_or_zero(task.get("height"))
+    if width <= 0 or height <= 0:
+        return 0.0
+    patch_count = int(((width + 31) // 32) * ((height + 31) // 32))
+    estimated_tokens = min(max(patch_count, 1), 1536)
+    return round(estimated_tokens * 0.00000001, 8)
+
+
+def _numeric_or_zero(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float):
+        return max(int(value), 0)
+    if isinstance(value, str) and value.strip():
+        try:
+            return max(int(float(value)), 0)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _source_id_for_task(evidence: Mapping[str, Any]) -> str | None:
+    sources = evidence.get("sources")
+    if not isinstance(sources, list):
+        return None
+    ids = [
+        source.get("id")
+        for source in sources
+        if isinstance(source, Mapping) and isinstance(source.get("id"), str)
+    ]
+    return ids[0] if len(ids) == 1 else None
+
+
+def _source_url_for_task(evidence: Mapping[str, Any], source_id: Any) -> str | None:
+    if not isinstance(source_id, str) or not source_id:
+        return None
+    sources = evidence.get("sources")
+    if not isinstance(sources, list):
+        return None
+    for source in sources:
+        if isinstance(source, Mapping) and source.get("id") == source_id:
+            return _first_optional_string(source, "url")
+    return None
+
+
+def _fetch_id_for_candidate_id(candidate_id: str) -> str:
+    return "fetch_" + _sanitize_identifier(candidate_id.removeprefix("cand_"))
+
+
+def _image_id_for_candidate_id(candidate_id: str) -> str:
+    return "img_" + _sanitize_identifier(candidate_id.removeprefix("cand_"))
+
+
+def _redact_provider_text(
+    value: str,
+    *,
+    config: OpenAIResponsesVisionConfig | None,
+) -> str:
+    redacted = value
+    if config is not None and config.api_key:
+        redacted = redacted.replace(config.api_key, "[REDACTED]")
+    parts: list[str] = []
+    cursor = 0
+    for match in URL_PATTERN.finditer(redacted):
+        parts.append(_redact_secret_fields(redacted[cursor : match.start()]))
+        parts.append(_sanitize_provider_url(match.group(0)))
+        cursor = match.end()
+    parts.append(_redact_secret_fields(redacted[cursor:]))
+    return "".join(parts)
+
+
+def _redact_secret_fields(value: str) -> str:
+    redacted = BEARER_VALUE_PATTERN.sub(r"\1 [REDACTED]", value)
+    redacted = PRIVATE_ABSOLUTE_PATH_PATTERN.sub("[REDACTED_PATH]", redacted)
+    redacted = SECRET_JSON_FIELD_PATTERN.sub(r"\1[REDACTED]\3", redacted)
+    return SECRET_FIELD_PATTERN.sub(r"\1\2[REDACTED]", redacted)
+
+
+def _is_sensitive_provider_metadata_key(key: str) -> bool:
+    return bool(SENSITIVE_PROVIDER_KEY_PATTERN.search(key))
+
+
+def _sanitize_provider_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return value
+
+    hostname = parsed.hostname
+    if not hostname:
+        return value
+    host = hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
+
+    query_items = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        query_items.append((key, "[REDACTED]" if _is_sensitive_url_query_key(key) else item))
+    query = urlencode(query_items, doseq=True, safe="[]") if query_items else ""
+    fragment = "[REDACTED]" if parsed.fragment else ""
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
+
+
+def _is_sensitive_url_query_key(key: str) -> bool:
+    normalized = key.strip().lower()
+    if normalized in SENSITIVE_URL_QUERY_KEYS:
+        return True
+    compact = normalized.replace("-", "_")
+    if compact in SENSITIVE_URL_QUERY_KEYS:
+        return True
+    return bool(
+        re.search(
+            r"(^|[_-])(api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|"
+            r"client[_-]?secret|token|secret|credential|credentials|password|auth|authorization|"
+            r"bearer)([_-]|$)",
+            normalized,
+        )
+    )
+
+
+def _redact_provider_value(
+    value: Any,
+    *,
+    config: OpenAIResponsesVisionConfig | None,
+) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if _is_sensitive_provider_metadata_key(key_text):
+                redacted[key_text] = "[REDACTED]"
+            else:
+                redacted[key_text] = _redact_provider_value(item, config=config)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_provider_value(item, config=config) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_provider_value(item, config=config) for item in value]
+    if isinstance(value, str):
+        return _redact_provider_text(value, config=config)
+    return value
+
+
+def _remove_openai_visual_evidence(evidence: dict[str, Any]) -> dict[str, int]:
+    images = evidence.get("images", [])
+    if not isinstance(images, list):
+        return {"images": 0, "visual_supports": 0, "supporting_images": 0}
+
+    kept_images: list[Any] = []
+    removed_image_ids: set[str] = set()
+    removed_images = 0
+    for image in images:
+        if isinstance(image, Mapping) and _is_openai_visual_image(image):
+            removed_images += 1
+            image_id = image.get("id")
+            if isinstance(image_id, str) and image_id:
+                removed_image_ids.add(image_id)
+            continue
+        kept_images.append(image)
+
+    if not removed_images:
+        return {"images": 0, "visual_supports": 0, "supporting_images": 0}
+
+    evidence["images"] = kept_images
+    removed_supports = 0
+    removed_supporting_images = 0
+    claims = evidence.get("claims", [])
+    if isinstance(claims, list):
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            supporting_images = claim.get("supporting_images")
+            if isinstance(supporting_images, list):
+                filtered_supporting_images = [
+                    item
+                    for item in supporting_images
+                    if not (isinstance(item, str) and item in removed_image_ids)
+                ]
+                removed_supporting_images += len(supporting_images) - len(filtered_supporting_images)
+                claim["supporting_images"] = filtered_supporting_images
+            visual_supports = claim.get("visual_supports")
+            if isinstance(visual_supports, list):
+                filtered_supports = [
+                    support
+                    for support in visual_supports
+                    if not (
+                        isinstance(support, Mapping)
+                        and isinstance(support.get("image_id"), str)
+                        and support.get("image_id") in removed_image_ids
+                    )
+                ]
+                removed_supports += len(visual_supports) - len(filtered_supports)
+                claim["visual_supports"] = filtered_supports
+
+    return {
+        "images": removed_images,
+        "visual_supports": removed_supports,
+        "supporting_images": removed_supporting_images,
+    }
+
+
+def _is_openai_visual_image(image: Mapping[str, Any]) -> bool:
+    for key in ("analysis_provider", "provider", "visual_provider"):
+        if _first_optional_string(image, key) == OPENAI_RESPONSES_VISION_PROVIDER:
+            return True
+    provenance = image.get("provider_provenance")
+    if isinstance(provenance, Mapping):
+        return _first_optional_string(provenance, "provider") == OPENAI_RESPONSES_VISION_PROVIDER
+    return False
 
 
 def _link_visual_evidence_to_claims(evidence: dict[str, Any]) -> int:
@@ -562,23 +2333,33 @@ def _normalize_visual_record(
         _first_optional_string(record, "ocr_text", "text_in_image")
         or _first_optional_string(image, "ocr_text", "text_in_image")
     )
+    if ocr_text:
+        ocr_text = _redact_provider_text(ocr_text, config=None)
     ocr_outputs = _ocr_outputs(record, image, ocr_text=ocr_text)
+    ocr_outputs = _redact_provider_value(ocr_outputs, config=None)
     visual_summary = (
         _first_optional_string(record, "vlm_visual_summary", "visual_summary")
         or _first_optional_string(image, "vlm_visual_summary", "visual_summary")
     )
+    if visual_summary:
+        visual_summary = _redact_provider_text(visual_summary, config=None)
     visual_description = (
         _first_optional_string(record, "vlm_visual_description", "visual_description")
         or _first_optional_string(image, "vlm_visual_description", "visual_description")
     )
+    if visual_description:
+        visual_description = _redact_provider_text(visual_description, config=None)
     if visual_summary:
         observations.append(visual_summary)
     if visual_description and visual_description != visual_summary:
         observations.append(visual_description)
 
-    observations = _dedupe(observations)
-    inferences = _dedupe(inferences)
-    caveats = _dedupe(_string_list(record, "caveats") + _string_list(image, "caveats"))
+    observations = _dedupe(_redact_provider_text(item, config=None) for item in observations)
+    inferences = _dedupe(_redact_provider_text(item, config=None) for item in inferences)
+    caveats = _dedupe(
+        _redact_provider_text(item, config=None)
+        for item in (_string_list(record, "caveats") + _string_list(image, "caveats"))
+    )
     if explicit_artifact_path is None and not artifact_file.exists():
         caveats.append("metadata-only visual record; no local image artifact was provided")
 
@@ -614,9 +2395,14 @@ def _normalize_visual_record(
     }
     raw_provider_metadata = record.get("raw_provider_metadata")
     if isinstance(raw_provider_metadata, Mapping):
-        visual["raw_provider_metadata"] = dict(raw_provider_metadata)
+        visual["raw_provider_metadata"] = _redact_provider_value(
+            dict(raw_provider_metadata),
+            config=None,
+        )
     elif isinstance(response, Mapping):
-        visual["raw_provider_metadata"] = {"response": dict(response)}
+        visual["raw_provider_metadata"] = {
+            "response": _redact_provider_value(dict(response), config=None)
+        }
     _copy_optional_visual_metadata(record, image, visual)
     visual["cache_key"] = image_cache_key(visual, source=source)
     return visual
@@ -865,9 +2651,12 @@ def _copy_optional_visual_metadata(
     for key in scalar_keys:
         value = _first_optional_string(record, key) or _first_optional_string(image, key)
         if value:
-            visual[key] = value
+            visual[key] = _redact_provider_text(value, config=None)
     for key in list_keys:
-        values = _dedupe(_string_list(record, key) + _string_list(image, key))
+        values = _dedupe(
+            _redact_provider_text(value, config=None)
+            for value in (_string_list(record, key) + _string_list(image, key))
+        )
         if values:
             visual[key] = values
     for key in number_keys:
@@ -881,7 +2670,7 @@ def _copy_optional_visual_metadata(
         if not isinstance(value, Mapping):
             value = image.get(key)
         if isinstance(value, Mapping):
-            visual[key] = dict(value)
+            visual[key] = _redact_provider_value(dict(value), config=None)
 
 
 def _phase3_observation_records(
