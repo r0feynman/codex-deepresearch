@@ -450,6 +450,8 @@ def run_acquire_visual(args: argparse.Namespace) -> int:
         return 2
 
     print(json.dumps(result, indent=2, sort_keys=True))
+    if result.get("status") == "blocked_missing_visual_provider":
+        return 2
     validation = result.get("validation")
     if isinstance(validation, dict) and validation.get("valid") is False:
         return 2
@@ -1273,9 +1275,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         action="append",
         help=(
-            "Local/test visual provider. Repeatable or comma-separated. "
-            "Defaults to local-page, local-image-fixture, local-screenshot-fixture. "
-            "Use page-image-extractor alone to run the page image fetch/cache provider."
+            "Visual provider. Repeatable or comma-separated. Defaults to "
+            "local-page, local-image-fixture, local-screenshot-fixture. Use "
+            "brave-image-search for the credential- and storage-confirmation-gated "
+            "real web image search adapter. Use page-image-extractor alone to "
+            "run the page image fetch/cache provider."
         ),
     )
     acquire_visual.add_argument(

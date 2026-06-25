@@ -135,6 +135,19 @@ plugins/codex-deepresearch/scripts/codex-deepresearch acquire-visual \
 
 The command writes all candidates to `visual_candidates.jsonl` and selected handoff records to `visual_observations.jsonl`. It preserves candidate classes for Open Graph images, body images, image search results, and screenshots; records MIME, size, URL duplicate, content hash, and near-duplicate checks; stores OCR/text-in-image fields separately from visual summary/description fields; and marks favicon, logo, thumbnail, tracking pixel, low-value preview, duplicate, and budget-pruned candidates with removal reasons. The local screenshot fixture represents first viewport, full-page, scroll, and interaction capture modes and records unsupported capabilities explicitly.
 
+For automated CLI candidate discovery with a real image search provider, select `brave-image-search` and configure `CODEX_DEEPRESEARCH_BRAVE_SEARCH_API_KEY` or `BRAVE_SEARCH_API_KEY` in the environment. Brave's public Search API materials say result storage rights are plan/terms dependent, so persisted candidate discovery also requires the non-secret confirmation `CODEX_DEEPRESEARCH_BRAVE_ALLOW_RESULT_STORAGE=true` after the operator has confirmed their plan allows storing result metadata. Without that confirmation, the adapter blocks before making the provider request and writes `blocked_missing_visual_provider` diagnostics without persisted candidates.
+
+```bash
+export CODEX_DEEPRESEARCH_BRAVE_ALLOW_RESULT_STORAGE=true
+plugins/codex-deepresearch/scripts/codex-deepresearch acquire-visual \
+  --run <run_id_or_path> \
+  --provider brave-image-search
+```
+
+Optional non-secret controls are `CODEX_DEEPRESEARCH_BRAVE_IMAGE_COUNT`, `CODEX_DEEPRESEARCH_BRAVE_COUNTRY`, `CODEX_DEEPRESEARCH_BRAVE_SEARCH_LANG`, `CODEX_DEEPRESEARCH_BRAVE_SAFESEARCH`, `CODEX_DEEPRESEARCH_BRAVE_TIMEOUT_SECONDS`, and `CODEX_DEEPRESEARCH_BRAVE_ESTIMATED_COST_USD`. The adapter writes `provider_mode=real`, `provider_kind=web_image_search`, source page URL, image URL, rank, score, policy state, cost fields, and sanitized provider diagnostics to `visual_candidates.jsonl`; it does not fetch image bytes or create VLM observations. Provider status persists sanitized diagnostics, rate-limit headers, external-network flags, config key names, and cost counters. If the real provider is requested but credentials, storage confirmation, or availability are missing, the command writes `blocked_missing_visual_provider` diagnostics and does not fabricate local fixture candidates.
+
+References: Brave Search API FAQ, https://brave.com/search/api/; Brave Search API Terms of Service, https://api-dashboard.search.brave.com/terms-of-service.
+
 `text_only` routes are an explicit no-op: the command writes empty visual candidate/observation artifacts and records zero image search, screenshot, OCR, and VLM work.
 
 ## Vision Adapter
