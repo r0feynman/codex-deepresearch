@@ -1011,6 +1011,7 @@ def _visual_release_gate(
         "visual_provider_status_completed_auto_visual": (
             counts["visual_provider_status_completed_auto_visual"]
         ),
+        "report_status_completed": counts["report_status_completed"],
         "codex_interactive_analyzed_non_fixture_images_at_least_3": (
             counts["codex_interactive_analyzed_images"] >= 3
         ),
@@ -1175,6 +1176,9 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
             isinstance(visual_provider_status, Mapping)
             and visual_provider_status.get("status") == "completed_auto_visual"
         ),
+        "report_status_completed": (
+            isinstance(report_status, Mapping) and report_status.get("status") == "completed"
+        ),
         "real_automatic_visual_counts": real_automatic_visual_release_counts(
             candidates=candidates,
             fetches=fetches,
@@ -1193,6 +1197,7 @@ def _empty_visual_counts() -> dict[str, Any]:
         "non_release_visual_images": 0,
         "release_evidence_is_non_fixture": True,
         "visual_provider_status_completed_auto_visual": False,
+        "report_status_completed": False,
         "real_automatic_visual_counts": real_automatic_visual_release_counts(),
     }
 
@@ -1213,7 +1218,7 @@ def _is_codex_interactive_real_analyzed(record: Mapping[str, Any]) -> bool:
     if "codex-interactive" not in provider_values:
         return False
     status = str(record.get("observation_status") or record.get("analysis_status") or "")
-    return status == "analyzed" or bool(record.get("observations"))
+    return status == "analyzed"
 
 
 def _report_cited_visual_or_mixed_claims(

@@ -222,6 +222,27 @@ class FreshSessionE2ETests(unittest.TestCase):
             gate["checks"]["codex_interactive_analyzed_non_fixture_images_at_least_3"]
         )
 
+    def test_completed_auto_visual_rejects_failed_observation_statuses(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        observations[1]["observation_status"] = "failed"
+        observations[2]["observation_status"] = "needs_manual_review"
+        self._write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 1)
+        self.assertFalse(
+            gate["checks"]["codex_interactive_analyzed_non_fixture_images_at_least_3"]
+        )
+
     def test_completed_auto_visual_report_citation_must_use_codex_observed_image(self) -> None:
         run_dir = self._complete_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
@@ -273,6 +294,18 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["release_gate_passed"], gate)
         self.assertEqual(gate["report_cited_visual_or_mixed_claims"], 0)
         self.assertFalse(gate["checks"]["report_cited_visual_or_mixed_claim_at_least_1"])
+
+    def test_completed_auto_visual_requires_completed_report_status(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        report_status = self.read_json(run_dir / "report_status.json")
+        report_status["status"] = "failed_visual_evidence_unused"
+        self._write_json(run_dir / "report_status.json", report_status)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertFalse(gate["checks"]["report_status_completed"])
 
     def test_completed_auto_visual_requires_matching_visual_provider_status(self) -> None:
         run_dir = self._complete_visual_run_dir(image_count=3)
