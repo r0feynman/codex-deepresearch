@@ -283,6 +283,7 @@ def _evaluate_claim(
     source_ids = _resolved_source_ids(claim, sources_by_id=sources_by_id)
     quote_spans = _resolved_quote_spans(claim, sources_by_id=sources_by_id)
     image_ids = _resolved_image_ids(claim, images_by_id=images_by_id)
+    visual_supports = _resolved_visual_supports(claim, images_by_id=images_by_id)
     reasons = _exclusion_reasons(
         claim,
         source_ids=source_ids,
@@ -299,6 +300,7 @@ def _evaluate_claim(
         "source_ids": source_ids,
         "quote_spans": quote_spans,
         "image_ids": image_ids,
+        "visual_supports": visual_supports,
         "exclusion_reasons": reasons,
     }
 
@@ -1222,6 +1224,20 @@ def _status_claim_record(item: Mapping[str, Any], *, include_evidence: bool) -> 
     if include_evidence:
         record["source_ids"] = item["source_ids"]
         record["image_ids"] = item["image_ids"]
+        record["visual_supports"] = [
+            {
+                "image_id": support.get("image_id"),
+                "observation_ref": support.get("observation_ref"),
+                "relation_type": support.get("relation_type"),
+                "provider": support.get("provider"),
+            }
+            for support in item.get("visual_supports", [])
+            if isinstance(support, Mapping)
+        ]
+        record["verifier_vote_refs"] = _string_list(claim.get("verifier_vote_refs"))
+        record["visual_verifier_vote_refs"] = _string_list(
+            claim.get("visual_verifier_vote_refs")
+        )
     else:
         record["exclusion_reasons"] = item["exclusion_reasons"]
     return record

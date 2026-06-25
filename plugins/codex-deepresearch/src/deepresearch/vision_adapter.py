@@ -334,12 +334,16 @@ def ingest_vision_observations(
                 run_dir,
                 phase3_observations,
             )
+        generated_claims = _visual_claims_from_observations(evidence, now=now)
+        evidence["claims"].extend(generated_claims)
+        generated_claim_count = len(generated_claims)
         linkage_count = _link_visual_evidence_to_claims(evidence)
         adapter_status = "visual_evidence_ingested"
     else:
         missing_claims = _missing_visual_claims(evidence, now=now)
         evidence["claims"].extend(missing_claims)
         _write_jsonl(visual_observations_path, [])
+        generated_claim_count = 0
         linkage_count = 0
         adapter_status = "needs_visual_evidence" if missing_claims else "no_visual_tasks"
 
@@ -352,6 +356,7 @@ def ingest_vision_observations(
         "visual_observations_path": "visual_observations.jsonl",
         "images_ingested": len(normalized_images),
         "images_reused": images_reused,
+        "observation_claims_created": generated_claim_count,
         "claim_visual_links_created": linkage_count,
         "missing_visual_claims_created": 0
         if normalized_images
@@ -398,6 +403,7 @@ def ingest_vision_observations(
             "provider": normalized_provider,
             "images_ingested": len(normalized_images),
             "images_reused": images_reused,
+            "observation_claims_created": generated_claim_count,
             "claim_visual_links_created": linkage_count,
             "missing_visual_claims_created": evidence["vision_adapter"][
                 "missing_visual_claims_created"
@@ -2015,6 +2021,136 @@ def _is_openai_visual_image(image: Mapping[str, Any]) -> bool:
     return False
 
 
+def _visual_claims_from_observations(
+    evidence: Mapping[str, Any],
+    *,
+    now: str,
+) -> list[dict[str, Any]]:
+    images = evidence.get("images", [])
+    claims = evidence.get("claims", [])
+    if not isinstance(images, list) or not isinstance(claims, list):
+        return []
+
+    used_claim_ids = _existing_ids(claims)
+    existing_generated_keys = _existing_observation_claim_keys(claims)
+    generated: list[dict[str, Any]] = []
+    for image in images:
+        if not isinstance(image, Mapping):
+            continue
+        image_id = image.get("id")
+        source_id = image.get("source_id")
+        if not isinstance(image_id, str) or not isinstance(source_id, str):
+            continue
+        if not _image_can_generate_visual_claim(image):
+            continue
+        observation_index, observation_text = _first_observation(image)
+        if observation_index is None or observation_text is None:
+            continue
+        claim_key = (image_id, observation_index, observation_text)
+        if claim_key in existing_generated_keys:
+            continue
+
+        claim_id = _unique_id(
+            f"claim_visual_{image_id}_{observation_index + 1}",
+            used_claim_ids,
+        )
+        support = _visual_support_from_image(
+            image,
+            observation_index=observation_index,
+            observation_text=observation_text,
+        )
+        generated.append(
+            {
+                "id": claim_id,
+                "text": _visual_claim_text(observation_text),
+                "claim_type": "visual",
+                "supporting_sources": [source_id],
+                "supporting_images": [image_id],
+                "visual_supports": [support],
+                "quote_spans": [],
+                "votes": [],
+                "verification_status": "unverified",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "low",
+                "caveats": _visual_claim_caveats(image),
+                "angle_id": _first_optional_string(image, "angle_id"),
+                "route": _first_optional_string(image, "route") or "visual_required",
+                "visual_tasks": _string_list(image, "visual_tasks"),
+                "created_at": now,
+                "extraction_stage": "vision_adapter_observation_claim",
+                "source_image_id": image_id,
+                "source_observation_ref": support["observation_ref"],
+            }
+        )
+        existing_generated_keys.add(claim_key)
+    return generated
+
+
+def _existing_observation_claim_keys(claims: Sequence[Any]) -> set[tuple[str, int, str]]:
+    keys: set[tuple[str, int, str]] = set()
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        raw_supports = claim.get("visual_supports", [])
+        if not isinstance(raw_supports, list):
+            continue
+        for support in raw_supports:
+            if not isinstance(support, Mapping):
+                continue
+            image_id = support.get("image_id")
+            observation_index = support.get("observation_index")
+            observation_text = support.get("observation_text")
+            if (
+                isinstance(image_id, str)
+                and isinstance(observation_index, int)
+                and isinstance(observation_text, str)
+            ):
+                keys.add((image_id, observation_index, observation_text))
+    return keys
+
+
+def _image_can_generate_visual_claim(image: Mapping[str, Any]) -> bool:
+    if image.get("analysis_status") != "analyzed":
+        return False
+    if _string_list(image, "policy_flags"):
+        return False
+    observations = _string_list(image, "observations")
+    return bool(observations)
+
+
+def _visual_support_from_image(
+    image: Mapping[str, Any],
+    *,
+    observation_index: int,
+    observation_text: str,
+) -> dict[str, Any]:
+    image_id = str(image["id"])
+    return {
+        "image_id": image_id,
+        "observation_ref": f"images.{image_id}.observations[{observation_index}]",
+        "observation_index": observation_index,
+        "observation_text": observation_text,
+        "relation_type": _visual_relation_type(image),
+        "provider": _visual_support_provider(image),
+        "rationale": "Generated from an explicit VLM observation, not an inference-only note.",
+        "confidence": 0.74,
+    }
+
+
+def _visual_claim_text(observation_text: str) -> str:
+    stripped = " ".join(observation_text.strip().split())
+    stripped = stripped.rstrip(".")
+    return f"Visual observation: {stripped}."
+
+
+def _visual_claim_caveats(image: Mapping[str, Any]) -> list[str]:
+    caveats = _string_list(image, "caveats")
+    if _string_list(image, "inferences"):
+        caveats.append("VLM inferences are preserved separately and were not used as claim text.")
+    return _dedupe(caveats)
+
+
 def _link_visual_evidence_to_claims(evidence: dict[str, Any]) -> int:
     claims = evidence.get("claims", [])
     images = evidence.get("images", [])
@@ -2146,6 +2282,8 @@ def _image_matches_claim(
         return False
     if _string_list(image, "policy_flags"):
         return False
+    if claim.get("extraction_stage") == "vision_adapter_observation_claim":
+        return image.get("id") == claim.get("source_image_id")
 
     source_id = image.get("source_id")
     if isinstance(source_id, str) and source_id in _string_list(claim, "supporting_sources"):

@@ -410,6 +410,152 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertIn("## Visual Findings", report)
         self.assertIn("claim `claim_visual_fixture`", report)
 
+    def test_visual_required_run_generates_supported_visual_claims_from_observations(self) -> None:
+        run_dir = self.prepared_visual_run_with_html_source()
+
+        acquire = acquire_visual_candidates(run=run_dir)
+        ingest = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        verified = verify_claims(run=run_dir)
+        report_status = synthesize_report(run=run_dir)
+
+        self.assertEqual(acquire["status"], "visual_candidates_collected")
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertGreater(ingest["observation_claims_created"], 0)
+        self.assertEqual(verified["status"], "completed")
+        self.assertEqual(report_status["status"], "completed")
+
+        evidence = self.read_json(run_dir / "evidence.json")
+        generated_claims = [
+            claim
+            for claim in evidence["claims"]
+            if claim.get("extraction_stage") == "vision_adapter_observation_claim"
+        ]
+        supported_claims = [
+            claim
+            for claim in generated_claims
+            if claim.get("verification_status") == "supported"
+        ]
+        self.assertGreater(len(supported_claims), 0)
+        claim = supported_claims[0]
+        self.assertEqual(claim["claim_type"], "visual")
+        self.assertTrue(claim["supporting_images"])
+        self.assertTrue(claim["visual_supports"])
+        self.assertTrue(claim["visual_verifier_vote_refs"])
+        self.assertTrue(claim["verifier_vote_refs"])
+
+        support = claim["visual_supports"][0]
+        image_id = support["image_id"]
+        self.assertIn(image_id, claim["supporting_images"])
+        image = next(image for image in evidence["images"] if image["id"] == image_id)
+        self.assertEqual(
+            support["observation_ref"],
+            f"images.{image_id}.observations[{support['observation_index']}]",
+        )
+        self.assertEqual(
+            support["observation_text"],
+            image["observations"][support["observation_index"]],
+        )
+
+        verifier_votes = {
+            vote["id"]: vote for vote in self.read_jsonl(run_dir / "verifier_votes.jsonl")
+        }
+        visual_vote = verifier_votes[claim["visual_verifier_vote_refs"][0]]
+        self.assertEqual(visual_vote["verifier_type"], "visual")
+        self.assertEqual(visual_vote["vote"], "support")
+        self.assertIn(image_id, visual_vote["evidence_refs"])
+
+        cited_images = {
+            cited_image
+            for item in report_status["included_claims"]
+            for cited_image in item.get("image_ids", [])
+        }
+        self.assertEqual(set(report_status["used_images"]), cited_images)
+        self.assertIn(image_id, cited_images)
+        included_claim = next(
+            item for item in report_status["included_claims"] if item["claim_id"] == claim["id"]
+        )
+        self.assertIn(image_id, included_claim["image_ids"])
+        self.assertTrue(included_claim["visual_supports"])
+        self.assertTrue(included_claim["visual_verifier_vote_refs"])
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## Visual Findings", report)
+        self.assertIn(f"claim `{claim['id']}`", report.lower())
+        self.assertIn(f"`{image_id}`", report)
+
+        validation = validate_artifacts(
+            evidence_path=run_dir / "evidence.json",
+            visual_observations_path=run_dir / "visual_observations.jsonl",
+            verifier_votes_path=run_dir / "verifier_votes.jsonl",
+        )
+        self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+
+    def test_policy_blocked_and_inference_only_observations_do_not_create_supported_claims(self) -> None:
+        run_dir = self.prepared_visual_run_with_html_source()
+        images_dir = run_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        (images_dir / "policy.png").write_bytes(b"\x89PNG\r\n\x1a\npolicy")
+        (images_dir / "inference.png").write_bytes(b"\x89PNG\r\n\x1a\ninference")
+        records = [
+            {
+                "id": "img_policy_blocked",
+                "source_id": "src_visual_page",
+                "origin": "screenshot",
+                "local_artifact_path": "images/policy.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 360,
+                "observations": ["A policy-blocked screenshot contains visible text."],
+                "inferences": [],
+                "visual_tasks": ["screenshot_support"],
+                "analysis_status": "policy_blocked",
+                "policy_flags": ["private_image"],
+                "route": "visual_required",
+                "angle_id": "angle_001",
+            },
+            {
+                "id": "img_inference_only",
+                "source_id": "src_visual_page",
+                "origin": "screenshot",
+                "local_artifact_path": "images/inference.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 360,
+                "observations": [],
+                "inferences": ["The screenshot probably implies a product capability."],
+                "visual_tasks": ["screenshot_support"],
+                "analysis_status": "analyzed",
+                "policy_flags": [],
+                "route": "visual_required",
+                "angle_id": "angle_001",
+            },
+        ]
+        (run_dir / "visual_observations.jsonl").write_text(
+            "\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n",
+            encoding="utf-8",
+        )
+
+        ingest = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        verified = verify_claims(run=run_dir)
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(ingest["observation_claims_created"], 0)
+        self.assertEqual(verified["status"], "completed")
+        evidence = self.read_json(run_dir / "evidence.json")
+        risky_claims = [
+            claim
+            for claim in evidence["claims"]
+            if claim.get("source_image_id") in {"img_policy_blocked", "img_inference_only"}
+        ]
+        self.assertEqual(risky_claims, [])
+        self.assertFalse(
+            any(
+                claim.get("verification_status") == "supported"
+                and claim.get("confidence") == "high"
+                for claim in evidence["claims"]
+            )
+        )
+
     def test_text_only_route_collects_zero_visual_work(self) -> None:
         prepared = prepare_run(
             question="Text-only visual acquisition gating",

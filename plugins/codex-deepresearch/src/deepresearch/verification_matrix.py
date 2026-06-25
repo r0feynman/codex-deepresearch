@@ -135,6 +135,7 @@ def verify_claims(
             claim_votes = preserved_votes + reusable_matrix_votes
             claim["votes"] = claim_votes
             claim["verification_route"] = route
+            _update_vote_reference_fields(claim, claim_votes)
             _update_report_eligibility(claim)
             all_votes.extend(claim_votes)
             claim_statuses.append(_claim_status_record(claim, route, 0, cache_hit=True))
@@ -151,6 +152,7 @@ def verify_claims(
             claim["confidence"] = "low"
             claim["verification_route"] = route
             claim["votes"] = preserved_votes
+            _update_vote_reference_fields(claim, preserved_votes)
             _update_report_eligibility(claim)
             all_votes.extend(preserved_votes)
             claim_statuses.append(_claim_status_record(claim, route, 0))
@@ -169,6 +171,7 @@ def verify_claims(
         claim["cache_key"] = current_claim_cache_key
         claim["verification_cache_key"] = current_claim_cache_key
         claim["verified_at"] = now
+        _update_vote_reference_fields(claim, claim_votes)
         _update_claim_state(claim, route=route, votes=claim_votes, images_by_id=images_by_id)
         all_votes.extend(claim_votes)
         claim_statuses.append(_claim_status_record(claim, route, len(generated_votes)))
@@ -411,7 +414,7 @@ def _update_claim_state(
         review_status = "needs_more_evidence"
         promotion_status = "not_eligible"
         confidence = "low"
-    elif _has_required_support(route, support_by_type):
+    elif _has_required_support(claim, route=route, support_by_type=support_by_type):
         status = "supported"
         review_status = "auto_reviewed"
         promotion_status = "eligible"
@@ -471,12 +474,23 @@ def _report_exclusion_reason(claim: Mapping[str, Any]) -> str:
     return "not_report_eligible"
 
 
-def _has_required_support(route: str, support_by_type: Mapping[str, int]) -> bool:
-    if support_by_type.get("text", 0) < 2:
-        return False
+def _has_required_support(
+    claim: Mapping[str, Any],
+    *,
+    route: str,
+    support_by_type: Mapping[str, int],
+) -> bool:
     if support_by_type.get("policy", 0) < 1 and support_by_type.get("freshness", 0) < 1:
         return False
-    if route == "visual_required" and support_by_type.get("visual", 0) < 1:
+    claim_type = claim.get("claim_type")
+    if claim_type == "visual":
+        return support_by_type.get("visual", 0) >= 1
+    if support_by_type.get("text", 0) < 2:
+        return False
+    if (
+        route == "visual_required"
+        or claim_type == "mixed"
+    ) and support_by_type.get("visual", 0) < 1:
         return False
     return True
 
@@ -580,6 +594,31 @@ def _vote(
         "rationale": rationale,
         "created_at": created_at,
     }
+
+
+def _update_vote_reference_fields(
+    claim: dict[str, Any],
+    votes: Sequence[Mapping[str, Any]],
+) -> None:
+    vote_ids = [
+        vote_id
+        for vote in votes
+        for vote_id in [vote.get("id")]
+        if isinstance(vote_id, str) and vote_id
+    ]
+    visual_vote_ids = [
+        vote_id
+        for vote in votes
+        for vote_id in [vote.get("id")]
+        if vote.get("verifier_type") == "visual"
+        and isinstance(vote_id, str)
+        and vote_id
+    ]
+    claim["verifier_vote_refs"] = list(dict.fromkeys(vote_ids))
+    if visual_vote_ids:
+        claim["visual_verifier_vote_refs"] = list(dict.fromkeys(visual_vote_ids))
+    else:
+        claim.pop("visual_verifier_vote_refs", None)
 
 
 def _preserved_votes(
