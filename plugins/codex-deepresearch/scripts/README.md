@@ -228,6 +228,22 @@ The command reads only the local `evidence.json` artifact and writes `report.md`
 
 High-confidence text findings require a source-linked quote span. Visual and mixed findings require supporting image evidence IDs that resolve to non-policy-blocked `VisualEvidence`. Unsupported, refuted, policy-blocked, budget-pruned, unverified, and otherwise under-evidenced claims are kept out of the confident findings and recorded in the status manifest and the report's excluded evidence section.
 
+## Export Report
+
+Use `export-report` after `synthesize` has written local `evidence.json`, `report.md`, and `report_status.json`:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch export-report \
+  --run <run_id_or_path> \
+  --template technical_report \
+  --format all \
+  --output-dir /tmp/codex-deepresearch-report-export
+```
+
+Templates are `technical_report`, `market_report`, `competitor_analysis`, and `incident_report`; short aliases `technical`, `market`, `competitor`, and `incident` are accepted. Formats are `markdown`, `json`, `csv`, `html`, or `all`; `--format` may be repeated or comma-separated. HTML writes a small bundle directory with `index.html` and `manifest.json`.
+
+Exports read only local artifacts and do not call network, model, search, or VLM services. All templates use the same supported evidence model as `synthesize`: unsupported, rejected, policy-blocked, and not-eligible claims are excluded by default. Pass `--include-excluded-caveats` only when the review bundle should include those claims in an explicit excluded/caveated section or row. JSON exports include report status, claim IDs, used source IDs, used image IDs, caveats, source metadata, and image appendix metadata. CSV exports include one review row per included claim, plus excluded/caveated rows only when requested.
+
 ## Manual Sources
 
 Use `ingest-manual` when the user provides URLs or images directly, or when Codex-native search handoff is blocked. The command does not call external search, fetch remote bodies, run VLM analysis, or create a fetch queue:

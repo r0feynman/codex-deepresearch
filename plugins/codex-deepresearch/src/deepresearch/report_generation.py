@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .evidence_schema import validate_artifacts
+from .report_public_safety import (
+    public_artifact_ref,
+    public_url_ref,
+    sanitize_public_string,
+    sanitize_public_value,
+)
 from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
 from .trace import record_stage_trace
@@ -130,6 +136,7 @@ def synthesize_report(
         if report_path.exists():
             status["report_path"] = str(report_path)
             status["artifacts"]["report"] = str(report_path)
+        status = _public_report_status(status, run_dir=run_dir)
         record_stage_trace(
             run_dir,
             stage="synthesize",
@@ -138,6 +145,7 @@ def synthesize_report(
             prompt_summary="Synthesize a Markdown report from validated evidence.",
             tool_call_summary="Skipped report synthesis because run_steps.json marks the stage terminal.",
         )
+        status = _public_report_status(status, run_dir=run_dir)
         _write_json(run_dir / REPORT_STATUS_FILENAME, status)
         return status
 
@@ -174,6 +182,7 @@ def synthesize_report(
             },
             "external_model_call": False,
         }
+        status = _public_report_status(status, run_dir=run_dir)
         record_stage_trace(
             run_dir,
             stage="synthesize",
@@ -182,6 +191,7 @@ def synthesize_report(
             prompt_summary="Synthesize a Markdown report from validated evidence.",
             tool_call_summary="Validated evidence before report generation and removed stale report output on failure.",
         )
+        status = _public_report_status(status, run_dir=run_dir)
         _write_json(status_path, status)
         return status
 
@@ -189,36 +199,15 @@ def synthesize_report(
     if not isinstance(claims, list):
         raise ReportGenerationError("evidence.claims must be a list")
 
-    sources_by_id = _records_by_id(evidence.get("sources", []))
-    images_by_id = _records_by_id(evidence.get("images", []))
-    included: list[dict[str, Any]] = []
-    excluded: list[dict[str, Any]] = []
-
-    for claim in claims:
-        if not isinstance(claim, Mapping):
-            continue
-        evaluation = _evaluate_claim(
-            claim,
-            sources_by_id=sources_by_id,
-            images_by_id=images_by_id,
-        )
-        if evaluation["included"]:
-            included.append(evaluation)
-        else:
-            excluded.append(evaluation)
-
-    used_source_ids = _ordered_unique(
-        source_id
-        for item in included
-        for source_id in item["source_ids"]
-    )
-    used_image_ids = _ordered_unique(
-        image_id
-        for item in included
-        for image_id in item["image_ids"]
-    )
-    report_shape = _report_shape(evidence)
-    usable_image_ids = _usable_image_ids(evidence, images_by_id=images_by_id)
+    evidence_model = report_evidence_model(evidence)
+    sources_by_id = evidence_model["sources_by_id"]
+    images_by_id = evidence_model["images_by_id"]
+    included = evidence_model["included"]
+    excluded = evidence_model["excluded"]
+    used_source_ids = evidence_model["used_sources"]
+    used_image_ids = evidence_model["used_images"]
+    report_shape = evidence_model["report_shape"]
+    usable_image_ids = evidence_model["usable_images"]
     visual_evidence_unused = (
         report_shape["visual_required"]
         and bool(usable_image_ids)
@@ -234,6 +223,7 @@ def synthesize_report(
         report_shape=report_shape,
         usable_image_ids=usable_image_ids,
         visual_evidence_unused=visual_evidence_unused,
+        run_dir=run_dir,
     )
     report_path.write_text(report_markdown, encoding="utf-8")
     status = {
@@ -273,6 +263,7 @@ def synthesize_report(
             included,
         )
     )
+    status = _public_report_status(status, run_dir=run_dir)
     record_stage_trace(
         run_dir,
         stage="synthesize",
@@ -281,8 +272,58 @@ def synthesize_report(
         prompt_summary="Synthesize a Markdown report from validated evidence.",
         tool_call_summary="Rendered report.md from verified local evidence and wrote report_status.json.",
     )
+    status = _public_report_status(status, run_dir=run_dir)
     _write_json(status_path, status)
     return status
+
+
+def report_evidence_model(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the reportable evidence model used by synthesis and exports."""
+
+    claims = evidence.get("claims", [])
+    if not isinstance(claims, list):
+        raise ReportGenerationError("evidence.claims must be a list")
+
+    sources_by_id = _records_by_id(evidence.get("sources", []))
+    images_by_id = _records_by_id(evidence.get("images", []))
+    included: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        evaluation = _evaluate_claim(
+            claim,
+            sources_by_id=sources_by_id,
+            images_by_id=images_by_id,
+        )
+        if evaluation["included"]:
+            included.append(evaluation)
+        else:
+            excluded.append(evaluation)
+
+    used_source_ids = _ordered_unique(
+        source_id
+        for item in included
+        for source_id in item["source_ids"]
+    )
+    used_image_ids = _ordered_unique(
+        image_id
+        for item in included
+        for image_id in item["image_ids"]
+    )
+    report_shape = _report_shape(evidence)
+    usable_image_ids = _usable_image_ids(evidence, images_by_id=images_by_id)
+    return {
+        "sources_by_id": sources_by_id,
+        "images_by_id": images_by_id,
+        "included": included,
+        "excluded": excluded,
+        "used_sources": used_source_ids,
+        "used_images": used_image_ids,
+        "report_shape": report_shape,
+        "usable_images": usable_image_ids,
+    }
 
 
 def _evaluate_claim(
@@ -334,7 +375,10 @@ def _exclusion_reasons(
         reasons.append("review_not_confirmed")
     if claim.get("include_in_final_report") is False:
         reasons.append(_string_value(claim.get("report_exclusion_reason"), "not_report_eligible"))
-    if claim.get("promotion_status") == "promotion_rejected":
+    promotion_status = claim.get("promotion_status")
+    if promotion_status == "not_eligible":
+        reasons.append("not_eligible")
+    if promotion_status == "promotion_rejected":
         reasons.append("promotion_rejected")
     if _is_boilerplate_claim(claim):
         reasons.append("boilerplate_noise")
@@ -374,9 +418,13 @@ def _render_report(
     report_shape: Mapping[str, Any],
     usable_image_ids: Sequence[str],
     visual_evidence_unused: bool,
+    run_dir: Path,
 ) -> str:
     lines: list[str] = []
-    title = _string_value(evidence.get("question"), "Codex DeepResearch Report")
+    title = sanitize_public_string(
+        _string_value(evidence.get("question"), "Codex DeepResearch Report"),
+        run_dir=run_dir,
+    )
     language = _string_value(report_shape.get("language"), "en")
     is_ko = language == "ko"
     lines.append(f"# {title}")
@@ -426,11 +474,15 @@ def _render_report(
                     quote,
                     sources_by_id=sources_by_id,
                 )
-                location = _string_value(quote.get("location"), "unspecified location")
+                location = sanitize_public_string(
+                    _string_value(quote.get("location"), "unspecified location"),
+                    run_dir=run_dir,
+                )
                 lines.append(f"   - Quote [{source_id}]: \"{quote_text}\" ({location})")
             caveats = _string_list(claim.get("caveats"))
             if caveats:
-                lines.append(f"   - {'주의점' if is_ko else 'Caveats'}: {'; '.join(caveats)}")
+                safe_caveats = [sanitize_public_string(caveat, run_dir=run_dir) for caveat in caveats]
+                lines.append(f"   - {'주의점' if is_ko else 'Caveats'}: {'; '.join(safe_caveats)}")
     else:
         lines.append(f"- {'확인된 내용이 없습니다.' if is_ko else 'No confirmed findings.'}")
     lines.append("")
@@ -472,7 +524,10 @@ def _render_report(
             lines.append(f"- Claim `{item['claim_id']}`: {claim_text}")
             for support in _resolved_visual_supports(claim, images_by_id=images_by_id):
                 image_id = _string_value(support.get("image_id"), "unknown")
-                observation_text = _string_value(support.get("observation_text"), "")
+                observation_text = sanitize_public_string(
+                    _string_value(support.get("observation_text"), ""),
+                    run_dir=run_dir,
+                )
                 provider = _string_value(support.get("provider"), "unknown")
                 relation_type = _string_value(support.get("relation_type"), "visual_match")
                 lines.append(
@@ -485,9 +540,9 @@ def _render_report(
         for image_id in _ordered_unique(image_id for item in included for image_id in item["image_ids"]):
             image = images_by_id.get(image_id, {})
             source_id = _string_value(image.get("source_id"), "unknown")
-            artifact = _string_value(image.get("local_artifact_path"), "unknown")
-            image_url = _string_value(image.get("image_url"), "")
-            page_url = _string_value(image.get("page_url"), "")
+            artifact = public_artifact_ref(image.get("local_artifact_path"), run_dir=run_dir) or "unknown"
+            image_url = public_url_ref(image.get("image_url"), run_dir=run_dir)
+            page_url = public_url_ref(image.get("page_url"), run_dir=run_dir)
             lines.append(f"- Image `{image_id}`")
             lines.append(f"  - Source: `{source_id}`")
             lines.append(f"  - Artifact: `{artifact}`")
@@ -495,7 +550,10 @@ def _render_report(
                 lines.append(f"  - Image URL: {image_url}")
             if page_url:
                 lines.append(f"  - Page URL: {page_url}")
-            observations = _string_list(image.get("observations"))
+            observations = [
+                sanitize_public_string(observation, run_dir=run_dir)
+                for observation in _string_list(image.get("observations"))
+            ]
             if observations:
                 lines.append(f"  - Observations: {_truncate('; '.join(observations), 220)}")
         lines.append("")
@@ -519,8 +577,8 @@ def _render_report(
     if any(item["source_ids"] for item in included):
         for source_id in _ordered_unique(source_id for item in included for source_id in item["source_ids"]):
             source = sources_by_id.get(source_id, {})
-            title = _string_value(source.get("title"), source_id)
-            url = _string_value(source.get("url"), "")
+            title = sanitize_public_string(_string_value(source.get("title"), source_id), run_dir=run_dir)
+            url = public_url_ref(source.get("url"), run_dir=run_dir)
             accessed_at = _string_value(source.get("accessed_at"), "unknown")
             lines.append(f"- [{source_id}] {title} - {url} (accessed {accessed_at})")
     else:
@@ -801,7 +859,7 @@ def _comparison_answer_records(
         record = {
             "criterion": criterion,
             "text": claim_text,
-            "caveats": _string_list(claim.get("caveats")),
+            "caveats": [sanitize_public_string(caveat) for caveat in _string_list(claim.get("caveats"))],
             "source_ids": item["source_ids"],
             "image_ids": item["image_ids"],
         }
@@ -838,7 +896,7 @@ def _comparison_answer_score(record: Mapping[str, Any], *, claim: Mapping[str, A
 
 
 def _answer_fragment(value: str) -> str:
-    stripped = value.strip()
+    stripped = sanitize_public_string(value).strip()
     for terminator in (". ", "。", "."):
         if terminator not in stripped:
             continue
@@ -1063,7 +1121,7 @@ def _caveat_records(
     records: list[str] = []
     seen_messages: set[str] = set()
     for item in included:
-        caveats = _string_list(item["claim"].get("caveats"))
+        caveats = [sanitize_public_string(caveat) for caveat in _string_list(item["claim"].get("caveats"))]
         for caveat in caveats:
             normalized = caveat.strip().lower()
             if normalized in seen_messages:
@@ -1317,27 +1375,37 @@ def _status_claim_record(item: Mapping[str, Any], *, include_evidence: bool) -> 
         "review_status": claim.get("review_status"),
         "promotion_status": claim.get("promotion_status"),
         "confidence": claim.get("confidence"),
+        "source_ids": item["source_ids"],
+        "image_ids": item["image_ids"],
+        "visual_supports": _status_visual_support_records(item),
+        "verifier_vote_refs": _string_list(claim.get("verifier_vote_refs")),
+        "visual_verifier_vote_refs": _string_list(claim.get("visual_verifier_vote_refs")),
+        "caveats": _string_list(claim.get("caveats")),
     }
-    if include_evidence:
-        record["source_ids"] = item["source_ids"]
-        record["image_ids"] = item["image_ids"]
-        record["visual_supports"] = [
-            {
-                "image_id": support.get("image_id"),
-                "observation_ref": support.get("observation_ref"),
-                "relation_type": support.get("relation_type"),
-                "provider": support.get("provider"),
-            }
-            for support in item.get("visual_supports", [])
-            if isinstance(support, Mapping)
-        ]
-        record["verifier_vote_refs"] = _string_list(claim.get("verifier_vote_refs"))
-        record["visual_verifier_vote_refs"] = _string_list(
-            claim.get("visual_verifier_vote_refs")
-        )
-    else:
+    if not include_evidence:
         record["exclusion_reasons"] = item["exclusion_reasons"]
     return record
+
+
+def _status_visual_support_records(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    claim = item["claim"]
+    resolved_image_ids = set(item["image_ids"])
+    records: list[dict[str, Any]] = []
+    for support in _mapping_records(claim.get("visual_supports")):
+        image_id = _string_value(support.get("image_id"), "")
+        if image_id not in resolved_image_ids:
+            continue
+        record = {
+            "image_id": image_id,
+            "relation_type": _string_value(support.get("relation_type"), "visual_match"),
+            "provider": _string_value(support.get("provider"), "unknown"),
+        }
+        if isinstance(support.get("observation_ref"), str):
+            record["observation_ref"] = support["observation_ref"]
+        if isinstance(support.get("observation_index"), int):
+            record["observation_index"] = support["observation_index"]
+        records.append(record)
+    return records
 
 
 def _resolved_source_ids(
@@ -1444,7 +1512,7 @@ def _claim_text_for_report(
     *,
     sources_by_id: Mapping[str, Mapping[str, Any]],
 ) -> str:
-    text = str(claim.get("text", "")).strip()
+    text = sanitize_public_string(str(claim.get("text", "")).strip())
     if _has_copyright_restricted_source(source_ids, sources_by_id=sources_by_id):
         return _truncate(text, 80) + " [copyright-truncated]"
     return _truncate(text, 180)
@@ -1456,7 +1524,7 @@ def _quote_text_for_report(
     sources_by_id: Mapping[str, Mapping[str, Any]],
 ) -> str:
     source_id = quote.get("source_id")
-    quote_text = str(quote.get("quote", "")).strip()
+    quote_text = sanitize_public_string(str(quote.get("quote", "")).strip())
     if isinstance(source_id, str) and _has_copyright_restricted_source(
         [source_id],
         sources_by_id=sources_by_id,
@@ -1601,6 +1669,10 @@ def _claim_count(claims: Any) -> int:
     if not isinstance(claims, list):
         return 0
     return len([claim for claim in claims if isinstance(claim, Mapping)])
+
+
+def _public_report_status(status: Mapping[str, Any], *, run_dir: Path) -> dict[str, Any]:
+    return sanitize_public_value(status, run_dir=run_dir)
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

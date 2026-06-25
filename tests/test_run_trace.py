@@ -190,7 +190,8 @@ class RunTraceTests(unittest.TestCase):
         ]
         for filename in status_files:
             status = self.read_json(run_dir / filename)
-            self.assertEqual(status["artifacts"]["run_trace"], str(trace_path))
+            expected_trace = "run_trace.jsonl" if filename == "report_status.json" else str(trace_path)
+            self.assertEqual(status["artifacts"]["run_trace"], expected_trace)
 
     def test_blocked_stage_records_failure_category(self) -> None:
         prepared = prepare_run(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -13,7 +14,7 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import synthesize_report
+from deepresearch import ReportExportError, export_report, synthesize_report
 
 
 class ReportGenerationTests(unittest.TestCase):
@@ -30,6 +31,9 @@ class ReportGenerationTests(unittest.TestCase):
 
     def load_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def export_output_path(self, run_dir: Path, result: dict, export_format: str) -> Path:
+        return run_dir / result["outputs"][export_format]
 
     def base_evidence(self) -> dict:
         return {
@@ -141,6 +145,64 @@ class ReportGenerationTests(unittest.TestCase):
             "confidence": 0.74,
         }
 
+    def report_export_run(self) -> Path:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = "Create a market report with competitor and incident evidence."
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_supported",
+                text="Supported technical finding remains reportable.",
+                caveats=["Scope is limited to fixture evidence."],
+            ),
+            self.claim(
+                claim_id="claim_visual",
+                text="The image shows Visible Example text.",
+                claim_type="visual",
+                supporting_images=["img_001"],
+                quote_spans=[],
+            ),
+            self.claim(
+                claim_id="claim_supported_not_eligible_export",
+                text="Supported but not eligible claim must stay out of default exports.",
+                promotion_status="not_eligible",
+            ),
+            self.claim(
+                claim_id="claim_rejected_high_confidence",
+                text="Rejected high-confidence claim must not appear as a finding.",
+                verification_status="refuted",
+                promotion_status="not_eligible",
+                confidence="high",
+                include_in_final_report=False,
+            ),
+            self.claim(
+                claim_id="claim_policy_blocked_export",
+                text="Policy-blocked claim must stay out of default exports.",
+                verification_status="policy_blocked",
+                review_status="needs_more_evidence",
+                promotion_status="not_eligible",
+                confidence="low",
+                include_in_final_report=False,
+            ),
+            self.claim(
+                claim_id="claim_not_eligible_export",
+                text="Not eligible claim must stay out of default exports.",
+                verification_status="insufficient_evidence",
+                review_status="needs_more_evidence",
+                promotion_status="not_eligible",
+                confidence="low",
+                include_in_final_report=False,
+            ),
+        ]
+        evidence["claims"][1]["visual_supports"] = [self.visual_support()]
+        evidence["claims"][1]["verifier_vote_refs"] = ["vote_text_1", "vote_visual_1", "vote_policy_1"]
+        evidence["claims"][1]["visual_verifier_vote_refs"] = ["vote_visual_1"]
+        self.write_json(run_dir / "evidence.json", evidence)
+        status = synthesize_report(run=run_dir)
+        self.assertEqual(status["status"], "completed")
+        return run_dir
+
     def test_high_confidence_text_claim_gets_source_quote_citation(self) -> None:
         run_dir = self.temp_run()
         evidence = self.load_json(run_dir / "evidence.json")
@@ -239,6 +301,100 @@ class ReportGenerationTests(unittest.TestCase):
             {"claim_unsupported", "claim_refuted", "claim_policy_blocked"},
         )
 
+    def test_supported_not_eligible_claim_is_excluded_from_synthesis_and_default_exports(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        not_eligible_source = self.source("src_not_eligible")
+        not_eligible_source["url"] = "https://example.com/not-eligible"
+        not_eligible_image = self.image("img_not_eligible")
+        not_eligible_image["source_id"] = "src_not_eligible"
+        not_eligible_image["image_url"] = "https://example.com/not-eligible.png"
+        not_eligible_image["page_url"] = "https://example.com/not-eligible"
+        not_eligible_text = "Supported auto-reviewed high confidence not eligible claim must not be reported."
+        evidence["sources"].append(not_eligible_source)
+        evidence["images"] = [not_eligible_image]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_reportable",
+                text="Reportable supported claim remains in the report.",
+            ),
+            self.claim(
+                claim_id="claim_supported_not_eligible",
+                text=not_eligible_text,
+                claim_type="mixed",
+                supporting_sources=["src_not_eligible"],
+                supporting_images=["img_not_eligible"],
+                quote_spans=[
+                    {
+                        "source_id": "src_not_eligible",
+                        "quote": "not eligible fixture",
+                        "location": "paragraph 2",
+                    }
+                ],
+                verification_status="supported",
+                review_status="auto_reviewed",
+                promotion_status="not_eligible",
+                confidence="high",
+            ),
+        ]
+        evidence["claims"][1]["visual_supports"] = [self.visual_support("img_not_eligible")]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        included_ids = {item["claim_id"] for item in status["included_claims"]}
+        excluded = {item["claim_id"]: item for item in status["excluded_claims"]}
+        self.assertEqual(status["claims_included"], 1)
+        self.assertEqual(status["claims_excluded"], 1)
+        self.assertEqual(status["used_sources"], ["src_001"])
+        self.assertEqual(status["used_images"], [])
+        self.assertEqual(included_ids, {"claim_reportable"})
+        self.assertEqual(set(excluded), {"claim_supported_not_eligible"})
+        self.assertIn("not_eligible", excluded["claim_supported_not_eligible"]["exclusion_reasons"])
+        self.assertEqual(excluded["claim_supported_not_eligible"]["source_ids"], ["src_not_eligible"])
+        self.assertEqual(excluded["claim_supported_not_eligible"]["image_ids"], ["img_not_eligible"])
+        before_excluded = report.split("## Excluded Or Caveated Evidence", 1)[0]
+        excluded_section = report.split("## Excluded Or Caveated Evidence", 1)[1]
+        self.assertNotIn(not_eligible_text, before_excluded)
+        self.assertNotIn("src_not_eligible", before_excluded)
+        self.assertNotIn("img_not_eligible", before_excluded)
+        self.assertIn(not_eligible_text, excluded_section)
+        self.assertIn("not_eligible", excluded_section)
+
+        default_result = export_report(
+            run=run_dir,
+            template="technical_report",
+            formats=["json", "markdown"],
+            output_dir=run_dir / "default-export",
+        )
+        default_payload = self.load_json(self.export_output_path(run_dir, default_result, "json"))
+        default_markdown = self.export_output_path(run_dir, default_result, "markdown").read_text(encoding="utf-8")
+        self.assertEqual(default_payload["claim_ids"], ["claim_reportable"])
+        self.assertEqual(default_payload["used_source_ids"], ["src_001"])
+        self.assertEqual(default_payload["used_image_ids"], [])
+        self.assertEqual(default_payload["report_status"]["used_sources"], ["src_001"])
+        self.assertEqual(default_payload["report_status"]["used_images"], [])
+        self.assertEqual(default_payload["excluded_claims"], [])
+        self.assertNotIn("claim_supported_not_eligible", default_markdown)
+        self.assertNotIn(not_eligible_text, default_markdown)
+
+        caveat_result = export_report(
+            run=run_dir,
+            template="technical_report",
+            formats=["json", "markdown"],
+            output_dir=run_dir / "excluded-export",
+            include_excluded_caveats=True,
+        )
+        caveat_payload = self.load_json(self.export_output_path(run_dir, caveat_result, "json"))
+        caveat_markdown = self.export_output_path(run_dir, caveat_result, "markdown").read_text(encoding="utf-8")
+        self.assertEqual(
+            [claim["claim_id"] for claim in caveat_payload["excluded_claims"]],
+            ["claim_supported_not_eligible"],
+        )
+        self.assertIn("Excluded claim `claim_supported_not_eligible`", caveat_markdown)
+        self.assertIn(not_eligible_text, caveat_markdown)
+
     def test_supported_claim_backed_by_blocked_source_is_excluded(self) -> None:
         run_dir = self.temp_run()
         claim_text = "Access-controlled source text must not become a finding."
@@ -294,6 +450,74 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(payload["claims_included"], 1)
         self.assertTrue((run_dir / "report.md").exists())
         self.assertTrue((run_dir / "report_status.json").exists())
+        self.assertEqual(payload["run_dir"], ".")
+        self.assertEqual(payload["report_path"], "report.md")
+        self.assertEqual(payload["report_status_path"], "report_status.json")
+        self.assertEqual(payload["artifacts"]["evidence"], "evidence.json")
+        self.assertNotIn(str(run_dir), command.stdout)
+
+    def test_synthesize_redacts_private_metadata_and_uses_relative_status_refs(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = (
+            "Investigate /home/user/private/question.txt and "
+            "file:///Users/alice/private/question.html"
+        )
+        source = evidence["sources"][0]
+        source["title"] = "Private source title /Users/alice/private/source-title.txt"
+        source["url"] = "file:///home/user/private/source.html"
+        source["local_artifact_path"] = str(run_dir / "sources" / "src_001.html")
+        image = self.image()
+        image["image_url"] = "file:///home/user/private/image.png"
+        image["page_url"] = "/Users/alice/private/page.html"
+        image["local_artifact_path"] = str(run_dir / "images" / "img_001.png")
+        image["observations"] = [
+            "Observation mentions /home/user/private/observation.png and "
+            "file:///home/user/private/observation.html"
+        ]
+        evidence["images"] = [image]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_private_report",
+                text="Supported claim mentions /home/user/private/claim.txt.",
+                claim_type="visual",
+                supporting_images=["img_001"],
+                quote_spans=[
+                    {
+                        "source_id": "src_001",
+                        "quote": "quote leaks file:///home/user/private/quote.html",
+                        "location": "/Users/alice/private/location.txt",
+                    }
+                ],
+                caveats=["Caveat includes /home/user/private/caveat.txt"],
+            )
+        ]
+        support = self.visual_support()
+        support["observation_text"] = image["observations"][0]
+        evidence["claims"][0]["visual_supports"] = [support]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["run_dir"], ".")
+        self.assertEqual(status["report_path"], "report.md")
+        self.assertEqual(status["report_status_path"], "report_status.json")
+        self.assertEqual(status["artifacts"]["evidence"], "evidence.json")
+        self.assertEqual(status["artifacts"]["report"], "report.md")
+        self.assertEqual(status["artifacts"]["report_status"], "report_status.json")
+        self.assertEqual(status["artifacts"]["run_steps"], "run_steps.json")
+        self.assertEqual(status["artifacts"]["run_trace"], "run_trace.jsonl")
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        status_text = (run_dir / "report_status.json").read_text(encoding="utf-8")
+        for content in (report, status_text):
+            self.assertNotIn(str(run_dir), content)
+            self.assertNotIn("/home/user/private", content)
+            self.assertNotIn("/Users/alice/private", content)
+            self.assertNotIn("file:///home/user/private", content)
+        self.assertIn("images/img_001.png", report)
+        self.assertIn("<redacted-file-url>", report)
+        self.assertIn("<redacted-local-path>", report)
 
     def test_invalid_evidence_cli_fails_without_confident_report(self) -> None:
         run_dir = self.temp_run()
@@ -325,6 +549,11 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertGreater(len(status["validation"]["errors"]), 0)
         self.assertEqual(status["claims_included"], 0)
         self.assertNotIn("report", status["artifacts"])
+        self.assertEqual(status["run_dir"], ".")
+        self.assertEqual(status["report_status_path"], "report_status.json")
+        self.assertEqual(status["artifacts"]["evidence"], "evidence.json")
+        self.assertEqual(status["artifacts"]["report_status"], "report_status.json")
+        self.assertNotIn(str(run_dir), command.stdout)
 
     def test_failed_validation_rerun_removes_stale_confident_report(self) -> None:
         run_dir = self.temp_run()
@@ -635,6 +864,342 @@ class ReportGenerationTests(unittest.TestCase):
             "The privacy policy now requires users to accept arbitration for some disputes.",
             confirmed,
         )
+
+    def test_report_export_templates_use_same_supported_evidence_model(self) -> None:
+        run_dir = self.report_export_run()
+        output_dir = run_dir / "template-exports"
+
+        for template in ("technical", "market", "competitor", "incident"):
+            result = export_report(
+                run=run_dir,
+                template=template,
+                formats=["markdown"],
+                output_dir=output_dir / template,
+            )
+            self.assertEqual(result["status"], "completed")
+            markdown = self.export_output_path(run_dir, result, "markdown").read_text(encoding="utf-8")
+            self.assertIn("Supported technical finding remains reportable.", markdown)
+            self.assertIn("claim_visual", markdown)
+            self.assertIn("Image `img_001`", markdown)
+            self.assertIn("[src_001]", markdown)
+            self.assertNotIn("Rejected high-confidence claim must not appear as a finding.", markdown)
+            self.assertNotIn("Policy-blocked claim must stay out of default exports.", markdown)
+            self.assertNotIn("Not eligible claim must stay out of default exports.", markdown)
+            self.assertNotIn("Supported but not eligible claim must stay out of default exports.", markdown)
+
+    def test_json_csv_and_html_exports_preserve_citation_and_image_linkage(self) -> None:
+        run_dir = self.report_export_run()
+        result = export_report(
+            run=run_dir,
+            template="competitor_analysis",
+            formats=["all"],
+            output_dir=run_dir / "all-exports",
+        )
+
+        payload = self.load_json(self.export_output_path(run_dir, result, "json"))
+        self.assertEqual(payload["report_status"]["status"], "completed")
+        self.assertEqual(payload["report_status"]["visual_observation_report_links_written"], 0)
+        self.assertEqual(payload["claim_ids"], ["claim_supported", "claim_visual"])
+        self.assertEqual(payload["used_source_ids"], ["src_001"])
+        self.assertEqual(payload["used_image_ids"], ["img_001"])
+        self.assertEqual(payload["caveats"], ["Scope is limited to fixture evidence."])
+        self.assertEqual(payload["image_appendix"][0]["image_id"], "img_001")
+        self.assertEqual(payload["image_appendix"][0]["artifact"], "images/img_001.png")
+        self.assertEqual(payload["excluded_claims"], [])
+        visual_claim = payload["claims"][1]
+        self.assertEqual(
+            visual_claim["visual_supports"][0]["observation_ref"],
+            "images.img_001.observations[0]",
+        )
+        self.assertEqual(visual_claim["visual_supports"][0]["observation_index"], 0)
+        self.assertEqual(
+            visual_claim["verifier_vote_refs"],
+            ["vote_text_1", "vote_visual_1", "vote_policy_1"],
+        )
+        self.assertEqual(visual_claim["visual_verifier_vote_refs"], ["vote_visual_1"])
+        visual_status_claim = {
+            claim["claim_id"]: claim for claim in payload["report_status"]["included_claims"]
+        }["claim_visual"]
+        self.assertEqual(
+            visual_status_claim["visual_supports"][0]["observation_ref"],
+            "images.img_001.observations[0]",
+        )
+        self.assertEqual(visual_status_claim["visual_supports"][0]["observation_index"], 0)
+        self.assertEqual(
+            visual_status_claim["verifier_vote_refs"],
+            ["vote_text_1", "vote_visual_1", "vote_policy_1"],
+        )
+        self.assertEqual(visual_status_claim["visual_verifier_vote_refs"], ["vote_visual_1"])
+
+        with self.export_output_path(run_dir, result, "csv").open(encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["claim_id"] for row in rows], ["claim_supported", "claim_visual"])
+        self.assertEqual(rows[0]["source_ids"], "src_001")
+        self.assertEqual(rows[1]["image_ids"], "img_001")
+        self.assertEqual(rows[0]["quote_source_ids"], "src_001")
+        self.assertEqual(rows[1]["visual_support_refs"], "images.img_001.observations[0]")
+        self.assertEqual(rows[1]["verifier_vote_refs"], "vote_text_1;vote_visual_1;vote_policy_1")
+        self.assertEqual(rows[1]["visual_verifier_vote_refs"], "vote_visual_1")
+
+        html_report = self.export_output_path(run_dir, result, "html").read_text(encoding="utf-8")
+        html_manifest = self.export_output_path(run_dir, result, "html").with_name("manifest.json")
+        self.assertTrue(html_manifest.exists())
+        self.assertIn("[src_001]", html_report)
+        self.assertIn("Image <code>img_001</code>", html_report)
+        self.assertIn("Supported technical finding remains reportable.", html_report)
+
+    def test_report_exports_redact_private_file_urls_and_absolute_paths(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["question"] = (
+            "Export report for /home/user/private/question.txt and "
+            "file:///Users/alice/private/question.html"
+        )
+        private_source = self.source("src_private")
+        private_source["title"] = "Private title /Users/alice/private/source-title.txt"
+        private_source["url"] = "file:///home/user/private/source.html"
+        private_source["local_artifact_path"] = str(run_dir / "sources" / "src_private.html")
+        private_image = self.image("img_private")
+        private_image["source_id"] = "src_private"
+        private_image["image_url"] = "/home/user/private/image.png"
+        private_image["page_url"] = "file:///home/user/private/page.html"
+        private_image["local_artifact_path"] = str(run_dir / "images" / "img_private.png")
+        private_image["observations"] = [
+            "Observation leaks /home/user/private/observation.png and "
+            "file:///home/user/private/observation.html"
+        ]
+        private_image["caveats"] = ["Image caveat leaks /Users/alice/private/image-caveat.txt"]
+        evidence["sources"].append(private_source)
+        evidence["images"] = [private_image]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_public_source",
+                text="Public source URL should be preserved.",
+            ),
+            self.claim(
+                claim_id="claim_private_source",
+                text="Private source URL /home/user/private/claim.txt should be redacted in exports.",
+                supporting_sources=["src_private"],
+                quote_spans=[
+                    {
+                        "source_id": "src_private",
+                        "quote": "private source fixture file:///home/user/private/quote.html",
+                        "location": "/Users/alice/private/location.txt",
+                    }
+                ],
+            ),
+            self.claim(
+                claim_id="claim_private_image",
+                text="Private image URLs should be redacted in exports.",
+                claim_type="visual",
+                supporting_sources=["src_private"],
+                supporting_images=["img_private"],
+                quote_spans=[],
+                caveats=["Claim caveat leaks /home/user/private/claim-caveat.txt"],
+            ),
+        ]
+        support = self.visual_support("img_private")
+        support["observation_text"] = private_image["observations"][0]
+        evidence["claims"][2]["visual_supports"] = [support]
+        self.write_json(run_dir / "evidence.json", evidence)
+        status = synthesize_report(run=run_dir)
+        self.assertEqual(status["status"], "completed")
+
+        result = export_report(
+            run=run_dir,
+            template="market_report",
+            formats=["all"],
+            output_dir=run_dir / "private-redaction-export",
+        )
+
+        payload = self.load_json(self.export_output_path(run_dir, result, "json"))
+        sources = {source["source_id"]: source for source in payload["sources"]}
+        image = payload["image_appendix"][0]
+        self.assertIn("<redacted-local-path>", payload["question"])
+        self.assertIn("<redacted-file-url>", payload["question"])
+        self.assertEqual(sources["src_001"]["url"], "https://example.com/source")
+        self.assertIn("<redacted-local-path>", sources["src_private"]["title"])
+        self.assertEqual(sources["src_private"]["url"], "<redacted-file-url>")
+        self.assertEqual(sources["src_private"]["artifact"], "sources/src_private.html")
+        self.assertEqual(image["image_url"], "<redacted-local-path>")
+        self.assertEqual(image["page_url"], "<redacted-file-url>")
+        self.assertEqual(image["artifact"], "images/img_private.png")
+        self.assertIn("<redacted-local-path>", image["observations"][0])
+        self.assertIn("<redacted-file-url>", image["observations"][0])
+        self.assertIn("<redacted-local-path>", image["caveats"][0])
+        self.assertEqual(result["output_dir"], "private-redaction-export")
+        self.assertNotIn(str(run_dir), json.dumps(result, sort_keys=True))
+
+        output_paths = [run_dir / path for path in result["outputs"].values()]
+        output_paths.append(self.export_output_path(run_dir, result, "html").with_name("manifest.json"))
+        for output_path in output_paths:
+            content = output_path.read_text(encoding="utf-8")
+            self.assertNotIn(str(run_dir), content, output_path)
+            self.assertNotIn("/home/user/private", content, output_path)
+            self.assertNotIn("/Users/alice/private", content, output_path)
+            self.assertNotIn("file:///home/user/private", content, output_path)
+        self.assertIn(
+            "https://example.com/source",
+            self.export_output_path(run_dir, result, "markdown").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "https://example.com/source",
+            self.export_output_path(run_dir, result, "html").read_text(encoding="utf-8"),
+        )
+
+    def test_export_include_excluded_caveats_marks_non_reportable_claims(self) -> None:
+        run_dir = self.report_export_run()
+
+        default_result = export_report(
+            run=run_dir,
+            template="incident_report",
+            formats=["markdown"],
+            output_dir=run_dir / "default-export",
+        )
+        default_markdown = self.export_output_path(run_dir, default_result, "markdown").read_text(encoding="utf-8")
+        self.assertNotIn("Excluded Or Caveated Claims", default_markdown)
+        self.assertNotIn("claim_rejected_high_confidence", default_markdown)
+        self.assertNotIn("claim_supported_not_eligible_export", default_markdown)
+
+        included_result = export_report(
+            run=run_dir,
+            template="incident_report",
+            formats=["json", "csv", "markdown"],
+            output_dir=run_dir / "excluded-export",
+            include_excluded_caveats=True,
+        )
+        markdown = self.export_output_path(run_dir, included_result, "markdown").read_text(encoding="utf-8")
+        self.assertIn("## Excluded Or Caveated Claims", markdown)
+        self.assertIn("Excluded claim `claim_rejected_high_confidence`", markdown)
+        self.assertIn("status `refuted`", markdown)
+        self.assertIn("Excluded claim `claim_supported_not_eligible_export`", markdown)
+        self.assertIn("Exclusion reasons: not_eligible", markdown)
+        self.assertIn("Excluded claim `claim_policy_blocked_export`", markdown)
+        self.assertIn("Excluded claim `claim_not_eligible_export`", markdown)
+
+        payload = self.load_json(self.export_output_path(run_dir, included_result, "json"))
+        excluded_ids = {claim["claim_id"] for claim in payload["excluded_claims"]}
+        self.assertEqual(
+            excluded_ids,
+            {
+                "claim_supported_not_eligible_export",
+                "claim_rejected_high_confidence",
+                "claim_policy_blocked_export",
+                "claim_not_eligible_export",
+            },
+        )
+        with self.export_output_path(run_dir, included_result, "csv").open(encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        excluded_rows = [row for row in rows if row["row_type"] == "excluded_caveat"]
+        self.assertEqual(len(excluded_rows), 4)
+
+    def test_cli_export_report_writes_all_formats(self) -> None:
+        run_dir = self.report_export_run()
+        output_dir = run_dir / "cli-exports"
+
+        command = subprocess.run(
+            [
+                str(RUNNER),
+                "export-report",
+                "--run",
+                str(run_dir),
+                "--template",
+                "technical_report",
+                "--format",
+                "all",
+                "--output-dir",
+                str(output_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(command.returncode, 0, command.stderr)
+        payload = json.loads(command.stdout)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["template"], "technical_report")
+        self.assertEqual(payload["output_dir"], "cli-exports")
+        self.assertEqual(
+            set(payload["outputs"]),
+            {"markdown", "json", "csv", "html"},
+        )
+        self.assertEqual(payload["outputs"]["markdown"], "cli-exports/technical_report.md")
+        self.assertEqual(payload["outputs"]["json"], "cli-exports/technical_report.json")
+        self.assertEqual(payload["outputs"]["csv"], "cli-exports/technical_report.csv")
+        self.assertEqual(payload["outputs"]["html"], "cli-exports/technical_report-html/index.html")
+        self.assertNotIn(str(run_dir), command.stdout)
+        self.assertTrue((output_dir / "technical_report.md").exists())
+        self.assertTrue((output_dir / "technical_report.json").exists())
+        self.assertTrue((output_dir / "technical_report.csv").exists())
+        self.assertTrue((output_dir / "technical_report-html" / "index.html").exists())
+
+        json_only_dir = run_dir / "cli-json-export"
+        json_command = subprocess.run(
+            [
+                str(RUNNER),
+                "export-report",
+                "--run",
+                str(run_dir),
+                "--template",
+                "technical_report",
+                "--format",
+                "json",
+                "--output-dir",
+                str(json_only_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(json_command.returncode, 0, json_command.stderr)
+        json_payload = json.loads(json_command.stdout)
+        self.assertEqual(json_payload["output_dir"], "cli-json-export")
+        self.assertEqual(set(json_payload["outputs"]), {"json"})
+        self.assertEqual(json_payload["outputs"]["json"], "cli-json-export/technical_report.json")
+        self.assertNotIn(str(run_dir), json_command.stdout)
+        self.assertTrue((json_only_dir / "technical_report.json").exists())
+        self.assertFalse((json_only_dir / "technical_report.md").exists())
+
+    def test_export_rejects_non_completed_report_status(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["routing"] = [
+            {
+                "angle_id": "angle_visual",
+                "question": "Visual evidence required",
+                "modality": "visual_required",
+                "reason": "image evidence is necessary",
+                "search_queries": ["visual evidence"],
+                "visual_tasks": ["screenshot_compare"],
+                "max_images": 2,
+            }
+        ]
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_text_only",
+                text="A visual claim referenced available image evidence but did not link usable visual support.",
+                claim_type="mixed",
+                supporting_images=["img_001"],
+                verification_status="insufficient_evidence",
+                review_status="needs_more_evidence",
+                promotion_status="not_eligible",
+                confidence="low",
+                include_in_final_report=False,
+            )
+        ]
+        evidence["claims"][0]["visual_supports"] = [self.visual_support()]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        self.assertEqual(status["status"], "failed_visual_evidence_unused")
+        with self.assertRaisesRegex(ReportExportError, "failed_visual_evidence_unused"):
+            export_report(run=run_dir, formats=["json"], output_dir=run_dir / "exports")
 
     def test_visual_required_report_fails_when_usable_image_evidence_is_unused(self) -> None:
         run_dir = self.temp_run()
