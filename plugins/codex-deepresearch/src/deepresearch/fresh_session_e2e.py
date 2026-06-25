@@ -1148,15 +1148,13 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
     fetches = _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
     observations = _read_optional_jsonl(run_dir / "visual_observations.jsonl")
     visual_provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    report_text = _read_optional_text(run_dir / "report.md")
     images = _mapping_list(evidence.get("images") if isinstance(evidence, Mapping) else [])
 
-    codex_image_ids: set[str] = set()
-    for observation in observations:
-        if _is_codex_interactive_real_analyzed(observation):
-            image_id = observation.get("evidence_image_id")
-            if isinstance(image_id, str) and image_id:
-                codex_image_ids.add(image_id)
-
+    codex_image_ids = _codex_interactive_real_evidence_image_ids(
+        images=images,
+        observations=observations,
+    )
     non_release_images = sum(
         1
         for image in images
@@ -1166,6 +1164,7 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
         evidence if isinstance(evidence, Mapping) else {},
         report_status if isinstance(report_status, Mapping) else {},
         eligible_image_ids=codex_image_ids,
+        report_text=report_text,
     )
     return {
         "codex_interactive_analyzed_images": len(codex_image_ids),
@@ -1221,11 +1220,89 @@ def _is_codex_interactive_real_analyzed(record: Mapping[str, Any]) -> bool:
     return status == "analyzed"
 
 
+def _codex_interactive_real_evidence_image_ids(
+    *,
+    images: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    images_by_id = {
+        image.get("id"): image
+        for image in images
+        if isinstance(image.get("id"), str) and image.get("id")
+    }
+    image_ids: set[str] = set()
+    for observation in observations:
+        if not _is_codex_interactive_real_analyzed(observation):
+            continue
+        image_id = observation.get("evidence_image_id")
+        if not isinstance(image_id, str) or not image_id:
+            continue
+        image = images_by_id.get(image_id)
+        if image is None:
+            continue
+        if not _is_codex_interactive_real_evidence_image(image):
+            continue
+        if not _evidence_image_matches_observation(image, observation):
+            continue
+        image_ids.add(image_id)
+    return image_ids
+
+
+def _is_codex_interactive_real_evidence_image(image: Mapping[str, Any]) -> bool:
+    if image.get("provider_mode") != "real":
+        return False
+    if image.get("analysis_status") != "analyzed":
+        return False
+    if str(image.get("policy_decision") or "allowed") != "allowed":
+        return False
+    if image.get("policy_flags"):
+        return False
+    provider_values = {
+        str(image.get(key) or "")
+        for key in (
+            "analysis_provider",
+            "visual_provider",
+            "model_or_tool",
+            "vlm_provider",
+        )
+    }
+    if "codex-interactive" not in provider_values:
+        return False
+    return bool(_string_items(image.get("observations")))
+
+
+def _evidence_image_matches_observation(
+    image: Mapping[str, Any],
+    observation: Mapping[str, Any],
+) -> bool:
+    for key in ("candidate_id", "fetch_id", "task_id", "angle_id"):
+        image_value = image.get(key)
+        observation_value = observation.get(key)
+        if (
+            isinstance(image_value, str)
+            and image_value
+            and isinstance(observation_value, str)
+            and observation_value
+            and image_value != observation_value
+        ):
+            return False
+    image_observations = set(_string_items(image.get("observations")))
+    observed_text = set(_string_items(observation.get("observations")))
+    if (
+        image_observations
+        and observed_text
+        and not image_observations.intersection(observed_text)
+    ):
+        return False
+    return True
+
+
 def _report_cited_visual_or_mixed_claims(
     evidence: Mapping[str, Any],
     report_status: Mapping[str, Any],
     *,
     eligible_image_ids: set[str],
+    report_text: str,
 ) -> int:
     used_images = {
         image_id
@@ -1236,33 +1313,80 @@ def _report_cited_visual_or_mixed_claims(
     if not used_images:
         return 0
     included_claims = _mapping_list(report_status.get("included_claims", []))
-    included_count = sum(
-        1
-        for claim in included_claims
-        if claim.get("claim_type") in {"visual", "mixed"}
-        and used_images.intersection(
-            image_id for image_id in claim.get("image_ids", []) if isinstance(image_id, str)
-        )
-    )
-    if included_count:
-        return included_count
     included_ids = {
         claim.get("claim_id")
         for claim in included_claims
         if isinstance(claim.get("claim_id"), str)
     }
-    claims = _mapping_list(evidence.get("claims", []))
-    return sum(
-        1
-        for claim in claims
-        if claim.get("claim_type") in {"visual", "mixed"}
-        and claim.get("verification_status") == "supported"
-        and (not included_ids or claim.get("id") in included_ids)
-        and used_images.intersection(
+    included_images_by_claim = {
+        str(claim.get("claim_id")): {
             image_id
-            for image_id in claim.get("supporting_images", [])
-            if isinstance(image_id, str)
-        )
+            for image_id in claim.get("image_ids", [])
+            if isinstance(image_id, str) and image_id in used_images
+        }
+        for claim in included_claims
+        if isinstance(claim.get("claim_id"), str)
+    }
+    claims = _mapping_list(evidence.get("claims", []))
+    cited_count = 0
+    for claim in claims:
+        claim_id = claim.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+        if claim.get("verification_status") != "supported":
+            continue
+        if included_ids and claim_id not in included_ids:
+            continue
+        linked_images = used_images.intersection(_string_items(claim.get("supporting_images")))
+        if included_images_by_claim:
+            linked_images &= included_images_by_claim.get(claim_id, set())
+        linked_images = {
+            image_id
+            for image_id in linked_images
+            if _claim_visual_supports_image(claim, image_id)
+        }
+        if not linked_images:
+            continue
+        if not _report_markdown_cites_visual_claim(
+            report_text,
+            claim=claim,
+            image_ids=linked_images,
+        ):
+            continue
+        cited_count += 1
+    return cited_count
+
+
+def _claim_visual_supports_image(claim: Mapping[str, Any], image_id: str) -> bool:
+    for support in _mapping_list(claim.get("visual_supports", [])):
+        if support.get("image_id") == image_id and isinstance(
+            support.get("observation_ref"), str
+        ):
+            return True
+    return False
+
+
+def _report_markdown_cites_visual_claim(
+    report_text: str,
+    *,
+    claim: Mapping[str, Any],
+    image_ids: set[str],
+) -> bool:
+    if not report_text.strip():
+        return False
+    claim_id = claim.get("id")
+    claim_text = claim.get("text")
+    has_claim = any(
+        isinstance(marker, str) and marker and marker in report_text
+        for marker in (claim_id, claim_text)
+    )
+    if not has_claim:
+        return False
+    return any(
+        image_id in report_text or f"img:{image_id}" in report_text
+        for image_id in image_ids
     )
 
 
@@ -1761,6 +1885,13 @@ def _read_optional_json(path: Path) -> Any:
         return {}
 
 
+def _read_optional_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 def _read_optional_jsonl(path: Path) -> list[Mapping[str, Any]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -1781,6 +1912,14 @@ def _read_optional_jsonl(path: Path) -> list[Mapping[str, Any]]:
 
 def _mapping_list(value: Any) -> list[Mapping[str, Any]]:
     return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _string_items(value: Any) -> list[str]:
+    return (
+        [item for item in value if isinstance(item, str) and item]
+        if isinstance(value, list)
+        else []
+    )
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

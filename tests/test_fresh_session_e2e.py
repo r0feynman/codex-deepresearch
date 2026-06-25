@@ -222,6 +222,21 @@ class FreshSessionE2ETests(unittest.TestCase):
             gate["checks"]["codex_interactive_analyzed_non_fixture_images_at_least_3"]
         )
 
+    def test_completed_auto_visual_requires_linked_evidence_image_records(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["images"] = []
+        self._write_json(run_dir / "evidence.json", evidence)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 0)
+        self.assertFalse(
+            gate["checks"]["codex_interactive_analyzed_non_fixture_images_at_least_3"]
+        )
+
     def test_completed_auto_visual_rejects_failed_observation_statuses(self) -> None:
         run_dir = self._complete_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
@@ -288,6 +303,17 @@ class FreshSessionE2ETests(unittest.TestCase):
                 ],
             },
         )
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["report_cited_visual_or_mixed_claims"], 0)
+        self.assertFalse(gate["checks"]["report_cited_visual_or_mixed_claim_at_least_1"])
+
+    def test_completed_auto_visual_requires_report_markdown_visual_claim_citation(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        (run_dir / "report.md").write_text("# Report\n\n## Visual Findings\n", encoding="utf-8")
 
         gate = self._visual_release_gate_with_response(run_status)
 
@@ -774,7 +800,15 @@ class FreshSessionE2ETests(unittest.TestCase):
                 ],
             },
         )
-        (run_dir / "report.md").write_text("# Report\n\n## Visual Findings\n", encoding="utf-8")
+        (run_dir / "report.md").write_text(
+            "# Report\n\n"
+            "## Visual Findings\n"
+            f"- Claim `{claim_id}`: The first real visual fixture contains "
+            "report-cited UI evidence.\n"
+            "- Image `img_real_001` (visual_match; provider `codex-interactive`): "
+            f"{images[0]['observations'][0]}\n",
+            encoding="utf-8",
+        )
         return run_dir
 
     def _visual_run_status(self, run_dir: Path, *, status: str) -> dict:
