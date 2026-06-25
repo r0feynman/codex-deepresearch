@@ -99,13 +99,21 @@ EXTERNAL_GATE_REQUIREMENTS = {
         "schemas": {"codex-deepresearch.automated-visual-e2e.v0"},
         "min_counts": {"passed": 4},
         "zero_counts": {"blocked", "failed"},
-        "thresholds": {"min_vlm_images": 3, "report_cited_visual_or_mixed_claims": 1},
+        "thresholds": {
+            "min_image_candidates": 10,
+            "min_vlm_images": 3,
+            "report_cited_visual_or_mixed_claims": 1,
+        },
     },
     "automatic_web_visual_e2e": {
         "schemas": {"codex-deepresearch.automated-visual-e2e.v0"},
         "min_counts": {"passed": 4},
         "zero_counts": {"blocked", "failed"},
-        "thresholds": {"min_vlm_images": 3, "report_cited_visual_or_mixed_claims": 1},
+        "thresholds": {
+            "min_image_candidates": 10,
+            "min_vlm_images": 3,
+            "report_cited_visual_or_mixed_claims": 1,
+        },
     },
 }
 _REAL_ACQUISITION_PROVIDER_KINDS = {
@@ -114,6 +122,49 @@ _REAL_ACQUISITION_PROVIDER_KINDS = {
     "screenshot",
     "pdf_rasterizer",
     "visual_acquisition",
+}
+_FRESH_SESSION_REQUIRED_ACCEPTANCE = {
+    "fixture_scenario_completed",
+    "serial_fallback_blocked_explicit",
+    "real_codex_exec_asserted_or_explicit",
+    "provenance_distinguishes_fixture_serial_real",
+    "ci_public_safe_without_private_artifacts",
+}
+_FRESH_SESSION_VISUAL_REQUIRED_ACCEPTANCE = {
+    "visual_required_prompt_exercised",
+    "release_gate_passed",
+    "completed_auto_visual_validation_rules_met",
+    "blocked_runs_name_missing_capability",
+    "blocked_runs_do_not_count_as_release_passes",
+    "fixture_manual_user_evidence_excluded",
+    "final_transcript_exposes_artifacts_and_status_summary",
+}
+_AUTOMATED_VISUAL_REQUIRED_ACCEPTANCE = {
+    "provider_scenario_gates_cover_required_set",
+    "no_user_image_automated_runs_reach_completed_auto_visual",
+    "all_required_scenarios_passed",
+    "image_centric_has_10_real_candidates",
+    "accepted_runs_have_3_real_openai_vlm_images",
+    "accepted_runs_have_report_cited_visual_or_mixed_claim",
+    "fixture_manual_user_provided_records_excluded",
+}
+_AUTOMATED_VISUAL_REQUIRED_SCENARIOS = {
+    "product_image_discovery",
+    "ui_screenshot_comparison",
+    "public_chart_report_visual_extraction",
+    "public_pdf_paper_figure_extraction",
+}
+_AUTOMATED_VISUAL_REQUIRED_ARTIFACTS = {
+    "run_status",
+    "visual_provider_status",
+    "evidence",
+    "report_status",
+    "visual_search_plan",
+    "report",
+    "visual_candidates",
+    "image_fetch_status",
+    "visual_observations",
+    "verifier_votes",
 }
 
 
@@ -397,15 +448,18 @@ def evaluate_public_beta_prompt_run(
     report_text = _read_optional_text(artifacts["report"])
     terminal_status = _terminal_status(run_status)
     missing_status = not isinstance(run_status, Mapping)
+    required_artifacts = _required_status_artifacts(prompt, terminal_status)
     missing_artifacts = [
         name
-        for name in _required_status_artifacts(prompt, terminal_status)
+        for name in required_artifacts
         if not artifacts[name].exists()
     ]
     run_binding = _supplied_run_binding(
         prompt=prompt,
         run_dir=run_path,
         suite_id=suite_id,
+        loaded_artifacts=loaded,
+        required_artifacts=required_artifacts,
         run_status=run_status if isinstance(run_status, Mapping) else {},
         evidence=evidence if isinstance(evidence, Mapping) else {},
         validation_time=validation_time,
@@ -739,14 +793,13 @@ def _validated_external_gate_result(
     status = str(payload.get("status") or "unknown")
     release_gate_passed = payload.get("release_gate_passed")
     release_gate_ready = payload.get("release_gate_ready")
-    explicit_release_flag = (
-        release_gate_passed is True or release_gate_ready is True
-    )
-    if not explicit_release_flag:
-        failures.append("release_gate_passed or release_gate_ready must be explicitly true")
+    if release_gate_passed is not True:
+        failures.append("release_gate_passed must be explicitly true")
+    if release_gate_ready is not None and release_gate_ready is not True:
+        failures.append("release_gate_ready contradicts release_gate_passed")
     if status != "passed":
         failures.append(f"status must be passed, got {status}")
-    if explicit_release_flag and status != "passed":
+    if release_gate_passed is True and status != "passed":
         failures.append("release gate flag contradicts non-passed status")
 
     outcome_counts = payload.get("outcome_counts")
@@ -788,6 +841,8 @@ def _validated_external_gate_result(
     if not freshness["fresh"]:
         failures.extend(freshness["failures"])
 
+    failures.extend(_external_gate_proof_failures(gate_id, payload))
+
     failed = _strict_int_count(outcome_counts, "failed")
     blocked = _strict_int_count(outcome_counts, "blocked")
     result_status = "passed" if not failures else "failed"
@@ -805,6 +860,317 @@ def _validated_external_gate_result(
         "generated_at": freshness.get("selected_timestamp"),
         "failures": failures,
     }
+
+
+def _external_gate_proof_failures(
+    gate_id: str,
+    payload: Mapping[str, Any],
+) -> list[str]:
+    failures = _common_external_gate_proof_failures(payload)
+    if gate_id == "fresh_session_full_runner_artifact_handoff":
+        failures.extend(_fresh_session_external_gate_failures(payload))
+    elif gate_id == "codex_plugin_interactive_visual_e2e":
+        failures.extend(_fresh_session_visual_external_gate_failures(payload))
+    elif gate_id in {
+        "automated_cli_real_provider_visual_e2e",
+        "automatic_web_visual_e2e",
+    }:
+        failures.extend(_automated_visual_external_gate_failures(payload))
+    return failures
+
+
+def _common_external_gate_proof_failures(payload: Mapping[str, Any]) -> list[str]:
+    failures: list[str] = []
+    if not isinstance(payload.get("suite_id"), str) or not payload["suite_id"].strip():
+        failures.append("suite_id is missing from external gate result")
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, Mapping) or not isinstance(
+        artifacts.get("results"), str
+    ) or not artifacts["results"].strip():
+        failures.append("artifacts.results is missing from external gate result")
+    gate_failures = payload.get("failures")
+    if not isinstance(gate_failures, list):
+        failures.append("failures must be present as a list")
+    elif gate_failures:
+        failures.append("failures must be empty when status is passed")
+    return failures
+
+
+def _fresh_session_external_gate_failures(payload: Mapping[str, Any]) -> list[str]:
+    failures: list[str] = []
+    failures.extend(
+        _acceptance_key_failures(
+            payload.get("acceptance"),
+            required_keys=_FRESH_SESSION_REQUIRED_ACCEPTANCE,
+            context="acceptance",
+        )
+    )
+    skill_gate = payload.get("skill_transcript_gate")
+    if not isinstance(skill_gate, Mapping) or skill_gate.get("status") != "passed":
+        failures.append("skill_transcript_gate.status must be passed")
+    elif not isinstance(skill_gate.get("route_command"), str) or not skill_gate[
+        "route_command"
+    ].strip():
+        failures.append("skill_transcript_gate.route_command is missing")
+    runner_gate = payload.get("runner_artifact_gate")
+    if not isinstance(runner_gate, Mapping) or runner_gate.get("status") != "passed":
+        failures.append("runner_artifact_gate.status must be passed")
+
+    scenarios = _mapping_list(payload.get("scenarios", []))
+    if not scenarios:
+        failures.append("scenarios must include fresh-session proof records")
+        return failures
+    real_scenarios = [
+        scenario
+        for scenario in scenarios
+        if scenario.get("terminal_outcome") == "completed_real_parallel"
+        and scenario.get("provenance_class") == "real_parallel"
+    ]
+    if not real_scenarios:
+        failures.append(
+            "scenarios must include a completed_real_parallel real_parallel proof"
+        )
+    for scenario in real_scenarios:
+        if scenario.get("status") != "passed":
+            failures.append("completed_real_parallel scenario.status must be passed")
+        validation = scenario.get("validation")
+        if not isinstance(validation, Mapping) or validation.get("status") != "passed":
+            failures.append(
+                "completed_real_parallel scenario.validation.status must be passed"
+            )
+            continue
+        required = {
+            str(name)
+            for name in validation.get("required_artifacts", [])
+            if isinstance(name, str) and name
+        }
+        artifacts = scenario.get("artifacts")
+        if not required:
+            failures.append(
+                "completed_real_parallel scenario.validation.required_artifacts is missing"
+            )
+        elif not isinstance(artifacts, Mapping):
+            failures.append("completed_real_parallel scenario.artifacts is missing")
+        else:
+            missing = sorted(name for name in required if name not in artifacts)
+            if missing:
+                failures.append(
+                    "completed_real_parallel scenario.artifacts lacks required "
+                    + ", ".join(missing)
+                )
+    return failures
+
+
+def _fresh_session_visual_external_gate_failures(payload: Mapping[str, Any]) -> list[str]:
+    failures: list[str] = []
+    if payload.get("release_gate_status") != "passed":
+        failures.append("release_gate_status must be passed")
+    failures.extend(
+        _acceptance_key_failures(
+            payload.get("acceptance"),
+            required_keys=_FRESH_SESSION_VISUAL_REQUIRED_ACCEPTANCE,
+            context="acceptance",
+        )
+    )
+    skill_gate = payload.get("skill_transcript_gate")
+    if not isinstance(skill_gate, Mapping) or skill_gate.get("status") != "passed":
+        failures.append("skill_transcript_gate.status must be passed")
+
+    scenarios = _mapping_list(payload.get("scenarios", []))
+    release_scenarios = [
+        scenario
+        for scenario in scenarios
+        if isinstance(scenario.get("visual_release_gate"), Mapping)
+        and scenario["visual_release_gate"].get("release_gate_passed") is True
+    ]
+    if not release_scenarios:
+        failures.append("scenarios must include a visual_release_gate release pass")
+    for scenario in release_scenarios:
+        gate = scenario["visual_release_gate"]
+        if gate.get("schema_version") != "codex-deepresearch.fresh-session-visual-e2e.v0":
+            failures.append("visual_release_gate.schema_version is missing or unsupported")
+        if gate.get("status") != "completed_auto_visual":
+            failures.append("visual_release_gate.status must be completed_auto_visual")
+        if int(gate.get("codex_interactive_analyzed_images") or 0) < 3:
+            failures.append(
+                "visual_release_gate.codex_interactive_analyzed_images is below 3"
+            )
+        if int(gate.get("report_cited_visual_or_mixed_claims") or 0) < 1:
+            failures.append(
+                "visual_release_gate.report_cited_visual_or_mixed_claims is below 1"
+            )
+        validation = gate.get("visual_artifact_validation")
+        if not isinstance(validation, Mapping) or validation.get("valid") is not True:
+            failures.append("visual_release_gate.visual_artifact_validation.valid must be true")
+        checks = gate.get("checks")
+        if not isinstance(checks, Mapping) or not checks:
+            failures.append("visual_release_gate.checks must be present")
+        else:
+            failed_checks = sorted(key for key, value in checks.items() if value is not True)
+            if failed_checks:
+                failures.append(
+                    "visual_release_gate.checks not all true: "
+                    + ", ".join(failed_checks)
+                )
+        required_artifacts = {
+            str(name)
+            for name in gate.get("required_response_artifacts", [])
+            if isinstance(name, str) and name
+        }
+        expected_artifacts = {
+            "run_status",
+            "evidence",
+            "visual_tasks",
+            "visual_observations",
+            "visual_provider_status",
+            "report",
+            "report_status",
+            "visual_candidates",
+            "image_fetch_status",
+        }
+        if not expected_artifacts.issubset(required_artifacts):
+            missing = sorted(expected_artifacts - required_artifacts)
+            failures.append(
+                "visual_release_gate.required_response_artifacts lacks "
+                + ", ".join(missing)
+            )
+    return failures
+
+
+def _automated_visual_external_gate_failures(payload: Mapping[str, Any]) -> list[str]:
+    failures: list[str] = []
+    failures.extend(
+        _acceptance_key_failures(
+            payload.get("acceptance"),
+            required_keys=_AUTOMATED_VISUAL_REQUIRED_ACCEPTANCE,
+            context="acceptance",
+        )
+    )
+    if payload.get("external_network_call") is not True:
+        failures.append("external_network_call must be true")
+    if payload.get("external_vlm_call") is not True:
+        failures.append("external_vlm_call must be true")
+    blockers = payload.get("blockers")
+    if not isinstance(blockers, list):
+        failures.append("blockers must be present as a list")
+    elif blockers:
+        failures.append("blockers must be empty when status is passed")
+
+    scenario_prompts = _mapping_list(payload.get("scenario_prompts", []))
+    prompt_ids = {str(item.get("id")) for item in scenario_prompts if item.get("id")}
+    if prompt_ids != _AUTOMATED_VISUAL_REQUIRED_SCENARIOS:
+        failures.append("scenario_prompts must cover the required visual scenario set")
+
+    thresholds = payload.get("thresholds")
+    min_image_candidates = (
+        _strict_int_count(thresholds, "min_image_candidates")
+        if isinstance(thresholds, Mapping)
+        else None
+    ) or 10
+    min_vlm_images = (
+        _strict_int_count(thresholds, "min_vlm_images")
+        if isinstance(thresholds, Mapping)
+        else None
+    ) or 3
+
+    scenarios = _mapping_list(payload.get("scenarios", []))
+    by_id = {str(item.get("id")): item for item in scenarios if item.get("id")}
+    if set(by_id) != _AUTOMATED_VISUAL_REQUIRED_SCENARIOS:
+        failures.append("scenarios must cover the required visual scenario set")
+    for scenario_id in sorted(_AUTOMATED_VISUAL_REQUIRED_SCENARIOS):
+        scenario = by_id.get(scenario_id)
+        if scenario is None:
+            continue
+        failures.extend(
+            _automated_visual_scenario_failures(
+                scenario_id=scenario_id,
+                scenario=scenario,
+                min_image_candidates=min_image_candidates,
+                min_vlm_images=min_vlm_images,
+            )
+        )
+    return failures
+
+
+def _automated_visual_scenario_failures(
+    *,
+    scenario_id: str,
+    scenario: Mapping[str, Any],
+    min_image_candidates: int,
+    min_vlm_images: int,
+) -> list[str]:
+    prefix = f"scenario {scenario_id}: "
+    failures: list[str] = []
+    if scenario.get("status") != "passed":
+        failures.append(prefix + "status must be passed")
+    if scenario.get("run_status") != "completed_auto_visual":
+        failures.append(prefix + "run_status must be completed_auto_visual")
+    if scenario.get("visual_provider_status") != "completed_auto_visual":
+        failures.append(prefix + "visual_provider_status must be completed_auto_visual")
+    if scenario.get("ok") is not True or scenario.get("terminal") is not True:
+        failures.append(prefix + "ok and terminal must be true")
+    if scenario.get("external_network_call") is not True:
+        failures.append(prefix + "external_network_call must be true")
+    if scenario.get("external_vlm_call") is not True:
+        failures.append(prefix + "external_vlm_call must be true")
+    validation = scenario.get("visual_artifact_validation")
+    if not isinstance(validation, Mapping) or validation.get("valid") is not True:
+        failures.append(prefix + "visual_artifact_validation.valid must be true")
+    artifacts = scenario.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        failures.append(prefix + "artifacts must be present")
+    else:
+        missing = sorted(_AUTOMATED_VISUAL_REQUIRED_ARTIFACTS - set(artifacts))
+        if missing:
+            failures.append(prefix + "artifacts lacks " + ", ".join(missing))
+    counts = scenario.get("counts")
+    release_counts = scenario.get("release_numerator_counts")
+    if not isinstance(counts, Mapping):
+        failures.append(prefix + "counts must be present")
+        counts = {}
+    if not isinstance(release_counts, Mapping):
+        failures.append(prefix + "release_numerator_counts must be present")
+        release_counts = {}
+    if scenario_id == "product_image_discovery":
+        candidates = _strict_int_count(counts, "scenario_real_candidates")
+        if candidates is None or candidates < min_image_candidates:
+            failures.append(prefix + "scenario_real_candidates is below threshold")
+    vlm = _strict_int_count(counts, "real_openai_responses_vision_observations")
+    if vlm is None or vlm < min_vlm_images:
+        failures.append(
+            prefix + "real_openai_responses_vision_observations is below threshold"
+        )
+    report_claims = _strict_int_count(counts, "report_cited_visual_or_mixed_claims")
+    if report_claims is None or report_claims < 1:
+        failures.append(prefix + "report_cited_visual_or_mixed_claims is below 1")
+    release_vlm = _strict_int_count(release_counts, "real_vlm_images_analyzed")
+    if release_vlm is None or release_vlm < min_vlm_images:
+        failures.append(prefix + "release_numerator_counts.real_vlm_images_analyzed is below threshold")
+    release_claims = _strict_int_count(
+        release_counts,
+        "report_cited_visual_or_mixed_claims",
+    )
+    if release_claims is None or release_claims < 1:
+        failures.append(
+            prefix
+            + "release_numerator_counts.report_cited_visual_or_mixed_claims is below 1"
+        )
+    return failures
+
+
+def _acceptance_key_failures(
+    acceptance: Any,
+    *,
+    required_keys: set[str],
+    context: str,
+) -> list[str]:
+    if not isinstance(acceptance, Mapping):
+        return [f"{context} must be present"]
+    failures = []
+    for key in sorted(required_keys):
+        if acceptance.get(key) is not True:
+            failures.append(f"{context}.{key} must be true")
+    return failures
 
 
 def _acceptance(
@@ -1169,6 +1535,8 @@ def _supplied_run_binding(
     prompt: Mapping[str, Any],
     run_dir: Path,
     suite_id: str,
+    loaded_artifacts: Mapping[str, Any],
+    required_artifacts: Sequence[str],
     run_status: Mapping[str, Any],
     evidence: Mapping[str, Any],
     validation_time: str | None,
@@ -1181,27 +1549,50 @@ def _supplied_run_binding(
     if run_status.get("schema_version") != RUN_STATUS_SCHEMA_VERSION:
         failures.append("run_status.schema_version is missing or unsupported")
 
+    identity_artifacts = _identity_artifact_payloads(
+        loaded_artifacts=loaded_artifacts,
+        required_artifacts=required_artifacts,
+    )
+    invalid_identity_artifacts = _invalid_identity_artifacts(
+        loaded_artifacts=loaded_artifacts,
+        required_artifacts=required_artifacts,
+    )
+    if invalid_identity_artifacts:
+        failures.append(
+            "required status artifact(s) are missing or invalid JSON: "
+            + ", ".join(invalid_identity_artifacts)
+        )
+
     prompt_ids = _string_field_values(
-        run_status,
-        evidence,
+        *identity_artifacts.values(),
         names=("prompt_id", "public_beta_prompt_id"),
     )
-    if not prompt_ids:
+    prompt_id_sources = _artifact_field_sources(
+        identity_artifacts,
+        names=("prompt_id", "public_beta_prompt_id"),
+    )
+    if not _artifact_has_any_field(
+        "run_status",
+        identity_artifacts,
+        names=("prompt_id", "public_beta_prompt_id"),
+    ) or not _artifact_has_any_field(
+        "evidence",
+        identity_artifacts,
+        names=("prompt_id", "public_beta_prompt_id"),
+    ):
         failures.append("prompt_id is missing from supplied run metadata")
     elif any(value != prompt_id for value in prompt_ids):
         failures.append(
             "prompt_id does not match manifest prompt "
-            f"{prompt_id}: {', '.join(prompt_ids)}"
+            f"{prompt_id}: {_format_artifact_sources(prompt_id_sources)}"
         )
 
     prompt_hashes = _string_field_values(
-        run_status,
-        evidence,
+        *identity_artifacts.values(),
         names=("prompt_hash", "public_beta_prompt_hash"),
     )
     questions = _string_field_values(
-        run_status,
-        evidence,
+        *identity_artifacts.values(),
         names=("prompt", "question", "original_question"),
     )
     if prompt_hashes:
@@ -1214,28 +1605,48 @@ def _supplied_run_binding(
         failures.append("original question or prompt_hash does not match manifest prompt")
 
     suite_ids = _string_field_values(
-        run_status,
-        evidence,
+        *identity_artifacts.values(),
         names=("suite_id", "validation_suite_id", "public_beta_suite_id"),
     )
-    if not suite_ids:
+    suite_id_sources = _artifact_field_sources(
+        identity_artifacts,
+        names=("suite_id", "validation_suite_id", "public_beta_suite_id"),
+    )
+    if not _artifact_has_any_field(
+        "run_status",
+        identity_artifacts,
+        names=("suite_id", "validation_suite_id", "public_beta_suite_id"),
+    ) or not _artifact_has_any_field(
+        "evidence",
+        identity_artifacts,
+        names=("suite_id", "validation_suite_id", "public_beta_suite_id"),
+    ):
         failures.append("suite_id is missing from supplied run metadata")
     elif any(value != suite_id for value in suite_ids):
         failures.append(
             "suite_id does not match validation suite "
-            f"{suite_id}: {', '.join(suite_ids)}"
+            f"{suite_id}: {_format_artifact_sources(suite_id_sources)}"
         )
 
-    freshness = _freshness_check(
-        _timestamp_candidates(run_status, evidence),
+    freshness = _freshness_check_by_artifact(
+        identity_artifacts,
         validation_time=validation_time,
     )
     if not freshness["fresh"]:
         failures.extend(freshness["failures"])
 
-    run_id_values = _string_field_values(run_status, evidence, names=("run_id",))
-    if len(set(run_id_values)) > 1:
-        failures.append("run_id values disagree across run_status and evidence")
+    run_id_sources = _artifact_field_sources(identity_artifacts, names=("run_id",))
+    missing_run_id = sorted(set(identity_artifacts) - set(run_id_sources))
+    if missing_run_id:
+        failures.append(
+            "run_id is missing from required artifact(s): "
+            + ", ".join(missing_run_id)
+        )
+    elif len(set(run_id_sources.values())) > 1:
+        failures.append(
+            "run_id values disagree across required status artifacts: "
+            + _format_artifact_sources(run_id_sources)
+        )
 
     return {
         "valid": not failures,
@@ -1244,6 +1655,112 @@ def _supplied_run_binding(
         "prompt_hash": expected_hash,
         "created_at": freshness.get("selected_timestamp"),
         "max_age_days": SUPPLIED_RUN_MAX_AGE_DAYS,
+        "bound_artifacts": sorted(identity_artifacts),
+        "failures": failures,
+    }
+
+
+def _identity_artifact_payloads(
+    *,
+    loaded_artifacts: Mapping[str, Any],
+    required_artifacts: Sequence[str],
+) -> dict[str, Mapping[str, Any]]:
+    identity_names = {
+        "run_status",
+        "evidence",
+        "report_status",
+        "visual_provider_status",
+        "visual_search_plan",
+    }
+    payloads: dict[str, Mapping[str, Any]] = {}
+    for name in required_artifacts:
+        if name not in identity_names:
+            continue
+        payload = loaded_artifacts.get(name)
+        if isinstance(payload, Mapping):
+            payloads[name] = payload
+    return payloads
+
+
+def _invalid_identity_artifacts(
+    *,
+    loaded_artifacts: Mapping[str, Any],
+    required_artifacts: Sequence[str],
+) -> list[str]:
+    identity_names = {
+        "run_status",
+        "evidence",
+        "report_status",
+        "visual_provider_status",
+        "visual_search_plan",
+    }
+    return [
+        name
+        for name in required_artifacts
+        if name in identity_names and not isinstance(loaded_artifacts.get(name), Mapping)
+    ]
+
+
+def _artifact_has_any_field(
+    artifact_name: str,
+    payloads: Mapping[str, Mapping[str, Any]],
+    *,
+    names: Sequence[str],
+) -> bool:
+    payload = payloads.get(artifact_name)
+    if not isinstance(payload, Mapping):
+        return False
+    return any(
+        isinstance(payload.get(name), str) and bool(payload.get(name).strip())
+        for name in names
+    )
+
+
+def _artifact_field_sources(
+    payloads: Mapping[str, Mapping[str, Any]],
+    *,
+    names: Sequence[str],
+) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for artifact_name, payload in payloads.items():
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, str) and value.strip():
+                sources[artifact_name] = value.strip()
+                break
+    return sources
+
+
+def _format_artifact_sources(sources: Mapping[str, str]) -> str:
+    return ", ".join(
+        f"{artifact}={value}" for artifact, value in sorted(sources.items())
+    )
+
+
+def _freshness_check_by_artifact(
+    payloads: Mapping[str, Mapping[str, Any]],
+    *,
+    validation_time: str | None,
+) -> dict[str, Any]:
+    failures: list[str] = []
+    selected: dict[str, str] = {}
+    for artifact_name, payload in payloads.items():
+        freshness = _freshness_check(
+            _timestamp_candidates(payload),
+            validation_time=validation_time,
+        )
+        if freshness["fresh"]:
+            selected_timestamp = freshness.get("selected_timestamp")
+            if isinstance(selected_timestamp, str):
+                selected[artifact_name] = selected_timestamp
+            continue
+        for failure in freshness["failures"]:
+            failures.append(f"{artifact_name}: {failure}")
+    selected_timestamp = max(selected.values()) if selected else None
+    return {
+        "fresh": not failures,
+        "selected_timestamp": selected_timestamp,
+        "selected_timestamps": selected,
         "failures": failures,
     }
 

@@ -18,6 +18,7 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch.public_beta_validation import (  # noqa: E402
     DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
+    EXTERNAL_GATE_REQUIREMENTS,
     PublicBetaValidationError,
     evaluate_public_beta_prompt_run,
     load_public_beta_prompt_manifest,
@@ -207,6 +208,85 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(any("suite_id" in failure for failure in failures), failures)
         self.assertTrue(any("older than" in failure for failure in failures), failures)
 
+    def test_supplied_run_rejects_stale_evidence_when_run_status_is_fresh(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "stale-evidence",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["created_at"] = "2020-01-01T00:00:00Z"
+        evidence["completed_at"] = "2020-01-01T00:00:00Z"
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        failures = result["supplied_run_binding"]["failures"]
+        self.assertTrue(any("evidence:" in failure for failure in failures), failures)
+        self.assertTrue(any("older than" in failure for failure in failures), failures)
+
+    def test_supplied_run_rejects_mismatched_report_status_run_id(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "mismatched-report",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        report_status = self.read_json(run_dir / "report_status.json")
+        report_status["run_id"] = "other-run"
+        self.write_json(run_dir / "report_status.json", report_status)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        failures = result["supplied_run_binding"]["failures"]
+        self.assertTrue(any("run_id values disagree" in failure for failure in failures), failures)
+        self.assertTrue(any("report_status=other-run" in failure for failure in failures), failures)
+
+    def test_visual_supplied_run_rejects_mismatched_visual_provider_run_id(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "mismatched-provider",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider_status["run_id"] = "other-run"
+        self.write_json(run_dir / "visual_provider_status.json", provider_status)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        failures = result["supplied_run_binding"]["failures"]
+        self.assertTrue(any("run_id values disagree" in failure for failure in failures), failures)
+        self.assertTrue(
+            any("visual_provider_status=other-run" in failure for failure in failures),
+            failures,
+        )
+
     def test_missing_external_gate_results_prevent_release_ready(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
@@ -247,36 +327,20 @@ class PublicBetaValidationTests(unittest.TestCase):
             any("External gate result artifacts were not supplied" in gap for gap in payload["remaining_gaps"])
         )
 
-    def test_spoofed_external_gate_results_cannot_default_zero_to_ready(self) -> None:
+    def test_minimal_spoofed_external_gate_results_are_rejected(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
         suite_id = "spoofed-external-gates"
-        prompt_runs = {}
-        for prompt in manifest["prompts"]:
-            if prompt["route"] in {"visual_required", "visual_optional"}:
-                prompt_runs[prompt["id"]] = self.write_visual_run(
-                    runs_dir / prompt["id"],
-                    prompt=prompt,
-                    suite_id=suite_id,
-                    run_status="completed_auto_visual",
-                    provider_status="completed_auto_visual",
-                )
-            else:
-                prompt_runs[prompt["id"]] = self.write_text_run(
-                    runs_dir / prompt["id"],
-                    prompt=prompt,
-                    suite_id=suite_id,
-                    status="completed_parallel",
-                )
-        spoofed_gate = runs_dir / "spoofed_gate.json"
-        self.write_json(
-            spoofed_gate,
-            {
-                "status": "passed",
-                "public_safe": True,
-                "outcome_counts": {},
-            },
+        prompt_runs = self.write_all_passing_prompt_runs(
+            manifest,
+            runs_dir=runs_dir / "prompt-runs",
+            suite_id=suite_id,
         )
+        gate_results = {}
+        for gate_id in EXTERNAL_GATE_REQUIREMENTS:
+            spoofed_gate = runs_dir / f"{gate_id}.json"
+            self.write_json(spoofed_gate, self.minimal_spoofed_gate_payload(gate_id))
+            gate_results[gate_id] = spoofed_gate
 
         with self.assertRaises(PublicBetaValidationError) as raised:
             run_public_beta_validation(
@@ -284,19 +348,24 @@ class PublicBetaValidationTests(unittest.TestCase):
                 suite_id=suite_id,
                 clean=True,
                 prompt_runs=prompt_runs,
-                gate_results={
-                    "automated_cli_real_provider_visual_e2e": spoofed_gate,
-                },
+                gate_results=gate_results,
             )
 
         payload = self.read_json(raised.exception.results_path)
-        gate = payload["external_gate_results"]["automated_cli_real_provider_visual_e2e"]
         self.assertEqual(payload["status"], "failed")
         self.assertFalse(payload["release_gate_ready"])
-        self.assertEqual(gate["status"], "failed")
-        self.assertTrue(any("schema_version" in failure for failure in gate["failures"]))
-        self.assertTrue(any("release_gate" in failure for failure in gate["failures"]))
-        self.assertTrue(any("outcome_counts.passed" in failure for failure in gate["failures"]))
+        for gate_id, gate in payload["external_gate_results"].items():
+            self.assertEqual(gate["status"], "failed", gate_id)
+            self.assertFalse(gate["release_gate_ready"], gate_id)
+            self.assertTrue(
+                any(
+                    "acceptance" in failure
+                    or "scenarios" in failure
+                    or "skill_transcript_gate" in failure
+                    for failure in gate["failures"]
+                ),
+                (gate_id, gate["failures"]),
+            )
 
     def test_summary_redacts_private_absolute_run_paths(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -402,6 +471,8 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "schema_version": "codex-deepresearch.report-status.v0",
                     "run_id": run_dir.name,
                     "status": "completed",
+                    "created_at": timestamp,
+                    "generated_at": timestamp,
                     "used_images": [],
                 },
             )
@@ -499,6 +570,8 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "schema_version": "codex-deepresearch.report-generation.v0",
                 "run_id": run_dir.name,
                 "status": "completed",
+                "created_at": timestamp,
+                "generated_at": timestamp,
                 "used_images": [image_id] if release_grade else ["img_001"],
             },
         )
@@ -510,6 +583,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "status": provider_status,
                 "ok": provider_status == "completed_auto_visual",
                 "terminal": True,
+                "created_at": timestamp,
                 "providers": [
                     {
                         "provider": "real-screenshot",
@@ -538,7 +612,12 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         self.write_json(
             run_dir / "visual_search_plan.json",
-            {"schema_version": "codex-deepresearch.visual-artifacts.v0", "tasks": []},
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "tasks": [],
+            },
         )
         self.write_jsonl(run_dir / "visual_candidates.jsonl", [candidate] if release_grade else [{}])
         self.write_jsonl(run_dir / "image_fetch_status.jsonl", [fetch] if release_grade else [{}])
@@ -554,6 +633,58 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         (run_dir / "report.md").write_text(report, encoding="utf-8")
         return run_dir
+
+    def write_all_passing_prompt_runs(
+        self,
+        manifest: dict[str, Any],
+        *,
+        runs_dir: Path,
+        suite_id: str,
+    ) -> dict[str, Path]:
+        prompt_runs = {}
+        for prompt in manifest["prompts"]:
+            if prompt["route"] in {"visual_required", "visual_optional"}:
+                prompt_runs[prompt["id"]] = self.write_visual_run(
+                    runs_dir / prompt["id"],
+                    prompt=prompt,
+                    suite_id=suite_id,
+                    run_status="completed_auto_visual",
+                    provider_status="completed_auto_visual",
+                )
+            else:
+                prompt_runs[prompt["id"]] = self.write_text_run(
+                    runs_dir / prompt["id"],
+                    prompt=prompt,
+                    suite_id=suite_id,
+                    status="completed_parallel",
+                )
+        return prompt_runs
+
+    def minimal_spoofed_gate_payload(self, gate_id: str) -> dict[str, Any]:
+        requirements = EXTERNAL_GATE_REQUIREMENTS[gate_id]
+        outcome_counts: dict[str, int] = {}
+        for count_name, minimum in requirements.get("min_counts", {}).items():
+            outcome_counts[count_name] = int(minimum)
+        for count_name in requirements.get("zero_counts", set()):
+            outcome_counts[count_name] = 0
+        thresholds = {
+            threshold_name: int(minimum)
+            for threshold_name, minimum in requirements.get("thresholds", {}).items()
+        }
+        payload: dict[str, Any] = {
+            "schema_version": next(iter(requirements["schemas"])),
+            "status": "passed",
+            "public_safe": True,
+            "release_gate_passed": True,
+            "suite_id": "spoofed-suite",
+            "generated_at": self.now(),
+            "outcome_counts": outcome_counts,
+            "artifacts": {"results": "spoofed-results.json"},
+            "failures": [],
+        }
+        if thresholds:
+            payload["thresholds"] = thresholds
+        return payload
 
     def write_jsonl(self, path: Path, records: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
