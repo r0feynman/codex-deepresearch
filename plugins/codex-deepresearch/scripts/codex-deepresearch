@@ -43,6 +43,12 @@ from deepresearch.page_image_extraction import (
     extract_and_fetch_page_images,
 )
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
+from deepresearch.run_monitor import (
+    inspect_run_monitor,
+    list_run_monitors,
+    render_run_detail,
+    render_run_list,
+)
 from deepresearch.run_state import RunStepStateError, inspect_run_state
 from deepresearch.search_handoff import SearchHandoffError, ingest_run, prepare_run, resolve_run_dir
 from deepresearch.trace import record_exception_trace
@@ -557,6 +563,30 @@ def run_run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_monitor_list(args: argparse.Namespace) -> int:
+    result = list_run_monitors(resolve_repo_path(args.runs_dir))
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(render_run_list(result))
+    return 0
+
+
+def run_monitor_detail(args: argparse.Namespace) -> int:
+    try:
+        run_dir = resolve_run_dir(args.run, runs_dir=resolve_repo_path(args.runs_dir))
+    except SearchHandoffError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    result = inspect_run_monitor(run_dir)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(render_run_detail(result))
+    return 0
+
+
 def run_plan_parallel(args: argparse.Namespace) -> int:
     try:
         result = plan_research_tasks(
@@ -811,6 +841,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for run artifacts, relative to the repo root by default.",
     )
     run_status.set_defaults(func=run_run_status)
+
+    monitor_list = subparsers.add_parser(
+        "monitor-list",
+        help="List run progress, shard counts, mode, and budget confirmation state.",
+    )
+    monitor_list.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    monitor_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the monitor list as machine-readable JSON.",
+    )
+    monitor_list.set_defaults(func=run_monitor_list)
+
+    monitor_detail = subparsers.add_parser(
+        "monitor-detail",
+        help="Show a run detail dashboard from status and shard artifacts.",
+    )
+    monitor_detail.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    monitor_detail.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    monitor_detail.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the monitor detail as machine-readable JSON.",
+    )
+    monitor_detail.set_defaults(func=run_monitor_detail)
 
     plan_parallel = subparsers.add_parser(
         "plan-parallel",
