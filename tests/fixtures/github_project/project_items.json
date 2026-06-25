@@ -1,0 +1,189 @@
+{
+  "items": [
+    {
+      "id": "item_6",
+      "content": {
+        "body": "## Metadata / Project Plan\n\n- Project Status: `Done`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Done`.\n",
+        "number": 6,
+        "state": "CLOSED",
+        "title": "[M5] Manual Sources Slice",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/6"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "status": "Done",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Done"
+    },
+    {
+      "id": "item_58",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
+        "number": 58,
+        "state": "OPEN",
+        "title": "[P3-UX1] Skill full-runner invocation router",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/58"
+      },
+      "labels": ["type:task", "component:skill", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Skill",
+      "priority": "P1",
+      "workflow Status": "Ready"
+    },
+    {
+      "id": "item_63",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
+        "number": 63,
+        "state": "OPEN",
+        "title": "[P3-AV1] Visual artifact schema and status states",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/63"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Ready"
+    },
+    {
+      "id": "item_64",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- Blocked by #63 (`P3-AV1`).\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 64,
+        "state": "OPEN",
+        "title": "[P3-AV2] Real image search provider adapter",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/64"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_68",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n### Soft Ordering\n\n- Requires at least one real visual acquisition path from P3-AV2, P3-AV3, P3-AV4, or P3-AV5. This is an OR dependency, so no single GitHub hard blocker should be used unless the coordinator chooses a specific first provider path.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `VLM`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 68,
+        "state": "OPEN",
+        "title": "[P3-AV6] Automated VLM adapter",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/68"
+      },
+      "labels": ["type:task", "component:vlm", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "VLM",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_69",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- Blocked by #68 (`P3-AV6`).\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Evidence`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 69,
+        "state": "OPEN",
+        "title": "[P3-AV7] Visual verifier and report linkage",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/69"
+      },
+      "labels": ["type:task", "component:evidence", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Evidence",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_70",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 70,
+        "state": "OPEN",
+        "title": "[P3-AV8] Codex-plugin interactive visual E2E gate",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/70"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_71",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 71,
+        "state": "OPEN",
+        "title": "[P3-AV9] Automated-cli real provider visual E2E gate",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/71"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_75",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- Blocked by #70 (`P3-AV8`).\n- Blocked by #71 (`P3-AV9`).\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 75,
+        "state": "OPEN",
+        "title": "[P3-E2E1] Public Beta real-use validation and failure taxonomy",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/75"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_76",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n- Hard blockers: none.\n\n## Metadata / Project Plan\n\n- Project Phase: intentionally unset because this is project operations work, not a roadmap product phase.\n- Project Status: `Todo`.\n- Project Work Type: `Task`.\n- Project Component: intentionally unset because the Project field lacks an Operations option.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
+        "number": 76,
+        "state": "OPEN",
+        "title": "[Task] Automate GitHub Project sync and verification",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/76"
+      },
+      "labels": ["type:task", "priority:P1", "component:project-management"],
+      "status": "In Progress",
+      "work Type": "Task",
+      "priority": "P1",
+      "workflow Status": "In Progress"
+    }
+  ]
+}
