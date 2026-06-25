@@ -1242,7 +1242,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Visual provider. Repeatable or comma-separated. Defaults to "
             "local-page, local-image-fixture, local-screenshot-fixture. Use "
-            "brave-image-search for the credential-gated real web image search adapter."
+            "brave-image-search for the credential- and storage-confirmation-gated "
+            "real web image search adapter."
         ),
     )
     acquire_visual.add_argument(
