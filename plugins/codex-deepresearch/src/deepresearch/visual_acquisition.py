@@ -17,6 +17,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
+from .browser_screenshot import (
+    BrowserScreenshotTransport,
+    PlaywrightBrowserTransport,
+    collect_browser_screenshot_candidates,
+)
 from .cache_keys import normalize_url
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, SEARCH_ROUTES, validate_artifacts
 from .pdf_rasterizer import (
@@ -45,6 +50,7 @@ DEFAULT_VISUAL_PROVIDERS = (
     DEFAULT_PDF_RASTERIZER_PROVIDER,
 )
 BRAVE_IMAGE_PROVIDER = "brave-image-search"
+BROWSER_SCREENSHOT_PROVIDER = "browser-screenshot"
 BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
 BRAVE_DEFAULT_SEARCH_LANG = "en"
 BRAVE_DEFAULT_COUNTRY = "US"
@@ -144,15 +150,16 @@ def acquire_visual_candidates(
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
     real_image_search_transport: _BraveImageSearchTransport | None = None,
     real_image_search_config: Mapping[str, Any] | None = None,
+    browser_transport: BrowserScreenshotTransport | None = None,
     max_pdf_bytes: int = DEFAULT_MAX_PDF_BYTES,
 ) -> dict[str, Any]:
     """Collect visual candidates for visual routes.
 
     The default local providers remain deterministic and never call live web,
-    browser automation, OCR services, VLMs, or external APIs. Selecting a real
-    provider such as ``brave-image-search`` uses the configured provider adapter
-    and writes candidate discovery records only; image fetch and VLM analysis
-    stay separate stages.
+    OCR services, VLMs, or external APIs. Selecting a configured provider such
+    as ``brave-image-search`` or ``browser-screenshot`` uses the provider
+    adapter but still keeps image fetch, VLM analysis, and verifier linkage as
+    separate stages.
     """
 
     if max_image_bytes < 1:
@@ -187,6 +194,7 @@ def acquire_visual_candidates(
         provider_names,
         real_image_search_transport=real_image_search_transport,
         real_image_search_config=real_image_search_config,
+        browser_transport=browser_transport,
         evidence=evidence,
     )
     real_provider_requested = any(_is_real_provider_name(provider.name) for provider in provider_instances)
@@ -246,14 +254,28 @@ def acquire_visual_candidates(
         )
 
     if real_provider_requested:
-        selected: list[dict[str, Any]] = []
+        selected = []
+        metadata_candidates, artifact_candidates = _split_real_candidate_records(candidates)
         candidate_records = _normalize_real_candidate_records(
-            candidates=candidates,
+            candidates=metadata_candidates,
             evidence=evidence,
             run_dir=run_dir,
             created_at=now,
         )
-        near_duplicate_groups: list[dict[str, Any]] = []
+        if artifact_candidates:
+            artifact_selected, artifact_records, near_duplicate_groups = (
+                _validate_and_select_candidates(
+                    run_dir=run_dir,
+                    evidence=evidence,
+                    candidates=artifact_candidates,
+                    max_image_bytes=max_image_bytes,
+                    created_at=now,
+                )
+            )
+            selected.extend(artifact_selected)
+            candidate_records.extend(artifact_records)
+        else:
+            near_duplicate_groups = []
     else:
         selected, candidate_records, near_duplicate_groups = _validate_and_select_candidates(
             run_dir=run_dir,
@@ -274,6 +296,15 @@ def acquire_visual_candidates(
         candidate_records=candidate_records,
         image_fetch_records=image_fetch_records,
     )
+    provider_statuses = _reconcile_screenshot_provider_statuses_after_validation(
+        provider_statuses=provider_statuses,
+        candidate_records=candidate_records,
+        image_fetch_records=image_fetch_records,
+    )
+    real_provider_succeeded = _real_provider_succeeded(
+        provider_statuses=provider_statuses,
+        image_fetch_records=image_fetch_records,
+    )
     visual_search_plan = _visual_search_plan(
         run_dir=run_dir,
         evidence=evidence,
@@ -285,24 +316,24 @@ def acquire_visual_candidates(
     )
     visual_status = (
         "real_image_search_candidates_collected"
-        if real_provider_requested and candidate_records
+        if real_provider_requested and real_provider_succeeded
         else "partial_auto_visual"
         if real_provider_requested
         else "fixture_visual_provider"
     )
-    visual_ok = not real_provider_requested or bool(candidate_records)
-    visual_terminal = real_provider_requested and not candidate_records
+    visual_ok = not real_provider_requested or real_provider_succeeded
+    visual_terminal = real_provider_requested and not real_provider_succeeded
     metric_classification = (
         "real_provider_candidate_discovery"
-        if real_provider_requested and candidate_records
+        if real_provider_requested and real_provider_succeeded
         else "included_failure"
         if real_provider_requested
         else "fixture_only_not_release_eligible"
     )
     actionable_cause = (
-        "configured real image search provider returned normalized candidates"
-        if real_provider_requested and candidate_records
-        else "configured real image search provider returned no image candidates"
+        "configured real visual provider returned successful candidates"
+        if real_provider_requested and real_provider_succeeded
+        else "configured real visual provider returned no successful candidates"
         if real_provider_requested
         else (
             "deterministic fixture/manual visual providers validate mechanics; "
@@ -338,7 +369,7 @@ def acquire_visual_candidates(
         "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
         "status": (
             "real_image_search_candidates_collected"
-            if real_provider_requested and candidate_records
+            if real_provider_requested and real_provider_succeeded
             else "partial_auto_visual"
             if real_provider_requested
             else "visual_candidates_collected"
@@ -407,7 +438,7 @@ def acquire_visual_candidates(
     )
     status_name = (
         "real_image_search_candidates_collected"
-        if real_provider_requested and candidate_records
+        if real_provider_requested and real_provider_succeeded
         else "partial_auto_visual"
         if real_provider_requested
         else "visual_candidates_collected"
@@ -648,6 +679,58 @@ class _LocalScreenshotFixtureProvider:
                 )
             )
         return records
+
+class _BrowserScreenshotProvider:
+    name = BROWSER_SCREENSHOT_PROVIDER
+
+    def __init__(self, transport: BrowserScreenshotTransport | None = None) -> None:
+        self._transport = transport
+        self.last_status: dict[str, Any] = _default_provider_status(
+            self.name,
+            candidates=0,
+            invoked=False,
+        )
+
+    def initial_status(self) -> dict[str, Any]:
+        active_transport = self._transport or PlaywrightBrowserTransport()
+        available, unavailable_reason = active_transport.availability()
+        return {
+            "provider": self.name,
+            "provider_kind": "screenshot",
+            "provider_mode": _browser_transport_provider_mode(active_transport),
+            "provider_run_id": None,
+            "configured": True,
+            "available": available,
+            "blocked_reason": unavailable_reason,
+            "invoked": False,
+            "invocations": 0,
+            "candidates": 0,
+            "candidates_discovered": 0,
+            "artifacts_fetched": 0,
+            "vlm_images_analyzed": 0,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "last_error": unavailable_reason,
+            "external_network_call": False,
+            "external_vlm_call": False,
+            "transport": active_transport.name,
+            "diagnostics": {"transport": active_transport.name},
+        }
+
+    def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
+        collection = collect_browser_screenshot_candidates(
+            run_dir=context.run_dir,
+            evidence=context.evidence,
+            sources=tuple(context.source_by_id.values()),
+            routes=context.routes,
+            screenshot_modes=context.screenshot_modes,
+            created_at=context.created_at,
+            transport=self._transport,
+            provider=self.name,
+        )
+        self.last_status = collection.provider_status
+        return collection.candidates
+
 
 class _HttpBraveImageSearchTransport:
     def fetch(
@@ -1308,13 +1391,37 @@ def _validate_and_select_candidates(
             record["status"] = "removed"
             record["removal_reasons"] = removal_reasons
             record["analysis_status"] = "skipped"
+            policy_block_reasons = {
+                "access_denied",
+                "access_controlled",
+                "captcha",
+                "captcha_protected",
+                "captcha_required",
+                "copyright_restricted",
+                "license_policy_blocked",
+                "login_gated",
+                "login_required",
+                "paywall",
+                "paywalled",
+                "pii_detected",
+                "policy_blocked",
+                "policy_decision_blocked",
+                "requires_login",
+                "robots_blocked",
+                "robots_disallowed",
+            }
             if "budget_pruned" in removal_reasons:
                 record["candidate_status"] = "budget_pruned"
                 record["policy_decision"] = "budget_pruned"
-            elif record.get("policy_decision") == "blocked":
+            elif record.get("policy_decision") == "blocked" or (
+                set(removal_reasons) & policy_block_reasons
+            ):
                 record["candidate_status"] = "policy_blocked"
+                record["policy_decision"] = "blocked"
                 record["analysis_status"] = "policy_blocked"
-            elif set(removal_reasons) & pdf_failure_reasons:
+            elif record.get("candidate_status") == "fetch_failed" or (
+                set(removal_reasons) & pdf_failure_reasons
+            ):
                 record["candidate_status"] = "fetch_failed"
             else:
                 record["candidate_status"] = "rejected"
@@ -1331,12 +1438,21 @@ def _validate_and_select_candidates(
             _mark_pdf_budget_pruned(record)
         else:
             record["status"] = "accepted"
-            record["candidate_status"] = "analyzed"
             record["removal_reasons"] = []
-            selected.append(_observation_from_candidate(record))
+            if record.get("requires_vlm_observation") is True:
+                record["candidate_status"] = "fetched"
+                record["analysis_status"] = "skipped"
+                record["supportable_evidence"] = False
+                record.setdefault("caveats", []).append(
+                    "requires_vlm_observation_and_verifier_linkage"
+                )
+            else:
+                record["candidate_status"] = "analyzed"
+                selected.append(_observation_from_candidate(record))
         record["rejection_reason"] = (
             record["removal_reasons"][0] if record.get("removal_reasons") else None
         )
+        _sync_nested_screenshot_validation_metadata(record)
         records.append(_persistable_candidate(record))
 
     return selected, records, list(near_duplicate_groups.values())
@@ -1415,6 +1531,28 @@ def _provider_statuses_after_selection(
             record["pdf_pages_skipped"] = pdf_skipped_by_provider.get(provider, 0)
         updated.append(record)
     return updated
+
+
+def _sync_nested_screenshot_validation_metadata(record: dict[str, Any]) -> None:
+    screenshot = record.get("screenshot")
+    if not isinstance(screenshot, Mapping) or record.get("status") != "removed":
+        return
+    reason = _string(record.get("rejection_reason")) or _string(
+        record.get("candidate_status")
+    ) or "removed"
+    updated = dict(screenshot)
+    updated.update(
+        {
+            "supported": False,
+            "unsupported_reason": reason,
+            "candidate_status": record.get("candidate_status"),
+            "rejection_reason": reason,
+            "failure_code": reason,
+            "policy_decision": record.get("policy_decision", "allowed"),
+            "policy_flags": list(_string_list(record.get("policy_flags"))),
+        }
+    )
+    record["screenshot"] = updated
 
 
 def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -1585,6 +1723,27 @@ def _normalize_real_candidate_records(
     return records
 
 
+def _split_real_candidate_records(
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    metadata_candidates: list[Mapping[str, Any]] = []
+    artifact_candidates: list[Mapping[str, Any]] = []
+    for candidate in candidates:
+        if _requires_local_artifact_validation(candidate):
+            artifact_candidates.append(candidate)
+        else:
+            metadata_candidates.append(candidate)
+    return metadata_candidates, artifact_candidates
+
+
+def _requires_local_artifact_validation(candidate: Mapping[str, Any]) -> bool:
+    return (
+        candidate.get("provider") == BROWSER_SCREENSHOT_PROVIDER
+        or candidate.get("provider_kind") == "screenshot"
+        or candidate.get("origin") == "screenshot"
+    )
+
+
 def _image_fetch_records_from_candidates(
     candidates: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1593,6 +1752,7 @@ def _image_fetch_records_from_candidates(
         candidate_id = str(candidate["candidate_id"])
         status = _fetch_status_for_candidate(candidate)
         fetched = status == "fetched"
+        requires_vlm_observation = candidate.get("requires_vlm_observation") is True
         record = {
             "fetch_id": _fetch_id_for_candidate_id(candidate_id),
             "candidate_id": candidate_id,
@@ -1607,7 +1767,7 @@ def _image_fetch_records_from_candidates(
             if isinstance(candidate.get("provider_provenance"), Mapping)
             else {},
             "fetch_status": status,
-            "http_status": None,
+            "http_status": candidate.get("http_status"),
             "mime_type": candidate.get("mime_type") if fetched else None,
             "byte_size": candidate.get("artifact_size_bytes") if fetched else None,
             "width": candidate.get("width") if fetched else None,
@@ -1615,7 +1775,9 @@ def _image_fetch_records_from_candidates(
             "hash": candidate.get("hash") if fetched else None,
             "phash": candidate.get("phash") if fetched else None,
             "local_artifact_path": candidate.get("local_artifact_path") if fetched else None,
-            "evidence_image_id": _image_id_for_candidate_id(candidate_id) if fetched else None,
+            "evidence_image_id": _image_id_for_candidate_id(candidate_id)
+            if fetched and not requires_vlm_observation
+            else None,
             "policy_decision": candidate.get("policy_decision", "allowed"),
             "policy_flags": list(candidate.get("policy_flags", []))
             if isinstance(candidate.get("policy_flags"), list)
@@ -1632,6 +1794,89 @@ def _image_fetch_records_from_candidates(
                 record[key] = dict(candidate[key])
         records.append(record)
     return records
+
+
+def _real_provider_succeeded(
+    *,
+    provider_statuses: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+) -> bool:
+    for status in provider_statuses:
+        provider_kind = _string(status.get("provider_kind")) or _provider_kind(
+            _string(status.get("provider")) or ""
+        )
+        if provider_kind == "web_image_search" and _int_or_zero(
+            status.get("candidates_discovered")
+        ) > 0:
+            return True
+    return any(
+        record.get("provider_kind") == "screenshot"
+        and record.get("fetch_status") == "fetched"
+        and isinstance(record.get("local_artifact_path"), str)
+        and bool(record.get("local_artifact_path"))
+        and isinstance(record.get("hash"), str)
+        and bool(record.get("hash"))
+        for record in image_fetch_records
+    )
+
+
+def _reconcile_screenshot_provider_statuses_after_validation(
+    *,
+    provider_statuses: Sequence[Mapping[str, Any]],
+    candidate_records: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    fetched_by_provider: dict[str, int] = {}
+    rejected_after_validation_by_provider: dict[str, int] = {}
+    for fetch in image_fetch_records:
+        if fetch.get("provider_kind") != "screenshot":
+            continue
+        provider = _string(fetch.get("provider"))
+        if not provider:
+            continue
+        if (
+            fetch.get("fetch_status") == "fetched"
+            and bool(_string(fetch.get("local_artifact_path")))
+            and bool(_string(fetch.get("hash")))
+        ):
+            fetched_by_provider[provider] = fetched_by_provider.get(provider, 0) + 1
+    for candidate in candidate_records:
+        if candidate.get("provider_kind") != "screenshot":
+            continue
+        if not isinstance(candidate.get("raw_provider_metadata"), Mapping):
+            continue
+        if candidate.get("candidate_status") == "fetched":
+            continue
+        provider = _string(candidate.get("provider"))
+        if not provider:
+            continue
+        rejected_after_validation_by_provider[provider] = (
+            rejected_after_validation_by_provider.get(provider, 0) + 1
+        )
+
+    reconciled: list[dict[str, Any]] = []
+    for status in provider_statuses:
+        updated = dict(status)
+        provider = _string(updated.get("provider"))
+        provider_kind = _string(updated.get("provider_kind")) or _provider_kind(provider)
+        has_browser_capture_counters = any(
+            counter in updated
+            for counter in ("captures_attempted", "captures_completed", "captures_succeeded")
+        )
+        if provider and provider_kind == "screenshot" and has_browser_capture_counters:
+            completed = _int_or_zero(updated.get("captures_completed"))
+            if completed == 0:
+                completed = _int_or_zero(updated.get("captures_succeeded"))
+            validated = fetched_by_provider.get(provider, 0)
+            updated["captures_completed"] = completed
+            updated["captures_succeeded"] = validated
+            updated["captures_validated"] = validated
+            updated["captures_rejected_after_validation"] = (
+                rejected_after_validation_by_provider.get(provider, 0)
+            )
+            updated["artifacts_fetched"] = validated
+        reconciled.append(updated)
+    return reconciled
 
 
 def _visual_search_plan(
@@ -1765,6 +2010,16 @@ def _visual_provider_status(
                 ),
             }
         )
+        for counter in (
+            "captures_attempted",
+            "captures_completed",
+            "captures_succeeded",
+            "captures_validated",
+            "captures_rejected_after_validation",
+            "captures_skipped",
+        ):
+            if counter in provider_status:
+                providers[-1][counter] = _int_or_zero(provider_status.get(counter))
     return {
         "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
         "run_id": run_dir.name,
@@ -1838,15 +2093,34 @@ def _score_from_rank(rank: int) -> float:
 
 
 def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
+    reasons = set(_string_list(candidate.get("removal_reasons")))
+    policy_block_reasons = {
+        "access_denied",
+        "access_controlled",
+        "captcha",
+        "captcha_protected",
+        "captcha_required",
+        "copyright_restricted",
+        "license_policy_blocked",
+        "login_gated",
+        "login_required",
+        "paywall",
+        "paywalled",
+        "pii_detected",
+        "policy_blocked",
+        "policy_decision_blocked",
+        "requires_login",
+        "robots_blocked",
+        "robots_disallowed",
+    }
+    if (
+        candidate.get("policy_decision") == "blocked"
+        or candidate.get("candidate_status") == "policy_blocked"
+        or reasons & policy_block_reasons
+    ):
+        return "policy_blocked"
     if candidate.get("status") == "accepted":
         return "fetched"
-    reasons = set(_string_list(candidate.get("removal_reasons")))
-    if candidate.get("policy_decision") == "blocked" or reasons & {
-        "access_blocked_pdf",
-        "policy_blocked_pdf",
-        "paywalled_pdf",
-    }:
-        return "policy_blocked"
     if "budget_pruned" in reasons:
         return "budget_pruned"
     if "unsupported_mime_type" in reasons:
@@ -1864,6 +2138,12 @@ def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
         return "failed"
     if reasons & {"duplicate_image_url", "duplicate_content_hash", "near_duplicate"}:
         return "deduped"
+    if candidate.get("candidate_status") == "fetch_failed" or reasons & {
+        "browser_transport_unavailable",
+        "capture_failed",
+        "retrieval_failed",
+    }:
+        return "failed"
     return "skipped"
 
 
@@ -2767,7 +3047,7 @@ def _sanitized_result_metadata(
 
 
 def _is_real_provider_name(provider: str) -> bool:
-    return provider == BRAVE_IMAGE_PROVIDER
+    return provider in {BRAVE_IMAGE_PROVIDER, BROWSER_SCREENSHOT_PROVIDER}
 
 
 def _uses_fixture_sources(provider_names: Sequence[str]) -> bool:
@@ -2818,10 +3098,17 @@ def _default_provider_status(
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
         "last_error": None,
-        "external_network_call": _is_real_provider_name(provider) and invoked,
+        "external_network_call": provider == BRAVE_IMAGE_PROVIDER and invoked,
         "external_vlm_call": False,
         "diagnostics": {},
     }
+
+
+def _browser_transport_provider_mode(transport: BrowserScreenshotTransport) -> str:
+    mode = _string(getattr(transport, "provider_mode", "real")) or "real"
+    if mode in {"real", "fixture", "manual", "user_provided"}:
+        return mode
+    return "real"
 
 
 def _blocked_actionable_cause(provider_statuses: Sequence[Mapping[str, Any]]) -> str:
@@ -2858,6 +3145,7 @@ def _providers(
     *,
     real_image_search_transport: _BraveImageSearchTransport | None,
     real_image_search_config: Mapping[str, Any] | None,
+    browser_transport: BrowserScreenshotTransport | None,
     evidence: Mapping[str, Any],
 ) -> list[_VisualProvider]:
     providers: list[_VisualProvider] = []
@@ -2872,6 +3160,8 @@ def _providers(
             providers.append(_LocalImageFixtureProvider())
         elif name == "local-screenshot-fixture":
             providers.append(_LocalScreenshotFixtureProvider())
+        elif name == BROWSER_SCREENSHOT_PROVIDER:
+            providers.append(_BrowserScreenshotProvider(transport=browser_transport))
         elif name == BRAVE_IMAGE_PROVIDER:
             providers.append(
                 _BraveImageSearchProvider(
