@@ -20,9 +20,16 @@ class FakeBrowserTransport:
     name = "fake-browser"
     provider_mode = "fixture"
 
-    def __init__(self, *, available: bool = True, http_status: int = 200) -> None:
+    def __init__(
+        self,
+        *,
+        available: bool = True,
+        http_status: int = 200,
+        capture_error: str | None = None,
+    ) -> None:
         self._available = available
         self._http_status = http_status
+        self._capture_error = capture_error
         self.calls: list[dict[str, Any]] = []
 
     def availability(self) -> tuple[bool, str | None]:
@@ -48,6 +55,10 @@ class FakeBrowserTransport:
                 "timeout_ms": timeout_ms,
             }
         )
+        if self._capture_error is not None:
+            from deepresearch.browser_screenshot import BrowserScreenshotError
+
+            raise BrowserScreenshotError(self._capture_error)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(
             b"\x89PNG\r\n\x1a\n"
@@ -58,6 +69,7 @@ class FakeBrowserTransport:
             height=1800 if full_page else int(viewport["height"]),
             http_status=self._http_status,
             final_url=url,
+            external_network_call=url.startswith(("http://", "https://")),
             provider_metadata={"fake": True},
         )
 
@@ -246,6 +258,48 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertEqual(provider["invocations"], 0)
         self.assertFalse(provider["external_network_call"])
 
+    def test_remote_capture_error_is_failed_acquisition_without_external_network(self) -> None:
+        run_dir = self.prepared_visual_run()
+        transport = FakeBrowserTransport(capture_error="browser executable missing")
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=("browser-screenshot",),
+            screenshot_modes=("first_viewport",),
+            browser_transport=transport,
+        )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(result["candidate_records"], 1)
+        self.assertEqual(result["selected_observations"], 0)
+        self.assertFalse(result["external_network_call"])
+        self.assertTrue(result["visual_artifact_validation"]["valid"])
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(candidates[0]["candidate_status"], "fetch_failed")
+        self.assertEqual(candidates[0]["rejection_reason"], "capture_failed")
+        self.assertIn("capture_failed", candidates[0]["removal_reasons"])
+        self.assertFalse(candidates[0]["provider_provenance"]["external_network_call"])
+        self.assertEqual(fetches[0]["fetch_status"], "failed")
+        self.assertEqual(fetches[0]["failure_code"], "capture_failed")
+        self.assertIsNone(fetches[0]["local_artifact_path"])
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertFalse(provider_status["ok"])
+        self.assertTrue(provider_status["terminal"])
+        self.assertTrue(provider["available"])
+        self.assertEqual(provider["invocations"], 1)
+        self.assertEqual(provider["artifacts_fetched"], 0)
+        self.assertEqual(provider["last_error"], "browser executable missing")
+        self.assertFalse(provider["external_network_call"])
+        self.assertEqual(result["providers"][0]["captures_succeeded"], 0)
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.assertFalse(evidence["visual_acquisition"]["external_network_call"])
+
     def test_access_denied_http_status_after_navigation_is_policy_blocked(self) -> None:
         run_dir = self.prepared_visual_run()
         transport = FakeBrowserTransport(http_status=403)
@@ -349,6 +403,40 @@ class BrowserScreenshotTests(unittest.TestCase):
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         provider = provider_status["providers"][0]
         self.assertFalse(provider["external_network_call"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.assertFalse(evidence["visual_acquisition"]["external_network_call"])
+
+    def test_local_only_success_does_not_report_external_network(self) -> None:
+        run_dir = self.prepared_visual_run(
+            sources=[
+                self.public_source(
+                    id="src_local_allowed",
+                    url=(Path(tempfile.gettempdir()) / "local-only-browser-source.html").as_uri(),
+                    local_artifact_path="sources/local-only-browser-source.html",
+                )
+            ]
+        )
+        transport = FakeBrowserTransport()
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=("browser-screenshot",),
+            screenshot_modes=("first_viewport",),
+            browser_transport=transport,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertTrue(transport.calls[0]["url"].startswith("file://"))
+        self.assertFalse(result["external_network_call"])
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(candidates[0]["candidate_status"], "fetched")
+        self.assertFalse(candidates[0]["provider_provenance"]["external_network_call"])
+        provider = self.read_json(run_dir / "visual_provider_status.json")["providers"][0]
+        self.assertEqual(provider["artifacts_fetched"], 1)
+        self.assertFalse(provider["external_network_call"])
+        self.assertEqual(result["providers"][0]["captures_succeeded"], 1)
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertFalse(evidence["visual_acquisition"]["external_network_call"])
 

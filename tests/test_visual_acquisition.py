@@ -70,6 +70,7 @@ class FakeBrowserScreenshotTransport:
             height=int(viewport["height"]),
             http_status=200,
             final_url=url,
+            external_network_call=url.startswith(("http://", "https://")),
             provider_metadata={"fake": True},
         )
 

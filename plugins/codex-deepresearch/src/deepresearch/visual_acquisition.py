@@ -280,6 +280,10 @@ def acquire_visual_candidates(
     visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
     image_fetch_records = _image_fetch_records_from_candidates(candidate_records)
+    real_provider_succeeded = _real_provider_succeeded(
+        provider_statuses=provider_statuses,
+        image_fetch_records=image_fetch_records,
+    )
     visual_search_plan = _visual_search_plan(
         run_dir=run_dir,
         evidence=evidence,
@@ -291,24 +295,24 @@ def acquire_visual_candidates(
     )
     visual_status = (
         "real_image_search_candidates_collected"
-        if real_provider_requested and candidate_records
+        if real_provider_requested and real_provider_succeeded
         else "partial_auto_visual"
         if real_provider_requested
         else "fixture_visual_provider"
     )
-    visual_ok = not real_provider_requested or bool(candidate_records)
-    visual_terminal = real_provider_requested and not candidate_records
+    visual_ok = not real_provider_requested or real_provider_succeeded
+    visual_terminal = real_provider_requested and not real_provider_succeeded
     metric_classification = (
         "real_provider_candidate_discovery"
-        if real_provider_requested and candidate_records
+        if real_provider_requested and real_provider_succeeded
         else "included_failure"
         if real_provider_requested
         else "fixture_only_not_release_eligible"
     )
     actionable_cause = (
-        "configured real image search provider returned normalized candidates"
-        if real_provider_requested and candidate_records
-        else "configured real image search provider returned no image candidates"
+        "configured real visual provider returned successful candidates"
+        if real_provider_requested and real_provider_succeeded
+        else "configured real visual provider returned no successful candidates"
         if real_provider_requested
         else (
             "deterministic fixture/manual visual providers validate mechanics; "
@@ -343,7 +347,7 @@ def acquire_visual_candidates(
         "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
         "status": (
             "real_image_search_candidates_collected"
-            if real_provider_requested and candidate_records
+            if real_provider_requested and real_provider_succeeded
             else "partial_auto_visual"
             if real_provider_requested
             else "visual_candidates_collected"
@@ -410,7 +414,7 @@ def acquire_visual_candidates(
     )
     status_name = (
         "real_image_search_candidates_collected"
-        if real_provider_requested and candidate_records
+        if real_provider_requested and real_provider_succeeded
         else "partial_auto_visual"
         if real_provider_requested
         else "visual_candidates_collected"
@@ -1575,6 +1579,30 @@ def _image_fetch_records_from_candidates(
             }
         )
     return records
+
+
+def _real_provider_succeeded(
+    *,
+    provider_statuses: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+) -> bool:
+    for status in provider_statuses:
+        provider_kind = _string(status.get("provider_kind")) or _provider_kind(
+            _string(status.get("provider")) or ""
+        )
+        if provider_kind == "web_image_search" and _int_or_zero(
+            status.get("candidates_discovered")
+        ) > 0:
+            return True
+        if provider_kind == "screenshot" and _int_or_zero(
+            status.get("captures_succeeded")
+        ) > 0:
+            return True
+    return any(
+        record.get("provider_kind") == "screenshot"
+        and record.get("fetch_status") == "fetched"
+        for record in image_fetch_records
+    )
 
 
 def _visual_search_plan(

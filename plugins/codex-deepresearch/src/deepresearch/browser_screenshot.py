@@ -64,6 +64,7 @@ class BrowserScreenshotCapture:
     mime_type: str = "image/png"
     http_status: int | None = None
     final_url: str | None = None
+    external_network_call: bool = False
     provider_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -154,6 +155,8 @@ class PlaywrightBrowserTransport:
                         height=height,
                         http_status=response.status if response is not None else None,
                         final_url=page.url,
+                        external_network_call=_is_remote_url(url)
+                        or _is_remote_url(page.url),
                         provider_metadata={"browser": "chromium", "headless": True},
                     )
                 finally:
@@ -192,7 +195,7 @@ def collect_browser_screenshot_candidates(
     captures_succeeded = 0
     captures_skipped = 0
     last_error: str | None = unavailable_reason
-    external_capture_attempted = False
+    confirmed_external_network_call = False
 
     for source in _capture_sources(sources):
         page_url = _page_url(source)
@@ -256,8 +259,6 @@ def collect_browser_screenshot_candidates(
 
             output_path = run_dir / relative_path
             captures_attempted += 1
-            if _is_remote_url(page_url):
-                external_capture_attempted = True
             try:
                 capture = active_transport.capture(
                     url=page_url,
@@ -279,6 +280,9 @@ def collect_browser_screenshot_candidates(
                 )
                 continue
 
+            confirmed_external_network_call = (
+                confirmed_external_network_call or capture.external_network_call
+            )
             final_url = capture.final_url or page_url
             post_navigation_decision = _post_navigation_decision(capture.http_status)
             if post_navigation_decision is not None:
@@ -330,7 +334,7 @@ def collect_browser_screenshot_candidates(
         "captures_attempted": captures_attempted,
         "captures_succeeded": captures_succeeded,
         "captures_skipped": captures_skipped,
-        "external_network_call": external_capture_attempted
+        "external_network_call": confirmed_external_network_call
         or candidate_external_network_call,
         "external_vlm_call": False,
         "transport": active_transport.name,
@@ -456,10 +460,7 @@ def _with_capture_context(
     updated = dict(record)
     screenshot = dict(updated["screenshot"])
     provider_provenance = dict(updated.get("provider_provenance", {}))
-    page_url = _string(updated.get("page_url"))
-    provider_provenance["external_network_call"] = _is_remote_url(page_url) or _is_remote_url(
-        final_url
-    )
+    provider_provenance["external_network_call"] = bool(capture.external_network_call)
     screenshot.update(
         {
             "supported": True,
