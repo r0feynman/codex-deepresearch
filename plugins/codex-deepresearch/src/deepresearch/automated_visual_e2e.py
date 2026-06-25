@@ -26,6 +26,13 @@ DEFAULT_MIN_VLM_IMAGES = 3
 _OPENAI_VISION_PROVIDER = "openai-responses-vision"
 _REAL_MODES = {"real"}
 _NON_RELEASE_MODES = {"fixture", "manual", "user_provided"}
+_REAL_ACQUISITION_PROVIDER_KINDS = {
+    "web_image_search",
+    "page_extractor",
+    "screenshot",
+    "pdf_rasterizer",
+    "visual_acquisition",
+}
 _SUCCESS_STATUS = "completed_auto_visual"
 _BLOCKED_TERMINAL_STATUSES = {
     "blocked_missing_visual_provider",
@@ -266,6 +273,7 @@ def evaluate_automated_visual_run(
     candidates = _read_optional_jsonl(artifacts["visual_candidates"])
     fetches = _read_optional_jsonl(artifacts["image_fetch_status"])
     observations = _read_optional_jsonl(artifacts["visual_observations"])
+    verifier_votes = _read_optional_jsonl(artifacts["verifier_votes"])
 
     loaded = {
         "run_status": run_status,
@@ -277,6 +285,7 @@ def evaluate_automated_visual_run(
         "visual_candidates": candidates,
         "image_fetch_status": fetches,
         "visual_observations": observations,
+        "verifier_votes": verifier_votes,
     }
     provider_terminal = _status_text(provider_status)
     run_terminal = _status_text(run_status)
@@ -338,7 +347,10 @@ def evaluate_automated_visual_run(
     report_claims = _report_cited_visual_claims(
         evidence if isinstance(evidence, Mapping) else {},
         report_status if isinstance(report_status, Mapping) else {},
+        candidate_records,
+        fetch_records,
         observation_records,
+        [item for item in verifier_votes or [] if isinstance(item, Mapping)],
         report_text or "",
     )
     non_release_records = _non_release_record_count(
@@ -729,6 +741,7 @@ def _artifact_paths(run_dir: Path) -> dict[str, Path]:
         "visual_candidates": run_dir / VISUAL_CANDIDATES_FILENAME,
         "image_fetch_status": run_dir / IMAGE_FETCH_STATUS_FILENAME,
         "visual_observations": run_dir / "visual_observations.jsonl",
+        "verifier_votes": run_dir / "verifier_votes.jsonl",
     }
 
 
@@ -739,7 +752,7 @@ def _artifact_failure_class(name: str) -> str:
         return "fetch"
     if name == "visual_observations":
         return "vlm"
-    if name in {"report_status", "report"}:
+    if name in {"report_status", "report", "verifier_votes"}:
         return "report-linkage"
     return "contradiction"
 
@@ -822,10 +835,7 @@ def _real_openai_observations(observations: Sequence[Mapping[str, Any]]) -> list
     return [
         item
         for item in observations
-        if item.get("provider") == _OPENAI_VISION_PROVIDER
-        and item.get("provider_kind") == "vlm"
-        and item.get("provider_mode") == "real"
-        and item.get("observation_status") == "analyzed"
+        if _is_real_openai_analyzed_observation(item)
     ]
 
 
@@ -838,6 +848,9 @@ def _has_real_openai_provider(provider_status: Any, *, min_vlm_images: int) -> b
             provider.get("provider") == _OPENAI_VISION_PROVIDER
             and provider.get("provider_kind") == "vlm"
             and provider.get("provider_mode") == "real"
+            and provider.get("configured") is True
+            and provider.get("available") is True
+            and not provider.get("blocked_reason")
             and int(provider.get("vlm_images_analyzed") or 0) >= min_vlm_images
             and int(provider.get("invocations") or 0) >= min_vlm_images
         ):
@@ -879,7 +892,10 @@ def _policy_blocks_release(
 def _report_cited_visual_claims(
     evidence: Mapping[str, Any],
     report_status: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    fetches: Sequence[Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
+    verifier_votes: Sequence[Mapping[str, Any]],
     report_text: str,
 ) -> list[dict[str, Any]]:
     used_images = {
@@ -889,14 +905,27 @@ def _report_cited_visual_claims(
     }
     if not used_images:
         return []
-    observation_report_pairs = {
-        (str(link.get("claim_id")), str(item.get("evidence_image_id")))
-        for item in observations
-        if isinstance(item, Mapping)
-        for link in item.get("report_links", [])
-        if isinstance(link, Mapping)
-        and isinstance(link.get("claim_id"), str)
-        and isinstance(item.get("evidence_image_id"), str)
+    candidates_by_id = {
+        str(item.get("candidate_id")): item
+        for item in candidates
+        if isinstance(item.get("candidate_id"), str) and item.get("candidate_id")
+    }
+    fetches_by_id = {
+        str(item.get("fetch_id")): item
+        for item in fetches
+        if isinstance(item.get("fetch_id"), str) and item.get("fetch_id")
+    }
+    images_by_id = {
+        str(image.get("id")): image
+        for image in evidence.get("images", [])
+        if isinstance(image, Mapping)
+        and isinstance(image.get("id"), str)
+        and image.get("id")
+    }
+    verifier_vote_ids = {
+        str(vote.get("id"))
+        for vote in verifier_votes
+        if isinstance(vote.get("id"), str) and vote.get("id")
     }
     cited: list[dict[str, Any]] = []
     for claim in evidence.get("claims", []) if isinstance(evidence.get("claims"), list) else []:
@@ -917,14 +946,156 @@ def _report_cited_visual_claims(
         linked_images = supporting_images & used_images
         if not linked_images:
             continue
-        if not any((claim_id, image_id) in observation_report_pairs for image_id in linked_images):
-            continue
         if report_text and claim_id not in report_text and not any(
             image_id in report_text for image_id in linked_images
         ):
             continue
-        cited.append({"claim_id": claim_id, "image_ids": sorted(linked_images)})
+        release_linked_images = sorted(
+            image_id
+            for image_id in linked_images
+            if _has_real_report_cited_observation(
+                claim=claim,
+                claim_id=claim_id,
+                image_id=image_id,
+                candidates_by_id=candidates_by_id,
+                fetches_by_id=fetches_by_id,
+                images_by_id=images_by_id,
+                observations=observations,
+                verifier_vote_ids=verifier_vote_ids,
+            )
+        )
+        if release_linked_images:
+            cited.append({"claim_id": claim_id, "image_ids": release_linked_images})
     return cited
+
+
+def _has_real_report_cited_observation(
+    *,
+    claim: Mapping[str, Any],
+    claim_id: str,
+    image_id: str,
+    candidates_by_id: Mapping[str, Mapping[str, Any]],
+    fetches_by_id: Mapping[str, Mapping[str, Any]],
+    images_by_id: Mapping[str, Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+    verifier_vote_ids: set[str],
+) -> bool:
+    image = images_by_id.get(image_id)
+    if image is None or not _is_real_policy_allowed_acquisition_record(image):
+        return False
+    for observation in observations:
+        if observation.get("evidence_image_id") != image_id:
+            continue
+        if not _is_real_openai_analyzed_observation(observation):
+            continue
+        if not _has_report_link(observation, claim_id):
+            continue
+        if not _has_verifier_vote_link(observation, claim_id, verifier_vote_ids):
+            continue
+        candidate_id = observation.get("candidate_id")
+        fetch_id = observation.get("fetch_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            continue
+        if not isinstance(fetch_id, str) or not fetch_id:
+            continue
+        candidate = candidates_by_id.get(candidate_id)
+        fetch = fetches_by_id.get(fetch_id)
+        if candidate is None or fetch is None:
+            continue
+        if not _is_real_policy_allowed_acquisition_record(candidate):
+            continue
+        if not _is_real_policy_allowed_fetch(fetch, image_id=image_id, candidate_id=candidate_id):
+            continue
+        if image.get("candidate_id") not in {None, candidate_id}:
+            continue
+        if image.get("fetch_id") not in {None, fetch_id}:
+            continue
+        if not _claim_visual_supports_image(claim, image_id):
+            continue
+        return True
+    return False
+
+
+def _is_real_openai_analyzed_observation(record: Mapping[str, Any]) -> bool:
+    provenance = record.get("provider_provenance")
+    return (
+        record.get("provider") == _OPENAI_VISION_PROVIDER
+        and record.get("provider_kind") == "vlm"
+        and record.get("provider_mode") == "real"
+        and record.get("observation_status") == "analyzed"
+        and record.get("policy_decision") == "allowed"
+        and isinstance(provenance, Mapping)
+        and provenance.get("provider") == _OPENAI_VISION_PROVIDER
+        and provenance.get("provider_kind") == "vlm"
+        and provenance.get("provider_mode") == "real"
+        and bool(record.get("external_vlm_call") or provenance.get("external_vlm_call"))
+    )
+
+
+def _is_real_policy_allowed_acquisition_record(record: Mapping[str, Any]) -> bool:
+    provenance = record.get("provider_provenance")
+    return (
+        record.get("provider_mode") == "real"
+        and record.get("provider_kind") in _REAL_ACQUISITION_PROVIDER_KINDS
+        and record.get("policy_decision") == "allowed"
+        and isinstance(provenance, Mapping)
+        and provenance.get("provider_mode") == "real"
+        and provenance.get("provider_kind") in _REAL_ACQUISITION_PROVIDER_KINDS
+    )
+
+
+def _is_real_policy_allowed_fetch(
+    fetch: Mapping[str, Any],
+    *,
+    image_id: str,
+    candidate_id: str,
+) -> bool:
+    return (
+        _is_real_policy_allowed_acquisition_record(fetch)
+        and fetch.get("fetch_status") == "fetched"
+        and fetch.get("candidate_id") == candidate_id
+        and fetch.get("evidence_image_id") == image_id
+    )
+
+
+def _has_report_link(observation: Mapping[str, Any], claim_id: str) -> bool:
+    for link in observation.get("report_links", []):
+        if not isinstance(link, Mapping):
+            continue
+        if link.get("claim_id") != claim_id:
+            continue
+        if link.get("citation_id") or link.get("report_section_id"):
+            return True
+    return False
+
+
+def _has_verifier_vote_link(
+    observation: Mapping[str, Any],
+    claim_id: str,
+    verifier_vote_ids: set[str],
+) -> bool:
+    if not verifier_vote_ids:
+        return False
+    for link in observation.get("verifier_links", []):
+        if not isinstance(link, Mapping):
+            continue
+        if link.get("claim_id") != claim_id:
+            continue
+        vote_id = link.get("verifier_vote_id")
+        if isinstance(vote_id, str) and vote_id in verifier_vote_ids:
+            return True
+    return False
+
+
+def _claim_visual_supports_image(claim: Mapping[str, Any], image_id: str) -> bool:
+    for support in claim.get("visual_supports", []):
+        if not isinstance(support, Mapping):
+            continue
+        if support.get("image_id") == image_id and isinstance(
+            support.get("observation_ref"), str
+        ):
+            return True
+    return False
 
 
 def _scenario_plan_matches(plan: Any, scenario: AutomatedVisualScenario) -> bool:

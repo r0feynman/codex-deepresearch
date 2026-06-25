@@ -224,6 +224,68 @@ class AutomatedVisualE2ETests(unittest.TestCase):
         self.assertEqual(result["counts"]["real_openai_responses_vision_observations"], 3)
         self.assertGreater(result["counts"]["excluded_non_release_records"], 0)
 
+    def test_strict_gate_rejects_unavailable_openai_provider_status_with_real_counters(
+        self,
+    ) -> None:
+        run_dir = self.write_real_scenario_run(
+            self.temp_dir() / "unavailable-openai-provider-run",
+            scenario_id="product_image_discovery",
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        openai_provider = provider_status["providers"][-1]
+        self.assertEqual(openai_provider["provider"], "openai-responses-vision")
+        openai_provider["configured"] = False
+        openai_provider["available"] = False
+        openai_provider["blocked_reason"] = "missing_openai_api_key"
+        openai_provider["last_error"] = "missing_openai_api_key"
+        self.write_json(run_dir / "visual_provider_status.json", provider_status)
+
+        result = evaluate_automated_visual_run(
+            run_dir,
+            scenario=self.scenario("product_image_discovery"),
+        )
+
+        failure_checks = {failure["check"] for failure in result["failures"]}
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["counts"]["real_openai_responses_vision_observations"], 3)
+        self.assertIn("openai_responses_vision_provider_status", failure_checks)
+        self.assertNotIn("openai_responses_vision_image_floor", failure_checks)
+
+    def test_report_cited_claim_requires_real_openai_observation_for_that_image(
+        self,
+    ) -> None:
+        run_dir = self.write_real_scenario_run(
+            self.temp_dir() / "fixture-cited-observation-run",
+            scenario_id="product_image_discovery",
+            observation_count=4,
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        for observation in observations:
+            if observation["evidence_image_id"] != "img_real_001":
+                continue
+            observation["provider_mode"] = "fixture"
+            observation["provider_provenance"] = {
+                "provider": "openai-responses-vision",
+                "provider_kind": "vlm",
+                "provider_mode": "fixture",
+                "external_vlm_call": False,
+            }
+            observation["estimated_cost_usd"] = 0.0
+            observation["actual_cost_usd"] = 0.0
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_automated_visual_run(
+            run_dir,
+            scenario=self.scenario("product_image_discovery"),
+        )
+
+        failure_checks = {failure["check"] for failure in result["failures"]}
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["counts"]["real_openai_responses_vision_observations"], 3)
+        self.assertIn("report_cited_visual_or_mixed_claim", failure_checks)
+        self.assertNotIn("openai_responses_vision_image_floor", failure_checks)
+        self.assertNotIn("openai_responses_vision_provider_status", failure_checks)
+
     def test_cli_outputs_blocked_diagnostics_with_allow_blocked(self) -> None:
         command = subprocess.run(
             [
