@@ -30,10 +30,13 @@ from .execution_mode import ConfigResolutionError, RunConfig, resolve_config
 from .fetch_claims import FetchClaimsError, fetch_claims
 from .fresh_session_e2e import (
     DEFAULT_FRESH_SESSION_INVOKE,
+    DEFAULT_FRESH_SESSION_VISUAL_INVOKE,
     DEFAULT_SCENARIO_TIMEOUT_SECONDS,
     FRESH_SESSION_E2E_SCHEMA_VERSION,
+    FRESH_SESSION_VISUAL_E2E_SCHEMA_VERSION,
     FreshSessionE2EError,
     run_fresh_session_e2e,
+    run_fresh_session_visual_e2e,
 )
 from .guardrails import GuardrailsError, enforce_guardrails
 from .invocation_router import RUN_STATUS_FILENAME, RUN_STATUS_SCHEMA_VERSION, run_skill_invocation
@@ -140,7 +143,9 @@ __all__ = [
     "EVIDENCE_REVIEW_SCHEMA_VERSION",
     "REVIEW_STATUS_FILENAME",
     "FRESH_SESSION_E2E_SCHEMA_VERSION",
+    "FRESH_SESSION_VISUAL_E2E_SCHEMA_VERSION",
     "DEFAULT_FRESH_SESSION_INVOKE",
+    "DEFAULT_FRESH_SESSION_VISUAL_INVOKE",
     "DEFAULT_SCENARIO_TIMEOUT_SECONDS",
     "TraceError",
     "TraceValidationError",
@@ -170,6 +175,7 @@ __all__ = [
     "fetch_claims",
     "inspect_evidence",
     "run_fresh_session_e2e",
+    "run_fresh_session_visual_e2e",
     "ingest_run",
     "ingest_manual_sources",
     "ingest_vision_observations",

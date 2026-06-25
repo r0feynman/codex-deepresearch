@@ -77,6 +77,20 @@ plugins/codex-deepresearch/scripts/codex-deepresearch automated-visual-e2e \
 
 The results file classifies provider, fetch, policy, VLM, contradiction, and report-linkage failures. Fixture, local test, manual-review, and user-provided-only visual evidence are reported but excluded from release numerator counts.
 
+## Fresh Session Visual E2E
+
+`fresh-session-visual-e2e` is the P3-AV8 public-safe visual gate. It keeps fixture/manual/user-provided visual evidence out of release-gate passes, records a blocked status when a visual-required prompt lacks a real visual/VLM provider, and only sets `release_gate_passed=true` for `completed_auto_visual` runs with at least 3 real Codex-interactive analyzed images and at least 1 report-cited visual or mixed claim.
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-visual-e2e \
+  --runs-dir /tmp/codex-deepresearch-fresh-session-visual-e2e \
+  --suite-id fresh-session-visual-e2e \
+  --clean \
+  --real-codex-interactive skip
+```
+
+The default `skip` mode is deterministic and CI-safe: the command exits successfully when the harness, transcript artifact exposure, fixture exclusion, and blocked-provider diagnostics are valid, but the result remains `release_gate_passed=false` with `release_gate_status=blocked_public_safe`. Use `--completed-auto-visual-run <run-dir-or-run_status.json>` with `--real-codex-interactive=require` for a strict local gate that fails unless real Codex-interactive visual capability produces validated `completed_auto_visual` artifacts.
+
 ## Resolve Config
 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:

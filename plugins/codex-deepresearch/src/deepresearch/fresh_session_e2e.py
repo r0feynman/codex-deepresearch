@@ -9,14 +9,27 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .visual_artifacts import (
+    IMAGE_FETCH_STATUS_FILENAME,
+    VISUAL_CANDIDATES_FILENAME,
+    VISUAL_PROVIDER_STATUS_FILENAME,
+    real_automatic_visual_release_counts,
+    validate_visual_artifacts,
+)
 
 FRESH_SESSION_E2E_SCHEMA_VERSION = "codex-deepresearch.fresh-session-e2e.v0"
+FRESH_SESSION_VISUAL_E2E_SCHEMA_VERSION = "codex-deepresearch.fresh-session-visual-e2e.v0"
 DEFAULT_FRESH_SESSION_INVOKE = (
     "$deep-research: Compare three public approaches for deterministic "
     "software release validation and cite the evidence quality tradeoffs."
 )
+DEFAULT_FRESH_SESSION_VISUAL_INVOKE = (
+    "$deep-research: Compare public product screenshots for three calculator "
+    "applications and cite the visual evidence differences."
+)
 DEFAULT_SCENARIO_TIMEOUT_SECONDS = 120.0
 REAL_CODEX_EXEC_MODES = ("auto", "require", "skip")
+REAL_CODEX_INTERACTIVE_MODES = ("auto", "require", "skip")
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = PLUGIN_ROOT.parents[1]
@@ -167,6 +180,140 @@ def run_fresh_session_e2e(
     return results
 
 
+def run_fresh_session_visual_e2e(
+    *,
+    runs_dir: str | Path,
+    suite_id: str = "fresh-session-visual-e2e",
+    invocation: str = DEFAULT_FRESH_SESSION_VISUAL_INVOKE,
+    clean: bool = False,
+    real_codex_interactive: str = "skip",
+    completed_auto_visual_run: str | Path | None = None,
+    runner_path: str | Path = RUNNER_PATH,
+    skill_path: str | Path = SKILL_PATH,
+    scenario_timeout_seconds: float = DEFAULT_SCENARIO_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run the fresh-session visual gate without fabricating real visual capability."""
+
+    if real_codex_interactive not in REAL_CODEX_INTERACTIVE_MODES:
+        raise FreshSessionE2EError(
+            "real_codex_interactive must be one of: "
+            + ", ".join(REAL_CODEX_INTERACTIVE_MODES)
+        )
+    if not invocation.startswith("$deep-research:"):
+        raise FreshSessionE2EError("fresh-session visual gate requires a $deep-research: invocation")
+
+    root_runs_dir = Path(runs_dir)
+    suite_dir = root_runs_dir / suite_id
+    if suite_dir.exists():
+        if not clean:
+            raise FreshSessionE2EError(f"suite directory already exists: {suite_dir}")
+        shutil.rmtree(suite_dir)
+    suite_dir.mkdir(parents=True)
+    results_path = suite_dir / "fresh_session_visual_e2e_results.json"
+
+    runner = Path(runner_path)
+    scenarios: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    skill_transcript_gate = _skill_transcript_gate(
+        runner_path=runner,
+        skill_path=Path(skill_path),
+        invocation=invocation,
+    )
+    if skill_transcript_gate["status"] != "passed":
+        failures.append(
+            {
+                "check": "skill_transcript_gate",
+                "detail": skill_transcript_gate["detail"],
+            }
+        )
+
+    scenario_specs: list[Mapping[str, Any]] = [
+        _visual_fixture_scenario(invocation),
+        _visual_public_safe_provider_blocked_scenario(invocation),
+    ]
+    if completed_auto_visual_run is not None:
+        completed_run_status = _load_completed_auto_visual_run_status(
+            Path(completed_auto_visual_run)
+        )
+        scenario_specs.append(
+            _visual_completed_auto_visual_scenario(
+                completed_run_status,
+                invocation=invocation,
+            )
+        )
+
+    for scenario in scenario_specs:
+        summary = _run_scenario(
+            scenario,
+            suite_dir=suite_dir,
+            runner_path=runner,
+            skill_transcript_gate=skill_transcript_gate,
+            timeout_seconds=scenario_timeout_seconds,
+        )
+        scenarios.append(summary)
+        failures.extend(summary.get("failures", []))
+
+    acceptance = _visual_acceptance(scenarios)
+    if real_codex_interactive == "require" and not acceptance["release_gate_passed"]:
+        failures.append(
+            {
+                "check": "visual_release_gate_required",
+                "detail": (
+                    "real Codex-interactive visual mode was required, but no "
+                    "visual-required fresh-session scenario reached completed_auto_visual "
+                    "with release-grade evidence"
+                ),
+            }
+        )
+    for key in (
+        "completed_auto_visual_validation_rules_met",
+        "blocked_runs_name_missing_capability",
+        "blocked_runs_do_not_count_as_release_passes",
+        "fixture_manual_user_evidence_excluded",
+        "final_transcript_exposes_artifacts_and_status_summary",
+    ):
+        if acceptance[key] is not True:
+            failures.append(
+                {
+                    "check": key,
+                    "detail": "fresh-session visual E2E invariant did not pass",
+                }
+            )
+
+    release_gate_status = _visual_release_gate_status(
+        scenarios,
+        real_codex_interactive=real_codex_interactive,
+    )
+    results: dict[str, Any] = {
+        "schema_version": FRESH_SESSION_VISUAL_E2E_SCHEMA_VERSION,
+        "status": "passed" if not failures else "failed",
+        "release_gate_status": release_gate_status,
+        "release_gate_passed": acceptance["release_gate_passed"],
+        "suite_id": suite_id,
+        "suite_dir": str(suite_dir.resolve()),
+        "invocation": invocation,
+        "real_codex_interactive_mode": real_codex_interactive,
+        "completed_auto_visual_run": str(Path(completed_auto_visual_run).resolve())
+        if completed_auto_visual_run is not None
+        else None,
+        "scenario_timeout_seconds": scenario_timeout_seconds,
+        "skill_transcript_gate": skill_transcript_gate,
+        "scenarios": scenarios,
+        "outcome_counts": _visual_outcome_counts(scenarios),
+        "acceptance": acceptance,
+        "failures": failures,
+        "artifacts": {"results": str(results_path.resolve())},
+        "public_safe": True,
+    }
+    _write_json(results_path, results)
+    if failures:
+        raise FreshSessionE2EError(
+            f"fresh-session visual E2E gate failed; see {results_path}",
+            results_path=results_path,
+        )
+    return results
+
+
 def render_final_response(
     run_status: Mapping[str, Any],
     *,
@@ -187,6 +334,16 @@ def render_final_response(
     )
     provenance = (
         run_status.get("provenance") if isinstance(run_status.get("provenance"), Mapping) else {}
+    )
+    visual_release_gate = (
+        run_status.get("visual_release_gate")
+        if isinstance(run_status.get("visual_release_gate"), Mapping)
+        else {}
+    )
+    visual_provider = (
+        run_status.get("visual_provider")
+        if isinstance(run_status.get("visual_provider"), Mapping)
+        else {}
     )
     lines = [
         "DeepResearch fresh-session transcript result",
@@ -213,8 +370,25 @@ def render_final_response(
             f"attempted={provenance.get('attempted_real_child_execution', False)}, "
             f"accepted_shards={provenance.get('accepted_shards', 0)}"
         ),
-        "Artifacts:",
     ]
+    if visual_release_gate:
+        lines.append(
+            "Visual summary: "
+            f"release_gate_passed={visual_release_gate.get('release_gate_passed')}, "
+            f"status={visual_release_gate.get('status')}, "
+            f"codex_interactive_analyzed_images="
+            f"{visual_release_gate.get('codex_interactive_analyzed_images', 0)}, "
+            f"report_cited_visual_claims="
+            f"{visual_release_gate.get('report_cited_visual_or_mixed_claims', 0)}, "
+            f"blocked_capability={visual_release_gate.get('blocked_capability')}"
+        )
+    elif visual_provider:
+        lines.append(
+            "Visual summary: "
+            f"provider_status={visual_provider.get('status')}, "
+            f"blocked_capability={_blocked_capability(run_status)}"
+        )
+    lines.append("Artifacts:")
     if isinstance(skill_transcript_gate, Mapping):
         lines.insert(
             2,
@@ -444,11 +618,47 @@ def _run_scenario(
                 exc=exc,
             )
 
+    response_run_status = run_status
+    visual_release_gate: dict[str, Any] | None = None
+    if scenario.get("visual_release_gate") is True:
+        visual_release_gate = _visual_release_gate(
+            run_status,
+            final_response="",
+            scenario_id=scenario_id,
+            check_final_response=False,
+        )
+        response_run_status = dict(run_status)
+        response_run_status["visual_release_gate"] = _visual_release_summary(
+            visual_release_gate
+        )
+
     final_response = render_final_response(
-        run_status,
+        response_run_status,
         scenario_id=scenario_id,
         skill_transcript_gate=skill_transcript_gate,
     )
+    if scenario.get("visual_release_gate") is True:
+        visual_release_gate = _visual_release_gate(
+            run_status,
+            final_response=final_response,
+            scenario_id=scenario_id,
+            check_final_response=True,
+        )
+        response_run_status = dict(run_status)
+        response_run_status["visual_release_gate"] = _visual_release_summary(
+            visual_release_gate
+        )
+        final_response = render_final_response(
+            response_run_status,
+            scenario_id=scenario_id,
+            skill_transcript_gate=skill_transcript_gate,
+        )
+        visual_release_gate = _visual_release_gate(
+            run_status,
+            final_response=final_response,
+            scenario_id=scenario_id,
+            check_final_response=True,
+        )
     transcript = (
         "# Fresh Session Transcript\n\n"
         "SKILL INSTRUCTIONS LOADED:\n"
@@ -462,7 +672,7 @@ def _run_scenario(
     )
     transcript_path.write_text(transcript, encoding="utf-8")
     validation = validate_final_response(
-        run_status=run_status,
+        run_status=response_run_status,
         final_response=final_response,
         scenario_id=scenario_id,
         skill_transcript_gate=skill_transcript_gate,
@@ -471,8 +681,26 @@ def _run_scenario(
     failures = list(validation["failures"])
     if not expected["ok"]:
         failures.append(_failure(scenario_id, expected["check"], expected["detail"]))
+    if visual_release_gate is not None:
+        expected_release = scenario.get("expected_release_gate_pass")
+        if expected_release is True and visual_release_gate["release_gate_passed"] is not True:
+            failures.append(
+                _failure(
+                    scenario_id,
+                    "visual_release_gate_not_passed",
+                    "scenario was expected to satisfy completed_auto_visual release criteria",
+                )
+            )
+        if expected_release is False and visual_release_gate["release_gate_passed"] is True:
+            failures.append(
+                _failure(
+                    scenario_id,
+                    "non_release_visual_scenario_counted",
+                    "fixture, manual, user-provided, or blocked visual evidence counted as a release pass",
+                )
+            )
 
-    return {
+    summary = {
         "id": scenario_id,
         "description": scenario["description"],
         "status": "passed" if not failures else "failed",
@@ -503,6 +731,9 @@ def _run_scenario(
         "validation": validation,
         "failures": failures,
     }
+    if visual_release_gate is not None:
+        summary["visual_release_gate"] = visual_release_gate
+    return summary
 
 
 def _fixture_scenario(invocation: str) -> dict[str, Any]:
@@ -527,6 +758,86 @@ def _fixture_scenario(invocation: str) -> dict[str, Any]:
             "--max-tasks",
             "3",
         ],
+    }
+
+
+def _visual_fixture_scenario(invocation: str) -> dict[str, Any]:
+    return {
+        "id": "visual_fixture_not_release_pass",
+        "description": (
+            "deterministic visual-required fixture coverage that must not satisfy "
+            "the real-use visual release gate"
+        ),
+        "invocation": invocation,
+        "expected_terminal_outcome": "completed_fixture",
+        "expected_release_gate_pass": False,
+        "visual_release_gate": True,
+        "command": [
+            "invoke",
+            invocation,
+            "--runs-dir",
+            "__RUNS_DIR__",
+            "--adapter",
+            "fixture",
+            "--route",
+            "visual_required",
+            "--budget",
+            "quick",
+            "--min-tasks",
+            "3",
+            "--max-tasks",
+            "3",
+        ],
+    }
+
+
+def _visual_public_safe_provider_blocked_scenario(invocation: str) -> dict[str, Any]:
+    return {
+        "id": "visual_required_provider_blocked",
+        "description": (
+            "visual-required fresh-session prompt records missing real visual provider "
+            "without counting as a release-gate pass"
+        ),
+        "invocation": invocation,
+        "expected_terminal_outcome": "blocked_explicit",
+        "expected_release_gate_pass": False,
+        "visual_release_gate": True,
+        "command": [
+            "invoke",
+            invocation,
+            "--runs-dir",
+            "__RUNS_DIR__",
+            "--adapter",
+            "codex-exec",
+            "--route",
+            "visual_required",
+            "--budget",
+            "quick",
+            "--min-tasks",
+            "1",
+            "--max-tasks",
+            "1",
+            "--no-degrade",
+        ],
+    }
+
+
+def _visual_completed_auto_visual_scenario(
+    run_status: Mapping[str, Any],
+    *,
+    invocation: str,
+) -> dict[str, Any]:
+    return {
+        "id": "visual_completed_auto_release_candidate",
+        "description": (
+            "operator-supplied completed_auto_visual artifact handoff must satisfy "
+            "the real-use visual release gate"
+        ),
+        "invocation": str(run_status.get("invocation") or invocation),
+        "expected_terminal_outcome": "completed_auto_visual",
+        "expected_release_gate_pass": True,
+        "visual_release_gate": True,
+        "run_status": dict(run_status),
     }
 
 
@@ -668,6 +979,333 @@ def _skipped_real_codex_scenario(
         "expected_terminal_outcome": "blocked_explicit",
         "run_status": run_status,
     }
+
+
+def _visual_release_gate(
+    run_status: Mapping[str, Any],
+    *,
+    final_response: str,
+    scenario_id: str,
+    check_final_response: bool,
+) -> dict[str, Any]:
+    status = str(run_status.get("status") or "")
+    run_dir = _run_dir_from_status(run_status)
+    artifacts = run_status.get("artifacts") if isinstance(run_status.get("artifacts"), Mapping) else {}
+    counts = _visual_evidence_counts(run_dir)
+    visual_artifact_validation = {"valid": False, "errors": []}
+    if status == "completed_auto_visual" and run_dir is not None:
+        validation = validate_visual_artifacts(run_dir=run_dir)
+        visual_artifact_validation = validation.to_dict()
+
+    artifact_exposure = _visual_artifact_exposure(
+        status=status,
+        run_dir=run_dir,
+        artifacts=artifacts,
+        final_response=final_response,
+        check_final_response=check_final_response,
+    )
+    checks = {
+        "status_completed_auto_visual": status == "completed_auto_visual",
+        "run_ok_terminal": run_status.get("ok") is True and run_status.get("terminal") is True,
+        "visual_artifacts_schema_valid": visual_artifact_validation.get("valid") is True,
+        "visual_provider_status_completed_auto_visual": (
+            counts["visual_provider_status_completed_auto_visual"]
+        ),
+        "codex_interactive_analyzed_non_fixture_images_at_least_3": (
+            counts["codex_interactive_analyzed_images"] >= 3
+        ),
+        "report_cited_visual_or_mixed_claim_at_least_1": (
+            counts["report_cited_visual_or_mixed_claims"] >= 1
+        ),
+        "fixture_manual_user_evidence_excluded": counts["release_evidence_is_non_fixture"],
+        "final_transcript_exposes_required_artifacts": artifact_exposure["ok"],
+        "final_transcript_exposes_status_summary": (
+            not check_final_response or "Visual summary:" in final_response
+        ),
+    }
+    release_gate_passed = all(checks.values())
+    failures = [
+        _failure(scenario_id, check, "visual release-gate check did not pass")
+        for check, passed in checks.items()
+        if passed is not True and status == "completed_auto_visual"
+    ]
+    failures.extend(artifact_exposure["failures"])
+    return {
+        "schema_version": FRESH_SESSION_VISUAL_E2E_SCHEMA_VERSION,
+        "status": status,
+        "release_gate_passed": release_gate_passed,
+        "blocked_capability": _blocked_capability(run_status),
+        "blocked_detail": _blocked_detail(run_status),
+        "codex_interactive_analyzed_images": counts["codex_interactive_analyzed_images"],
+        "report_cited_visual_or_mixed_claims": counts[
+            "report_cited_visual_or_mixed_claims"
+        ],
+        "non_release_visual_images": counts["non_release_visual_images"],
+        "real_automatic_visual_counts": counts["real_automatic_visual_counts"],
+        "visual_artifact_validation": visual_artifact_validation,
+        "required_response_artifacts": artifact_exposure["required_artifacts"],
+        "checks": checks,
+        "failures": failures,
+    }
+
+
+def _visual_release_summary(visual_release_gate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": visual_release_gate.get("status"),
+        "release_gate_passed": visual_release_gate.get("release_gate_passed"),
+        "blocked_capability": visual_release_gate.get("blocked_capability"),
+        "codex_interactive_analyzed_images": visual_release_gate.get(
+            "codex_interactive_analyzed_images", 0
+        ),
+        "report_cited_visual_or_mixed_claims": visual_release_gate.get(
+            "report_cited_visual_or_mixed_claims", 0
+        ),
+    }
+
+
+def _visual_artifact_exposure(
+    *,
+    status: str,
+    run_dir: Path | None,
+    artifacts: Mapping[str, Any],
+    final_response: str,
+    check_final_response: bool,
+) -> dict[str, Any]:
+    failures: list[dict[str, Any]] = []
+    required = _required_visual_artifacts(status)
+    if run_dir is None:
+        return {
+            "ok": status in _EXPLICIT_TERMINAL_STATUSES,
+            "required_artifacts": [],
+            "failures": failures,
+        }
+    exposed = True
+    for key in required:
+        value = artifacts.get(key)
+        if not isinstance(value, str) or not value.strip():
+            value = str(run_dir / _visual_artifact_filename(key))
+        artifact_path = Path(value) if Path(value).is_absolute() else run_dir / value
+        if not artifact_path.is_file():
+            exposed = False
+            failures.append(
+                _failure(
+                    "visual",
+                    f"missing_{key}_artifact_file",
+                    f"required visual artifact file does not exist: {artifact_path}",
+                )
+            )
+            continue
+        if check_final_response and str(artifact_path) not in final_response and value not in final_response:
+            exposed = False
+            failures.append(
+                _failure(
+                    "visual",
+                    f"missing_{key}_artifact_in_response",
+                    f"final response does not expose {key} artifact path",
+                )
+            )
+    if check_final_response and "Visual summary:" not in final_response:
+        exposed = False
+    return {"ok": exposed, "required_artifacts": required, "failures": failures}
+
+
+def _required_visual_artifacts(status: str) -> list[str]:
+    required = [
+        "run_status",
+        "evidence",
+        "visual_tasks",
+        "visual_observations",
+        "visual_provider_status",
+    ]
+    if status in _SYNTHESIZED_SUCCESS_STATUSES:
+        required.extend(["report", "report_status"])
+    if status == "completed_auto_visual":
+        required.extend(["visual_candidates", "image_fetch_status"])
+    return required
+
+
+def _visual_artifact_filename(key: str) -> str:
+    return {
+        "run_status": "run_status.json",
+        "evidence": "evidence.json",
+        "visual_tasks": "visual_tasks.json",
+        "visual_observations": "visual_observations.jsonl",
+        "visual_provider_status": VISUAL_PROVIDER_STATUS_FILENAME,
+        "report": "report.md",
+        "report_status": "report_status.json",
+        "visual_candidates": VISUAL_CANDIDATES_FILENAME,
+        "image_fetch_status": IMAGE_FETCH_STATUS_FILENAME,
+    }.get(key, key)
+
+
+def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
+    if run_dir is None:
+        return _empty_visual_counts()
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    report_status = _read_optional_json(run_dir / "report_status.json")
+    candidates = _read_optional_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+    fetches = _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+    observations = _read_optional_jsonl(run_dir / "visual_observations.jsonl")
+    visual_provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    images = _mapping_list(evidence.get("images") if isinstance(evidence, Mapping) else [])
+
+    codex_image_ids: set[str] = set()
+    for observation in observations:
+        if _is_codex_interactive_real_analyzed(observation):
+            image_id = observation.get("evidence_image_id")
+            if isinstance(image_id, str) and image_id:
+                codex_image_ids.add(image_id)
+
+    non_release_images = sum(
+        1
+        for image in images
+        if str(image.get("provider_mode") or "") in {"fixture", "manual", "user_provided"}
+    )
+    report_cited_claims = _report_cited_visual_or_mixed_claims(
+        evidence if isinstance(evidence, Mapping) else {},
+        report_status if isinstance(report_status, Mapping) else {},
+        eligible_image_ids=codex_image_ids,
+    )
+    return {
+        "codex_interactive_analyzed_images": len(codex_image_ids),
+        "report_cited_visual_or_mixed_claims": report_cited_claims,
+        "non_release_visual_images": non_release_images,
+        "release_evidence_is_non_fixture": non_release_images == 0,
+        "visual_provider_status_completed_auto_visual": (
+            isinstance(visual_provider_status, Mapping)
+            and visual_provider_status.get("status") == "completed_auto_visual"
+        ),
+        "real_automatic_visual_counts": real_automatic_visual_release_counts(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            visual_provider_status=visual_provider_status
+            if isinstance(visual_provider_status, Mapping)
+            else None,
+        ),
+    }
+
+
+def _empty_visual_counts() -> dict[str, Any]:
+    return {
+        "codex_interactive_analyzed_images": 0,
+        "report_cited_visual_or_mixed_claims": 0,
+        "non_release_visual_images": 0,
+        "release_evidence_is_non_fixture": True,
+        "visual_provider_status_completed_auto_visual": False,
+        "real_automatic_visual_counts": real_automatic_visual_release_counts(),
+    }
+
+
+def _is_codex_interactive_real_analyzed(record: Mapping[str, Any]) -> bool:
+    if record.get("provider_mode") != "real":
+        return False
+    provider_values = {
+        str(record.get(key) or "")
+        for key in (
+            "provider",
+            "visual_provider",
+            "analysis_provider",
+            "model_or_tool",
+            "vlm_provider",
+        )
+    }
+    if "codex-interactive" not in provider_values:
+        return False
+    status = str(record.get("observation_status") or record.get("analysis_status") or "")
+    return status == "analyzed" or bool(record.get("observations"))
+
+
+def _report_cited_visual_or_mixed_claims(
+    evidence: Mapping[str, Any],
+    report_status: Mapping[str, Any],
+    *,
+    eligible_image_ids: set[str],
+) -> int:
+    used_images = {
+        image_id
+        for image_id in report_status.get("used_images", [])
+        if isinstance(image_id, str) and image_id
+    }
+    used_images &= eligible_image_ids
+    if not used_images:
+        return 0
+    included_claims = _mapping_list(report_status.get("included_claims", []))
+    included_count = sum(
+        1
+        for claim in included_claims
+        if claim.get("claim_type") in {"visual", "mixed"}
+        and used_images.intersection(
+            image_id for image_id in claim.get("image_ids", []) if isinstance(image_id, str)
+        )
+    )
+    if included_count:
+        return included_count
+    included_ids = {
+        claim.get("claim_id")
+        for claim in included_claims
+        if isinstance(claim.get("claim_id"), str)
+    }
+    claims = _mapping_list(evidence.get("claims", []))
+    return sum(
+        1
+        for claim in claims
+        if claim.get("claim_type") in {"visual", "mixed"}
+        and claim.get("verification_status") == "supported"
+        and (not included_ids or claim.get("id") in included_ids)
+        and used_images.intersection(
+            image_id
+            for image_id in claim.get("supporting_images", [])
+            if isinstance(image_id, str)
+        )
+    )
+
+
+def _blocked_capability(run_status: Mapping[str, Any]) -> str | None:
+    diagnostics = (
+        run_status.get("diagnostics") if isinstance(run_status.get("diagnostics"), Mapping) else {}
+    )
+    required = diagnostics.get("required_capability")
+    if isinstance(required, str) and required:
+        return required
+    status = str(run_status.get("status") or "")
+    if status == "blocked_missing_visual_provider":
+        return "visual_provider"
+    if status == "blocked_missing_vlm_provider":
+        return "vlm_provider"
+    if status == "blocked_missing_search_handoff":
+        return "search_handoff"
+    actionable = str(diagnostics.get("actionable_cause") or "").lower()
+    if "codex exec" in actionable:
+        return "codex-exec"
+    if "visual" in actionable and "provider" in actionable:
+        return "visual_provider"
+    if "vlm" in actionable:
+        return "vlm_provider"
+    if "search" in actionable or "handoff" in actionable:
+        return "search_handoff"
+    return None
+
+
+def _blocked_detail(run_status: Mapping[str, Any]) -> str | None:
+    diagnostics = (
+        run_status.get("diagnostics") if isinstance(run_status.get("diagnostics"), Mapping) else {}
+    )
+    detail = diagnostics.get("actionable_cause")
+    return detail if isinstance(detail, str) and detail else None
+
+
+def _load_completed_auto_visual_run_status(path: Path) -> dict[str, Any]:
+    run_status_path = path if path.name == "run_status.json" else path / "run_status.json"
+    if not run_status_path.is_file():
+        raise FreshSessionE2EError(
+            "completed_auto_visual run must point to a run directory or run_status.json: "
+            f"{path}"
+        )
+    payload = json.loads(run_status_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise FreshSessionE2EError(f"run_status.json is not a JSON object: {run_status_path}")
+    return dict(payload)
 
 
 def _payload_from_subprocess(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -877,6 +1515,97 @@ def _acceptance(scenarios: Sequence[Mapping[str, Any]]) -> dict[str, bool]:
     }
 
 
+def _visual_acceptance(scenarios: Sequence[Mapping[str, Any]]) -> dict[str, bool]:
+    visual_gates = [
+        scenario.get("visual_release_gate")
+        for scenario in scenarios
+        if isinstance(scenario.get("visual_release_gate"), Mapping)
+    ]
+    blocked_gates = [
+        scenario.get("visual_release_gate")
+        for scenario in scenarios
+        if scenario.get("terminal_outcome") == "blocked_explicit"
+        and isinstance(scenario.get("visual_release_gate"), Mapping)
+    ]
+    fixture_gates = [
+        scenario.get("visual_release_gate")
+        for scenario in scenarios
+        if scenario.get("provenance_class") == "fixture_only"
+        and isinstance(scenario.get("visual_release_gate"), Mapping)
+    ]
+    release_gate_passed = any(gate.get("release_gate_passed") is True for gate in visual_gates)
+    blocked_capabilities = {
+        "codex-exec",
+        "search_handoff",
+        "visual_provider",
+        "vlm_provider",
+    }
+    return {
+        "visual_required_prompt_exercised": bool(visual_gates),
+        "release_gate_passed": release_gate_passed,
+        "completed_auto_visual_validation_rules_met": all(
+            gate.get("release_gate_passed") is True
+            for gate in visual_gates
+            if gate.get("status") == "completed_auto_visual"
+        ),
+        "blocked_runs_name_missing_capability": all(
+            gate.get("blocked_capability") in blocked_capabilities for gate in blocked_gates
+        ),
+        "blocked_runs_do_not_count_as_release_passes": all(
+            gate.get("release_gate_passed") is not True for gate in blocked_gates
+        ),
+        "fixture_manual_user_evidence_excluded": all(
+            gate.get("release_gate_passed") is not True for gate in fixture_gates
+        ),
+        "final_transcript_exposes_artifacts_and_status_summary": all(
+            gate.get("checks", {}).get("final_transcript_exposes_required_artifacts") is True
+            and gate.get("checks", {}).get("final_transcript_exposes_status_summary") is True
+            for gate in visual_gates
+        ),
+    }
+
+
+def _visual_release_gate_status(
+    scenarios: Sequence[Mapping[str, Any]],
+    *,
+    real_codex_interactive: str,
+) -> str:
+    gates = [
+        scenario.get("visual_release_gate")
+        for scenario in scenarios
+        if isinstance(scenario.get("visual_release_gate"), Mapping)
+    ]
+    if any(gate.get("release_gate_passed") is True for gate in gates):
+        return "passed"
+    if any(scenario.get("terminal_outcome") == "blocked_explicit" for scenario in scenarios):
+        return "blocked_public_safe"
+    if real_codex_interactive == "skip":
+        return "not_run_public_safe"
+    return "not_passed"
+
+
+def _visual_outcome_counts(scenarios: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counts = {
+        "release_gate_passed": 0,
+        "blocked_public_safe": 0,
+        "fixture_not_release_pass": 0,
+        "completed_auto_visual": 0,
+    }
+    for scenario in scenarios:
+        gate = scenario.get("visual_release_gate")
+        if not isinstance(gate, Mapping):
+            continue
+        if gate.get("release_gate_passed") is True:
+            counts["release_gate_passed"] += 1
+        if scenario.get("terminal_outcome") == "blocked_explicit":
+            counts["blocked_public_safe"] += 1
+        if scenario.get("provenance_class") == "fixture_only" and gate.get("release_gate_passed") is not True:
+            counts["fixture_not_release_pass"] += 1
+        if gate.get("status") == "completed_auto_visual":
+            counts["completed_auto_visual"] += 1
+    return counts
+
+
 def _outcome_counts(scenarios: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     counts = {
         "completed_fixture": 0,
@@ -906,6 +1635,10 @@ def _distinguishes_provenance(*classes: Any) -> bool:
 def _terminal_outcome(run_status: Mapping[str, Any]) -> str:
     status = str(run_status.get("status") or "")
     provenance_class = _provenance_class(run_status)
+    if status == "completed_auto_visual":
+        return "completed_auto_visual"
+    if status == "partial_auto_visual":
+        return "partial_auto_visual"
     if provenance_class == "real_parallel" and status in {
         "completed_parallel",
         "completed_partial_parallel",
@@ -1007,6 +1740,42 @@ def _int_or_zero(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _run_dir_from_status(run_status: Mapping[str, Any]) -> Path | None:
+    value = run_status.get("run_dir")
+    if not isinstance(value, str) or not value:
+        return None
+    return Path(value)
+
+
+def _read_optional_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
+def _read_optional_jsonl(path: Path) -> list[Mapping[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return []
+    records: list[Mapping[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, Mapping):
+            records.append(record)
+    return records
+
+
+def _mapping_list(value: Any) -> list[Mapping[str, Any]]:
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

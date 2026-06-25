@@ -14,10 +14,12 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
+from deepresearch import fresh_session_e2e as fresh_session_module  # noqa: E402
 from deepresearch.fresh_session_e2e import (  # noqa: E402
     FreshSessionE2EError,
     render_final_response,
     run_fresh_session_e2e,
+    run_fresh_session_visual_e2e,
     validate_final_response,
 )
 
@@ -102,6 +104,214 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertEqual(
             persisted["schema_version"],
             "codex-deepresearch.fresh-session-e2e.v0",
+        )
+
+    def test_visual_gate_records_public_safe_blocked_provider_without_release_pass(self) -> None:
+        result = run_fresh_session_visual_e2e(
+            runs_dir=self.temp_runs_dir(),
+            suite_id="fresh-session-visual",
+            clean=True,
+            real_codex_interactive="skip",
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertFalse(result["release_gate_passed"])
+        self.assertEqual(result["release_gate_status"], "blocked_public_safe")
+        scenarios = {scenario["id"]: scenario for scenario in result["scenarios"]}
+        blocked = scenarios["visual_required_provider_blocked"]
+
+        self.assertEqual(blocked["terminal_outcome"], "blocked_explicit")
+        self.assertEqual(blocked["run_status"], "blocked_missing_visual_provider")
+        gate = blocked["visual_release_gate"]
+        self.assertFalse(gate["release_gate_passed"])
+        self.assertEqual(gate["blocked_capability"], "visual_provider")
+        self.assertIn("real visual acquisition provider", gate["blocked_detail"])
+        self.assertTrue(Path(blocked["artifacts"]["visual_provider_status"]).is_file())
+        self.assertTrue(result["acceptance"]["blocked_runs_name_missing_capability"])
+        self.assertTrue(result["acceptance"]["blocked_runs_do_not_count_as_release_passes"])
+
+    def test_visual_fixture_evidence_cannot_satisfy_release_gate(self) -> None:
+        result = run_fresh_session_visual_e2e(
+            runs_dir=self.temp_runs_dir(),
+            suite_id="fresh-session-visual-fixture",
+            clean=True,
+            real_codex_interactive="skip",
+        )
+        fixture = {
+            scenario["id"]: scenario for scenario in result["scenarios"]
+        }["visual_fixture_not_release_pass"]
+
+        self.assertEqual(fixture["terminal_outcome"], "completed_fixture")
+        self.assertEqual(fixture["provenance_class"], "fixture_only")
+        self.assertFalse(fixture["visual_release_gate"]["release_gate_passed"])
+        self.assertEqual(fixture["visual_release_gate"]["codex_interactive_analyzed_images"], 0)
+        self.assertTrue(result["acceptance"]["fixture_manual_user_evidence_excluded"])
+
+    def test_visual_final_transcript_exposes_artifacts_and_status_summary(self) -> None:
+        result = run_fresh_session_visual_e2e(
+            runs_dir=self.temp_runs_dir(),
+            suite_id="fresh-session-visual-transcript",
+            clean=True,
+            real_codex_interactive="skip",
+        )
+        blocked = {
+            scenario["id"]: scenario for scenario in result["scenarios"]
+        }["visual_required_provider_blocked"]
+        transcript = Path(blocked["transcript"]).read_text(encoding="utf-8")
+
+        self.assertIn("Visual summary:", transcript)
+        self.assertIn("blocked_capability=visual_provider", transcript)
+        self.assertIn("run_status.json", transcript)
+        self.assertIn("visual_provider_status.json", transcript)
+        self.assertIn(blocked["artifacts"]["run_status"], transcript)
+        self.assertIn(blocked["artifacts"]["visual_provider_status"], transcript)
+        gate_checks = blocked["visual_release_gate"]["checks"]
+        self.assertTrue(gate_checks["final_transcript_exposes_required_artifacts"])
+        self.assertTrue(gate_checks["final_transcript_exposes_status_summary"])
+
+    def test_completed_auto_visual_requires_three_real_codex_images_and_report_citation(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertTrue(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 3)
+        self.assertEqual(gate["report_cited_visual_or_mixed_claims"], 1)
+        self.assertTrue(gate["visual_artifact_validation"]["valid"], gate["visual_artifact_validation"])
+
+    def test_completed_auto_visual_rejects_mixed_fixture_image_evidence(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["images"].append(
+            {
+                "id": "img_fixture",
+                "provider_mode": "fixture",
+                "analysis_provider": "fixture",
+                "analysis_status": "analyzed",
+                "observations": ["fixture-only observation"],
+            }
+        )
+        self._write_json(run_dir / "evidence.json", evidence)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["non_release_visual_images"], 1)
+        self.assertFalse(gate["checks"]["fixture_manual_user_evidence_excluded"])
+
+    def test_completed_auto_visual_counts_only_real_vlm_observation_records(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=1)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        evidence = self.read_json(run_dir / "evidence.json")
+        for index in (2, 3):
+            image = dict(evidence["images"][0])
+            image["id"] = f"img_padded_{index:03d}"
+            image["analysis_provider"] = "codex-interactive"
+            image["analysis_status"] = "analyzed"
+            image["provider_mode"] = "real"
+            image["observations"] = ["evidence-only observation should not count"]
+            evidence["images"].append(image)
+        self._write_json(run_dir / "evidence.json", evidence)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 1)
+        self.assertFalse(
+            gate["checks"]["codex_interactive_analyzed_non_fixture_images_at_least_3"]
+        )
+
+    def test_completed_auto_visual_report_citation_must_use_codex_observed_image(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["images"].append(
+            {
+                "id": "img_fixture",
+                "provider_mode": "fixture",
+                "analysis_provider": "fixture",
+                "analysis_status": "analyzed",
+                "observations": ["fixture-only observation"],
+            }
+        )
+        evidence["claims"].append(
+            {
+                "id": "claim_fixture_visual",
+                "text": "Fixture visual evidence should not release the gate.",
+                "claim_type": "visual",
+                "supporting_sources": [],
+                "supporting_images": ["img_fixture"],
+                "quote_spans": [],
+                "votes": [],
+                "verification_status": "supported",
+                "review_status": "human_accepted",
+                "promotion_status": "not_eligible",
+                "confidence": "high",
+                "caveats": [],
+            }
+        )
+        self._write_json(run_dir / "evidence.json", evidence)
+        self._write_json(
+            run_dir / "report_status.json",
+            {
+                "status": "completed",
+                "report_path": "report.md",
+                "used_images": ["img_fixture"],
+                "included_claims": [
+                    {
+                        "claim_id": "claim_fixture_visual",
+                        "claim_type": "visual",
+                        "image_ids": ["img_fixture"],
+                    }
+                ],
+            },
+        )
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["report_cited_visual_or_mixed_claims"], 0)
+        self.assertFalse(gate["checks"]["report_cited_visual_or_mixed_claim_at_least_1"])
+
+    def test_completed_auto_visual_requires_matching_visual_provider_status(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider_status["status"] = "partial_auto_visual"
+        provider_status["ok"] = False
+        provider_status["metric_classification"] = "included_failure"
+        self._write_json(run_dir / "visual_provider_status.json", provider_status)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertFalse(gate["checks"]["visual_provider_status_completed_auto_visual"])
+
+    def test_visual_gate_accepts_supplied_completed_auto_visual_run_for_release_pass(self) -> None:
+        completed_run_dir = self._complete_visual_run_dir(image_count=3)
+        self._visual_run_status(completed_run_dir, status="completed_auto_visual")
+
+        result = run_fresh_session_visual_e2e(
+            runs_dir=self.temp_runs_dir(),
+            suite_id="fresh-session-visual-completed",
+            clean=True,
+            real_codex_interactive="require",
+            completed_auto_visual_run=completed_run_dir,
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(result["release_gate_passed"])
+        self.assertEqual(result["release_gate_status"], "passed")
+        self.assertEqual(result["completed_auto_visual_run"], str(completed_run_dir.resolve()))
+        completed = {
+            scenario["id"]: scenario for scenario in result["scenarios"]
+        }["visual_completed_auto_release_candidate"]
+        self.assertEqual(completed["terminal_outcome"], "completed_auto_visual")
+        self.assertTrue(completed["visual_release_gate"]["release_gate_passed"])
+        self.assertEqual(
+            completed["visual_release_gate"]["codex_interactive_analyzed_images"],
+            3,
         )
 
     def test_broken_skill_instructions_fail_user_facing_gate(self) -> None:
@@ -357,6 +567,432 @@ class FreshSessionE2ETests(unittest.TestCase):
             encoding="utf-8",
         )
         return payload
+
+    def _complete_visual_run_dir(self, *, image_count: int) -> Path:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        run_dir = Path(temp_dir.name)
+        created_at = "2026-06-25T00:00:00Z"
+        task_id = "task_visual_001"
+        angle_id = "angle_001"
+        claim_id = "claim_visual_001"
+        vote_id = "vote_visual_001"
+
+        candidates = []
+        fetches = []
+        observations = []
+        images = []
+        for index in range(1, image_count + 1):
+            image_id = f"img_real_{index:03d}"
+            candidate = self._visual_candidate(
+                candidate_id=f"cand_real_{index:03d}",
+                task_id=task_id,
+                angle_id=angle_id,
+                rank=index,
+            )
+            fetch = self._visual_fetch(
+                candidate=candidate,
+                fetch_id=f"fetch_real_{index:03d}",
+                evidence_image_id=image_id,
+            )
+            candidates.append(candidate)
+            fetches.append(fetch)
+            observations.append(
+                self._visual_observation(
+                    candidate=candidate,
+                    fetch=fetch,
+                    evidence_image_id=image_id,
+                    claim_id=claim_id if index == 1 else None,
+                    vote_id=vote_id if index == 1 else None,
+                    created_at=created_at,
+                )
+            )
+            images.append(
+                self._visual_evidence_image(
+                    candidate=candidate,
+                    fetch=fetch,
+                    evidence_image_id=image_id,
+                )
+            )
+
+        self._write_json(
+            run_dir / "visual_tasks.json",
+            {"tasks": [{"id": task_id, "angle_id": angle_id, "route": "visual_required"}]},
+        )
+        self._write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": created_at,
+                "tasks": [
+                    {
+                        "plan_id": "plan_visual_001",
+                        "task_id": task_id,
+                        "angle_id": angle_id,
+                        "route": "visual_required",
+                        "target_evidence_type": "web_image",
+                        "query": "codex interactive visual release fixture",
+                        "providers": ["page-image-extractor", "codex-interactive"],
+                        "source_search_result_ids": [],
+                        "caps": {
+                            "max_candidates": image_count,
+                            "max_fetches": image_count,
+                            "max_vlm_images": image_count,
+                            "max_cost_usd": 1.0,
+                        },
+                        "policy_constraints": {"robots": "allowed"},
+                        "estimated_cost_usd": 0.1,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        self._write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self._write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self._write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        self._write_json(
+            run_dir / "visual_provider_status.json",
+            {
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_dir.name,
+                "status": "completed_auto_visual",
+                "ok": True,
+                "terminal": True,
+                "metric_classification": "success",
+                "providers": [
+                    self._visual_provider(
+                        provider="page-image-extractor",
+                        provider_kind="page_extractor",
+                        invocations=1,
+                        candidates_discovered=image_count,
+                        artifacts_fetched=image_count,
+                        vlm_images_analyzed=0,
+                    ),
+                    self._visual_provider(
+                        provider="codex-interactive",
+                        provider_kind="vlm",
+                        invocations=1,
+                        candidates_discovered=0,
+                        artifacts_fetched=image_count,
+                        vlm_images_analyzed=image_count,
+                    ),
+                ],
+            },
+        )
+        self._write_json(
+            run_dir / "evidence.json",
+            {
+                "schema_version": "0.1.0",
+                "run_id": run_dir.name,
+                "created_at": created_at,
+                "question": "Visual release fixture",
+                "mode": "codex-plugin",
+                "search_provider": "codex-native",
+                "vlm_provider": "codex-interactive",
+                "search_tasks": [],
+                "images": images,
+                "claims": [
+                    {
+                        "id": claim_id,
+                        "text": "The first real visual fixture contains report-cited UI evidence.",
+                        "claim_type": "visual",
+                        "supporting_sources": [],
+                        "supporting_images": ["img_real_001"],
+                        "visual_supports": [
+                            {
+                                "image_id": "img_real_001",
+                                "observation_ref": "images.img_real_001.observations[0]",
+                                "observation_index": 0,
+                                "observation_text": images[0]["observations"][0],
+                                "provider": "codex-interactive",
+                                "confidence": 0.92,
+                            }
+                        ],
+                        "quote_spans": [],
+                        "votes": [{"id": vote_id}],
+                        "verification_status": "supported",
+                        "review_status": "human_accepted",
+                        "promotion_status": "not_eligible",
+                        "confidence": "high",
+                        "caveats": [],
+                    }
+                ],
+            },
+        )
+        self._write_json(
+            run_dir / "report_status.json",
+            {
+                "status": "completed",
+                "report_path": "report.md",
+                "used_images": ["img_real_001"],
+                "included_claims": [
+                    {
+                        "claim_id": claim_id,
+                        "claim_type": "visual",
+                        "image_ids": ["img_real_001"],
+                        "visual_supports": [
+                            {
+                                "image_id": "img_real_001",
+                                "observation_ref": "images.img_real_001.observations[0]",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        (run_dir / "report.md").write_text("# Report\n\n## Visual Findings\n", encoding="utf-8")
+        return run_dir
+
+    def _visual_run_status(self, run_dir: Path, *, status: str) -> dict:
+        payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_dir.name,
+            "run_dir": str(run_dir),
+            "selected_mode": "full-runner",
+            "status": status,
+            "ok": True,
+            "terminal": True,
+            "provenance": {
+                "type": "real_child_execution",
+                "adapter": "codex-exec",
+                "fixture_only": False,
+                "manual_handoff": False,
+                "real_child_execution": True,
+                "accepted_shards": 1,
+            },
+            "diagnostics": {"actionable_cause": "completed visual fixture"},
+            "artifacts": {
+                "run_status": str(run_dir / "run_status.json"),
+                "evidence": str(run_dir / "evidence.json"),
+                "report": str(run_dir / "report.md"),
+                "report_status": str(run_dir / "report_status.json"),
+                "visual_tasks": str(run_dir / "visual_tasks.json"),
+                "visual_observations": str(run_dir / "visual_observations.jsonl"),
+                "visual_provider_status": str(run_dir / "visual_provider_status.json"),
+                "visual_candidates": str(run_dir / "visual_candidates.jsonl"),
+                "image_fetch_status": str(run_dir / "image_fetch_status.jsonl"),
+            },
+            "shard_summary": {
+                "planned_task_count": 1,
+                "accepted_shard_count": 1,
+                "merged_shard_count": 1,
+                "failed_task_count": 0,
+                "blocked_task_count": 0,
+                "rejected_shard_count": 0,
+                "discarded_task_count": 0,
+            },
+            "fallback": {"parallel_degraded": False, "needs_serial_handoff": False},
+        }
+        self._write_json(run_dir / "run_status.json", payload)
+        return payload
+
+    def _visual_release_gate_with_response(self, run_status: dict) -> dict:
+        initial_gate = fresh_session_module._visual_release_gate(
+            run_status,
+            final_response="",
+            scenario_id="completed_visual",
+            check_final_response=False,
+        )
+        response_status = dict(run_status)
+        response_status["visual_release_gate"] = fresh_session_module._visual_release_summary(
+            initial_gate
+        )
+        response = render_final_response(response_status, scenario_id="completed_visual")
+        return fresh_session_module._visual_release_gate(
+            run_status,
+            final_response=response,
+            scenario_id="completed_visual",
+            check_final_response=True,
+        )
+
+    def _visual_candidate(
+        self,
+        *,
+        candidate_id: str,
+        task_id: str,
+        angle_id: str,
+        rank: int,
+    ) -> dict:
+        return {
+            "candidate_id": candidate_id,
+            "plan_id": "plan_visual_001",
+            "task_id": task_id,
+            "angle_id": angle_id,
+            "provider": "page-image-extractor",
+            "provider_kind": "page_extractor",
+            "provider_mode": "real",
+            "provider_run_id": "run_page_image_extractor_001",
+            "provider_provenance": {
+                "provider": "page-image-extractor",
+                "provider_kind": "page_extractor",
+                "provider_mode": "real",
+            },
+            "origin": "page_image",
+            "page_url": "https://example.com/page",
+            "image_url": f"https://example.com/{candidate_id}.png",
+            "rank": rank,
+            "score": 1.0,
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "candidate_status": "analyzed",
+            "rejection_reason": None,
+            "estimated_cost_usd": 0.01,
+            "actual_cost_usd": 0.01,
+        }
+
+    def _visual_fetch(self, *, candidate: dict, fetch_id: str, evidence_image_id: str) -> dict:
+        return {
+            "fetch_id": fetch_id,
+            "candidate_id": candidate["candidate_id"],
+            "task_id": candidate["task_id"],
+            "angle_id": candidate["angle_id"],
+            "provider": candidate["provider"],
+            "provider_kind": candidate["provider_kind"],
+            "provider_mode": candidate["provider_mode"],
+            "provider_run_id": candidate["provider_run_id"],
+            "provider_provenance": dict(candidate["provider_provenance"]),
+            "fetch_status": "fetched",
+            "http_status": 200,
+            "mime_type": "image/png",
+            "byte_size": 128,
+            "width": 640,
+            "height": 360,
+            "hash": f"sha256:{evidence_image_id}",
+            "phash": f"phash:{evidence_image_id}",
+            "local_artifact_path": f"images/{evidence_image_id}.png",
+            "evidence_image_id": evidence_image_id,
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "failure_code": None,
+            "estimated_cost_usd": 0.01,
+            "actual_cost_usd": 0.01,
+        }
+
+    def _visual_observation(
+        self,
+        *,
+        candidate: dict,
+        fetch: dict,
+        evidence_image_id: str,
+        claim_id: str | None,
+        vote_id: str | None,
+        created_at: str,
+    ) -> dict:
+        verifier_links = []
+        report_links = []
+        if claim_id:
+            verifier_links.append(
+                {
+                    "claim_id": claim_id,
+                    "visual_support_ref": f"images.{evidence_image_id}.observations[0]",
+                    "verifier_vote_id": vote_id,
+                }
+            )
+            report_links.append(
+                {
+                    "claim_id": claim_id,
+                    "report_section_id": "visual-findings",
+                    "citation_id": f"img:{evidence_image_id}",
+                }
+            )
+        return {
+            "observation_id": f"obs_{evidence_image_id}",
+            "evidence_image_id": evidence_image_id,
+            "task_id": candidate["task_id"],
+            "angle_id": candidate["angle_id"],
+            "candidate_id": candidate["candidate_id"],
+            "fetch_id": fetch["fetch_id"],
+            "provider": "codex-interactive",
+            "provider_kind": "vlm",
+            "provider_mode": "real",
+            "provider_run_id": "run_codex_interactive_001",
+            "provider_provenance": {
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+            },
+            "model_or_tool": "codex-interactive",
+            "observation_status": "analyzed",
+            "observations": [f"Codex-interactive visual observation for {evidence_image_id}."],
+            "inferences": [],
+            "confidence": 0.93,
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "caveats": [],
+            "verifier_links": verifier_links,
+            "report_links": report_links,
+            "estimated_cost_usd": 0.02,
+            "actual_cost_usd": 0.02,
+            "created_at": created_at,
+        }
+
+    def _visual_evidence_image(self, *, candidate: dict, fetch: dict, evidence_image_id: str) -> dict:
+        return {
+            "id": evidence_image_id,
+            "source_id": "src_visual_001",
+            "origin": "page_image",
+            "image_url": candidate["image_url"],
+            "page_url": candidate["page_url"],
+            "local_artifact_path": fetch["local_artifact_path"],
+            "mime_type": fetch["mime_type"],
+            "width": fetch["width"],
+            "height": fetch["height"],
+            "observations": [f"Codex-interactive visual observation for {evidence_image_id}."],
+            "inferences": [],
+            "visual_tasks": [candidate["task_id"]],
+            "analysis_provider": "codex-interactive",
+            "analysis_status": "analyzed",
+            "policy_flags": [],
+            "caveats": [],
+            "task_id": candidate["task_id"],
+            "angle_id": candidate["angle_id"],
+            "candidate_id": candidate["candidate_id"],
+            "fetch_id": fetch["fetch_id"],
+            "hash": fetch["hash"],
+            "provider": candidate["provider"],
+            "provider_kind": candidate["provider_kind"],
+            "provider_mode": candidate["provider_mode"],
+            "provider_provenance": dict(candidate["provider_provenance"]),
+            "policy_decision": "allowed",
+            "estimated_cost_usd": 0.03,
+            "actual_cost_usd": 0.03,
+        }
+
+    def _visual_provider(
+        self,
+        *,
+        provider: str,
+        provider_kind: str,
+        invocations: int,
+        candidates_discovered: int,
+        artifacts_fetched: int,
+        vlm_images_analyzed: int,
+    ) -> dict:
+        return {
+            "provider": provider,
+            "provider_kind": provider_kind,
+            "provider_mode": "real",
+            "configured": True,
+            "available": True,
+            "blocked_reason": None,
+            "invocations": invocations,
+            "candidates_discovered": candidates_discovered,
+            "artifacts_fetched": artifacts_fetched,
+            "vlm_images_analyzed": vlm_images_analyzed,
+            "estimated_cost_usd": 0.1,
+            "actual_cost_usd": 0.1,
+            "last_error": None,
+        }
+
+    def _write_json(self, path: Path, payload: dict) -> None:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
 
     def _write_chat_only_runner(self) -> Path:
         runner_dir = self.temp_runs_dir()
