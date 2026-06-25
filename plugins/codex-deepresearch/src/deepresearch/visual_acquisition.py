@@ -7,7 +7,9 @@ import json
 import mimetypes
 import os
 import re
+import struct
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -74,6 +76,48 @@ PNG_1X1 = (
     b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00\xef\xbf\xa7\xdb"
     b"\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+_FONT_5X7 = {
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "11100"),
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10011", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "J": ("00001", "00001", "00001", "00001", "10001", "10001", "01110"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+    "_": ("00000", "00000", "00000", "00000", "00000", "00000", "11111"),
+    ":": ("00000", "00100", "00100", "00000", "00100", "00100", "00000"),
+    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+}
 
 
 class VisualAcquisitionError(ValueError):
@@ -269,6 +313,11 @@ def acquire_visual_candidates(
     visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
     image_fetch_records = _image_fetch_records_from_candidates(candidate_records)
+    provider_statuses = _provider_statuses_after_selection(
+        provider_statuses=provider_statuses,
+        candidate_records=candidate_records,
+        image_fetch_records=image_fetch_records,
+    )
     visual_search_plan = _visual_search_plan(
         run_dir=run_dir,
         evidence=evidence,
@@ -1336,6 +1385,42 @@ def _mark_pdf_budget_pruned(record: dict[str, Any]) -> None:
     record["rasterizer"] = rasterizer
 
 
+def _provider_statuses_after_selection(
+    *,
+    provider_statuses: Sequence[Mapping[str, Any]],
+    candidate_records: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    fetched_by_provider: dict[str, int] = {}
+    pdf_rasterized_by_provider: dict[str, int] = {}
+    pdf_skipped_by_provider: dict[str, int] = {}
+    for fetch in image_fetch_records:
+        provider = _string(fetch.get("provider"))
+        if provider and fetch.get("fetch_status") == "fetched":
+            fetched_by_provider[provider] = fetched_by_provider.get(provider, 0) + 1
+    for record in candidate_records:
+        if record.get("provider_kind") != "pdf_rasterizer":
+            continue
+        provider = _string(record.get("provider"))
+        if not provider:
+            continue
+        if record.get("status") == "accepted":
+            pdf_rasterized_by_provider[provider] = pdf_rasterized_by_provider.get(provider, 0) + 1
+        else:
+            pdf_skipped_by_provider[provider] = pdf_skipped_by_provider.get(provider, 0) + 1
+
+    updated: list[dict[str, Any]] = []
+    for provider_status in provider_statuses:
+        record = dict(provider_status)
+        provider = _string(record.get("provider"))
+        if record.get("provider_kind") == "pdf_rasterizer" and provider:
+            record["artifacts_fetched"] = fetched_by_provider.get(provider, 0)
+            record["pdf_pages_rasterized"] = pdf_rasterized_by_provider.get(provider, 0)
+            record["pdf_pages_skipped"] = pdf_skipped_by_provider.get(provider, 0)
+        updated.append(record)
+    return updated
+
+
 def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     image_id = _image_id_for_candidate_id(str(candidate["candidate_id"]))
     fetch_id = _fetch_id_for_candidate_id(str(candidate["candidate_id"]))
@@ -1809,9 +1894,233 @@ def _materialize_candidate_artifact(run_dir: Path, candidate: Mapping[str, Any])
     except ValueError as exc:
         raise VisualAcquisitionError(f"candidate artifact escapes run directory: {relative}") from exc
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    seed = str(candidate.get("content_seed") or candidate["id"]).encode("utf-8")
-    artifact.write_bytes(PNG_1X1 + b"\n" + seed + b"\n")
+    if candidate.get("provider_kind") == "pdf_rasterizer" and candidate.get("origin") in {
+        "pdf_page",
+        "pdf_figure",
+    }:
+        _write_pdf_raster_png(artifact, candidate)
+    else:
+        seed = str(candidate.get("content_seed") or candidate["id"]).encode("utf-8")
+        artifact.write_bytes(PNG_1X1 + b"\n" + seed + b"\n")
     return artifact
+
+
+def _write_pdf_raster_png(path: Path, candidate: Mapping[str, Any]) -> None:
+    width = _positive_dimension(candidate.get("width"), fallback=1240)
+    height = _positive_dimension(candidate.get("height"), fallback=1754)
+    seed = str(candidate.get("content_seed") or candidate.get("candidate_id") or candidate.get("id"))
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    accent = (48 + digest[0] % 120, 70 + digest[1] % 100, 95 + digest[2] % 100)
+    muted = (218, 224, 228)
+    paper = (250, 250, 246)
+    ink = (36, 42, 48)
+    pixels = bytearray(bytes(paper) * width * height)
+
+    margin_x = max(36, width // 28)
+    margin_y = max(44, height // 32)
+    content_x = margin_x + 36
+    content_y = margin_y + 120
+    content_w = width - (content_x * 2)
+    _draw_rect(pixels, width, height, margin_x, margin_y, width - 2 * margin_x, height - 2 * margin_y, (255, 255, 255))
+    _draw_border(pixels, width, height, margin_x, margin_y, width - 2 * margin_x, height - 2 * margin_y, (80, 88, 96), 3)
+    _draw_rect(pixels, width, height, margin_x, margin_y, width - 2 * margin_x, 86, accent)
+    _draw_text(
+        pixels,
+        width,
+        height,
+        content_x,
+        margin_y + 28,
+        _pdf_raster_title(candidate),
+        scale=max(4, width // 310),
+        color=(255, 255, 255),
+    )
+    _draw_text(
+        pixels,
+        width,
+        height,
+        content_x,
+        margin_y + 102,
+        _pdf_raster_subtitle(candidate),
+        scale=max(3, width // 420),
+        color=ink,
+    )
+
+    y = content_y + 40
+    for index in range(12):
+        line_w = max(80, content_w - (digest[index % len(digest)] % max(1, content_w // 3)))
+        _draw_rect(pixels, width, height, content_x, y, line_w, 12, muted)
+        y += 34 if index % 3 else 46
+
+    figure_y = max(content_y + 470, height // 2 - 130)
+    figure_h = min(360, height - figure_y - margin_y - 120)
+    figure_w = min(content_w, width - 2 * content_x)
+    _draw_rect(pixels, width, height, content_x, figure_y, figure_w, figure_h, (244, 247, 249))
+    _draw_border(pixels, width, height, content_x, figure_y, figure_w, figure_h, accent, 4)
+    label = "FIGURE CANDIDATE" if candidate.get("origin") == "pdf_figure" else "PAGE VISUAL REGION"
+    _draw_text(
+        pixels,
+        width,
+        height,
+        content_x + 28,
+        figure_y + 24,
+        label,
+        scale=max(3, width // 430),
+        color=ink,
+    )
+    chart_x = content_x + 60
+    chart_y = figure_y + 100
+    chart_w = figure_w - 120
+    chart_h = max(120, figure_h - 160)
+    _draw_border(pixels, width, height, chart_x, chart_y, chart_w, chart_h, (116, 124, 132), 2)
+    bar_count = 7
+    gap = max(10, chart_w // 45)
+    bar_w = max(24, (chart_w - gap * (bar_count + 1)) // bar_count)
+    for index in range(bar_count):
+        value = 28 + digest[(index + 5) % len(digest)] % max(30, chart_h - 40)
+        x = chart_x + gap + index * (bar_w + gap)
+        y0 = chart_y + chart_h - value - 4
+        color = accent if index % 2 == 0 else (96, 132, 156)
+        _draw_rect(pixels, width, height, x, y0, bar_w, value, color)
+
+    footer = "DETERMINISTIC PUBLIC SAFE PDF RASTER"
+    _draw_text(
+        pixels,
+        width,
+        height,
+        content_x,
+        height - margin_y - 72,
+        footer,
+        scale=max(3, width // 440),
+        color=(86, 94, 102),
+    )
+    path.write_bytes(_encode_png_rgb(width, height, pixels))
+
+
+def _positive_dimension(value: Any, *, fallback: int) -> int:
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, float) and value.is_integer() and value > 0:
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = int(float(value))
+        except ValueError:
+            return fallback
+        return parsed if parsed > 0 else fallback
+    return fallback
+
+
+def _pdf_raster_title(candidate: Mapping[str, Any]) -> str:
+    page = _positive_dimension(candidate.get("page_number"), fallback=1)
+    prefix = "PDF FIGURE" if candidate.get("origin") == "pdf_figure" else "PDF PAGE"
+    return f"{prefix} {page:03d}"[:34]
+
+
+def _pdf_raster_subtitle(candidate: Mapping[str, Any]) -> str:
+    source = _string(candidate.get("source_id")) or "source"
+    figure = candidate.get("figure_hint")
+    if isinstance(figure, Mapping):
+        label = _string(figure.get("label") or figure.get("figure") or figure.get("caption"))
+        if label:
+            return f"SOURCE {source} FIGURE {label}"[:42]
+    return f"SOURCE {source}"[:42]
+
+
+def _draw_text(
+    pixels: bytearray,
+    width: int,
+    height: int,
+    x: int,
+    y: int,
+    text: str,
+    *,
+    scale: int,
+    color: tuple[int, int, int],
+) -> None:
+    cursor = x
+    for character in text.upper():
+        pattern = _FONT_5X7.get(character, _FONT_5X7.get(" "))
+        if pattern is None:
+            cursor += 4 * scale
+            continue
+        for row_index, row in enumerate(pattern):
+            for col_index, value in enumerate(row):
+                if value == "1":
+                    _draw_rect(
+                        pixels,
+                        width,
+                        height,
+                        cursor + col_index * scale,
+                        y + row_index * scale,
+                        scale,
+                        scale,
+                        color,
+                    )
+        cursor += 6 * scale
+
+
+def _draw_border(
+    pixels: bytearray,
+    width: int,
+    height: int,
+    x: int,
+    y: int,
+    rect_w: int,
+    rect_h: int,
+    color: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    _draw_rect(pixels, width, height, x, y, rect_w, thickness, color)
+    _draw_rect(pixels, width, height, x, y + rect_h - thickness, rect_w, thickness, color)
+    _draw_rect(pixels, width, height, x, y, thickness, rect_h, color)
+    _draw_rect(pixels, width, height, x + rect_w - thickness, y, thickness, rect_h, color)
+
+
+def _draw_rect(
+    pixels: bytearray,
+    width: int,
+    height: int,
+    x: int,
+    y: int,
+    rect_w: int,
+    rect_h: int,
+    color: tuple[int, int, int],
+) -> None:
+    if rect_w <= 0 or rect_h <= 0:
+        return
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(width, x + rect_w)
+    y1 = min(height, y + rect_h)
+    if x0 >= x1 or y0 >= y1:
+        return
+    row = bytes(color) * (x1 - x0)
+    for row_index in range(y0, y1):
+        start = (row_index * width + x0) * 3
+        pixels[start : start + len(row)] = row
+
+
+def _encode_png_rgb(width: int, height: int, pixels: bytes | bytearray) -> bytes:
+    rows = bytearray()
+    stride = width * 3
+    for y in range(height):
+        rows.append(0)
+        start = y * stride
+        rows.extend(pixels[start : start + stride])
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(bytes(rows), level=9))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(kind)
+    checksum = zlib.crc32(data, checksum) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
 
 
 def _validated_mime_type(record: Mapping[str, Any], artifact: Path) -> str:

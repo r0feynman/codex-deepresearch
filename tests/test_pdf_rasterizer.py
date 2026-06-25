@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,12 @@ class PdfRasterizerTests(unittest.TestCase):
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def png_dimensions(self, path: Path) -> tuple[int, int]:
+        data = path.read_bytes()
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(data[12:16], b"IHDR")
+        return struct.unpack(">II", data[16:24])
 
     def write_pdf(self, run_dir: Path, name: str, body: bytes = b"") -> Path:
         path = run_dir / "sources" / name
@@ -119,6 +126,14 @@ class PdfRasterizerTests(unittest.TestCase):
         candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
         fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
         self.assertEqual({candidate["origin"] for candidate in candidates}, {"pdf_page", "pdf_figure"})
+        for candidate in candidates:
+            artifact = run_dir / candidate["local_artifact_path"]
+            self.assertEqual(
+                self.png_dimensions(artifact),
+                (candidate["width"], candidate["height"]),
+            )
+            self.assertNotEqual((candidate["width"], candidate["height"]), (1, 1))
+            self.assertGreater(artifact.stat().st_size, 1_000)
         self.assertEqual({fetch["fetch_status"] for fetch in fetches}, {"fetched"})
         self.assertTrue(all(fetch["hash"].startswith("sha256:") for fetch in fetches))
         self.assertTrue(all(fetch["pdf_url"] == source["url"] for fetch in fetches))
@@ -380,6 +395,11 @@ class PdfRasterizerTests(unittest.TestCase):
                 self.assertEqual(candidate["compute_counters"]["pdf_pages_skipped"], 1)
                 self.assertTrue(candidate["rasterizer"]["budget_pruned"])
         self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 2)
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider["provider"], "local-pdf-rasterizer")
+        self.assertEqual(provider["artifacts_fetched"], 1)
+        self.assertEqual(result["providers"][0]["artifacts_fetched"], 1)
         visual_validation = validate_visual_artifacts(run_dir=run_dir, evidence_path=None)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
 
