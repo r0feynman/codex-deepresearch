@@ -28,7 +28,7 @@ $deep-research: Codex DeepResearch smoke test
 
 The final response should name the selected mode and final status. If synthesis completes, it should include the run directory plus `report.md`, `evidence.json`, `run_status.json`, and `report_status.json`. If the run is blocked, it should expose `run_status.json` with `ok=false`, `terminal=true`, the exact `status`, and `diagnostics.actionable_cause`. It should not silently become a chat-only answer unless the prompt explicitly requested quick mode.
 
-For a local CLI install/update smoke, run:
+For a local CLI install/update preflight smoke that checks readiness without performing the install or update itself, run:
 
 ```bash
 plugins/codex-deepresearch/scripts/codex-deepresearch smoke \
@@ -156,7 +156,7 @@ Provider-gated real runs: real image search, browser/PDF acquisition, and Respon
 
 `openai-responses-vision` real VLM analysis requires `--provider-mode real`, `--allow-real-vlm` or `CODEX_DEEPRESEARCH_OPENAI_RESPONSES_VISION_ALLOW_REAL=1`, and an API key in `OPENAI_API_KEY` or `CODEX_DEEPRESEARCH_OPENAI_API_KEY`. Missing permission or credentials should produce `blocked_missing_vlm_provider` while preserving fetched visual artifacts when policy allows.
 
-Local providers such as `local-page`, `local-image-fixture`, `local-screenshot-fixture`, and `local-pdf-rasterizer` are deterministic validation aids. They should record `provider_mode=fixture` and should not be described as release-eligible automatic visual evidence.
+Local providers such as `local-page`, `local-image-fixture`, `local-screenshot-fixture`, and `local-pdf-rasterizer` are deterministic validation aids. The default local fixture path should record `provider_mode=fixture`; explicit rasterizer runs should preserve their rasterizer provenance. Local providers should not be described as release-eligible automatic visual evidence.
 
 ## Example Gallery
 
