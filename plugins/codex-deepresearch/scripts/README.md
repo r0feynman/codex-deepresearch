@@ -120,6 +120,22 @@ plugins/codex-deepresearch/scripts/codex-deepresearch run-status --run <run_id_o
 
 Most completed stages rerun and revalidate their inputs until M15 cache keys exist. Stages that explicitly skip a completed rerun keep the primary stage state as `completed` and record the skipped rerun in `run_steps.json` history plus `run_trace.jsonl`.
 
+## Run Monitor
+
+Use `monitor-list` for a compact read-only dashboard of run phase, shard buckets, provenance mode, evidence counts, and budget confirmation state:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch monitor-list --runs-dir research-runs
+```
+
+Use `monitor-detail` to inspect one run without opening implementation files:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch monitor-detail --run <run_id_or_path>
+```
+
+The monitor reads existing status artifacts only: `run_status.json`, `status.json`, `run_steps.json`, `parallel_orchestration_status.json`, `research_tasks.json`, `subagent_assignments.jsonl`, `merge_status.json`, `run_trace.jsonl`, visual status artifacts, `evidence.json`, and `budget_estimate.json`. Compact shard output is ordered as queued/active/completed/failed/accepted/merged/retried/blocked. List output uses run IDs and paths relative to `--runs-dir`; detail output may show the selected run directory but renders nested artifacts run-relative or as `<outside-run-dir>` when a status payload points elsewhere. Pass `--json` to either command for deterministic machine-readable output.
+
 ## Visual Acquisition
 
 Use `acquire-visual` on `visual_required` or `visual_optional` runs to create deterministic local/test image candidates before `ingest-vision`:
