@@ -44,6 +44,8 @@ plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-e2e \
 
 The gate scenarios cover fixture full-runner completion, serial fallback as an explicit blocked state, and a real `codex-exec` scenario. Use `--real-codex-exec=skip` for CI/no-private-artifact validation; it records a blocked diagnostic instead of pretending real child execution occurred. Use `--real-codex-exec=require` for a local strict gate that fails unless real `codex-exec` produces `accepted_shards > 0`.
 
+The CLI default is public-safe `--real-codex-exec=skip`. Use `--real-codex-exec=auto` to attempt real child execution when Codex CLI is available. Real and fixture scenarios are bounded by `--scenario-timeout-seconds` (default `120`); auto mode records a timeout as an explicit blocked diagnostic, while require mode fails unless real execution completes with accepted shards.
+
 ## Resolve Config
 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:

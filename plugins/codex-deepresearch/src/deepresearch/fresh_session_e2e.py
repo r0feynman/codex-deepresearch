@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -14,11 +15,13 @@ DEFAULT_FRESH_SESSION_INVOKE = (
     "$deep-research: Compare three public approaches for deterministic "
     "software release validation and cite the evidence quality tradeoffs."
 )
+DEFAULT_SCENARIO_TIMEOUT_SECONDS = 120.0
 REAL_CODEX_EXEC_MODES = ("auto", "require", "skip")
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = PLUGIN_ROOT.parents[1]
 RUNNER_PATH = PLUGIN_ROOT / "scripts" / "codex-deepresearch"
+SKILL_PATH = PLUGIN_ROOT / "skills" / "deep-research" / "SKILL.md"
 
 _SYNTHESIZED_SUCCESS_STATUSES = {
     "completed_parallel",
@@ -66,8 +69,10 @@ def run_fresh_session_e2e(
     suite_id: str = "fresh-session-e2e",
     invocation: str = DEFAULT_FRESH_SESSION_INVOKE,
     clean: bool = False,
-    real_codex_exec: str = "auto",
+    real_codex_exec: str = "skip",
     runner_path: str | Path = RUNNER_PATH,
+    skill_path: str | Path = SKILL_PATH,
+    scenario_timeout_seconds: float = DEFAULT_SCENARIO_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Run a public-safe scripted transcript gate for a fresh skill invocation."""
 
@@ -90,12 +95,16 @@ def run_fresh_session_e2e(
     runner = Path(runner_path)
     scenarios: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    skill_preflight = _skill_preflight(runner)
-    if skill_preflight["status"] != "passed":
+    skill_transcript_gate = _skill_transcript_gate(
+        runner_path=runner,
+        skill_path=Path(skill_path),
+        invocation=invocation,
+    )
+    if skill_transcript_gate["status"] != "passed":
         failures.append(
             {
-                "check": "installed_skill_preflight",
-                "detail": skill_preflight["detail"],
+                "check": "skill_transcript_gate",
+                "detail": skill_transcript_gate["detail"],
             }
         )
 
@@ -108,11 +117,21 @@ def run_fresh_session_e2e(
             scenario,
             suite_dir=suite_dir,
             runner_path=runner,
+            skill_transcript_gate=skill_transcript_gate,
+            timeout_seconds=scenario_timeout_seconds,
         )
         scenarios.append(summary)
         failures.extend(summary.get("failures", []))
 
     acceptance = _acceptance(scenarios)
+    runner_artifact_gate = _runner_artifact_gate(scenarios)
+    if runner_artifact_gate["status"] != "passed":
+        failures.append(
+            {
+                "check": "runner_artifact_gate",
+                "detail": runner_artifact_gate["detail"],
+            }
+        )
     for key, value in acceptance.items():
         if value is not True:
             failures.append(
@@ -129,7 +148,9 @@ def run_fresh_session_e2e(
         "suite_dir": str(suite_dir.resolve()),
         "invocation": invocation,
         "real_codex_exec_mode": real_codex_exec,
-        "skill_preflight": skill_preflight,
+        "scenario_timeout_seconds": scenario_timeout_seconds,
+        "skill_transcript_gate": skill_transcript_gate,
+        "runner_artifact_gate": runner_artifact_gate,
         "scenarios": scenarios,
         "outcome_counts": _outcome_counts(scenarios),
         "acceptance": acceptance,
@@ -146,7 +167,12 @@ def run_fresh_session_e2e(
     return results
 
 
-def render_final_response(run_status: Mapping[str, Any], *, scenario_id: str) -> str:
+def render_final_response(
+    run_status: Mapping[str, Any],
+    *,
+    scenario_id: str,
+    skill_transcript_gate: Mapping[str, Any] | None = None,
+) -> str:
     """Render the assistant-facing response that the transcript gate validates."""
 
     artifacts = run_status.get("artifacts") if isinstance(run_status.get("artifacts"), Mapping) else {}
@@ -164,6 +190,7 @@ def render_final_response(run_status: Mapping[str, Any], *, scenario_id: str) ->
     )
     lines = [
         "DeepResearch fresh-session transcript result",
+        "Transcript kind: skill-invocation",
         f"Scenario: {scenario_id}",
         f"Mode: {run_status.get('selected_mode')}",
         f"Status: {run_status.get('status')}",
@@ -188,6 +215,16 @@ def render_final_response(run_status: Mapping[str, Any], *, scenario_id: str) ->
         ),
         "Artifacts:",
     ]
+    if isinstance(skill_transcript_gate, Mapping):
+        lines.insert(
+            2,
+            f"Skill instructions: {skill_transcript_gate.get('skill_path')} "
+            f"sha256={skill_transcript_gate.get('skill_sha256')}",
+        )
+        lines.insert(
+            3,
+            f"Skill route command: {skill_transcript_gate.get('route_command')}",
+        )
     for key in sorted(artifacts):
         value = artifacts[key]
         if isinstance(value, str):
@@ -202,6 +239,7 @@ def validate_final_response(
     run_status: Mapping[str, Any],
     final_response: str,
     scenario_id: str,
+    skill_transcript_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate one scripted assistant response against fresh-session rules."""
 
@@ -228,6 +266,35 @@ def validate_final_response(
                 "fresh-session $deep-research invocation ended as quick-chat",
             )
         )
+
+    if not isinstance(skill_transcript_gate, Mapping) or skill_transcript_gate.get("status") != "passed":
+        failures.append(
+            _failure(
+                scenario_id,
+                "skill_transcript_gate_not_passed",
+                "fresh-session transcript must be generated from passing canonical skill instructions",
+            )
+        )
+    else:
+        required_markers = (
+            "Transcript kind: skill-invocation",
+            str(skill_transcript_gate.get("skill_path") or ""),
+            str(skill_transcript_gate.get("route_command") or ""),
+        )
+        missing_markers = [
+            marker
+            for marker in required_markers
+            if marker and marker not in final_response
+        ]
+        if missing_markers:
+            failures.append(
+                _failure(
+                    scenario_id,
+                    "not_skill_invocation_transcript",
+                    "transcript is missing skill-invocation markers: "
+                    + ", ".join(missing_markers),
+                )
+            )
 
     response_successful = _looks_successful(final_response)
     if response_successful and not run_dir:
@@ -342,6 +409,8 @@ def _run_scenario(
     *,
     suite_dir: Path,
     runner_path: Path,
+    skill_transcript_gate: Mapping[str, Any],
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     scenario_id = str(scenario["id"])
     transcript_path = suite_dir / f"{scenario_id}_transcript.md"
@@ -352,19 +421,41 @@ def _run_scenario(
     if command is None:
         run_status = dict(scenario["run_status"])
         completed = None
+        timed_out = False
     else:
-        completed = subprocess.run(
-            [str(runner_path), *command],
-            cwd=REPO_ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        run_status = _payload_from_subprocess(completed)
+        try:
+            completed = subprocess.run(
+                [str(runner_path), *command],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            run_status = _payload_from_subprocess(completed)
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            completed = None
+            timed_out = True
+            run_status = _timeout_run_status(
+                scenario=scenario,
+                command=[str(runner_path), *command],
+                timeout_seconds=timeout_seconds,
+                exc=exc,
+            )
 
-    final_response = render_final_response(run_status, scenario_id=scenario_id)
+    final_response = render_final_response(
+        run_status,
+        scenario_id=scenario_id,
+        skill_transcript_gate=skill_transcript_gate,
+    )
     transcript = (
         "# Fresh Session Transcript\n\n"
+        "SKILL INSTRUCTIONS LOADED:\n"
+        f"- path: {skill_transcript_gate.get('skill_path')}\n"
+        f"- sha256: {skill_transcript_gate.get('skill_sha256')}\n"
+        f"- route command: {skill_transcript_gate.get('route_command')}\n"
+        f"- status: {skill_transcript_gate.get('status')}\n\n"
         f"USER: {scenario['invocation']}\n\n"
         "ASSISTANT:\n"
         f"{final_response}"
@@ -374,6 +465,7 @@ def _run_scenario(
         run_status=run_status,
         final_response=final_response,
         scenario_id=scenario_id,
+        skill_transcript_gate=skill_transcript_gate,
     )
     expected = _expected_outcome_ok(scenario, run_status, validation)
     failures = list(validation["failures"])
@@ -401,9 +493,13 @@ def _run_scenario(
         "fallback": dict(run_status.get("fallback", {}))
         if isinstance(run_status.get("fallback"), Mapping)
         else {},
+        "diagnostics": dict(run_status.get("diagnostics", {}))
+        if isinstance(run_status.get("diagnostics"), Mapping)
+        else {},
         "transcript": str(transcript_path.resolve()),
         "returncode": completed.returncode if completed is not None else None,
         "stderr": completed.stderr.strip()[:500] if completed is not None else "",
+        "timed_out": timed_out,
         "validation": validation,
         "failures": failures,
     }
@@ -465,7 +561,7 @@ def _real_codex_exec_scenario(invocation: str, *, real_codex_exec: str) -> dict[
         return _skipped_real_codex_scenario(
             invocation,
             detail="real codex-exec scenario skipped by --real-codex-exec=skip",
-            codex_path=codex_path,
+            codex_available=bool(codex_path),
         )
     if real_codex_exec == "auto" and not codex_path:
         return {
@@ -523,7 +619,7 @@ def _real_codex_exec_scenario(invocation: str, *, real_codex_exec: str) -> dict[
 
 
 def _skipped_real_codex_scenario(
-    invocation: str, *, detail: str, codex_path: str | None
+    invocation: str, *, detail: str, codex_available: bool
 ) -> dict[str, Any]:
     run_status = {
         "schema_version": "codex-deepresearch.run-status.v0",
@@ -546,7 +642,7 @@ def _skipped_real_codex_scenario(
         },
         "diagnostics": {
             "actionable_cause": detail,
-            "codex_cli_path": codex_path,
+            "codex_cli_available": codex_available,
             "retry": "rerun with --real-codex-exec=auto or require to launch real child runs",
         },
         "artifacts": {},
@@ -598,6 +694,60 @@ def _payload_from_subprocess(completed: subprocess.CompletedProcess[str]) -> dic
         }
 
 
+def _timeout_run_status(
+    *,
+    scenario: Mapping[str, Any],
+    command: Sequence[str],
+    timeout_seconds: float,
+    exc: subprocess.TimeoutExpired,
+) -> dict[str, Any]:
+    invocation = str(scenario.get("invocation") or "")
+    return {
+        "schema_version": "codex-deepresearch.run-status.v0",
+        "run_id": None,
+        "run_dir": None,
+        "invocation": invocation,
+        "question": invocation.split(":", 1)[1].strip() if ":" in invocation else invocation,
+        "selected_mode": "blocked",
+        "status": "blocked_preflight",
+        "ok": False,
+        "terminal": True,
+        "provenance": {
+            "type": "blocked_preflight",
+            "adapter": _adapter_from_command(command),
+            "fixture_only": False,
+            "manual_handoff": False,
+            "attempted_real_child_execution": _adapter_from_command(command) == "codex-exec",
+            "real_child_execution": False,
+            "real_use_e2e_eligible": False,
+        },
+        "diagnostics": {
+            "actionable_cause": (
+                f"fresh-session scenario timed out after {timeout_seconds:g} seconds"
+            ),
+            "timeout_seconds": timeout_seconds,
+            "command": _redacted_command(command),
+            "stdout": _timeout_text(getattr(exc, "stdout", None)),
+            "stderr": _timeout_text(getattr(exc, "stderr", None)),
+        },
+        "artifacts": {},
+        "shard_summary": {
+            "planned_task_count": None,
+            "accepted_shard_count": 0,
+            "merged_shard_count": 0,
+            "failed_task_count": 0,
+            "blocked_task_count": 0,
+            "rejected_shard_count": 0,
+            "discarded_task_count": 0,
+        },
+        "fallback": {
+            "parallel_degraded": None,
+            "needs_serial_handoff": None,
+            "degraded_reason": "scenario_timeout",
+        },
+    }
+
+
 def _expected_outcome_ok(
     scenario: Mapping[str, Any],
     run_status: Mapping[str, Any],
@@ -620,13 +770,18 @@ def _expected_outcome_ok(
     }
 
 
-def _skill_preflight(runner_path: Path) -> dict[str, Any]:
+def _skill_transcript_gate(
+    *,
+    runner_path: Path,
+    skill_path: Path,
+    invocation: str,
+) -> dict[str, Any]:
     manifest_path = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
-    skill_path = PLUGIN_ROOT / "skills" / "deep-research" / "SKILL.md"
     checks: dict[str, bool] = {
         "manifest_exists": manifest_path.is_file(),
         "canonical_skill_exists": skill_path.is_file(),
         "runner_executable": runner_path.is_file(),
+        "normal_invocation": invocation.startswith("$deep-research:"),
     }
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -638,19 +793,55 @@ def _skill_preflight(runner_path: Path) -> dict[str, Any]:
         skill_text = skill_path.read_text(encoding="utf-8")
     except OSError:
         skill_text = ""
-    checks["skill_invokes_runner"] = (
-        "$deep-research:" in skill_text
-        and "codex-deepresearch invoke" in skill_text
+    route_command = _extract_route_command(skill_text)
+    checks["skill_names_deep_research"] = "name: deep-research" in skill_text
+    checks["skill_has_invocation_router_section"] = "## Invocation Router" in skill_text
+    checks["skill_references_deep_research_invocation"] = "$deep-research:" in skill_text
+    checks["skill_forbids_normal_chat_only"] = (
+        "do not answer directly in chat" in skill_text.lower()
+    )
+    checks["skill_routes_normal_invocation_through_runner"] = bool(route_command)
+    checks["skill_reserves_quick_chat_for_explicit_request"] = (
+        "quick-chat only when the user explicitly asks" in skill_text.lower()
+        or "quick-chat` only when the user explicitly asks" in skill_text.lower()
+    )
+    checks["skill_reports_blocked_status"] = (
+        "blocked statuses must expose" in skill_text.lower()
+        and "do not silently return a chat-only answer" in skill_text.lower()
     )
     passed = all(checks.values())
     return {
         "status": "passed" if passed else "failed",
         "checks": checks,
+        "skill_path": str(skill_path.resolve()) if skill_path.exists() else str(skill_path),
+        "skill_sha256": sha256(skill_text.encode("utf-8")).hexdigest() if skill_text else None,
+        "route_command": route_command,
+        "transcript_source": "canonical_skill_instructions",
         "detail": (
-            "canonical skill and plugin runner entrypoint are present"
+            "canonical skill instructions route normal invocations through the runner"
             if passed
-            else "canonical skill or plugin runner entrypoint is incomplete"
+            else "canonical skill instructions do not satisfy the fresh-session invocation contract"
         ),
+    }
+
+
+def _runner_artifact_gate(scenarios: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    skill_checks = {"skill_transcript_gate_not_passed", "not_skill_invocation_transcript"}
+    failures = [
+        failure
+        for scenario in scenarios
+        for failure in scenario.get("validation", {}).get("failures", [])
+        if isinstance(failure, Mapping) and failure.get("check") not in skill_checks
+    ]
+    passed = not failures
+    return {
+        "status": "passed" if passed else "failed",
+        "detail": (
+            "runner artifact handoff validation passed for all scripted scenarios"
+            if passed
+            else "runner artifact handoff validation failed for one or more scripted scenarios"
+        ),
+        "failures": failures,
     }
 
 
@@ -820,6 +1011,42 @@ def _int_or_zero(value: Any) -> int:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _extract_route_command(skill_text: str) -> str | None:
+    for raw_line in skill_text.splitlines():
+        line = raw_line.strip()
+        if "codex-deepresearch" not in line or " invoke " not in f" {line} ":
+            continue
+        if "$deep-research:" not in line:
+            continue
+        if "plugins/codex-deepresearch/scripts/codex-deepresearch" not in line:
+            continue
+        return line
+    return None
+
+
+def _adapter_from_command(command: Sequence[str]) -> str | None:
+    parts = [str(part) for part in command]
+    for index, part in enumerate(parts):
+        if part == "--adapter" and index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def _redacted_command(command: Sequence[str]) -> list[str]:
+    return [
+        "<invocation>" if str(part).startswith("$deep-research:") else str(part)
+        for part in command
+    ]
+
+
+def _timeout_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")[:500]
+    return str(value)[:500]
 
 
 def _scenario_command_args(

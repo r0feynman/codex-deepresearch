@@ -20,6 +20,7 @@ from deepresearch import (
     BudgetEstimateError,
     ConfigResolutionError,
     DEFAULT_FRESH_SESSION_INVOKE,
+    DEFAULT_SCENARIO_TIMEOUT_SECONDS,
     FreshSessionE2EError,
     resolve_config,
     run_fresh_session_e2e,
@@ -591,6 +592,7 @@ def run_fresh_session_e2e_command(args: argparse.Namespace) -> int:
             clean=args.clean,
             real_codex_exec=args.real_codex_exec,
             runner_path=Path(__file__).resolve(),
+            scenario_timeout_seconds=args.scenario_timeout_seconds,
         )
     except (FreshSessionE2EError, OSError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -691,13 +693,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fresh_session.add_argument(
         "--real-codex-exec",
-        default="auto",
+        default="skip",
         choices=("auto", "require", "skip"),
         help=(
-            "How to handle the real codex-exec scenario: auto attempts it when "
+            "How to handle the real codex-exec scenario: skip records a public-safe "
+            "blocked diagnostic, auto attempts it when "
             "Codex CLI is available, require fails unless real execution is available, "
-            "and skip records an explicit blocked diagnostic without launching it."
+            "and every launched scenario is bounded by --scenario-timeout-seconds."
         ),
+    )
+    fresh_session.add_argument(
+        "--scenario-timeout-seconds",
+        type=float,
+        default=DEFAULT_SCENARIO_TIMEOUT_SECONDS,
+        help="Per-scenario subprocess timeout for fixture, serial, auto, and require paths.",
     )
     fresh_session.set_defaults(func=run_fresh_session_e2e_command)
 
