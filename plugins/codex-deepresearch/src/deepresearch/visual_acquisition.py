@@ -1,17 +1,21 @@
-"""Deterministic visual candidate acquisition for local/test DeepResearch runs."""
+"""Visual candidate acquisition for local/test and configured real provider runs."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import mimetypes
+import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
-from urllib.parse import urljoin, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from .cache_keys import normalize_url
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, SEARCH_ROUTES, validate_artifacts
@@ -32,6 +36,29 @@ DEFAULT_VISUAL_PROVIDERS = (
     "local-image-fixture",
     "local-screenshot-fixture",
 )
+BRAVE_IMAGE_PROVIDER = "brave-image-search"
+BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
+BRAVE_DEFAULT_SEARCH_LANG = "en"
+BRAVE_DEFAULT_COUNTRY = "US"
+BRAVE_DEFAULT_SAFESEARCH = "strict"
+BRAVE_DEFAULT_TIMEOUT_SECONDS = 20.0
+BRAVE_DEFAULT_ESTIMATED_COST_USD = 0.005
+BRAVE_DEFAULT_USER_AGENT = "codex-deepresearch/0.1"
+BRAVE_STORAGE_CONFIRMATION_ENV = "CODEX_DEEPRESEARCH_BRAVE_ALLOW_RESULT_STORAGE"
+REDACTED_SECRET = "[REDACTED]"
+SECRET_KEY_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|subscription[-_]?token|authorization|bearer|token|secret|password)"
+)
+SECRET_JSON_FIELD_PATTERN = re.compile(
+    r"(?i)([\"']?(?:api[_-]?key|subscription[-_]?token|authorization|bearer|token|secret|password)"
+    r"[\"']?\s*:\s*[\"'])([^\"']+)([\"'])"
+)
+SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|subscription[-_]?token|authorization|bearer|token|secret|password)"
+    r"(\s*[:=]\s*)([^\s,;}\]\)]+)"
+)
+TRUE_CONFIG_VALUES = {"1", "true", "yes", "on"}
+FALSE_CONFIG_VALUES = {"0", "false", "no", "off"}
 SCREENSHOT_MODES = ("first_viewport", "full_page", "scroll", "interaction")
 DEFAULT_MAX_IMAGE_BYTES = 1_000_000
 SUPPORTED_MIME_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
@@ -65,6 +92,42 @@ class _VisualProvider(Protocol):
         """Return unvalidated visual candidates."""
 
 
+@dataclass(frozen=True)
+class _BraveImageSearchConfig:
+    api_key: str | None
+    endpoint: str
+    count: int
+    country: str
+    search_lang: str
+    safesearch: str
+    timeout_seconds: float
+    estimated_cost_usd: float
+    actual_cost_usd: float
+    user_agent: str
+    allow_result_storage: bool
+
+
+@dataclass(frozen=True)
+class _BraveImageSearchResponse:
+    status_code: int
+    payload: Mapping[str, Any]
+    headers: Mapping[str, str]
+    elapsed_ms: int
+
+
+class _BraveImageSearchTransport(Protocol):
+    def fetch(
+        self,
+        *,
+        endpoint: str,
+        api_key: str,
+        params: Mapping[str, Any],
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> _BraveImageSearchResponse:
+        """Fetch one provider response."""
+
+
 def acquire_visual_candidates(
     *,
     run: str | Path,
@@ -72,12 +135,16 @@ def acquire_visual_candidates(
     providers: Sequence[str] | None = None,
     screenshot_modes: Sequence[str] | None = None,
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+    real_image_search_transport: _BraveImageSearchTransport | None = None,
+    real_image_search_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Collect deterministic local/test visual candidates for visual routes.
+    """Collect visual candidates for visual routes.
 
-    The stage never calls live web, browser automation, OCR services, VLMs, or
-    external APIs. Providers either parse local run artifacts or create small
-    deterministic fixture image files inside the run directory.
+    The default local providers remain deterministic and never call live web,
+    browser automation, OCR services, VLMs, or external APIs. Selecting a real
+    provider such as ``brave-image-search`` uses the configured provider adapter
+    and writes candidate discovery records only; image fetch and VLM analysis
+    stay separate stages.
     """
 
     if max_image_bytes < 1:
@@ -106,7 +173,37 @@ def acquire_visual_candidates(
         )
         return status
 
-    source_by_id = _ensure_fixture_sources(run_dir, evidence, created_at=now)
+    provider_instances = _providers(
+        provider_names,
+        real_image_search_transport=real_image_search_transport,
+        real_image_search_config=real_image_search_config,
+        evidence=evidence,
+    )
+    real_provider_requested = any(_is_real_provider_name(provider.name) for provider in provider_instances)
+    active_provider_names = provider_names
+    if real_provider_requested:
+        provider_instances = [
+            provider for provider in provider_instances if _is_real_provider_name(provider.name)
+        ]
+        active_provider_names = tuple(provider.name for provider in provider_instances)
+        preflight_statuses = [_initial_provider_status(provider) for provider in provider_instances]
+        if not any(
+            status.get("configured") is True and status.get("available") is True
+            for status in preflight_statuses
+        ):
+            return _write_blocked_missing_visual_provider(
+                run_dir,
+                evidence=evidence,
+                evidence_path=evidence_path,
+                routes=routes,
+                provider_names=active_provider_names,
+                provider_statuses=preflight_statuses,
+                created_at=now,
+            )
+
+    source_by_id = _source_by_id(evidence)
+    if not real_provider_requested and _uses_fixture_sources(active_provider_names):
+        source_by_id = _ensure_fixture_sources(run_dir, evidence, created_at=now)
     context = _VisualContext(
         run_dir=run_dir,
         evidence=evidence,
@@ -119,25 +216,42 @@ def acquire_visual_candidates(
 
     candidates: list[dict[str, Any]] = []
     provider_statuses: list[dict[str, Any]] = []
-    for provider in _providers(provider_names):
+    for provider in provider_instances:
         provider_candidates = provider.collect(context)
         candidates.extend(provider_candidates)
-        provider_statuses.append(
-            {
-                "provider": provider.name,
-                "candidates": len(provider_candidates),
-                "external_network_call": False,
-                "external_vlm_call": False,
-            }
+        provider_statuses.append(_collection_provider_status(provider, provider_candidates))
+
+    if real_provider_requested and not any(
+        status.get("available") is True for status in provider_statuses
+    ):
+        return _write_blocked_missing_visual_provider(
+            run_dir,
+            evidence=evidence,
+            evidence_path=evidence_path,
+            routes=routes,
+            provider_names=active_provider_names,
+            provider_statuses=provider_statuses,
+            created_at=now,
         )
 
-    selected, candidate_records, near_duplicate_groups = _validate_and_select_candidates(
-        run_dir=run_dir,
-        evidence=evidence,
-        candidates=candidates,
-        max_image_bytes=max_image_bytes,
-        created_at=now,
-    )
+    if real_provider_requested:
+        selected: list[dict[str, Any]] = []
+        candidate_records = _normalize_real_candidate_records(
+            candidates=candidates,
+            evidence=evidence,
+            run_dir=run_dir,
+            created_at=now,
+        )
+        near_duplicate_groups: list[dict[str, Any]] = []
+    else:
+        selected, candidate_records, near_duplicate_groups = _validate_and_select_candidates(
+            run_dir=run_dir,
+            evidence=evidence,
+            candidates=candidates,
+            max_image_bytes=max_image_bytes,
+            created_at=now,
+        )
+
     visual_candidates_path = run_dir / "visual_candidates.jsonl"
     visual_search_plan_path = run_dir / VISUAL_SEARCH_PLAN_FILENAME
     image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
@@ -148,26 +262,50 @@ def acquire_visual_candidates(
         run_dir=run_dir,
         evidence=evidence,
         routes=routes,
-        provider_names=provider_names,
+        provider_names=active_provider_names,
         created_at=now,
         selected_observations=len(selected),
+        state="completed",
+    )
+    visual_status = (
+        "real_image_search_candidates_collected"
+        if real_provider_requested and candidate_records
+        else "partial_auto_visual"
+        if real_provider_requested
+        else "fixture_visual_provider"
+    )
+    visual_ok = not real_provider_requested or bool(candidate_records)
+    visual_terminal = real_provider_requested and not candidate_records
+    metric_classification = (
+        "real_provider_candidate_discovery"
+        if real_provider_requested and candidate_records
+        else "included_failure"
+        if real_provider_requested
+        else "fixture_only_not_release_eligible"
+    )
+    actionable_cause = (
+        "configured real image search provider returned normalized candidates"
+        if real_provider_requested and candidate_records
+        else "configured real image search provider returned no image candidates"
+        if real_provider_requested
+        else (
+            "deterministic fixture/manual visual providers validate mechanics; "
+            "records are excluded from real automatic visual release counts"
+        )
     )
     visual_provider_status = _visual_provider_status(
         run_dir=run_dir,
-        status="fixture_visual_provider",
-        ok=True,
-        terminal=False,
-        metric_classification="fixture_only_not_release_eligible",
-        provider_names=provider_names,
+        status=visual_status,
+        ok=visual_ok,
+        terminal=visual_terminal,
+        metric_classification=metric_classification,
+        provider_names=active_provider_names,
         provider_statuses=provider_statuses,
         candidate_records=candidate_records,
         image_fetch_records=image_fetch_records,
         observations=selected,
         created_at=now,
-        actionable_cause=(
-            "deterministic fixture/manual visual providers validate mechanics; "
-            "records are excluded from real automatic visual release counts"
-        ),
+        actionable_cause=actionable_cause,
     )
     _write_json(visual_search_plan_path, visual_search_plan)
     _write_jsonl(visual_candidates_path, candidate_records)
@@ -181,7 +319,13 @@ def acquire_visual_candidates(
     route_summary = _route_summary(routes)
     evidence["visual_acquisition"] = {
         "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
-        "status": "visual_candidates_collected",
+        "status": (
+            "real_image_search_candidates_collected"
+            if real_provider_requested and candidate_records
+            else "partial_auto_visual"
+            if real_provider_requested
+            else "visual_candidates_collected"
+        ),
         "created_at": now,
         "providers": provider_statuses,
         "routes": route_summary,
@@ -201,7 +345,7 @@ def acquire_visual_candidates(
             "content_hash_check": True,
             "near_duplicate_check": True,
         },
-        "image_search_invocations": _count_provider(provider_statuses, "local-image-fixture"),
+        "image_search_invocations": _image_search_invocations(provider_statuses),
         "screenshot_capture_requests": len(screenshot_capture["requests"]),
         "ocr_records": len(
             [
@@ -210,7 +354,9 @@ def acquire_visual_candidates(
                 if isinstance(record.get("ocr_text"), str) and record["ocr_text"]
             ]
         ),
-        "external_network_call": False,
+        "external_network_call": any(
+            bool(status.get("external_network_call")) for status in provider_statuses
+        ),
         "external_ocr_call": False,
         "external_vlm_call": False,
     }
@@ -240,7 +386,14 @@ def acquire_visual_candidates(
         visual_provider_status_path=visual_provider_status_path,
         evidence_path=None,
     )
-    status = _base_status(run_dir, evidence, "visual_candidates_collected", now)
+    status_name = (
+        "real_image_search_candidates_collected"
+        if real_provider_requested and candidate_records
+        else "partial_auto_visual"
+        if real_provider_requested
+        else "visual_candidates_collected"
+    )
+    status = _base_status(run_dir, evidence, status_name, now)
     status.update(
         {
             "providers": provider_statuses,
@@ -259,7 +412,9 @@ def acquire_visual_candidates(
                 "screenshot_capture_requests"
             ],
             "ocr_records": evidence["visual_acquisition"]["ocr_records"],
-            "external_network_call": False,
+            "external_network_call": any(
+                bool(item.get("external_network_call")) for item in provider_statuses
+            ),
             "external_ocr_call": False,
             "external_vlm_call": False,
             "artifacts": {
@@ -472,6 +627,327 @@ class _LocalScreenshotFixtureProvider:
                     vlm_visual_description=f"Deterministic {mode} screenshot capture artifact.",
                 )
             )
+        return records
+
+
+class _HttpBraveImageSearchTransport:
+    def fetch(
+        self,
+        *,
+        endpoint: str,
+        api_key: str,
+        params: Mapping[str, Any],
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> _BraveImageSearchResponse:
+        started = time.monotonic()
+        query = urlencode({key: value for key, value in params.items() if value is not None})
+        request = Request(
+            f"{endpoint}?{query}",
+            headers={**headers, "X-Subscription-Token": api_key},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                payload = _loads_provider_payload(body)
+                return _BraveImageSearchResponse(
+                    status_code=int(getattr(response, "status", 200)),
+                    payload=payload,
+                    headers=dict(response.headers.items()),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                )
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            return _BraveImageSearchResponse(
+                status_code=int(exc.code),
+                payload=_loads_provider_payload(body),
+                headers=dict(exc.headers.items()) if exc.headers is not None else {},
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+
+
+class _BraveImageSearchProvider:
+    name = BRAVE_IMAGE_PROVIDER
+
+    def __init__(
+        self,
+        *,
+        config: _BraveImageSearchConfig,
+        transport: _BraveImageSearchTransport | None = None,
+    ) -> None:
+        self.config = config
+        self.transport = transport or _HttpBraveImageSearchTransport()
+        self.last_status = self.initial_status()
+
+    def initial_status(self) -> dict[str, Any]:
+        configured = bool(self.config.api_key)
+        storage_confirmed = self.config.allow_result_storage
+        if not configured:
+            blocked_reason = "missing_brave_search_api_key"
+        elif not storage_confirmed:
+            blocked_reason = "brave_result_storage_not_confirmed"
+        else:
+            blocked_reason = None
+        return {
+            "provider": self.name,
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "configured": configured,
+            "available": configured and storage_confirmed,
+            "blocked_reason": blocked_reason,
+            "invoked": False,
+            "invocations": 0,
+            "candidates": 0,
+            "candidates_discovered": 0,
+            "artifacts_fetched": 0,
+            "vlm_images_analyzed": 0,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "last_error": None,
+            "external_network_call": False,
+            "external_vlm_call": False,
+            "diagnostics": {
+                "endpoint": self.config.endpoint,
+                "config_keys": _brave_config_keys(
+                    configured=configured,
+                    storage_confirmed=storage_confirmed,
+                ),
+                "count": self.config.count,
+                "country": self.config.country,
+                "search_lang": self.config.search_lang,
+                "safesearch": self.config.safesearch,
+                "result_storage_confirmed": storage_confirmed,
+                "storage_confirmation_env": BRAVE_STORAGE_CONFIRMATION_ENV,
+                "storage_policy": "persisted result metadata requires explicit plan/terms confirmation",
+            },
+        }
+
+    def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
+        if not self.config.api_key or not self.config.allow_result_storage:
+            self.last_status = self.initial_status()
+            return []
+
+        secrets = _provider_secret_values(self.config)
+        candidates: list[dict[str, Any]] = []
+        invocations = 0
+        last_error: str | None = None
+        blocked_reason: str | None = None
+        successful_invocations = 0
+        failed_invocations = 0
+        diagnostics_by_query: list[dict[str, Any]] = []
+        for route in context.routes:
+            query = _query_for_route(context, route)
+            if not query:
+                continue
+            invocations += 1
+            params = {
+                "q": query[:400],
+                "count": self.config.count,
+                "country": self.config.country,
+                "search_lang": self.config.search_lang,
+                "safesearch": self.config.safesearch,
+            }
+            try:
+                response = self.transport.fetch(
+                    endpoint=self.config.endpoint,
+                    api_key=self.config.api_key,
+                    params=params,
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip",
+                        "User-Agent": self.config.user_agent,
+                    },
+                    timeout_seconds=self.config.timeout_seconds,
+                )
+            except (OSError, TimeoutError, URLError) as exc:
+                failed_invocations += 1
+                blocked_reason = blocked_reason or "provider_request_failed"
+                last_error = _redact_provider_text(
+                    str(exc) or exc.__class__.__name__,
+                    secrets=secrets,
+                )
+                diagnostics_by_query.append(
+                    _provider_query_diagnostics(
+                        query=query,
+                        params=params,
+                        status_code=None,
+                        headers={},
+                        elapsed_ms=None,
+                        error=last_error,
+                    )
+                )
+                continue
+            query_diagnostics = _provider_query_diagnostics(
+                query=query,
+                params=params,
+                status_code=response.status_code,
+                headers=response.headers,
+                elapsed_ms=response.elapsed_ms,
+                error=None,
+            )
+            diagnostics_by_query.append(query_diagnostics)
+            if response.status_code != 200:
+                failed_invocations += 1
+                reason = _blocked_reason_for_http_status(response.status_code)
+                blocked_reason = blocked_reason or reason
+                last_error = _redact_provider_text(
+                    _provider_error_message(response.payload, response.status_code),
+                    secrets=secrets,
+                )
+                query_diagnostics["error"] = last_error
+                continue
+            results = response.payload.get("results")
+            if not isinstance(results, list):
+                failed_invocations += 1
+                blocked_reason = blocked_reason or "provider_response_invalid"
+                last_error = "provider response did not include results[]"
+                query_diagnostics["error"] = last_error
+                continue
+            provider_run_id = f"{self.name}:{context.run_dir.name}:{invocations}"
+            route_candidates = self._candidates_from_results(
+                results=results,
+                route=route,
+                query=query,
+                provider_run_id=provider_run_id,
+                provider_diagnostics=query_diagnostics,
+                created_at=context.created_at,
+            )
+            successful_invocations += 1
+            candidates.extend(route_candidates)
+
+        estimated_cost = invocations * self.config.estimated_cost_usd
+        actual_cost = invocations * self.config.actual_cost_usd
+        available = successful_invocations > 0
+        self.last_status = {
+            "provider": self.name,
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "configured": True,
+            "available": available,
+            "blocked_reason": None if available else blocked_reason,
+            "invoked": invocations > 0,
+            "invocations": invocations,
+            "candidates": len(candidates),
+            "candidates_discovered": len(candidates),
+            "artifacts_fetched": 0,
+            "vlm_images_analyzed": 0,
+            "estimated_cost_usd": estimated_cost,
+            "actual_cost_usd": actual_cost,
+            "last_error": last_error,
+            "external_network_call": invocations > 0,
+            "external_vlm_call": False,
+            "diagnostics": {
+                "endpoint": self.config.endpoint,
+                "config_keys": _brave_config_keys(
+                    configured=True,
+                    storage_confirmed=self.config.allow_result_storage,
+                ),
+                "queries": diagnostics_by_query,
+                "result_count": len(candidates),
+                "successful_invocations": successful_invocations,
+                "failed_invocations": failed_invocations,
+                "partial_failure": successful_invocations > 0 and failed_invocations > 0,
+                "rate_limited": any(
+                    item.get("http_status") == 429 for item in diagnostics_by_query
+                ),
+                "auth_failed": any(
+                    item.get("http_status") in {401, 403} for item in diagnostics_by_query
+                ),
+                "result_storage_confirmed": self.config.allow_result_storage,
+                "storage_confirmation_env": BRAVE_STORAGE_CONFIRMATION_ENV,
+            },
+        }
+        _assign_real_candidate_costs(
+            candidates,
+            estimated_cost_usd=estimated_cost,
+            actual_cost_usd=actual_cost,
+        )
+        return candidates
+
+    def _candidates_from_results(
+        self,
+        *,
+        results: Sequence[Any],
+        route: Mapping[str, Any],
+        query: str,
+        provider_run_id: str,
+        provider_diagnostics: Mapping[str, Any],
+        created_at: str,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for index, result in enumerate(results, start=1):
+            if not isinstance(result, Mapping):
+                continue
+            image_url = _result_image_url(result)
+            page_url = _result_page_url(result)
+            if not image_url or not page_url:
+                continue
+            task_id = _string(route.get("task_id")) or _task_id_for_angle(route.get("id"))
+            candidate_id = "cand_" + _safe_id(
+                f"{self.name}_{task_id}_{index}_{hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:12]}"
+            )
+            width, height = _result_dimensions(result)
+            score = _score_from_rank(index)
+            provider_provenance = {
+                "provider": self.name,
+                "provider_kind": "web_image_search",
+                "provider_mode": "real",
+                "provider_run_id": provider_run_id,
+                "fixture_only": False,
+                "external_network_call": True,
+                "external_vlm_call": False,
+                "retrieved_at": created_at,
+                "query": query,
+                "result_rank": index,
+            }
+            record = {
+                "id": candidate_id,
+                "candidate_id": candidate_id,
+                "plan_id": f"plan_{task_id}",
+                "task_id": task_id,
+                "provider": self.name,
+                "provider_kind": "web_image_search",
+                "provider_mode": "real",
+                "provider_run_id": provider_run_id,
+                "provider_provenance": provider_provenance,
+                "route": route.get("modality"),
+                "angle_id": route.get("id"),
+                "candidate_class": "image_search",
+                "origin": "image_search",
+                "image_url": image_url,
+                "page_url": page_url,
+                "rank": index,
+                "score": score,
+                "width": width,
+                "height": height,
+                "alt_text": _result_title(result),
+                "visual_tasks": list(route.get("visual_tasks", []))
+                if isinstance(route.get("visual_tasks"), list)
+                else [],
+                "analysis_status": "skipped",
+                "observations": [],
+                "inferences": [],
+                "policy_flags": [],
+                "policy_decision": "allowed",
+                "candidate_status": "ranked",
+                "rejection_reason": None,
+                "removal_reasons": [],
+                "caveats": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "provider_diagnostics": {
+                    "query": query,
+                    "provider_http_status": provider_diagnostics.get("http_status"),
+                    "rate_limit": provider_diagnostics.get("rate_limit", {}),
+                },
+            }
+            if self.config.allow_result_storage:
+                record["raw_provider_metadata"] = _sanitized_result_metadata(
+                    result,
+                    secrets=_provider_secret_values(self.config),
+                )
+            records.append(record)
         return records
 
 
@@ -885,6 +1361,46 @@ def _apply_phase3_candidate_defaults(
     record.setdefault("actual_cost_usd", 0.0)
 
 
+def _normalize_real_candidate_records(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    run_dir: Path,
+    created_at: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_urls: dict[str, str] = {}
+    for index, raw_candidate in enumerate(candidates, start=1):
+        record = dict(raw_candidate)
+        record["rank"] = int(record.get("rank") or index)
+        record["score"] = float(record.get("score") or _score_from_rank(record["rank"]))
+        record["acquired_at"] = created_at
+        _apply_phase3_candidate_defaults(record, evidence=evidence, run_dir=run_dir)
+        record.setdefault("candidate_class", "image_search")
+        record.setdefault("origin", "image_search")
+        record.setdefault("analysis_status", "skipped")
+        record.setdefault("observations", [])
+        record.setdefault("inferences", [])
+        record.setdefault("visual_tasks", [])
+        record.setdefault("policy_flags", [])
+        record.setdefault("caveats", [])
+        record.setdefault("removal_reasons", [])
+        normalized_url = _normalized_candidate_url(record)
+        if normalized_url:
+            previous = seen_urls.get(normalized_url)
+            if previous is not None:
+                record["duplicate_of"] = previous
+                record["candidate_status"] = "rejected"
+                record["rejection_reason"] = "duplicate_image_url"
+                record["removal_reasons"] = _dedupe(
+                    [*_string_list(record.get("removal_reasons")), "duplicate_image_url"]
+                )
+            else:
+                seen_urls[normalized_url] = str(record["candidate_id"])
+        records.append(_persistable_candidate(record))
+    return records
+
+
 def _image_fetch_records_from_candidates(
     candidates: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -937,6 +1453,7 @@ def _visual_search_plan(
     provider_names: Sequence[str],
     created_at: str,
     selected_observations: int,
+    state: str,
 ) -> dict[str, Any]:
     tasks = []
     for route in routes:
@@ -964,7 +1481,7 @@ def _visual_search_plan(
                     "policy_decision": "allowed",
                 },
                 "estimated_cost_usd": 0.0,
-                "state": "completed",
+                "state": state,
             }
         )
     return {
@@ -998,6 +1515,10 @@ def _visual_provider_status(
     providers = []
     for provider in provider_names:
         provider_status = status_by_provider.get(provider, {})
+        provider_kind = _string(provider_status.get("provider_kind")) or _provider_kind(provider)
+        provider_mode = _string(provider_status.get("provider_mode")) or (
+            "real" if _is_real_provider_name(provider) else "fixture"
+        )
         provider_candidates = [
             item for item in candidate_records if item.get("provider") == provider
         ]
@@ -1013,18 +1534,43 @@ def _visual_provider_status(
         providers.append(
             {
                 "provider": provider,
-                "provider_kind": _provider_kind(provider),
-                "provider_mode": "fixture",
-                "configured": True,
-                "available": True,
-                "blocked_reason": None,
-                "invocations": 0 if invoked is False else 1,
-                "candidates_discovered": len(provider_candidates),
-                "artifacts_fetched": len(provider_fetches),
-                "vlm_images_analyzed": len(provider_observations),
-                "estimated_cost_usd": 0.0,
-                "actual_cost_usd": 0.0,
-                "last_error": None,
+                "provider_kind": provider_kind,
+                "provider_mode": provider_mode,
+                "configured": provider_status.get("configured") is not False,
+                "available": provider_status.get("available") is not False,
+                "blocked_reason": provider_status.get("blocked_reason"),
+                "invocations": _int_or_zero(provider_status.get("invocations"))
+                if "invocations" in provider_status
+                else 0
+                if invoked is False
+                else 1,
+                "candidates_discovered": _int_or_zero(
+                    provider_status.get("candidates_discovered")
+                )
+                if "candidates_discovered" in provider_status
+                else len(provider_candidates),
+                "artifacts_fetched": _int_or_zero(provider_status.get("artifacts_fetched"))
+                if "artifacts_fetched" in provider_status
+                else len(provider_fetches),
+                "vlm_images_analyzed": _int_or_zero(
+                    provider_status.get("vlm_images_analyzed")
+                )
+                if "vlm_images_analyzed" in provider_status
+                else len(provider_observations),
+                "estimated_cost_usd": float(provider_status.get("estimated_cost_usd") or 0.0),
+                "actual_cost_usd": float(provider_status.get("actual_cost_usd") or 0.0),
+                "last_error": _redact_provider_text(
+                    str(provider_status["last_error"]),
+                    secrets=(),
+                )
+                if provider_status.get("last_error") is not None
+                else None,
+                "external_network_call": bool(provider_status.get("external_network_call")),
+                "external_vlm_call": bool(provider_status.get("external_vlm_call")),
+                "diagnostics": _redact_provider_value(
+                    provider_status.get("diagnostics", {}),
+                    secrets=(),
+                ),
             }
         )
     return {
@@ -1049,6 +1595,8 @@ def _visual_provider_status(
 
 
 def _provider_kind(provider: str) -> str:
+    if provider == BRAVE_IMAGE_PROVIDER:
+        return "web_image_search"
     if provider == "local-page":
         return "page_extractor"
     if provider == "local-image-fixture":
@@ -1218,13 +1766,7 @@ def _write_text_only_skip(
         metric_classification="excluded_text_only",
         provider_names=provider_names,
         provider_statuses=[
-            {
-                "provider": name,
-                "candidates": 0,
-                "external_network_call": False,
-                "external_vlm_call": False,
-                "invoked": False,
-            }
+            _default_provider_status(name, candidates=0, invoked=False)
             for name in provider_names
         ],
         candidate_records=[],
@@ -1242,7 +1784,10 @@ def _write_text_only_skip(
         "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
         "status": "no_visual_tasks",
         "created_at": created_at,
-        "providers": [{"provider": name, "invoked": False} for name in provider_names],
+        "providers": [
+            _default_provider_status(name, candidates=0, invoked=False)
+            for name in provider_names
+        ],
         "screenshot_capture": {
             "requested_modes": list(screenshot_modes),
             "requests": [],
@@ -1287,7 +1832,10 @@ def _write_text_only_skip(
     status = _base_status(run_dir, evidence, "no_visual_tasks", created_at)
     status.update(
         {
-            "providers": [{"provider": name, "invoked": False} for name in provider_names],
+            "providers": [
+                _default_provider_status(name, candidates=0, invoked=False)
+                for name in provider_names
+            ],
             "candidate_records": 0,
             "selected_observations": 0,
             "candidate_counts": {},
@@ -1300,6 +1848,144 @@ def _write_text_only_skip(
             "external_network_call": False,
             "external_ocr_call": False,
             "external_vlm_call": False,
+            "validation": validation.to_dict(),
+            "visual_artifact_validation": visual_artifact_validation.to_dict(),
+            "artifacts": {
+                "evidence": str(evidence_path),
+                "visual_search_plan": str(visual_search_plan_path),
+                "visual_candidates": str(visual_candidates_path),
+                "image_fetch_status": str(image_fetch_status_path),
+                "visual_observations": str(visual_observations_path),
+                "visual_provider_status": str(visual_provider_status_path),
+                "visual_acquisition_status": str(run_dir / "visual_acquisition_status.json"),
+            },
+        }
+    )
+    _write_json(run_dir / "visual_acquisition_status.json", status)
+    return status
+
+
+def _write_blocked_missing_visual_provider(
+    run_dir: Path,
+    *,
+    evidence: dict[str, Any],
+    evidence_path: Path,
+    routes: Sequence[Mapping[str, Any]],
+    provider_names: Sequence[str],
+    provider_statuses: Sequence[Mapping[str, Any]],
+    created_at: str,
+) -> dict[str, Any]:
+    visual_candidates_path = run_dir / "visual_candidates.jsonl"
+    visual_search_plan_path = run_dir / VISUAL_SEARCH_PLAN_FILENAME
+    image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
+    visual_observations_path = run_dir / "visual_observations.jsonl"
+    visual_search_plan = _visual_search_plan(
+        run_dir=run_dir,
+        evidence=evidence,
+        routes=routes,
+        provider_names=provider_names,
+        created_at=created_at,
+        selected_observations=0,
+        state="blocked",
+    )
+    actionable_cause = _blocked_actionable_cause(provider_statuses)
+    visual_provider_status = _visual_provider_status(
+        run_dir=run_dir,
+        status="blocked_missing_visual_provider",
+        ok=False,
+        terminal=True,
+        metric_classification="excluded_blocked",
+        provider_names=provider_names,
+        provider_statuses=provider_statuses,
+        candidate_records=[],
+        image_fetch_records=[],
+        observations=[],
+        created_at=created_at,
+        actionable_cause=actionable_cause,
+    )
+    _write_json(visual_search_plan_path, visual_search_plan)
+    _write_jsonl(visual_candidates_path, [])
+    _write_jsonl(image_fetch_status_path, [])
+    _write_jsonl(visual_observations_path, [])
+    _write_json(visual_provider_status_path, visual_provider_status)
+    evidence["visual_acquisition"] = {
+        "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
+        "status": "blocked_missing_visual_provider",
+        "created_at": created_at,
+        "providers": [dict(status) for status in provider_statuses],
+        "routes": _route_summary(routes),
+        "candidate_records_path": "visual_candidates.jsonl",
+        "visual_search_plan_path": VISUAL_SEARCH_PLAN_FILENAME,
+        "image_fetch_status_path": IMAGE_FETCH_STATUS_FILENAME,
+        "visual_observations_path": "visual_observations.jsonl",
+        "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
+        "candidate_counts": {},
+        "removal_counts": {},
+        "near_duplicate_groups": [],
+        "screenshot_capture": {
+            "interface_modes": list(SCREENSHOT_MODES),
+            "providers": [],
+            "requests": [],
+            "unsupported": [],
+        },
+        "image_search_invocations": sum(
+            int(status.get("invocations") or 0) for status in provider_statuses
+        ),
+        "screenshot_capture_requests": 0,
+        "ocr_records": 0,
+        "external_network_call": any(
+            bool(status.get("external_network_call")) for status in provider_statuses
+        ),
+        "external_ocr_call": False,
+        "external_vlm_call": False,
+        "diagnostics": {"actionable_cause": actionable_cause},
+    }
+    handoff = evidence.get("handoff")
+    if isinstance(handoff, dict):
+        handoff["visual_observations_path"] = "visual_observations.jsonl"
+        handoff["visual_candidates_path"] = "visual_candidates.jsonl"
+        handoff["visual_search_plan_path"] = VISUAL_SEARCH_PLAN_FILENAME
+        handoff["image_fetch_status_path"] = IMAGE_FETCH_STATUS_FILENAME
+        handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
+        handoff["visual_status"] = "blocked_missing_visual_provider"
+    _write_json(evidence_path, evidence)
+    validation = validate_artifacts(
+        evidence_path=evidence_path,
+        visual_observations_path=visual_observations_path,
+    )
+    visual_artifact_validation = validate_visual_artifacts(
+        run_dir=run_dir,
+        visual_search_plan_path=visual_search_plan_path,
+        visual_candidates_path=visual_candidates_path,
+        image_fetch_status_path=image_fetch_status_path,
+        visual_observations_path=visual_observations_path,
+        visual_provider_status_path=visual_provider_status_path,
+        evidence_path=None,
+    )
+    status = _base_status(run_dir, evidence, "blocked_missing_visual_provider", created_at)
+    status.update(
+        {
+            "ok": False,
+            "terminal": True,
+            "providers": [dict(item) for item in provider_statuses],
+            "candidate_records": 0,
+            "selected_observations": 0,
+            "candidate_counts": {},
+            "removal_counts": {},
+            "near_duplicate_groups": [],
+            "screenshot_capture": evidence["visual_acquisition"]["screenshot_capture"],
+            "image_search_invocations": evidence["visual_acquisition"][
+                "image_search_invocations"
+            ],
+            "screenshot_capture_requests": 0,
+            "ocr_records": 0,
+            "external_network_call": evidence["visual_acquisition"][
+                "external_network_call"
+            ],
+            "external_ocr_call": False,
+            "external_vlm_call": False,
+            "diagnostics": {"actionable_cause": actionable_cause},
             "validation": validation.to_dict(),
             "visual_artifact_validation": visual_artifact_validation.to_dict(),
             "artifacts": {
@@ -1387,6 +2073,17 @@ def _ensure_fixture_sources(
     return by_id
 
 
+def _source_by_id(evidence: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    sources = evidence.get("sources", [])
+    if not isinstance(sources, list):
+        raise VisualAcquisitionError("evidence.sources must be a list")
+    return {
+        source["id"]: source
+        for source in sources
+        if isinstance(source, Mapping) and isinstance(source.get("id"), str)
+    }
+
+
 def _fixture_image_source(source_by_id: Mapping[str, Mapping[str, Any]]) -> Mapping[str, Any]:
     if "src_visual_fixture_images" in source_by_id:
         return source_by_id["src_visual_fixture_images"]
@@ -1433,6 +2130,486 @@ def _fixture_page_source(source_by_id: Mapping[str, Mapping[str, Any]]) -> Mappi
     }
 
 
+def _brave_image_search_config(
+    *,
+    evidence: Mapping[str, Any],
+    overrides: Mapping[str, Any] | None,
+) -> _BraveImageSearchConfig:
+    max_images = max(10, _max_images(evidence))
+    api_key = _config_string(
+        overrides,
+        "brave_api_key",
+        env_names=("CODEX_DEEPRESEARCH_BRAVE_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"),
+    )
+    return _BraveImageSearchConfig(
+        api_key=api_key,
+        endpoint=_config_string(
+            overrides,
+            "brave_endpoint",
+            env_names=("CODEX_DEEPRESEARCH_BRAVE_IMAGE_ENDPOINT",),
+            default=BRAVE_IMAGE_ENDPOINT,
+        )
+        or BRAVE_IMAGE_ENDPOINT,
+        count=_bounded_int(
+            _config_value(
+                overrides,
+                "brave_image_count",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_IMAGE_COUNT",),
+            ),
+            default=max_images,
+            minimum=1,
+            maximum=200,
+        ),
+        country=(
+            _config_string(
+                overrides,
+                "brave_country",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_COUNTRY",),
+                default=BRAVE_DEFAULT_COUNTRY,
+            )
+            or BRAVE_DEFAULT_COUNTRY
+        ).upper(),
+        search_lang=(
+            _config_string(
+                overrides,
+                "brave_search_lang",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_SEARCH_LANG",),
+                default=BRAVE_DEFAULT_SEARCH_LANG,
+            )
+            or BRAVE_DEFAULT_SEARCH_LANG
+        ).lower(),
+        safesearch=(
+            _config_string(
+                overrides,
+                "brave_safesearch",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_SAFESEARCH",),
+                default=BRAVE_DEFAULT_SAFESEARCH,
+            )
+            or BRAVE_DEFAULT_SAFESEARCH
+        ).lower(),
+        timeout_seconds=_bounded_float(
+            _config_value(
+                overrides,
+                "brave_timeout_seconds",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_TIMEOUT_SECONDS",),
+            ),
+            default=BRAVE_DEFAULT_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=120.0,
+        ),
+        estimated_cost_usd=_bounded_float(
+            _config_value(
+                overrides,
+                "brave_estimated_cost_usd",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_ESTIMATED_COST_USD",),
+            ),
+            default=BRAVE_DEFAULT_ESTIMATED_COST_USD,
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        actual_cost_usd=_bounded_float(
+            _config_value(
+                overrides,
+                "brave_actual_cost_usd",
+                env_names=("CODEX_DEEPRESEARCH_BRAVE_ACTUAL_COST_USD",),
+            ),
+            default=0.0,
+            minimum=0.0,
+            maximum=100.0,
+        ),
+        user_agent=_config_string(
+            overrides,
+            "brave_user_agent",
+            env_names=("CODEX_DEEPRESEARCH_BRAVE_USER_AGENT",),
+            default=BRAVE_DEFAULT_USER_AGENT,
+        )
+        or BRAVE_DEFAULT_USER_AGENT,
+        allow_result_storage=_config_bool(
+            overrides,
+            "brave_allow_result_storage",
+            env_names=(BRAVE_STORAGE_CONFIRMATION_ENV,),
+            default=False,
+        ),
+    )
+
+
+def _config_value(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str],
+) -> Any:
+    if overrides is not None and key in overrides:
+        return overrides[key]
+    for env_name in env_names:
+        if env_name in os.environ:
+            return os.environ[env_name]
+    return None
+
+
+def _config_string(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str],
+    default: str | None = None,
+) -> str | None:
+    value = _config_value(overrides, key, env_names=env_names)
+    if value is None:
+        return default
+    return _string(value)
+
+
+def _config_bool(
+    overrides: Mapping[str, Any] | None,
+    key: str,
+    *,
+    env_names: Sequence[str],
+    default: bool,
+) -> bool:
+    value = _config_value(overrides, key, env_names=env_names)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUE_CONFIG_VALUES:
+            return True
+        if normalized in FALSE_CONFIG_VALUES:
+            return False
+    return default
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    parsed = _int_or_zero(value)
+    if parsed <= 0:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool):
+        parsed = default
+    elif isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = float(value)
+        except ValueError:
+            parsed = default
+    else:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _brave_config_keys(*, configured: bool, storage_confirmed: bool) -> list[str]:
+    keys = [
+        "CODEX_DEEPRESEARCH_BRAVE_SEARCH_API_KEY or BRAVE_SEARCH_API_KEY"
+        if configured
+        else "missing: CODEX_DEEPRESEARCH_BRAVE_SEARCH_API_KEY or BRAVE_SEARCH_API_KEY",
+        BRAVE_STORAGE_CONFIRMATION_ENV
+        if storage_confirmed
+        else f"missing: {BRAVE_STORAGE_CONFIRMATION_ENV}",
+        "CODEX_DEEPRESEARCH_BRAVE_IMAGE_COUNT",
+        "CODEX_DEEPRESEARCH_BRAVE_COUNTRY",
+        "CODEX_DEEPRESEARCH_BRAVE_SEARCH_LANG",
+        "CODEX_DEEPRESEARCH_BRAVE_SAFESEARCH",
+        "CODEX_DEEPRESEARCH_BRAVE_ESTIMATED_COST_USD",
+    ]
+    return keys
+
+
+def _query_for_route(context: _VisualContext, route: Mapping[str, Any]) -> str:
+    angle_id = _string(route.get("id"))
+    if angle_id:
+        task = context.visual_task_by_angle.get(angle_id)
+        if isinstance(task, Mapping):
+            query = _string(task.get("query"))
+            if query:
+                return query
+    query = _string(route.get("query"))
+    if query:
+        return query
+    return _string(context.evidence.get("question")) or ""
+
+
+def _loads_provider_payload(body: str) -> Mapping[str, Any]:
+    if not body.strip():
+        return {}
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return {"raw_error": body[:500]}
+    return payload if isinstance(payload, Mapping) else {"raw_payload": payload}
+
+
+def _provider_query_diagnostics(
+    *,
+    query: str,
+    params: Mapping[str, Any],
+    status_code: int | None,
+    headers: Mapping[str, str],
+    elapsed_ms: int | None,
+    error: str | None,
+) -> dict[str, Any]:
+    normalized_headers = {str(key).lower(): str(value) for key, value in headers.items()}
+    return {
+        "query": query,
+        "count": params.get("count"),
+        "country": params.get("country"),
+        "search_lang": params.get("search_lang"),
+        "safesearch": params.get("safesearch"),
+        "http_status": status_code,
+        "elapsed_ms": elapsed_ms,
+        "rate_limit": {
+            "limit": normalized_headers.get("x-ratelimit-limit"),
+            "remaining": normalized_headers.get("x-ratelimit-remaining"),
+            "reset": normalized_headers.get("x-ratelimit-reset"),
+            "retry_after": normalized_headers.get("retry-after"),
+        },
+        "cache": {"cache_control": normalized_headers.get("cache-control")},
+        "error": error,
+    }
+
+
+def _blocked_reason_for_http_status(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "provider_auth_failed"
+    if status_code == 429:
+        return "provider_rate_limited"
+    if 400 <= status_code < 500:
+        return f"provider_http_{status_code}"
+    if status_code >= 500:
+        return "provider_unavailable"
+    return "provider_request_failed"
+
+
+def _provider_error_message(payload: Mapping[str, Any], status_code: int) -> str:
+    error = payload.get("error")
+    if isinstance(error, Mapping):
+        message = _string(error.get("message")) or _string(error.get("detail"))
+        code = _string(error.get("code"))
+        if message and code:
+            return f"{code}: {message}"
+        if message:
+            return message
+        if code:
+            return code
+    message = _string(payload.get("message")) or _string(payload.get("detail"))
+    return message or f"provider returned HTTP {status_code}"
+
+
+def _provider_secret_values(config: _BraveImageSearchConfig) -> tuple[str, ...]:
+    return tuple(value for value in (config.api_key,) if isinstance(value, str) and value)
+
+
+def _redact_provider_value(value: Any, *, secrets: Sequence[str]) -> Any:
+    if isinstance(value, str):
+        return _redact_provider_text(value, secrets=secrets)
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if SECRET_KEY_PATTERN.search(key_text):
+                redacted[key_text] = REDACTED_SECRET
+            else:
+                redacted[key_text] = _redact_provider_value(item, secrets=secrets)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_provider_value(item, secrets=secrets) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_provider_value(item, secrets=secrets) for item in value]
+    return value
+
+
+def _redact_provider_text(value: str, *, secrets: Sequence[str]) -> str:
+    redacted = value
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, REDACTED_SECRET)
+    redacted = SECRET_JSON_FIELD_PATTERN.sub(
+        lambda match: f"{match.group(1)}{REDACTED_SECRET}{match.group(3)}",
+        redacted,
+    )
+    redacted = SECRET_FIELD_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{REDACTED_SECRET}",
+        redacted,
+    )
+    return redacted
+
+
+def _assign_real_candidate_costs(
+    candidates: Sequence[dict[str, Any]],
+    *,
+    estimated_cost_usd: float,
+    actual_cost_usd: float,
+) -> None:
+    if not candidates:
+        return
+    per_candidate_estimate = estimated_cost_usd / len(candidates)
+    per_candidate_actual = actual_cost_usd / len(candidates)
+    for candidate in candidates:
+        candidate["estimated_cost_usd"] = round(per_candidate_estimate, 8)
+        candidate["actual_cost_usd"] = round(per_candidate_actual, 8)
+
+
+def _result_image_url(result: Mapping[str, Any]) -> str | None:
+    direct = _string(result.get("image_url")) or _string(result.get("thumbnail_url"))
+    if direct:
+        return direct
+    properties = result.get("properties")
+    if isinstance(properties, Mapping):
+        value = (
+            _string(properties.get("url"))
+            or _string(properties.get("image_url"))
+            or _string(properties.get("thumbnail_url"))
+        )
+        if value:
+            return value
+    thumbnail = result.get("thumbnail")
+    if isinstance(thumbnail, Mapping):
+        value = _string(thumbnail.get("src")) or _string(thumbnail.get("url"))
+        if value:
+            return value
+    meta_url = result.get("meta_url")
+    if isinstance(meta_url, Mapping):
+        value = _string(meta_url.get("path")) or _string(meta_url.get("url"))
+        if value and re.search(r"\.(png|jpe?g|gif|webp)(?:\?|$)", value, re.IGNORECASE):
+            return value
+    return None
+
+
+def _result_page_url(result: Mapping[str, Any]) -> str | None:
+    source = result.get("source")
+    if isinstance(source, Mapping):
+        value = _string(source.get("url")) or _string(source.get("page_url"))
+        if value:
+            return value
+    return (
+        _string(result.get("page_url"))
+        or _string(result.get("source_page_url"))
+        or _string(result.get("url"))
+        or _string(result.get("host_page_url"))
+    )
+
+
+def _result_title(result: Mapping[str, Any]) -> str | None:
+    return _string(result.get("title")) or _string(result.get("alt")) or "Image search result"
+
+
+def _result_dimensions(result: Mapping[str, Any]) -> tuple[int, int]:
+    properties = result.get("properties")
+    if isinstance(properties, Mapping):
+        width = _int_or_zero(properties.get("width"))
+        height = _int_or_zero(properties.get("height"))
+        if width or height:
+            return width, height
+    return _int_or_zero(result.get("width")), _int_or_zero(result.get("height"))
+
+
+def _sanitized_result_metadata(
+    result: Mapping[str, Any],
+    *,
+    secrets: Sequence[str],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in ("title", "type", "age"):
+        value = result.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            metadata[key] = value
+    source = result.get("source")
+    if isinstance(source, Mapping):
+        metadata["source"] = {
+            str(key): value
+            for key, value in source.items()
+            if key in {"name", "url"} and (isinstance(value, str) or value is None)
+        }
+    properties = result.get("properties")
+    if isinstance(properties, Mapping):
+        metadata["properties"] = {
+            str(key): value
+            for key, value in properties.items()
+            if key in {"width", "height", "format", "content_type"}
+            and (isinstance(value, (str, int, float, bool)) or value is None)
+        }
+    return _redact_provider_value(metadata, secrets=secrets)
+
+
+def _is_real_provider_name(provider: str) -> bool:
+    return provider == BRAVE_IMAGE_PROVIDER
+
+
+def _uses_fixture_sources(provider_names: Sequence[str]) -> bool:
+    return any(
+        provider in {"local-image-fixture", "local-screenshot-fixture"}
+        for provider in provider_names
+    )
+
+
+def _initial_provider_status(provider: _VisualProvider) -> dict[str, Any]:
+    status = getattr(provider, "initial_status", None)
+    if callable(status):
+        value = status()
+        if isinstance(value, Mapping):
+            return dict(value)
+    return _default_provider_status(provider.name, candidates=0, invoked=False)
+
+
+def _collection_provider_status(
+    provider: _VisualProvider,
+    provider_candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    value = getattr(provider, "last_status", None)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return _default_provider_status(provider.name, candidates=len(provider_candidates), invoked=True)
+
+
+def _default_provider_status(
+    provider: str,
+    *,
+    candidates: int,
+    invoked: bool,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "provider_kind": _provider_kind(provider),
+        "provider_mode": "real" if _is_real_provider_name(provider) else "fixture",
+        "configured": True,
+        "available": True,
+        "blocked_reason": None,
+        "invoked": invoked,
+        "invocations": 1 if invoked else 0,
+        "candidates": candidates,
+        "candidates_discovered": candidates,
+        "artifacts_fetched": 0,
+        "vlm_images_analyzed": 0,
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "last_error": None,
+        "external_network_call": _is_real_provider_name(provider) and invoked,
+        "external_vlm_call": False,
+        "diagnostics": {},
+    }
+
+
+def _blocked_actionable_cause(provider_statuses: Sequence[Mapping[str, Any]]) -> str:
+    reasons = []
+    for status in provider_statuses:
+        provider = _string(status.get("provider")) or "unknown-provider"
+        reason = _string(status.get("blocked_reason")) or _string(status.get("last_error"))
+        if reason:
+            reasons.append(f"{provider}: {reason}")
+    suffix = "; ".join(reasons) if reasons else "no configured or available real visual provider"
+    return (
+        "visual_required route needs a configured and available real image search provider; "
+        + suffix
+    )
+
+
 def _source_html_path(run_dir: Path, source: Mapping[str, Any]) -> Path | None:
     local_path = source.get("local_artifact_path")
     if isinstance(local_path, str):
@@ -1448,8 +2625,18 @@ def _source_html_path(run_dir: Path, source: Mapping[str, Any]) -> Path | None:
     return None
 
 
-def _providers(names: Sequence[str]) -> list[_VisualProvider]:
+def _providers(
+    names: Sequence[str],
+    *,
+    real_image_search_transport: _BraveImageSearchTransport | None,
+    real_image_search_config: Mapping[str, Any] | None,
+    evidence: Mapping[str, Any],
+) -> list[_VisualProvider]:
     providers: list[_VisualProvider] = []
+    brave_config = _brave_image_search_config(
+        evidence=evidence,
+        overrides=real_image_search_config,
+    )
     for name in names:
         if name == "local-page":
             providers.append(_LocalPageProvider())
@@ -1457,6 +2644,13 @@ def _providers(names: Sequence[str]) -> list[_VisualProvider]:
             providers.append(_LocalImageFixtureProvider())
         elif name == "local-screenshot-fixture":
             providers.append(_LocalScreenshotFixtureProvider())
+        elif name == BRAVE_IMAGE_PROVIDER:
+            providers.append(
+                _BraveImageSearchProvider(
+                    config=brave_config,
+                    transport=real_image_search_transport,
+                )
+            )
         else:
             raise VisualAcquisitionError(f"unknown visual provider: {name}")
     return providers
@@ -1587,7 +2781,23 @@ def _route_summary(routes: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _count_provider(statuses: Sequence[Mapping[str, Any]], provider: str) -> int:
-    return sum(1 for status in statuses if status.get("provider") == provider)
+    return sum(
+        _int_or_zero(status.get("invocations")) or 1
+        for status in statuses
+        if status.get("provider") == provider
+    )
+
+
+def _image_search_invocations(statuses: Sequence[Mapping[str, Any]]) -> int:
+    total = 0
+    for status in statuses:
+        provider = _string(status.get("provider")) or ""
+        if _provider_kind(provider) != "web_image_search":
+            continue
+        total += _int_or_zero(status.get("invocations")) or (
+            1 if status.get("invoked") is not False else 0
+        )
+    return total
 
 
 def _normalized_candidate_url(record: Mapping[str, Any]) -> str | None:
