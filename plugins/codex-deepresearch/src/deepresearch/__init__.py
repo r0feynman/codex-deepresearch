@@ -14,6 +14,7 @@ from .evidence_schema import ValidationError, ValidationResult, validate_artifac
 from .execution_mode import ConfigResolutionError, RunConfig, resolve_config
 from .fetch_claims import FetchClaimsError, fetch_claims
 from .guardrails import GuardrailsError, enforce_guardrails
+from .invocation_router import RUN_STATUS_FILENAME, RUN_STATUS_SCHEMA_VERSION, run_skill_invocation
 from .manual_sources import ManualSourcesError, ingest_manual_sources
 from .modality_router import ModalityDecision, route_angle, route_angles
 from .mvp_smoke import MvpSmokeError, run_mvp_smoke
@@ -70,6 +71,8 @@ __all__ = [
     "RunConfig",
     "RUN_STEPS_FILENAME",
     "RUN_STEPS_SCHEMA_VERSION",
+    "RUN_STATUS_FILENAME",
+    "RUN_STATUS_SCHEMA_VERSION",
     "RunStepStateError",
     "SearchHandoffError",
     "TRACE_FILENAME",
@@ -103,6 +106,7 @@ __all__ = [
     "run_steps_path",
     "run_mvp_smoke",
     "run_parallel_orchestration",
+    "run_skill_invocation",
     "synthesize_report",
     "transition_stage",
     "validate_artifacts",
