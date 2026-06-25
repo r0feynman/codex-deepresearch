@@ -21,6 +21,7 @@ from deepresearch import (  # noqa: E402
     validate_artifacts,
     verify_claims,
 )
+from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
 from deepresearch.visual_acquisition import _BraveImageSearchResponse  # noqa: E402
 
 
@@ -32,6 +33,46 @@ class FakeBraveImageTransport:
     def fetch(self, **kwargs) -> _BraveImageSearchResponse:
         self.calls.append(kwargs)
         return brave_image_response(count=self.count)
+
+
+class FakeBrowserScreenshotTransport:
+    name = "fake-browser"
+    provider_mode = "real"
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def availability(self) -> tuple[bool, str | None]:
+        return True, None
+
+    def capture(
+        self,
+        *,
+        url: str,
+        output_path: Path,
+        viewport: dict,
+        full_page: bool,
+        timeout_ms: int,
+    ) -> BrowserScreenshotCapture:
+        self.calls.append(
+            {
+                "url": url,
+                "output_path": output_path,
+                "viewport": dict(viewport),
+                "full_page": full_page,
+                "timeout_ms": timeout_ms,
+            }
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"\x89PNG\r\n\x1a\nmixed-real-browser-screenshot")
+        return BrowserScreenshotCapture(
+            width=int(viewport["width"]),
+            height=int(viewport["height"]),
+            http_status=200,
+            final_url=url,
+            external_network_call=url.startswith(("http://", "https://")),
+            provider_metadata={"fake": True},
+        )
 
 
 class ScriptedBraveImageTransport:
@@ -766,6 +807,88 @@ class VisualAcquisitionTests(unittest.TestCase):
             {"brave-image-search"},
         )
         self.assertEqual(provider_status["providers"][0]["invocations"], 1)
+
+    def test_mixed_real_providers_keep_browser_screenshot_candidates(self) -> None:
+        prepared = prepare_run(
+            question="Find image and screenshot evidence with mixed real providers",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_browser_page",
+                "type": "web",
+                "url": "https://example.test/browser-page",
+                "title": "Browser page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/browser-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "route": "visual_required",
+                "angle_id": "angle_001",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        brave_transport = FakeBraveImageTransport(count=3)
+        browser_transport = FakeBrowserScreenshotTransport()
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["brave-image-search", "browser-screenshot"],
+            screenshot_modes=["first_viewport"],
+            real_image_search_transport=brave_transport,
+            real_image_search_config={
+                "brave_api_key": "test-secret-token",
+                "brave_allow_result_storage": True,
+                "brave_image_count": 3,
+            },
+            browser_transport=browser_transport,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        self.assertEqual(len(brave_transport.calls), 1)
+        self.assertEqual(len(browser_transport.calls), 1)
+        self.assertEqual(result["candidate_records"], 4)
+        self.assertEqual(result["screenshot_capture_requests"], 1)
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(
+            {candidate["provider"] for candidate in candidates},
+            {"brave-image-search", "browser-screenshot"},
+        )
+        screenshots = [
+            candidate for candidate in candidates if candidate["provider"] == "browser-screenshot"
+        ]
+        self.assertEqual(len(screenshots), 1)
+        self.assertEqual(screenshots[0]["candidate_status"], "fetched")
+        self.assertTrue(screenshots[0]["requires_vlm_observation"])
+        self.assertFalse(screenshots[0]["supportable_evidence"])
+        self.assertTrue((run_dir / screenshots[0]["local_artifact_path"]).is_file())
+        self.assertTrue(screenshots[0]["hash"].startswith("sha256:"))
+        self.assert_no_fixture_sources(run_dir)
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(
+            {provider["provider"] for provider in provider_status["providers"]},
+            {"brave-image-search", "browser-screenshot"},
+        )
+        browser_provider = [
+            provider
+            for provider in provider_status["providers"]
+            if provider["provider"] == "browser-screenshot"
+        ][0]
+        self.assertEqual(browser_provider["provider_kind"], "screenshot")
+        self.assertEqual(browser_provider["provider_mode"], "real")
+        self.assertTrue(browser_provider["available"])
+        self.assertEqual(browser_provider["invocations"], 1)
+        self.assertEqual(browser_provider["artifacts_fetched"], 1)
+        self.assertEqual(browser_provider["vlm_images_analyzed"], 0)
 
     def test_text_only_route_does_not_call_real_image_search_provider(self) -> None:
         prepared = prepare_run(
