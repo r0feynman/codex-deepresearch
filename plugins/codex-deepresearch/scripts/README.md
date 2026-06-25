@@ -2,6 +2,8 @@
 
 `codex-deepresearch` is the plugin-local developer runner. It validates the plugin scaffold, starts smoke run directories, normalizes execution-mode configuration, and manages Codex-native search handoff and manual-source artifacts.
 
+For the end-to-end local plugin install/update/remove flow, first-run verification, troubleshooting, and beta example gallery, see `../../../docs/codex-deepresearch-plugin-guide.md`.
+
 ## Smoke
 
 From the repository root:
