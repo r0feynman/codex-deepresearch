@@ -291,6 +291,84 @@ def run_fresh_session_e2e_validation(runner: Path) -> None:
         fail("fresh-session gate skipped real codex-exec scenario must be explicit blocked")
 
 
+def run_fresh_session_visual_e2e_validation(runner: Path) -> None:
+    """Validate the CI-safe P3-AV8 fresh-session visual release gate."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="codex-deepresearch-fresh-session-visual-e2e-",
+        dir="/tmp",
+    ) as runs_dir:
+        suite_id = "validate-fresh-session-visual-suite"
+        result = subprocess.run(
+            [
+                str(runner),
+                "fresh-session-visual-e2e",
+                "--runs-dir",
+                runs_dir,
+                "--suite-id",
+                suite_id,
+                "--clean",
+                "--real-codex-interactive",
+                "skip",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        results_path = (
+            Path(runs_dir) / suite_id / "fresh_session_visual_e2e_results.json"
+        )
+        if result.returncode != 0:
+            fail("runner fresh-session-visual-e2e CI-safe gate must exit 0")
+        raw_payload = result.stdout.strip() or results_path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        fail(f"runner fresh-session-visual-e2e must output valid JSON: {exc}")
+    if payload.get("status") != "passed":
+        fail("runner fresh-session-visual-e2e did not report passed")
+    if payload.get("real_codex_interactive_mode") != "skip":
+        fail("fresh-session visual gate must run in public-safe skip mode")
+    if payload.get("release_gate_status") != "blocked_public_safe":
+        fail("fresh-session visual gate must record blocked_public_safe release status")
+    if payload.get("release_gate_passed") is not False:
+        fail("fresh-session visual gate skip mode must not pass the release gate")
+    if payload.get("public_safe") is not True:
+        fail("fresh-session visual gate must mark the smoke public-safe")
+    acceptance = payload.get("acceptance")
+    if not isinstance(acceptance, dict):
+        fail("runner fresh-session-visual-e2e acceptance checks must be a JSON object")
+    expected_acceptance = {
+        "visual_required_prompt_exercised": True,
+        "completed_auto_visual_validation_rules_met": True,
+        "blocked_runs_name_missing_capability": True,
+        "blocked_runs_do_not_count_as_release_passes": True,
+        "fixture_manual_user_evidence_excluded": True,
+        "final_transcript_exposes_artifacts_and_status_summary": True,
+    }
+    for key, expected in expected_acceptance.items():
+        if acceptance.get(key) is not expected:
+            fail(f"fresh-session visual gate acceptance check failed: {key}")
+    if acceptance.get("release_gate_passed") is not False:
+        fail("fresh-session visual gate acceptance must not claim a release pass")
+    scenarios = {scenario.get("id"): scenario for scenario in payload.get("scenarios", [])}
+    fixture = scenarios.get("visual_fixture_not_release_pass", {})
+    if fixture.get("terminal_outcome") != "completed_fixture":
+        fail("fresh-session visual fixture scenario did not complete")
+    if fixture.get("visual_release_gate", {}).get("release_gate_passed") is not False:
+        fail("fresh-session visual fixture evidence must not satisfy the release gate")
+    blocked = scenarios.get("visual_required_provider_blocked", {})
+    if blocked.get("terminal_outcome") != "blocked_explicit":
+        fail("fresh-session visual skipped provider scenario must be explicit blocked")
+    if blocked.get("run_status") != "blocked_missing_visual_provider":
+        fail("fresh-session visual skipped provider scenario must name missing capability")
+    if blocked.get("visual_release_gate", {}).get("blocked_capability") != "visual_provider":
+        fail("fresh-session visual blocked gate must record visual_provider capability")
+    if "visual_provider_status" not in blocked.get("artifacts", {}):
+        fail("fresh-session visual blocked scenario did not expose provider status artifact")
+
+
 def main() -> None:
     for relative_path in REQUIRED_FILES:
         if not (ROOT / relative_path).exists():
@@ -373,6 +451,7 @@ def main() -> None:
 
     run_parallel_orchestration_validation(runner)
     run_fresh_session_e2e_validation(runner)
+    run_fresh_session_visual_e2e_validation(runner)
 
     with tempfile.TemporaryDirectory() as manual_runs_dir:
         manual_result = subprocess.run(
