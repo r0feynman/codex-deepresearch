@@ -254,6 +254,44 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertIn("real_vlm_observation", errors[0].message)
         self.assertIn("report_cited_supported_visual_claim", errors[0].message)
 
+    def test_report_used_supported_visual_claim_requires_observation_links(self) -> None:
+        run_dir = self.write_phase3_fixture()
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["verifier_links"] = []
+        observations[0]["report_links"] = []
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        error_codes = {error.code for error in result.errors}
+        self.assertIn("missing_verifier_link", error_codes)
+        self.assertIn("missing_report_link", error_codes)
+
+    def test_completed_auto_visual_rejects_zero_provider_counters(self) -> None:
+        run_dir = self.write_phase3_fixture()
+        provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        for provider in provider_status["providers"]:
+            provider["invocations"] = 0
+            provider["candidates_discovered"] = 0
+            provider["artifacts_fetched"] = 0
+            provider["vlm_images_analyzed"] = 0
+        self.write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, provider_status)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        errors = [
+            error
+            for error in result.errors
+            if error.code == "completed_auto_visual_provider_counters"
+        ]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("real_acquisition_invocations", errors[0].message)
+        self.assertIn("real_candidates_discovered", errors[0].message)
+        self.assertIn("real_artifacts_fetched", errors[0].message)
+        self.assertIn("real_vlm_images_analyzed", errors[0].message)
+
     def test_candidate_provider_kind_rejects_vlm_and_counts_do_not_inflate(self) -> None:
         run_dir = self.write_phase3_fixture()
         candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)

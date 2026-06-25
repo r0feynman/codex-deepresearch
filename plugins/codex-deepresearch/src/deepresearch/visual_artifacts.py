@@ -917,6 +917,88 @@ def _validate_completed_auto_visual_prerequisites(
             "completed_auto_visual_prerequisites",
             "completed_auto_visual requires: " + ", ".join(missing),
         )
+    if context.run_dir_validation:
+        _validate_completed_auto_visual_counter_reconciliation(
+            provider_records=provider_records,
+            candidate_records=candidate_records,
+            fetch_records=fetch_records,
+            observation_records=observation_records,
+            collector=collector,
+        )
+
+
+def _validate_completed_auto_visual_counter_reconciliation(
+    *,
+    provider_records: Sequence[Mapping[str, Any]],
+    candidate_records: Sequence[Mapping[str, Any]],
+    fetch_records: Sequence[Mapping[str, Any]],
+    observation_records: Sequence[Mapping[str, Any]],
+    collector: _Collector,
+) -> None:
+    real_acquisition_providers = [
+        record for record in provider_records if _is_real_acquisition_record(record)
+    ]
+    real_observation_providers = [
+        record for record in provider_records if _is_real_observation_record(record)
+    ]
+    real_candidates = [
+        record for record in candidate_records if _is_real_acquisition_record(record)
+    ]
+    real_fetched_artifacts = [
+        record
+        for record in fetch_records
+        if _is_real_acquisition_record(record)
+        and record.get("fetch_status") == "fetched"
+        and isinstance(record.get("evidence_image_id"), str)
+        and record.get("evidence_image_id")
+    ]
+    real_vlm_observations = [
+        record
+        for record in observation_records
+        if record.get("provider_mode") == "real"
+        and record.get("provider_kind") == "vlm"
+        and record.get("observation_status") == "analyzed"
+    ]
+    missing: list[str] = []
+    if (
+        real_candidates or real_fetched_artifacts
+    ) and _sum_provider_counter(real_acquisition_providers, "invocations") <= 0:
+        missing.append("real_acquisition_invocations")
+    if real_candidates and _sum_provider_counter(
+        real_acquisition_providers, "candidates_discovered"
+    ) <= 0:
+        missing.append("real_candidates_discovered")
+    if real_fetched_artifacts and _sum_provider_counter(
+        real_acquisition_providers, "artifacts_fetched"
+    ) <= 0:
+        missing.append("real_artifacts_fetched")
+    if real_vlm_observations and _sum_provider_counter(
+        real_observation_providers, "vlm_images_analyzed"
+    ) <= 0:
+        missing.append("real_vlm_images_analyzed")
+    real_vlm_providers = [
+        record
+        for record in provider_records
+        if record.get("provider_mode") == "real" and record.get("provider_kind") == "vlm"
+    ]
+    if real_vlm_observations and real_vlm_providers and _sum_provider_counter(
+        real_vlm_providers, "invocations"
+    ) <= 0:
+        missing.append("real_vlm_invocations")
+    if missing:
+        collector.add(
+            "$.visual_provider_status.providers",
+            "completed_auto_visual_provider_counters",
+            "completed_auto_visual provider counters must be positive for: "
+            + ", ".join(missing),
+        )
+
+
+def _sum_provider_counter(
+    providers: Sequence[Mapping[str, Any]],
+    field: str,
+) -> int:
+    return sum(_int(provider.get(field)) for provider in providers)
 
 
 def _has_report_cited_supported_visual_claim(context: _VisualContext) -> bool:
@@ -1233,8 +1315,6 @@ def _validate_claim_observation_report_lineage(
     context: _VisualContext,
     collector: _Collector,
 ) -> None:
-    if not context.observation_links_by_image_claim:
-        return
     verifier_pairs = {
         (image_id, claim_id)
         for link_type, image_id, claim_id in context.observation_links_by_image_claim
@@ -1255,6 +1335,11 @@ def _validate_claim_observation_report_lineage(
             continue
         for image_id in supporting_images:
             if not isinstance(image_id, str):
+                continue
+            if (
+                not context.report_used_image_ids
+                or image_id not in context.report_used_image_ids
+            ):
                 continue
             if (image_id, claim_id) not in verifier_pairs:
                 collector.add(
