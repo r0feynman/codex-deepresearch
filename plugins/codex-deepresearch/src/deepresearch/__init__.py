@@ -25,6 +25,12 @@ from .invocation_router import RUN_STATUS_FILENAME, RUN_STATUS_SCHEMA_VERSION, r
 from .manual_sources import ManualSourcesError, ingest_manual_sources
 from .modality_router import ModalityDecision, route_angle, route_angles
 from .mvp_smoke import MvpSmokeError, run_mvp_smoke
+from .page_image_extraction import (
+    FetchResponse,
+    PageImageExtractionError,
+    extract_and_fetch_page_images,
+    extract_page_image_candidates,
+)
 from .parallel_orchestrator import (
     AdapterUnavailable,
     CodexExecAdapter,
@@ -86,6 +92,7 @@ __all__ = [
     "ManualSourcesError",
     "ModalityDecision",
     "MvpSmokeError",
+    "PageImageExtractionError",
     "ParallelOrchestrationError",
     "ReportGenerationError",
     "RunConfig",
@@ -120,6 +127,9 @@ __all__ = [
     "budget_estimate_path",
     "enforce_guardrails",
     "estimate_budget",
+    "extract_and_fetch_page_images",
+    "extract_page_image_candidates",
+    "FetchResponse",
     "fetch_claims",
     "run_fresh_session_e2e",
     "ingest_run",
