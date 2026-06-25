@@ -848,6 +848,100 @@ class RunStateTests(unittest.TestCase):
             begin_stage(run_dir, "fetch_claims")
         self.assertEqual(cancelled_error.exception.to_dict()["code"], "run_cancelled")
 
+    def test_pause_survives_deleted_run_steps_reconstruction_and_blocks_ingest(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="pause reconstruction durable gate",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        pause_run(
+            run_dir,
+            reason="pause_reconstruction_regression",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        run_status_before = self.read_json(run_dir / "run_status.json")
+        run_control_before = self.read_json(run_control_path(run_dir))
+        run_steps_path(run_dir).unlink()
+
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        run_steps_before_ingest = self.read_json(run_steps_path(run_dir))
+        ingest = subprocess.run(
+            [
+                str(RUNNER),
+                "ingest",
+                "--run",
+                prepared["run_id"],
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(reconstructed["status"], "paused")
+        self.assertEqual(reconstructed["next_safe_stage"], "ingest")
+        self.assertEqual(reconstructed["control"]["status"], "paused")
+        self.assertEqual(ingest.returncode, 2)
+        self.assertEqual(json.loads(ingest.stderr)["code"], "run_paused")
+        self.assertFalse((run_dir / "ingest_status.json").exists())
+        self.assertEqual(self.read_json(run_dir / "run_status.json"), run_status_before)
+        self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
+        self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before_ingest)
+
+    def test_cancel_survives_deleted_run_steps_reconstruction_and_blocks_ingest(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="cancel reconstruction durable gate",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        cancel_run(
+            run_dir,
+            reason="cancel_reconstruction_regression",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        run_status_before = self.read_json(run_dir / "run_status.json")
+        run_control_before = self.read_json(run_control_path(run_dir))
+        run_steps_path(run_dir).unlink()
+
+        reconstructed = self.run_status_payload(runs_dir, prepared["run_id"])
+        run_steps_before_ingest = self.read_json(run_steps_path(run_dir))
+        ingest = subprocess.run(
+            [
+                str(RUNNER),
+                "ingest",
+                "--run",
+                prepared["run_id"],
+                "--runs-dir",
+                str(runs_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(reconstructed["status"], "cancelled")
+        self.assertIsNone(reconstructed["next_safe_stage"])
+        self.assertEqual(reconstructed["control"]["status"], "cancelled")
+        self.assertEqual(
+            reconstructed["terminal_run_status"]["status"],
+            "cancelled",
+        )
+        self.assertEqual(ingest.returncode, 2)
+        self.assertEqual(json.loads(ingest.stderr)["code"], "run_cancelled")
+        self.assertFalse((run_dir / "ingest_status.json").exists())
+        self.assertEqual(self.read_json(run_dir / "run_status.json"), run_status_before)
+        self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
+        self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before_ingest)
+
     def test_run_status_reconstructs_deleted_run_steps_from_trace(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(

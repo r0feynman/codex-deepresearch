@@ -232,9 +232,11 @@ def initialize_run_steps(
         if reconstruct_missing:
             _reconstruct_state_from_artifacts(state, run_dir, timestamp=now)
         changed = True
+    changed = _overlay_durable_run_artifacts(state, run_dir, timestamp=now) or changed
+    state = _with_resume_summary(state)
     if changed:
         _write_state(path, state)
-    return _with_resume_summary(state)
+    return state
 
 
 def begin_stage(
@@ -464,6 +466,10 @@ def inspect_run_state(run_dir: str | Path, *, run_id: str | None = None) -> dict
     if isinstance(control, Mapping):
         payload["control"] = dict(control)
         payload["artifacts"]["run_control"] = str(run_control_path(run_dir))
+    terminal_run_status = state.get("terminal_run_status")
+    if isinstance(terminal_run_status, Mapping):
+        payload["terminal_run_status"] = dict(terminal_run_status)
+        payload["artifacts"]["run_status"] = str(Path(run_dir) / RUN_STATUS_FILENAME)
     return payload
 
 
@@ -764,6 +770,105 @@ def _reconstruct_state_from_artifacts(
             "at": timestamp,
             "sources": _unique_strings(sources),
         }
+
+
+def _overlay_durable_run_artifacts(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> bool:
+    changed = False
+    changed = (
+        _overlay_run_control_artifact(state, run_dir, timestamp=timestamp)
+        or changed
+    )
+    changed = _overlay_terminal_run_status_artifact(state, run_dir) or changed
+    return changed
+
+
+def _overlay_run_control_artifact(
+    state: dict[str, Any],
+    run_dir: Path,
+    *,
+    timestamp: str,
+) -> bool:
+    control = _read_json_artifact(run_control_path(run_dir))
+    if control is None:
+        return False
+    status = _string_value(control.get("status"))
+    if status not in {"active", "paused", "cancelled"}:
+        return False
+
+    payload = dict(control)
+    payload["run_id"] = str(
+        payload.get("run_id")
+        or state.get("run_id")
+        or _resolve_run_id(run_dir)
+    )
+    payload["run_dir"] = str(run_dir.resolve())
+    changed = False
+    if state.get("control") != payload:
+        state["control"] = payload
+        changed = True
+
+    history = control.get("history")
+    if isinstance(history, list):
+        control_history = [dict(item) for item in history if isinstance(item, Mapping)]
+        if control_history and state.get("control_history") != control_history:
+            state["control_history"] = control_history
+            changed = True
+
+    if changed:
+        state["updated_at"] = _string_value(control.get("requested_at")) or timestamp
+    return changed
+
+
+def _overlay_terminal_run_status_artifact(
+    state: dict[str, Any],
+    run_dir: Path,
+) -> bool:
+    run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME)
+    if run_status is None:
+        if "terminal_run_status" in state:
+            state.pop("terminal_run_status", None)
+            return True
+        return False
+
+    persisted_status = _string_value(run_status.get("status")) or "terminal"
+    if (
+        run_status.get("terminal") is not True
+        and not _is_terminal_run_status_name(persisted_status)
+    ):
+        if "terminal_run_status" in state:
+            state.pop("terminal_run_status", None)
+            return True
+        return False
+
+    terminal = {
+        "status": persisted_status,
+        "ok": run_status.get("ok"),
+        "terminal": True,
+        "updated_at": _payload_timestamp(run_status),
+        "artifacts": _string_artifacts(run_status.get("artifacts")),
+    }
+    diagnostics = run_status.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        terminal["diagnostics"] = dict(diagnostics)
+    control = run_status.get("control")
+    if isinstance(control, Mapping):
+        terminal["control"] = dict(control)
+    provenance = run_status.get("provenance")
+    if isinstance(provenance, Mapping):
+        terminal["provenance"] = dict(provenance)
+
+    if state.get("terminal_run_status") == terminal:
+        return False
+    state["terminal_run_status"] = terminal
+    updated_at = terminal.get("updated_at")
+    if isinstance(updated_at, str) and updated_at:
+        state["updated_at"] = updated_at
+    return True
 
 
 def _replay_trace_artifact(
@@ -1478,7 +1583,27 @@ def _control_status(state: Mapping[str, Any]) -> str | None:
     return status if status in {"active", "paused", "cancelled"} else None
 
 
+def _terminal_run_status_payload(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    terminal = state.get("terminal_run_status")
+    if not isinstance(terminal, Mapping):
+        return None
+    status = _string_value(terminal.get("status"))
+    if terminal.get("terminal") is True or _is_terminal_run_status_name(status):
+        return terminal
+    return None
+
+
 def _raise_if_control_blocks_stage(state: Mapping[str, Any], stage: str) -> None:
+    terminal = _terminal_run_status_payload(state)
+    if terminal is not None:
+        persisted_status = _string_value(terminal.get("status")) or "terminal"
+        raise RunStepStateError(
+            code=_terminal_run_status_error_code(persisted_status),
+            message="terminal runs cannot start another stage",
+            stage=stage,
+            from_status=persisted_status,
+            to_status="running",
+        )
     status = _control_status(state)
     if status == "paused":
         raise RunStepStateError(
@@ -1974,6 +2099,18 @@ def _with_resume_summary(state: dict[str, Any]) -> dict[str, Any]:
     control_status = _control_status(state)
     if control_status == "cancelled":
         state["status"] = "cancelled"
+        state["next_safe_stage"] = None
+        state["next_stage_retryable"] = False
+        return state
+    terminal = _terminal_run_status_payload(state)
+    if terminal is not None:
+        persisted_status = _string_value(terminal.get("status")) or "terminal"
+        if persisted_status.startswith("cancelled"):
+            state["status"] = "cancelled"
+        elif persisted_status.startswith("completed"):
+            state["status"] = "completed"
+        else:
+            state["status"] = persisted_status
         state["next_safe_stage"] = None
         state["next_stage_retryable"] = False
         return state
