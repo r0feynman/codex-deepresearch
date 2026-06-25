@@ -41,6 +41,13 @@ IMAGE_REVIEW_GATE_POLICY_FLAGS = {
     "sensitive_possible",
     "unknown_license_image",
 }
+IMAGE_BLOCKING_POLICY_DECISIONS = {
+    "blocked",
+    "budget_pruned",
+    "disallowed",
+    "manual_review",
+    "restricted",
+}
 CLAIM_BLOCKING_POLICY_FLAGS = SOURCE_BLOCKING_POLICY_FLAGS | IMAGE_BLOCKING_POLICY_FLAGS | {
     "no_primary_source",
 }
@@ -135,7 +142,15 @@ def verify_claims(
             claim_votes = preserved_votes + reusable_matrix_votes
             claim["votes"] = claim_votes
             claim["verification_route"] = route
-            _update_report_eligibility(claim)
+            _update_vote_reference_fields(claim, claim_votes)
+            if _current_policy_blocks(
+                claim,
+                sources_by_id=sources_by_id,
+                images_by_id=images_by_id,
+            ):
+                _apply_current_policy_block(claim)
+            else:
+                _update_report_eligibility(claim)
             all_votes.extend(claim_votes)
             claim_statuses.append(_claim_status_record(claim, route, 0, cache_hit=True))
             reused_count += 1
@@ -151,6 +166,7 @@ def verify_claims(
             claim["confidence"] = "low"
             claim["verification_route"] = route
             claim["votes"] = preserved_votes
+            _update_vote_reference_fields(claim, preserved_votes)
             _update_report_eligibility(claim)
             all_votes.extend(preserved_votes)
             claim_statuses.append(_claim_status_record(claim, route, 0))
@@ -169,6 +185,7 @@ def verify_claims(
         claim["cache_key"] = current_claim_cache_key
         claim["verification_cache_key"] = current_claim_cache_key
         claim["verified_at"] = now
+        _update_vote_reference_fields(claim, claim_votes)
         _update_claim_state(claim, route=route, votes=claim_votes, images_by_id=images_by_id)
         all_votes.extend(claim_votes)
         claim_statuses.append(_claim_status_record(claim, route, len(generated_votes)))
@@ -190,6 +207,10 @@ def verify_claims(
     matrix_status_path = run_dir / "verification_matrix_status.json"
     _write_json(evidence_path, evidence)
     _write_jsonl(verifier_votes_path, _dedupe_votes(all_votes))
+    _persist_visual_observation_verifier_links(
+        run_dir / "visual_observations.jsonl",
+        claims,
+    )
 
     validation = validate_artifacts(
         evidence_path=evidence_path,
@@ -396,6 +417,11 @@ def _update_claim_state(
         review_status = "auto_reviewed"
         promotion_status = "not_eligible"
         confidence = "low"
+    elif blocked_count:
+        status = "policy_blocked"
+        review_status = "needs_more_evidence"
+        promotion_status = "not_eligible"
+        confidence = "low"
     elif _needs_visual_evidence(claim, route=route, images_by_id=images_by_id):
         status = "needs_visual_evidence"
         review_status = "needs_more_evidence"
@@ -406,12 +432,7 @@ def _update_claim_state(
         review_status = "needs_more_evidence"
         promotion_status = "not_eligible"
         confidence = "low"
-    elif blocked_count:
-        status = "policy_blocked"
-        review_status = "needs_more_evidence"
-        promotion_status = "not_eligible"
-        confidence = "low"
-    elif _has_required_support(route, support_by_type):
+    elif _has_required_support(claim, route=route, support_by_type=support_by_type):
         status = "supported"
         review_status = "auto_reviewed"
         promotion_status = "eligible"
@@ -471,12 +492,46 @@ def _report_exclusion_reason(claim: Mapping[str, Any]) -> str:
     return "not_report_eligible"
 
 
-def _has_required_support(route: str, support_by_type: Mapping[str, int]) -> bool:
-    if support_by_type.get("text", 0) < 2:
-        return False
+def _current_policy_blocks(
+    claim: Mapping[str, Any],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    source_refs = _string_list(claim.get("supporting_sources"))
+    image_refs = _string_list(claim.get("supporting_images"))
+    return (
+        _has_policy_block(source_refs, sources_by_id)
+        or _has_policy_image(image_refs, images_by_id, claim=claim)
+        or _has_claim_policy_block(claim)
+    )
+
+
+def _apply_current_policy_block(claim: dict[str, Any]) -> None:
+    claim["verification_status"] = "policy_blocked"
+    claim["review_status"] = "needs_more_evidence"
+    claim["promotion_status"] = "not_eligible"
+    claim["confidence"] = "low"
+    _update_report_eligibility(claim)
+
+
+def _has_required_support(
+    claim: Mapping[str, Any],
+    *,
+    route: str,
+    support_by_type: Mapping[str, int],
+) -> bool:
     if support_by_type.get("policy", 0) < 1 and support_by_type.get("freshness", 0) < 1:
         return False
-    if route == "visual_required" and support_by_type.get("visual", 0) < 1:
+    claim_type = claim.get("claim_type")
+    if claim_type == "visual":
+        return support_by_type.get("visual", 0) >= 1
+    if support_by_type.get("text", 0) < 2:
+        return False
+    if (
+        route == "visual_required"
+        or claim_type == "mixed"
+    ) and support_by_type.get("visual", 0) < 1:
         return False
     return True
 
@@ -580,6 +635,117 @@ def _vote(
         "rationale": rationale,
         "created_at": created_at,
     }
+
+
+def _update_vote_reference_fields(
+    claim: dict[str, Any],
+    votes: Sequence[Mapping[str, Any]],
+) -> None:
+    vote_ids = [
+        vote_id
+        for vote in votes
+        for vote_id in [vote.get("id")]
+        if isinstance(vote_id, str) and vote_id
+    ]
+    visual_vote_ids = [
+        vote_id
+        for vote in votes
+        for vote_id in [vote.get("id")]
+        if vote.get("verifier_type") == "visual"
+        and isinstance(vote_id, str)
+        and vote_id
+    ]
+    claim["verifier_vote_refs"] = list(dict.fromkeys(vote_ids))
+    if visual_vote_ids:
+        claim["visual_verifier_vote_refs"] = list(dict.fromkeys(visual_vote_ids))
+    else:
+        claim.pop("visual_verifier_vote_refs", None)
+
+
+def _persist_visual_observation_verifier_links(
+    path: Path,
+    claims: Sequence[Any],
+) -> None:
+    if not path.exists():
+        return
+    observations = _read_jsonl_records(path)
+    if observations is None:
+        return
+
+    links_by_image_id: dict[str, list[dict[str, Any]]] = {}
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        claim_id = claim.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        vote_ids = _string_list(claim.get("visual_verifier_vote_refs"))
+        if not vote_ids:
+            continue
+        supports = claim.get("visual_supports", [])
+        if not isinstance(supports, list):
+            continue
+        for support in supports:
+            if not isinstance(support, Mapping):
+                continue
+            image_id = support.get("image_id")
+            observation_ref = support.get("observation_ref")
+            if not isinstance(image_id, str) or not isinstance(observation_ref, str):
+                continue
+            for vote_id in vote_ids:
+                links_by_image_id.setdefault(image_id, []).append(
+                    {
+                        "claim_id": claim_id,
+                        "visual_support_ref": observation_ref,
+                        "verifier_vote_id": vote_id,
+                    }
+                )
+
+    if not links_by_image_id:
+        return
+
+    changed = False
+    updated: list[dict[str, Any]] = []
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            continue
+        record = dict(observation)
+        image_id = record.get("evidence_image_id") or record.get("id")
+        links = links_by_image_id.get(image_id) if isinstance(image_id, str) else None
+        if links:
+            record["verifier_links"] = _merge_link_records(
+                record.get("verifier_links"),
+                links,
+                key_fields=("claim_id", "visual_support_ref", "verifier_vote_id"),
+            )
+            changed = True
+        updated.append(record)
+
+    if changed:
+        _write_jsonl(path, updated)
+
+
+def _merge_link_records(
+    existing: Any,
+    additions: Sequence[Mapping[str, Any]],
+    *,
+    key_fields: Sequence[str],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if isinstance(existing, list):
+        records = [dict(item) for item in existing if isinstance(item, Mapping)]
+    seen = {
+        tuple(record.get(field) for field in key_fields)
+        for record in records
+    }
+    for addition in additions:
+        record = dict(addition)
+        key = tuple(record.get(field) for field in key_fields)
+        if key in seen:
+            continue
+        records.append(record)
+        seen.add(key)
+    return records
 
 
 def _preserved_votes(
@@ -783,6 +949,12 @@ def _usable_visual_support_refs(
 def _image_policy_blocks(image: Mapping[str, Any], *, claim: Mapping[str, Any]) -> bool:
     if image.get("analysis_status") == "policy_blocked":
         return True
+    if image.get("policy_decision") in IMAGE_BLOCKING_POLICY_DECISIONS:
+        return True
+    if image.get("license_policy") in {"restricted", "manual_review"}:
+        return True
+    if image.get("robots_policy") in {"disallowed", "manual_review"}:
+        return True
     flags = set(_string_list(image.get("policy_flags")))
     if flags.intersection(IMAGE_BLOCKING_POLICY_FLAGS):
         return True
@@ -856,6 +1028,22 @@ def _read_existing_verifier_votes(path: Path) -> dict[str, Mapping[str, Any]]:
         if isinstance(record, Mapping) and isinstance(record.get("id"), str):
             votes[record["id"]] = record
     return votes
+
+
+def _read_jsonl_records(path: Path) -> list[Any] | None:
+    records: list[Any] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            return None
+    return records
 
 
 def _dedupe_votes(votes: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:

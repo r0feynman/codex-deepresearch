@@ -102,6 +102,26 @@ def image_cache_key(
             "analysis_status": _normalize_scalar(
                 _first_string(image, "analysis_status") or ""
             ),
+            "policy_context": {
+                "policy_decision": _normalize_scalar(
+                    _first_string(image, "policy_decision")
+                    or _first_string(source, "policy_decision")
+                    or "allowed"
+                ),
+                "license_policy": _normalize_scalar(
+                    _first_string(image, "license_policy")
+                    or _first_string(source, "license_policy")
+                    or "unknown"
+                ),
+                "robots_policy": _normalize_scalar(
+                    _first_string(image, "robots_policy")
+                    or _first_string(source, "robots_policy")
+                    or "unknown"
+                ),
+                "source_policy_flags": _normalized_string_set(
+                    _string_list(source.get("policy_flags"))
+                ),
+            },
             "policy_flags": _normalized_string_set(_string_list(image.get("policy_flags"))),
             "observations": _normalized_text_list(image.get("observations")),
             "inferences": _normalized_text_list(image.get("inferences")),

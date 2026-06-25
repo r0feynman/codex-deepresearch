@@ -65,6 +65,18 @@ class CacheKeyTests(unittest.TestCase):
         )
         self.assertNotEqual(
             baseline,
+            image_cache_key({**image, "policy_decision": "blocked"}, source=source),
+        )
+        self.assertNotEqual(
+            baseline,
+            image_cache_key({**image, "license_policy": "restricted"}, source=source),
+        )
+        self.assertNotEqual(
+            baseline,
+            image_cache_key({**image, "robots_policy": "disallowed"}, source=source),
+        )
+        self.assertNotEqual(
+            baseline,
             image_cache_key({**image, "observations": ["The button is corrected."]}, source=source),
         )
 
