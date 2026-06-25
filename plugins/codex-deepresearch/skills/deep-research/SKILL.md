@@ -7,6 +7,22 @@ description: Run a Codex DeepResearch workflow for questions that need multi-sou
 
 Use this skill when the user asks for deep research, source-backed investigation, competitive analysis, incident/background research, technical comparison, or image-backed evidence gathering.
 
+## Invocation Router
+
+For a normal invocation, do not answer directly in chat. Route through the runner:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch invoke '$deep-research: <question>'
+```
+
+Default `$deep-research: <question>` selects `full-runner` mode. The runner must create or attempt to create a run directory, write `run_status.json`, and either reach synthesis or return an explicit terminal blocked status. The final response must name the selected mode, final status, `run_status.json`, and every generated evidence/report/status artifact.
+
+Use `quick-chat` only when the user explicitly asks for a quick answer, chat-only answer, or no full pipeline. In that case, state that no DeepResearch evidence bundle was produced.
+
+When the user provides URLs, PDF URLs/files, image URLs, or local images and asks to use them as sources, invoke manual handoff explicitly with the matching `--url`, `--pdf`, `--image-url`, or `--local-image` flags. Manual handoff must report the run directory and `run_status.json` provenance, and must not imply a real parallel DeepResearch run occurred.
+
+If preflight, search handoff, Codex execution, VLM, auth, sandbox, approval, or policy capability is blocked, report the terminal blocked status from `run_status.json`. Blocked statuses must expose `ok=false`, `terminal=true`, final `status`, and `diagnostics.actionable_cause`; do not silently return a chat-only answer.
+
 ## Workflow
 
 1. Restate the research question and identify constraints.

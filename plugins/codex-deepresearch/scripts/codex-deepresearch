@@ -16,7 +16,13 @@ REPO_ROOT = PLUGIN_ROOT.parents[1]
 PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import BudgetEstimateError, ConfigResolutionError, resolve_config, validate_artifacts
+from deepresearch import (
+    BudgetEstimateError,
+    ConfigResolutionError,
+    resolve_config,
+    run_skill_invocation,
+    validate_artifacts,
+)
 from deepresearch.fetch_claims import FetchClaimsError, fetch_claims
 from deepresearch.guardrails import GuardrailsError, enforce_guardrails
 from deepresearch.manual_sources import ManualSourcesError, ingest_manual_sources
@@ -258,6 +264,37 @@ def run_prepare(args: argparse.Namespace) -> int:
 
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def run_invoke(args: argparse.Namespace) -> int:
+    result = run_skill_invocation(
+        args.invocation,
+        runs_dir=resolve_repo_path(args.runs_dir),
+        quick_chat=args.quick_chat,
+        manual_handoff=args.manual_handoff,
+        urls=args.url,
+        pdfs=args.pdf,
+        image_urls=args.image_url,
+        local_images=args.local_image,
+        labels=args.label,
+        route=None if args.route == "auto" else args.route,
+        angles=args.angle,
+        budget_preset=args.budget,
+        max_results=args.max_results,
+        max_sources=args.max_sources,
+        max_images=args.max_images,
+        max_subagents=args.max_subagents,
+        max_agents=args.max_agents,
+        max_cost_usd=args.max_cost_usd,
+        confirm_budget=args.confirm_budget,
+        adapter_name=args.adapter,
+        min_tasks=args.min_tasks,
+        max_tasks=args.max_tasks,
+        allow_degraded=not args.no_degrade,
+        require_codex_exec=args.require_codex_exec,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") is True else 2
 
 
 def run_ingest(args: argparse.Namespace) -> int:
@@ -761,6 +798,139 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail instead of serially degrading when codex-exec is unavailable.",
     )
     orchestrate_parallel.set_defaults(func=run_orchestrate_parallel)
+
+    invoke = subparsers.add_parser(
+        "invoke",
+        help="Route a $deep-research skill invocation to full-runner, manual, or quick-chat mode.",
+    )
+    invoke.add_argument("invocation", help="Raw skill invocation, for example '$deep-research: ...'.")
+    invoke.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    invoke.add_argument(
+        "--quick-chat",
+        action="store_true",
+        help="Explicitly use chat-only quick mode; no evidence bundle is produced.",
+    )
+    invoke.add_argument(
+        "--manual-handoff",
+        action="store_true",
+        help="Explicitly use manual source handoff mode.",
+    )
+    invoke.add_argument(
+        "--url",
+        action="append",
+        default=[],
+        help="Manual http(s) page URL to record as a source. Repeatable.",
+    )
+    invoke.add_argument(
+        "--pdf",
+        action="append",
+        default=[],
+        help="Manual PDF URL or existing local PDF file to record as a source. Repeatable.",
+    )
+    invoke.add_argument(
+        "--image-url",
+        action="append",
+        default=[],
+        help="Manual http(s) image URL to record as a source and VisualEvidence. Repeatable.",
+    )
+    invoke.add_argument(
+        "--local-image",
+        action="append",
+        default=[],
+        help="Existing local image file to copy into the run and record as VisualEvidence. Repeatable.",
+    )
+    invoke.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Optional source title override, applied to manual inputs in option-group order.",
+    )
+    invoke.add_argument(
+        "--route",
+        default="auto",
+        choices=("auto", "text_only", "visual_required", "visual_optional"),
+        help="Search route override for full-runner mode.",
+    )
+    invoke.add_argument(
+        "--angle",
+        action="append",
+        help="Planner angle to classify and hand off. Repeat for multiple angles.",
+    )
+    invoke.add_argument(
+        "--budget",
+        "--budget-preset",
+        dest="budget",
+        default="standard",
+        help="Budget preset: quick, standard, deep, or exhaustive.",
+    )
+    invoke.add_argument(
+        "--max-results",
+        type=int,
+        default=8,
+        help="Maximum expected SearchResult records for generated handoff tasks.",
+    )
+    invoke.add_argument(
+        "--max-sources",
+        type=int,
+        help="Optional source cap to apply before search and fetch work starts.",
+    )
+    invoke.add_argument(
+        "--max-images",
+        type=int,
+        help="Optional image cap to apply before visual acquisition and VLM work starts.",
+    )
+    invoke.add_argument(
+        "--max-subagents",
+        type=int,
+        help="Optional concurrent Codex subagent cap for the planned run.",
+    )
+    invoke.add_argument(
+        "--max-agents",
+        type=int,
+        help="Optional concurrent runner-agent cap for the planned run.",
+    )
+    invoke.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Optional deterministic high-water cost cap in USD placeholder units.",
+    )
+    invoke.add_argument(
+        "--confirm-budget",
+        action="store_true",
+        help="Confirm execution for deep and exhaustive budget presets.",
+    )
+    invoke.add_argument(
+        "--adapter",
+        default="codex-exec",
+        choices=("codex-exec", "fixture", "serial-degraded"),
+        help="Full-runner adapter. fixture is deterministic and serial-degraded records blocked fallback.",
+    )
+    invoke.add_argument(
+        "--min-tasks",
+        type=int,
+        default=1,
+        help="Minimum ResearchTask records to create before execution.",
+    )
+    invoke.add_argument(
+        "--max-tasks",
+        type=int,
+        help="Optional task cap below the preset hard cap.",
+    )
+    invoke.add_argument(
+        "--no-degrade",
+        action="store_true",
+        help="Fail instead of serially degrading when codex-exec is unavailable.",
+    )
+    invoke.add_argument(
+        "--require-codex-exec",
+        action="store_true",
+        help="Treat a missing codex exec binary as blocked preflight before orchestration.",
+    )
+    invoke.set_defaults(func=run_invoke)
 
     prepare = subparsers.add_parser(
         "prepare",
