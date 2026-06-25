@@ -15,7 +15,7 @@ Add the repository marketplace and install the plugin:
 
 ```bash
 codex plugin marketplace add .
-codex plugin list --marketplace codex-deepresearch-local --available
+codex plugin list --marketplace codex-deepresearch-local --available --json
 codex plugin add codex-deepresearch@codex-deepresearch-local
 codex plugin list --json
 ```
@@ -110,7 +110,7 @@ Manual handoff records source metadata in a run directory without external searc
 
 `codex-plugin` mode does not assume hidden Codex search or VLM APIs. The handoff is artifact-based:
 
-1. `prepare` creates a run directory with `search_tasks.json`, `search_results.jsonl`, `visual_tasks.json` when needed, `visual_observations.jsonl`, `budget_estimate.json`, and `run_status.json`.
+1. `prepare` creates a run directory with `search_tasks.json`, `search_results.jsonl`, `visual_tasks.json` when needed, `visual_observations.jsonl`, `budget_estimate.json`, `status.json`, `run_steps.json`, and `run_trace.jsonl`. Higher-level `invoke` runs and terminal status wrappers write `run_status.json`.
 2. The active Codex-side agent performs allowed search or visual review and writes handoff records.
 3. `ingest` normalizes `search_results.jsonl` into `evidence.json` and `fetch_queue.json`.
 4. Visual routes use `acquire-visual` and/or explicit `visual_observations.jsonl`, then `ingest-vision`.
@@ -207,10 +207,6 @@ run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare \
   --angle "text claims from the public page" \
   --angle "visible page images and screenshots" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])')
-plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual \
-  --run "$run_dir" \
-  --url https://example.com/source \
-  --image-url https://example.com/image.png
 plugins/codex-deepresearch/scripts/codex-deepresearch acquire-visual \
   --run "$run_dir" \
   --provider local-page \
@@ -218,9 +214,13 @@ plugins/codex-deepresearch/scripts/codex-deepresearch acquire-visual \
 plugins/codex-deepresearch/scripts/codex-deepresearch ingest-vision \
   --run "$run_dir" \
   --provider manual-visual-review
+plugins/codex-deepresearch/scripts/codex-deepresearch ingest-manual \
+  --run "$run_dir" \
+  --url https://example.com/source \
+  --image-url https://example.com/image.png
 ```
 
-This demonstrates mixed text and visual artifact plumbing with manual/user-provided plus local fixture provenance. It is not a no-user-image real-provider run.
+This demonstrates mixed text and visual artifact plumbing with local fixture plus manual/user-provided provenance. It is not a no-user-image real-provider run.
 
 Manual or user-provided evidence:
 
