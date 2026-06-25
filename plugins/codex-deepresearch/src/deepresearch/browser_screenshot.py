@@ -192,13 +192,12 @@ def collect_browser_screenshot_candidates(
     captures_succeeded = 0
     captures_skipped = 0
     last_error: str | None = unavailable_reason
-    external_network_call = False
+    external_capture_attempted = False
 
     for source in _capture_sources(sources):
         page_url = _page_url(source)
         if page_url is None:
             continue
-        external_network_call = external_network_call or _is_remote_url(page_url)
         route = _source_route(routes, source)
         policy = _page_policy(source)
         for mode in screenshot_modes:
@@ -257,6 +256,8 @@ def collect_browser_screenshot_candidates(
 
             output_path = run_dir / relative_path
             captures_attempted += 1
+            if _is_remote_url(page_url):
+                external_capture_attempted = True
             try:
                 capture = active_transport.capture(
                     url=page_url,
@@ -309,6 +310,12 @@ def collect_browser_screenshot_candidates(
                 )
             )
 
+    candidate_external_network_call = False
+    for candidate in candidates:
+        provenance = candidate.get("provider_provenance")
+        if isinstance(provenance, Mapping) and provenance.get("external_network_call"):
+            candidate_external_network_call = True
+            break
     provider_status = {
         "provider": provider,
         "provider_kind": "screenshot",
@@ -323,7 +330,8 @@ def collect_browser_screenshot_candidates(
         "captures_attempted": captures_attempted,
         "captures_succeeded": captures_succeeded,
         "captures_skipped": captures_skipped,
-        "external_network_call": external_network_call and captures_attempted > 0,
+        "external_network_call": external_capture_attempted
+        or candidate_external_network_call,
         "external_vlm_call": False,
         "transport": active_transport.name,
         "last_error": last_error,
@@ -448,7 +456,10 @@ def _with_capture_context(
     updated = dict(record)
     screenshot = dict(updated["screenshot"])
     provider_provenance = dict(updated.get("provider_provenance", {}))
-    provider_provenance["external_network_call"] = _is_remote_url(final_url)
+    page_url = _string(updated.get("page_url"))
+    provider_provenance["external_network_call"] = _is_remote_url(page_url) or _is_remote_url(
+        final_url
+    )
     screenshot.update(
         {
             "supported": True,

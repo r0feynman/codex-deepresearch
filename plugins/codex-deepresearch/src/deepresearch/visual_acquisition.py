@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from .browser_screenshot import (
     BrowserScreenshotTransport,
+    PlaywrightBrowserTransport,
     collect_browser_screenshot_candidates,
 )
 from .cache_keys import normalize_url
@@ -41,6 +42,7 @@ DEFAULT_VISUAL_PROVIDERS = (
     "local-screenshot-fixture",
 )
 BRAVE_IMAGE_PROVIDER = "brave-image-search"
+BROWSER_SCREENSHOT_PROVIDER = "browser-screenshot"
 BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
 BRAVE_DEFAULT_SEARCH_LANG = "en"
 BRAVE_DEFAULT_COUNTRY = "US"
@@ -241,14 +243,28 @@ def acquire_visual_candidates(
         )
 
     if real_provider_requested:
-        selected: list[dict[str, Any]] = []
+        selected = []
+        metadata_candidates, artifact_candidates = _split_real_candidate_records(candidates)
         candidate_records = _normalize_real_candidate_records(
-            candidates=candidates,
+            candidates=metadata_candidates,
             evidence=evidence,
             run_dir=run_dir,
             created_at=now,
         )
-        near_duplicate_groups: list[dict[str, Any]] = []
+        if artifact_candidates:
+            artifact_selected, artifact_records, near_duplicate_groups = (
+                _validate_and_select_candidates(
+                    run_dir=run_dir,
+                    evidence=evidence,
+                    candidates=artifact_candidates,
+                    max_image_bytes=max_image_bytes,
+                    created_at=now,
+                )
+            )
+            selected.extend(artifact_selected)
+            candidate_records.extend(artifact_records)
+        else:
+            near_duplicate_groups = []
     else:
         selected, candidate_records, near_duplicate_groups = _validate_and_select_candidates(
             run_dir=run_dir,
@@ -637,7 +653,7 @@ class _LocalScreenshotFixtureProvider:
 
 
 class _BrowserScreenshotProvider:
-    name = "browser-screenshot"
+    name = BROWSER_SCREENSHOT_PROVIDER
 
     def __init__(self, transport: BrowserScreenshotTransport | None = None) -> None:
         self._transport = transport
@@ -646,6 +662,32 @@ class _BrowserScreenshotProvider:
             candidates=0,
             invoked=False,
         )
+
+    def initial_status(self) -> dict[str, Any]:
+        active_transport = self._transport or PlaywrightBrowserTransport()
+        available, unavailable_reason = active_transport.availability()
+        return {
+            "provider": self.name,
+            "provider_kind": "screenshot",
+            "provider_mode": _browser_transport_provider_mode(active_transport),
+            "provider_run_id": None,
+            "configured": True,
+            "available": available,
+            "blocked_reason": unavailable_reason,
+            "invoked": False,
+            "invocations": 0,
+            "candidates": 0,
+            "candidates_discovered": 0,
+            "artifacts_fetched": 0,
+            "vlm_images_analyzed": 0,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "last_error": unavailable_reason,
+            "external_network_call": False,
+            "external_vlm_call": False,
+            "transport": active_transport.name,
+            "diagnostics": {"transport": active_transport.name},
+        }
 
     def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
         collection = collect_browser_screenshot_candidates(
@@ -1465,6 +1507,27 @@ def _normalize_real_candidate_records(
                 seen_urls[normalized_url] = str(record["candidate_id"])
         records.append(_persistable_candidate(record))
     return records
+
+
+def _split_real_candidate_records(
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    metadata_candidates: list[Mapping[str, Any]] = []
+    artifact_candidates: list[Mapping[str, Any]] = []
+    for candidate in candidates:
+        if _requires_local_artifact_validation(candidate):
+            artifact_candidates.append(candidate)
+        else:
+            metadata_candidates.append(candidate)
+    return metadata_candidates, artifact_candidates
+
+
+def _requires_local_artifact_validation(candidate: Mapping[str, Any]) -> bool:
+    return (
+        candidate.get("provider") == BROWSER_SCREENSHOT_PROVIDER
+        or candidate.get("provider_kind") == "screenshot"
+        or candidate.get("origin") == "screenshot"
+    )
 
 
 def _image_fetch_records_from_candidates(
@@ -2642,7 +2705,7 @@ def _sanitized_result_metadata(
 
 
 def _is_real_provider_name(provider: str) -> bool:
-    return provider == BRAVE_IMAGE_PROVIDER
+    return provider in {BRAVE_IMAGE_PROVIDER, BROWSER_SCREENSHOT_PROVIDER}
 
 
 def _uses_fixture_sources(provider_names: Sequence[str]) -> bool:
@@ -2693,10 +2756,17 @@ def _default_provider_status(
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
         "last_error": None,
-        "external_network_call": _is_real_provider_name(provider) and invoked,
+        "external_network_call": provider == BRAVE_IMAGE_PROVIDER and invoked,
         "external_vlm_call": False,
         "diagnostics": {},
     }
+
+
+def _browser_transport_provider_mode(transport: BrowserScreenshotTransport) -> str:
+    mode = _string(getattr(transport, "provider_mode", "real")) or "real"
+    if mode in {"real", "fixture", "manual", "user_provided"}:
+        return mode
+    return "real"
 
 
 def _blocked_actionable_cause(provider_statuses: Sequence[Mapping[str, Any]]) -> str:
@@ -2748,7 +2818,7 @@ def _providers(
             providers.append(_LocalImageFixtureProvider())
         elif name == "local-screenshot-fixture":
             providers.append(_LocalScreenshotFixtureProvider())
-        elif name == "browser-screenshot":
+        elif name == BROWSER_SCREENSHOT_PROVIDER:
             providers.append(_BrowserScreenshotProvider(transport=browser_transport))
         elif name == BRAVE_IMAGE_PROVIDER:
             providers.append(

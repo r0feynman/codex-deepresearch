@@ -127,7 +127,7 @@ class BrowserScreenshotTests(unittest.TestCase):
             browser_transport=transport,
         )
 
-        self.assertEqual(result["status"], "visual_candidates_collected")
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
         self.assertTrue(result["external_network_call"])
         self.assertTrue(result["visual_artifact_validation"]["valid"])
         self.assertEqual(len(transport.calls), 2)
@@ -141,6 +141,7 @@ class BrowserScreenshotTests(unittest.TestCase):
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         plan = self.read_json(run_dir / "visual_search_plan.json")
 
+        self.assertEqual(provider_status["status"], "real_image_search_candidates_collected")
         self.assertEqual(plan["tasks"][0]["target_evidence_type"], "screenshot")
         self.assertEqual({candidate["candidate_status"] for candidate in candidates}, {"fetched"})
         self.assertEqual({fetch["fetch_status"] for fetch in fetches}, {"fetched"})
@@ -213,6 +214,38 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertEqual({fetch["fetch_status"] for fetch in fetches}, {"policy_blocked"})
         self.assertEqual([fetch["local_artifact_path"] for fetch in fetches], [None] * len(blocked_flags))
 
+    def test_unavailable_browser_transport_blocks_as_missing_visual_provider(self) -> None:
+        run_dir = self.prepared_visual_run()
+        transport = FakeBrowserTransport(available=False)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=("browser-screenshot",),
+            screenshot_modes=("first_viewport",),
+            browser_transport=transport,
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_visual_provider")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(len(transport.calls), 0)
+        self.assertEqual(result["candidate_records"], 0)
+        self.assertFalse(result["external_network_call"])
+        self.assertEqual(self.read_jsonl(run_dir / "visual_candidates.jsonl"), [])
+        self.assertEqual(self.read_jsonl(run_dir / "image_fetch_status.jsonl"), [])
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider_status["status"], "blocked_missing_visual_provider")
+        self.assertFalse(provider_status["ok"])
+        self.assertTrue(provider_status["terminal"])
+        self.assertEqual(provider["provider"], "browser-screenshot")
+        self.assertEqual(provider["provider_kind"], "screenshot")
+        self.assertFalse(provider["available"])
+        self.assertEqual(provider["blocked_reason"], "fake_browser_unavailable")
+        self.assertEqual(provider["invocations"], 0)
+        self.assertFalse(provider["external_network_call"])
+
     def test_access_denied_http_status_after_navigation_is_policy_blocked(self) -> None:
         run_dir = self.prepared_visual_run()
         transport = FakeBrowserTransport(http_status=403)
@@ -269,6 +302,55 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertEqual(fetches[0]["fetch_status"], "failed")
         self.assertEqual(fetches[0]["http_status"], 500)
         self.assertIsNone(fetches[0]["local_artifact_path"])
+
+    def test_remote_policy_skip_plus_local_capture_does_not_report_external_network(
+        self,
+    ) -> None:
+        run_dir = self.prepared_visual_run(
+            sources=[
+                self.public_source(
+                    id="src_remote_robots_blocked",
+                    url="https://example.test/robots-blocked",
+                    robots_policy="disallowed",
+                ),
+                self.public_source(
+                    id="src_local_allowed",
+                    url=(Path(tempfile.gettempdir()) / "local-browser-source.html").as_uri(),
+                    local_artifact_path="sources/local-browser-source.html",
+                ),
+            ]
+        )
+        transport = FakeBrowserTransport()
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=("browser-screenshot",),
+            screenshot_modes=("first_viewport",),
+            browser_transport=transport,
+        )
+
+        self.assertEqual(len(transport.calls), 1)
+        self.assertTrue(transport.calls[0]["url"].startswith("file://"))
+        self.assertFalse(result["external_network_call"])
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        by_source = {candidate["source_id"]: candidate for candidate in candidates}
+        self.assertEqual(by_source["src_remote_robots_blocked"]["candidate_status"], "policy_blocked")
+        self.assertEqual(by_source["src_local_allowed"]["candidate_status"], "fetched")
+        self.assertFalse(
+            by_source["src_local_allowed"]["provider_provenance"]["external_network_call"]
+        )
+        self.assertEqual(
+            {fetch["fetch_status"] for fetch in fetches},
+            {"policy_blocked", "fetched"},
+        )
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertFalse(provider["external_network_call"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.assertFalse(evidence["visual_acquisition"]["external_network_call"])
 
     def test_unsupported_scroll_and_interaction_modes_are_explicit_skips(self) -> None:
         run_dir = self.prepared_visual_run()
@@ -408,7 +490,7 @@ class BrowserScreenshotTests(unittest.TestCase):
             browser_transport=transport,
         )
 
-        self.assertEqual(result["status"], "visual_candidates_collected")
+        self.assertEqual(result["status"], "partial_auto_visual")
         self.assertEqual(len(transport.calls), 0)
         self.assertEqual(result["candidate_records"], 0)
         self.assertFalse(result["external_network_call"])
