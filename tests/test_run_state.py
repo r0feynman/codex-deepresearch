@@ -161,6 +161,90 @@ class RunStateTests(unittest.TestCase):
         payload = "\n".join(json.dumps(record) for record in records) + "\n"
         (run_dir / "search_results.jsonl").write_text(payload, encoding="utf-8")
 
+    def write_full_runner_handoff_status(self, run_dir: Path, run_id: str) -> dict:
+        artifact_files = {
+            "planning_status": "status.json",
+            "search_tasks": "search_tasks.json",
+            "search_results": "search_results.jsonl",
+            "visual_tasks": "visual_tasks.json",
+            "visual_observations": "visual_observations.jsonl",
+            "budget_estimate": "budget_estimate.json",
+            "fetch_claims_status": "fetch_claims_status.json",
+            "vision_ingest_status": "vision_ingest_status.json",
+            "guardrails_status": "guardrails_status.json",
+            "verification_matrix_status": "verification_matrix_status.json",
+            "custom_handoff_artifact": "custom_handoff.json",
+        }
+        for filename in artifact_files.values():
+            path = run_dir / filename
+            if filename.endswith(".jsonl") or filename.endswith(".md"):
+                path.write_text("", encoding="utf-8")
+            else:
+                self.write_json(path, {"fixture": filename})
+        artifacts = {
+            "run_status": str(run_dir / "run_status.json"),
+            "evidence": str(run_dir / "evidence.json"),
+            **{
+                key: str(run_dir / filename)
+                for key, filename in artifact_files.items()
+            },
+        }
+        payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "invocation": "$deep-research: handoff preservation",
+            "question": "handoff preservation",
+            "selected_mode": "full-runner",
+            "status": "running",
+            "ok": True,
+            "terminal": False,
+            "updated_at": "2026-06-25T00:00:00Z",
+            "provenance": {"type": "full_runner", "adapter": "fixture"},
+            "diagnostics": {
+                "actionable_cause": "existing handoff diagnostics",
+                "missing_required_artifacts": ["report_status"],
+            },
+            "shard_summary": {"accepted": 2},
+            "fallback": {"needs_serial_handoff": False},
+            "artifacts": artifacts,
+            "artifact_handoff": {
+                "run_dir": str(run_dir),
+                "status": "running",
+                "ok": True,
+                "terminal": False,
+                "artifact_paths": dict(artifacts),
+                "missing_required_artifacts": ["report_status"],
+                "shards": {"accepted": 2},
+                "fallback": {"needs_serial_handoff": False},
+                "diagnostics": {
+                    "actionable_cause": "existing handoff diagnostics",
+                    "missing_required_artifacts": ["report_status"],
+                },
+            },
+        }
+        self.write_json(run_dir / "run_status.json", payload)
+        return artifacts
+
+    def assert_handoff_artifacts_preserved(
+        self,
+        run_dir: Path,
+        expected_artifacts: dict[str, str],
+    ) -> dict:
+        run_status = self.read_json(run_dir / "run_status.json")
+        for key, value in expected_artifacts.items():
+            self.assertEqual(run_status["artifacts"][key], value)
+            self.assertEqual(run_status["artifact_handoff"]["artifact_paths"][key], value)
+        self.assertIn("run_control", run_status["artifacts"])
+        self.assertIn("run_control", run_status["artifact_handoff"]["artifact_paths"])
+        self.assertEqual(
+            run_status["artifact_handoff"]["missing_required_artifacts"],
+            ["report_status"],
+        )
+        self.assertEqual(run_status["shard_summary"], {"accepted": 2})
+        self.assertEqual(run_status["fallback"], {"needs_serial_handoff": False})
+        return run_status
+
     def run_status_payload(self, runs_dir: Path, run_id: str) -> dict:
         command = subprocess.run(
             [
@@ -387,6 +471,127 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(control["history"][-1]["action"], "resume")
         self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
         self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+
+    def test_pause_resume_cancel_preserve_existing_run_status_artifacts(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="control artifact preservation",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        expected_artifacts = self.write_full_runner_handoff_status(
+            run_dir,
+            prepared["run_id"],
+        )
+
+        pause_run(
+            run_dir,
+            reason="preserve_pause",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        paused_status = self.assert_handoff_artifacts_preserved(
+            run_dir,
+            expected_artifacts,
+        )
+        self.assertEqual(paused_status["status"], "paused")
+        self.assertFalse(paused_status["terminal"])
+
+        resume_run(
+            run_dir,
+            reason="preserve_resume",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+        resumed_status = self.assert_handoff_artifacts_preserved(
+            run_dir,
+            expected_artifacts,
+        )
+        self.assertEqual(resumed_status["status"], "resumed")
+        self.assertFalse(resumed_status["terminal"])
+
+        cancel_run(
+            run_dir,
+            reason="preserve_cancel",
+            timestamp="2026-06-25T00:02:00Z",
+        )
+        cancelled_status = self.assert_handoff_artifacts_preserved(
+            run_dir,
+            expected_artifacts,
+        )
+        self.assertEqual(cancelled_status["status"], "cancelled")
+        self.assertTrue(cancelled_status["terminal"])
+        self.assertFalse(cancelled_status["ok"])
+
+    def test_resume_rejects_completed_terminal_run_status_without_mutation(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="terminal completed resume rejection",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        terminal_status = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": prepared["run_id"],
+            "run_dir": str(run_dir),
+            "invocation": "$deep-research: completed",
+            "question": "terminal completed resume rejection",
+            "selected_mode": "fixture",
+            "status": "completed_fixture",
+            "ok": True,
+            "terminal": True,
+            "updated_at": "2026-06-25T00:00:00Z",
+            "provenance": {"type": "fixture"},
+            "diagnostics": {},
+            "artifacts": {"run_status": str(run_dir / "run_status.json")},
+        }
+        self.write_json(run_dir / "run_status.json", terminal_status)
+        run_steps_before = self.read_json(run_steps_path(run_dir))
+
+        with self.assertRaises(RunStepStateError) as resume_error:
+            resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+
+        self.assertEqual(resume_error.exception.to_dict()["code"], "run_completed")
+        self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
+        self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
+        self.assertFalse(run_control_path(run_dir).exists())
+
+        for persisted_status, expected_code in (
+            ("cancelled", "run_cancelled"),
+            ("failed_synthesis", "run_terminal"),
+        ):
+            with self.subTest(persisted_status=persisted_status):
+                prepared = prepare_run(
+                    question=f"terminal {persisted_status} resume rejection",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                terminal_status = {
+                    "schema_version": "codex-deepresearch.run-status.v0",
+                    "run_id": prepared["run_id"],
+                    "run_dir": str(run_dir),
+                    "invocation": "$deep-research: terminal",
+                    "question": f"terminal {persisted_status} resume rejection",
+                    "selected_mode": "fixture",
+                    "status": persisted_status,
+                    "ok": False,
+                    "terminal": True,
+                    "updated_at": "2026-06-25T00:00:00Z",
+                    "provenance": {"type": "fixture"},
+                    "diagnostics": {},
+                    "artifacts": {"run_status": str(run_dir / "run_status.json")},
+                }
+                self.write_json(run_dir / "run_status.json", terminal_status)
+                run_steps_before = self.read_json(run_steps_path(run_dir))
+
+                with self.assertRaises(RunStepStateError) as resume_error:
+                    resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+
+                self.assertEqual(resume_error.exception.to_dict()["code"], expected_code)
+                self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
+                self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
+                self.assertFalse(run_control_path(run_dir).exists())
 
     def test_resume_continue_does_not_duplicate_completed_evidence(self) -> None:
         runs_dir = self.temp_runs_dir()

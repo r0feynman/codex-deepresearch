@@ -540,6 +540,7 @@ def resume_run(
             code="run_cancelled",
             message="cancelled runs cannot be resumed",
         )
+    _raise_if_resume_blocked_by_terminal_run(run_dir, state, control_status)
     if control_status == "paused":
         reason_value = reason or "user_requested_resume"
         actionable_cause = (
@@ -1598,6 +1599,55 @@ def _write_control_artifact(
     return payload
 
 
+def _raise_if_resume_blocked_by_terminal_run(
+    run_dir: Path,
+    state: Mapping[str, Any],
+    control_status: str | None,
+) -> None:
+    state_status = _string_value(state.get("status"))
+    if state_status == "completed":
+        raise RunStepStateError(
+            code="run_completed",
+            message="completed runs cannot be resumed",
+            from_status=state_status,
+            to_status="resumed",
+        )
+    if state_status == "cancelled":
+        raise RunStepStateError(
+            code="run_cancelled",
+            message="cancelled runs cannot be resumed",
+            from_status=state_status,
+            to_status="resumed",
+        )
+    if control_status == "paused":
+        return
+
+    run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
+    if run_status.get("terminal") is not True:
+        return
+    persisted_status = _string_value(run_status.get("status")) or "terminal"
+    if persisted_status == "cancelled":
+        raise RunStepStateError(
+            code="run_cancelled",
+            message="cancelled runs cannot be resumed",
+            from_status=persisted_status,
+            to_status="resumed",
+        )
+    if persisted_status.startswith("completed"):
+        raise RunStepStateError(
+            code="run_completed",
+            message="completed runs cannot be resumed",
+            from_status=persisted_status,
+            to_status="resumed",
+        )
+    raise RunStepStateError(
+        code="run_terminal",
+        message="terminal runs cannot be resumed unless they are paused",
+        from_status=persisted_status,
+        to_status="resumed",
+    )
+
+
 def _write_control_run_status(
     run_dir: Path,
     control: Mapping[str, Any],
@@ -1607,19 +1657,41 @@ def _write_control_run_status(
 ) -> None:
     existing = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
     evidence = _read_json_artifact(run_dir / "evidence.json") or {}
-    diagnostics = (
+    control_diagnostics = (
         dict(control.get("diagnostics", {}))
         if isinstance(control.get("diagnostics"), Mapping)
         else {}
     )
-    payload = {
+    diagnostics = (
+        dict(existing.get("diagnostics", {}))
+        if isinstance(existing.get("diagnostics"), Mapping)
+        else {}
+    )
+    previous_actionable_cause = diagnostics.get("actionable_cause")
+    diagnostics.update(control_diagnostics)
+    control_actionable_cause = control_diagnostics.get("actionable_cause")
+    if (
+        isinstance(previous_actionable_cause, str)
+        and previous_actionable_cause
+        and previous_actionable_cause != control_actionable_cause
+    ):
+        diagnostics.setdefault("previous_actionable_cause", previous_actionable_cause)
+
+    artifacts = _control_artifact_paths(run_dir)
+    if isinstance(existing.get("artifacts"), Mapping):
+        artifacts = {str(key): value for key, value in existing["artifacts"].items()}
+        artifacts.update(_control_artifact_paths(run_dir))
+
+    status = status_override or str(control.get("status") or "unknown")
+    payload = dict(existing)
+    payload.update({
         "schema_version": _RUN_STATUS_SCHEMA_VERSION,
         "run_id": str(state.get("run_id") or _resolve_run_id(run_dir)),
         "run_dir": str(run_dir.resolve()),
         "invocation": str(existing.get("invocation") or ""),
         "question": str(existing.get("question") or evidence.get("question") or ""),
         "selected_mode": str(existing.get("selected_mode") or "full-runner"),
-        "status": status_override or str(control.get("status") or "unknown"),
+        "status": status,
         "ok": False if control.get("status") == "cancelled" else True,
         "terminal": bool(control.get("terminal")),
         "updated_at": str(control.get("requested_at") or _utc_now()),
@@ -1633,16 +1705,22 @@ def _write_control_run_status(
             "reason": control.get("reason"),
             "resume_next_safe_stage": control.get("resume_next_safe_stage"),
         },
-        "artifacts": _control_artifact_paths(run_dir),
-    }
-    payload["artifact_handoff"] = {
+        "artifacts": artifacts,
+    })
+    artifact_handoff = (
+        dict(existing.get("artifact_handoff", {}))
+        if isinstance(existing.get("artifact_handoff"), Mapping)
+        else {}
+    )
+    artifact_handoff.update({
         "run_dir": payload["run_dir"],
-        "status": payload["status"],
+        "status": status,
         "ok": payload["ok"],
         "terminal": payload["terminal"],
-        "artifact_paths": dict(payload["artifacts"]),
+        "artifact_paths": dict(artifacts),
         "diagnostics": dict(diagnostics),
-    }
+    })
+    payload["artifact_handoff"] = artifact_handoff
     _write_json_artifact(run_dir / RUN_STATUS_FILENAME, payload)
 
 
@@ -1670,11 +1748,27 @@ def _control_artifact_paths(run_dir: Path) -> dict[str, str]:
         "run_steps": RUN_STEPS_FILENAME,
         "run_status": RUN_STATUS_FILENAME,
         "run_trace": _RUN_TRACE_FILENAME,
+        "planning_status": "status.json",
         "evidence": "evidence.json",
+        "budget_estimate": "budget_estimate.json",
         "research_tasks": "research_tasks.json",
+        "search_tasks": "search_tasks.json",
+        "search_results": "search_results.jsonl",
+        "fetch_queue": "fetch_queue.json",
+        "visual_tasks": "visual_tasks.json",
+        "visual_observations": "visual_observations.jsonl",
         "subagent_assignments": "subagent_assignments.jsonl",
         "parallel_orchestration_status": "parallel_orchestration_status.json",
         "merge_status": "merge_status.json",
+        "visual_acquisition_status": "visual_acquisition_status.json",
+        "visual_provider_status": "visual_provider_status.json",
+        "image_fetch_status": "image_fetch_status.jsonl",
+        "ingest_status": "ingest_status.json",
+        "manual_ingest_status": "manual_ingest_status.json",
+        "fetch_claims_status": "fetch_claims_status.json",
+        "vision_ingest_status": "vision_ingest_status.json",
+        "guardrails_status": "guardrails_status.json",
+        "verification_matrix_status": "verification_matrix_status.json",
         "report": "report.md",
         "report_status": "report_status.json",
     }
