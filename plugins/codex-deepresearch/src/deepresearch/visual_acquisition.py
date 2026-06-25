@@ -23,6 +23,7 @@ from .pdf_rasterizer import (
     DEFAULT_MAX_PDF_BYTES,
     DEFAULT_PDF_RASTERIZER_PROVIDER,
     collect_pdf_rasterizer_candidates,
+    pdf_renderer_available,
     render_pdf_candidate_artifact,
 )
 from .search_handoff import resolve_run_dir
@@ -976,6 +977,7 @@ class _LocalPdfRasterizerProvider:
         self.last_status: dict[str, Any] = {}
 
     def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
+        requested_provider_mode = "real" if pdf_renderer_available() else "manual"
         result = collect_pdf_rasterizer_candidates(
             run_dir=context.run_dir,
             sources=tuple(context.source_by_id.values()),
@@ -983,15 +985,22 @@ class _LocalPdfRasterizerProvider:
             created_at=context.created_at,
             max_pdf_bytes=context.max_pdf_bytes,
             provider=self.name,
-            provider_mode="fixture",
+            provider_mode=requested_provider_mode,
         )
         renderer_unavailable = any(
             item.get("reason") == "renderer_unavailable_pdf" for item in result.diagnostics
         )
+        provider_mode = (
+            "real"
+            if result.pages_rasterized > 0
+            else "manual"
+            if renderer_unavailable
+            else "fixture"
+        )
         self.last_status = {
             "provider": self.name,
             "provider_kind": "pdf_rasterizer",
-            "provider_mode": "fixture",
+            "provider_mode": provider_mode,
             "configured": True,
             "available": not renderer_unavailable,
             "blocked_reason": "renderer_unavailable_pdf" if renderer_unavailable else None,
@@ -1523,7 +1532,7 @@ def _apply_phase3_candidate_defaults(
             "provider_kind": provider_kind,
             "provider_mode": provider_mode,
             "provider_run_id": provider_run_id,
-            "fixture_only": provider_mode != "real",
+            "fixture_only": provider_mode == "fixture",
             "external_network_call": False,
             "external_vlm_call": False,
         }

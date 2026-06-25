@@ -17,6 +17,7 @@ from deepresearch import (  # noqa: E402
     acquire_visual_candidates,
     ingest_vision_observations,
     prepare_run,
+    real_automatic_visual_release_counts,
     validate_artifacts,
     validate_visual_artifacts,
 )
@@ -178,6 +179,9 @@ class PdfRasterizerTests(unittest.TestCase):
         fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
         self.assertEqual({candidate["origin"] for candidate in candidates}, {"pdf_page", "pdf_figure"})
         for candidate in candidates:
+            self.assertEqual(candidate["provider_mode"], "real")
+            self.assertFalse(candidate["provider_provenance"]["fixture_only"])
+            self.assertFalse(candidate["provider_provenance"]["external_network_call"])
             artifact = run_dir / candidate["local_artifact_path"]
             self.assertEqual(
                 self.png_dimensions(artifact),
@@ -198,6 +202,12 @@ class PdfRasterizerTests(unittest.TestCase):
             next(fetch for fetch in fetches if fetch.get("figure_hint"))["figure_hint"]["label"],
             "Figure 1",
         )
+        self.assertEqual({fetch["provider_mode"] for fetch in fetches}, {"real"})
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider["provider"], "local-pdf-rasterizer")
+        self.assertEqual(provider["provider_mode"], "real")
+        self.assertEqual(provider["artifacts_fetched"], 2)
 
         ingest = ingest_vision_observations(run=run_dir, provider="codex-interactive")
         self.assertEqual(ingest["status"], "visual_evidence_ingested")
@@ -209,6 +219,10 @@ class PdfRasterizerTests(unittest.TestCase):
 
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertEqual({image["origin"] for image in evidence["images"]}, {"pdf_page", "pdf_figure"})
+        self.assertEqual({image["provider_mode"] for image in evidence["images"]}, {"real"})
+        self.assertTrue(
+            all(not image["provider_provenance"]["fixture_only"] for image in evidence["images"])
+        )
         figure = next(image for image in evidence["images"] if image["origin"] == "pdf_figure")
         self.assertEqual(figure["page_number"], 2)
         self.assertEqual(figure["figure_hint"]["label"], "Figure 1")
@@ -217,6 +231,7 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(figure["pdf_local_path"], source["local_artifact_path"])
         self.assertTrue(figure["hash"].startswith("sha256:"))
         observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        self.assertEqual({item["provider_mode"] for item in observations}, {"real"})
         figure_observation = next(item for item in observations if item["origin"] == "pdf_figure")
         self.assertEqual(figure_observation["pdf_url"], figure["pdf_url"])
         self.assertEqual(figure_observation["pdf_local_path"], figure["pdf_local_path"])
@@ -225,6 +240,16 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(figure_observation["rasterizer"], figure["rasterizer"])
         self.assertEqual(figure_observation["compute_counters"], figure["compute_counters"])
         self.assertEqual(figure_observation["cost_counters"], figure["cost_counters"])
+        counts = real_automatic_visual_release_counts(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            visual_provider_status=provider_status,
+        )
+        self.assertEqual(counts["real_candidates"], 2)
+        self.assertEqual(counts["real_fetches"], 2)
+        self.assertEqual(counts["real_observations"], 2)
+        self.assertEqual(counts["real_artifacts_fetched"], 2)
 
     def test_renderer_unavailable_prevents_accepted_pdf_evidence(self) -> None:
         prepared = prepare_run(
@@ -251,9 +276,25 @@ class PdfRasterizerTests(unittest.TestCase):
         fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
         self.assertEqual(fetches[0]["fetch_status"], "failed")
         self.assertEqual(fetches[0]["failure_code"], "renderer_unavailable_pdf")
+        self.assertEqual(fetches[0]["provider_mode"], "manual")
+        self.assertFalse(fetches[0]["provider_provenance"]["fixture_only"])
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(candidates[0]["provider_mode"], "manual")
+        self.assertFalse(candidates[0]["provider_provenance"]["fixture_only"])
         provider = self.read_json(run_dir / "visual_provider_status.json")["providers"][0]
         self.assertFalse(provider["available"])
         self.assertEqual(provider["blocked_reason"], "renderer_unavailable_pdf")
+        self.assertEqual(provider["provider_mode"], "manual")
+        counts = real_automatic_visual_release_counts(
+            candidates=candidates,
+            fetches=fetches,
+            observations=self.read_jsonl(run_dir / "visual_observations.jsonl"),
+            visual_provider_status=self.read_json(run_dir / "visual_provider_status.json"),
+        )
+        self.assertEqual(counts["real_candidates"], 0)
+        self.assertEqual(counts["real_fetches"], 0)
+        self.assertEqual(counts["real_observations"], 0)
+        self.assertEqual(counts["real_artifacts_fetched"], 0)
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertEqual(evidence["images"], [])
         self.assertFalse((run_dir / "images" / "pdf").exists())
@@ -372,6 +413,8 @@ class PdfRasterizerTests(unittest.TestCase):
         run_dir = Path(prepared["run_dir"])
         manual_license_pdf = self.write_pdf(run_dir, "manual-license.pdf")
         manual_robots_pdf = self.write_pdf(run_dir, "manual-robots.pdf")
+        manual_access_pdf = self.write_pdf(run_dir, "manual-access.pdf")
+        manual_flag_pdf = self.write_pdf(run_dir, "manual-flag.pdf")
         login_pdf = self.write_pdf(run_dir, "login.pdf")
         captcha_pdf = self.write_pdf(run_dir, "captcha.pdf")
         subscription_pdf = self.write_pdf(run_dir, "subscription.pdf")
@@ -388,6 +431,18 @@ class PdfRasterizerTests(unittest.TestCase):
                 "src_manual_robots",
                 manual_robots_pdf,
                 robots_policy="manual_review",
+            ),
+            self.pdf_source(
+                run_dir,
+                "src_manual_access",
+                manual_access_pdf,
+                access_policy="manual_review",
+            ),
+            self.pdf_source(
+                run_dir,
+                "src_manual_flag",
+                manual_flag_pdf,
+                policy_flags=["manual_review_required"],
             ),
             self.pdf_source(
                 run_dir,
@@ -426,13 +481,57 @@ class PdfRasterizerTests(unittest.TestCase):
             reason = fetch["failure_code"]
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
             status_by_reason.setdefault(reason, set()).add(fetch["fetch_status"])
-        self.assertEqual(reason_counts["policy_manual_review_pdf"], 4)
+        self.assertEqual(reason_counts["policy_manual_review_pdf"], 6)
         self.assertEqual(reason_counts["access_blocked_pdf"], 2)
         self.assertEqual(reason_counts["paywalled_pdf"], 1)
         self.assertEqual(status_by_reason["policy_manual_review_pdf"], {"failed"})
         self.assertEqual(status_by_reason["access_blocked_pdf"], {"policy_blocked"})
         self.assertEqual(status_by_reason["paywalled_pdf"], {"policy_blocked"})
-        self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 7)
+        self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 9)
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        manual_sources = {"src_manual_access", "src_manual_flag"}
+        self.assertEqual(
+            {
+                candidate["source_id"]
+                for candidate in candidates
+                if candidate["rejection_reason"] == "policy_manual_review_pdf"
+            }.intersection(manual_sources),
+            manual_sources,
+        )
+        self.assertFalse((run_dir / "images" / "pdf").exists())
+
+    @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
+    def test_pdf_adapter_fixture_mode_remains_fixture_only(self) -> None:
+        prepared = prepare_run(
+            question="Direct fixture-mode PDF rasterizer provenance",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=2,
+        )
+        run_dir = Path(prepared["run_dir"])
+        pdf_path = self.write_pdf(run_dir, "fixture-mode.pdf")
+        source = self.pdf_source(run_dir, "src_pdf_fixture_mode", pdf_path)
+        route = {
+            "id": "angle_001",
+            "modality": "visual_required",
+            "max_images": 2,
+            "visual_tasks": ["inspect_pdf"],
+        }
+
+        result = pdf_rasterizer.collect_pdf_rasterizer_candidates(
+            run_dir=run_dir,
+            sources=[source],
+            routes=[route],
+            created_at="2026-06-25T00:00:00Z",
+            provider="local-pdf-rasterizer",
+            provider_mode="fixture",
+        )
+
+        self.assertEqual(len(result.candidates), 1)
+        candidate = result.candidates[0]
+        self.assertEqual(candidate["provider_mode"], "fixture")
+        self.assertTrue(candidate["provider_provenance"]["fixture_only"])
+        self.assertTrue(candidate["provider_provenance"]["optional_raster_library_available"])
 
     @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
     def test_pdf_budget_pruning_records_skipped_pages(self) -> None:

@@ -428,6 +428,7 @@ def _diagnostic_candidate(
     provider_run_id = _provider_run_id(source, route)
     pdf_url = _pdf_url_value(source)
     page_url = _http_url_or_none(pdf_url)
+    diagnostic_provider_mode = _diagnostic_provider_mode(provider_mode)
     candidate_id = "cand_" + _safe_id(
         f"{provider}_{source['id']}_diagnostic_{reason}_{page_number}{figure_suffix}"
     )
@@ -436,11 +437,11 @@ def _diagnostic_candidate(
         "candidate_id": candidate_id,
         "provider": provider,
         "provider_kind": "pdf_rasterizer",
-        "provider_mode": provider_mode,
+        "provider_mode": diagnostic_provider_mode,
         "provider_run_id": provider_run_id,
         "provider_provenance": _provider_provenance(
             provider=provider,
-            provider_mode=provider_mode,
+            provider_mode=diagnostic_provider_mode,
             provider_run_id=provider_run_id,
         ),
         "source_id": source["id"],
@@ -543,6 +544,7 @@ def _source_blocker(
         policy_decision == "manual_review"
         or license_policy == "manual_review"
         or robots_policy == "manual_review"
+        or _manual_review_required(source)
     ):
         flags = _dedupe(policy_flags + ["manual_review_required"])
         return {
@@ -759,7 +761,7 @@ def _provider_provenance(
         "provider_kind": "pdf_rasterizer",
         "provider_mode": provider_mode,
         "provider_run_id": provider_run_id,
-        "fixture_only": provider_mode != "real",
+        "fixture_only": provider_mode == "fixture",
         "rasterizer_mode": PDF_RASTERIZER_MODE,
         "optional_raster_library": PDF_RENDERER_NAME,
         "optional_raster_library_available": pdf_renderer_available(),
@@ -839,6 +841,21 @@ def _access_blocker(source: Mapping[str, Any]) -> dict[str, str] | None:
             "message": "PDF source appears login-gated, CAPTCHA-gated, or access-controlled.",
         }
     return None
+
+
+def _manual_review_required(source: Mapping[str, Any]) -> bool:
+    manual_review_tokens = (
+        "manual_review",
+        "manual_review_required",
+        "needs_manual_review",
+        "requires_manual_review",
+        "human_review_required",
+    )
+    return any(_contains_access_token(value, manual_review_tokens) for value in _access_values(source))
+
+
+def _diagnostic_provider_mode(provider_mode: str) -> str:
+    return "manual" if provider_mode == "real" else provider_mode
 
 
 def _access_values(source: Mapping[str, Any]) -> list[str]:
