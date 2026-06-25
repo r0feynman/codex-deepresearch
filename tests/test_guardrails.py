@@ -242,6 +242,29 @@ class GuardrailsTests(unittest.TestCase):
         self.assertNotIn("promoted", claim["promotion_status"])
         self.assertFalse(claim["include_in_final_report"])
 
+    def test_quote_span_only_policy_blocked_source_blocks_claim(self) -> None:
+        run_dir = self.temp_run()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["sources"][0]["robots_policy"] = "disallowed"
+        evidence["claims"] = [
+            {
+                **self.claim(claim_id="claim_quote_only_blocked"),
+                "supporting_sources": [],
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = enforce_guardrails(run=run_dir)
+
+        evidence = self.assert_valid_evidence(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(status["claims"][0]["verification_status"], "policy_blocked")
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertIn("robots_disallowed", claim["policy_flags"])
+        self.assertNotEqual(claim["review_status"], "human_accepted")
+        self.assertEqual(claim["promotion_status"], "not_eligible")
+        self.assertFalse(claim["include_in_final_report"])
+
     def test_report_truncates_copyrighted_claims_and_quotes(self) -> None:
         run_dir = self.temp_run()
         long_passage = "Copyrighted passage " + ("with many copied words " * 20)

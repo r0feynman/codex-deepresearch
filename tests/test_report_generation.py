@@ -430,6 +430,39 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertIn("policy_blocked_source", report)
         self.assertIn("claim_stale_policy_source", report)
 
+    def test_supported_claim_backed_only_by_blocked_quote_source_is_excluded(self) -> None:
+        run_dir = self.temp_run()
+        claim_text = "Quote-span-only blocked source text must not become a finding."
+        evidence = self.load_json(run_dir / "evidence.json")
+        source = evidence["sources"][0]
+        source["policy_decision"] = "blocked"
+        source["retrieval_status"] = "failed"
+        source["retrieval_error"] = "guardrail_blocked_access_controlled"
+        source["policy_flags"] = ["login_gated"]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_quote_only_policy_source",
+                text=claim_text,
+                supporting_sources=[],
+                verification_status="supported",
+                review_status="auto_reviewed",
+                promotion_status="eligible",
+                confidence="high",
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        status = synthesize_report(run=run_dir)
+
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(status["claims_included"], 0)
+        self.assertEqual(status["claims_excluded"], 1)
+        self.assertEqual(status["used_sources"], [])
+        evidence_section = report.split("## Excluded Or Caveated Evidence")[0]
+        self.assertNotIn(claim_text, evidence_section)
+        self.assertIn("policy_blocked_source", status["excluded_claims"][0]["exclusion_reasons"])
+        self.assertIn("claim_quote_only_policy_source", report)
+
     def test_cli_synthesize_writes_report_status(self) -> None:
         run_dir = self.temp_run()
         evidence = self.load_json(run_dir / "evidence.json")

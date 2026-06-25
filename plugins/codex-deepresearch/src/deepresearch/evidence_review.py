@@ -338,16 +338,7 @@ def _claim_provenance(
     observations: Sequence[Mapping[str, Any]],
     report_status: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    source_ids = _ordered_unique(
-        [
-            *_string_list(claim.get("supporting_sources")),
-            *[
-                str(span.get("source_id"))
-                for span in _mapping_list(claim.get("quote_spans"))
-                if isinstance(span.get("source_id"), str)
-            ],
-        ]
-    )
+    source_ids = _claim_source_refs(claim)
     image_ids = _ordered_unique(_string_list(claim.get("supporting_images")))
     votes = _claim_votes(claim, votes_by_id=votes_by_id)
     visual_observations = _claim_visual_observations(
@@ -686,7 +677,7 @@ def _policy_blockers(
     include_review_gates: bool,
 ) -> list[str]:
     blockers: list[str] = []
-    for source_id in _string_list(claim.get("supporting_sources")):
+    for source_id in _claim_source_refs(claim):
         source = sources_by_id.get(source_id)
         if not isinstance(source, Mapping):
             blockers.append(f"missing_source:{source_id}")
@@ -837,6 +828,19 @@ def _mapping_list(value: Any) -> list[Mapping[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, Mapping)]
+
+
+def _claim_source_refs(claim: Mapping[str, Any]) -> list[str]:
+    return _ordered_unique(
+        [
+            *_string_list(claim.get("supporting_sources")),
+            *[
+                str(span.get("source_id"))
+                for span in _mapping_list(claim.get("quote_spans"))
+                if isinstance(span.get("source_id"), str)
+            ],
+        ]
+    )
 
 
 def _string_list(value: Any) -> list[str]:

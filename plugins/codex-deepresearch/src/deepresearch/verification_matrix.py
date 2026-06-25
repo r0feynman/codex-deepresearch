@@ -304,8 +304,8 @@ def _text_vote(
     sources_by_id: Mapping[str, Mapping[str, Any]],
     created_at: str,
 ) -> dict[str, Any]:
-    source_refs = _string_list(claim.get("supporting_sources"))
     quote_spans = _quote_spans(claim)
+    source_refs = _claim_source_refs(claim)
     evidence_refs = _quote_source_refs(quote_spans) or source_refs
     if not quote_spans:
         vote = "uncertain"
@@ -339,7 +339,7 @@ def _policy_vote(
     images_by_id: Mapping[str, Mapping[str, Any]],
     created_at: str,
 ) -> dict[str, Any]:
-    source_refs = _string_list(claim.get("supporting_sources"))
+    source_refs = _claim_source_refs(claim)
     image_refs = _string_list(claim.get("supporting_images"))
     refs = source_refs + image_refs
     blocked = (
@@ -516,7 +516,7 @@ def _current_policy_blocks(
     sources_by_id: Mapping[str, Mapping[str, Any]],
     images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> bool:
-    source_refs = _string_list(claim.get("supporting_sources"))
+    source_refs = _claim_source_refs(claim)
     image_refs = _string_list(claim.get("supporting_images"))
     return (
         _has_policy_block(source_refs, sources_by_id)
@@ -590,7 +590,7 @@ def _claim_route(
 
     source_routes = {
         source.get("route")
-        for source_id in _string_list(claim.get("supporting_sources"))
+        for source_id in _claim_source_refs(claim)
         for source in [sources_by_id.get(source_id)]
         if isinstance(source, Mapping) and source.get("route") in SEARCH_ROUTES
     }
@@ -855,6 +855,17 @@ def _quote_source_refs(quote_spans: Sequence[Mapping[str, Any]]) -> list[str]:
         for span in quote_spans
         if isinstance(span.get("source_id"), str) and span.get("source_id")
     ]
+
+
+def _claim_source_refs(claim: Mapping[str, Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            [
+                *_string_list(claim.get("supporting_sources")),
+                *_quote_source_refs(_quote_spans(claim)),
+            ]
+        )
+    )
 
 
 def _has_blocked_or_failed_source(

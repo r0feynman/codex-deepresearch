@@ -321,6 +321,40 @@ class EvidenceReviewTests(unittest.TestCase):
         self.assertEqual(reuse["eligible_count"], 0)
         self.assertIn("claim_policy_blocked", reuse["excluded_claims"][0]["reuse_blockers"])
 
+    def test_quote_span_only_blocked_source_cannot_be_accepted_or_reused(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["sources"][0]["robots_policy"] = "disallowed"
+        evidence["claims"] = [
+            {
+                **self.claim(claim_id="claim_quote_only_blocked", route="text_only"),
+                "supporting_sources": [],
+                "verification_status": "supported",
+                "review_status": "auto_reviewed",
+                "promotion_status": "eligible",
+                "include_in_final_report": True,
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        guardrails = enforce_guardrails(run=run_dir)
+
+        self.assertEqual(guardrails["claims"][0]["verification_status"], "policy_blocked")
+        with self.assertRaisesRegex(EvidenceReviewError, "policy_blocked"):
+            review_claim(run=run_dir, claim_id="claim_quote_only_blocked", decision="accepted")
+
+        evidence = self.assert_valid_evidence(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertNotEqual(claim["review_status"], "human_accepted")
+        self.assertEqual(claim["promotion_status"], "not_eligible")
+        self.assertFalse(claim["include_in_final_report"])
+        reuse = list_reusable_claims(run=run_dir)
+        self.assertEqual(reuse["eligible_count"], 0)
+        blockers = reuse["excluded_claims"][0]["reuse_blockers"]
+        self.assertIn("claim_policy_blocked", blockers)
+        self.assertIn("source_robots_policy:src_001:disallowed", blockers)
+
     def test_unsupported_claim_cannot_be_marked_accepted(self) -> None:
         run_dir = self.temp_run(route="text_only")
         evidence = self.load_json(run_dir / "evidence.json")
