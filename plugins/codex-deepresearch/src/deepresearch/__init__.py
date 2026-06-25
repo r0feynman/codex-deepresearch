@@ -41,6 +41,11 @@ from .parallel_orchestrator import (
     run_parallel_orchestration,
 )
 from .report_generation import ReportGenerationError, synthesize_report
+from .report_exports import (
+    REPORT_EXPORT_SCHEMA_VERSION,
+    ReportExportError,
+    export_report,
+)
 from .run_state import (
     RUN_STEPS_FILENAME,
     RUN_STEPS_SCHEMA_VERSION,
@@ -95,11 +100,13 @@ __all__ = [
     "PageImageExtractionError",
     "ParallelOrchestrationError",
     "ReportGenerationError",
+    "ReportExportError",
     "RunConfig",
     "RUN_STEPS_FILENAME",
     "RUN_STEPS_SCHEMA_VERSION",
     "RUN_STATUS_FILENAME",
     "RUN_STATUS_SCHEMA_VERSION",
+    "REPORT_EXPORT_SCHEMA_VERSION",
     "RunStepStateError",
     "SearchHandoffError",
     "TRACE_FILENAME",
@@ -148,6 +155,7 @@ __all__ = [
     "run_mvp_smoke",
     "run_parallel_orchestration",
     "run_skill_invocation",
+    "export_report",
     "synthesize_report",
     "transition_stage",
     "validate_artifacts",

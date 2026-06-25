@@ -43,6 +43,7 @@ from deepresearch.page_image_extraction import (
     extract_and_fetch_page_images,
 )
 from deepresearch.report_generation import ReportGenerationError, synthesize_report
+from deepresearch.report_exports import ReportExportError, export_report
 from deepresearch.run_monitor import (
     inspect_run_monitor,
     list_run_monitors,
@@ -549,6 +550,25 @@ def run_synthesize(args: argparse.Namespace) -> int:
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["status"] not in {"completed", "skipped"}:
         return 2
+    return 0
+
+
+def run_export_report(args: argparse.Namespace) -> int:
+    try:
+        output_dir = resolve_repo_path(args.output_dir) if args.output_dir else None
+        result = export_report(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            template=args.template,
+            formats=args.format or ["all"],
+            output_dir=output_dir,
+            include_excluded_caveats=args.include_excluded_caveats,
+        )
+    except (ReportExportError, ReportGenerationError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
@@ -1448,6 +1468,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for run artifacts, relative to the repo root by default.",
     )
     synthesize.set_defaults(func=run_synthesize)
+
+    export = subparsers.add_parser(
+        "export-report",
+        help="Export local report artifacts through beta report templates and formats.",
+    )
+    export.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    export.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    export.add_argument(
+        "--template",
+        default="technical_report",
+        help=(
+            "Template: technical_report, market_report, competitor_analysis, or "
+            "incident_report. Short aliases technical, market, competitor, and "
+            "incident are also accepted."
+        ),
+    )
+    export.add_argument(
+        "--format",
+        action="append",
+        help=(
+            "Export format: all, markdown, json, csv, or html. Repeatable or "
+            "comma-separated. Defaults to all."
+        ),
+    )
+    export.add_argument(
+        "--output-dir",
+        help="Destination directory. Defaults to exports/ inside the run directory.",
+    )
+    export.add_argument(
+        "--include-excluded-caveats",
+        action="store_true",
+        help=(
+            "Include rejected, policy-blocked, or not-eligible claims only in an "
+            "explicit excluded/caveated section or CSV/JSON row."
+        ),
+    )
+    export.set_defaults(func=run_export_report)
     return parser
 
 
