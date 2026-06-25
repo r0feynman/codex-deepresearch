@@ -13,6 +13,13 @@ from .budget_estimator import (
 from .evidence_schema import ValidationError, ValidationResult, validate_artifacts
 from .execution_mode import ConfigResolutionError, RunConfig, resolve_config
 from .fetch_claims import FetchClaimsError, fetch_claims
+from .fresh_session_e2e import (
+    DEFAULT_FRESH_SESSION_INVOKE,
+    DEFAULT_SCENARIO_TIMEOUT_SECONDS,
+    FRESH_SESSION_E2E_SCHEMA_VERSION,
+    FreshSessionE2EError,
+    run_fresh_session_e2e,
+)
 from .guardrails import GuardrailsError, enforce_guardrails
 from .invocation_router import RUN_STATUS_FILENAME, RUN_STATUS_SCHEMA_VERSION, run_skill_invocation
 from .manual_sources import ManualSourcesError, ingest_manual_sources
@@ -74,6 +81,7 @@ __all__ = [
     "ConfigResolutionError",
     "FixtureAdapter",
     "FetchClaimsError",
+    "FreshSessionE2EError",
     "GuardrailsError",
     "ManualSourcesError",
     "ModalityDecision",
@@ -89,6 +97,9 @@ __all__ = [
     "SearchHandoffError",
     "TRACE_FILENAME",
     "TRACE_SCHEMA_VERSION",
+    "FRESH_SESSION_E2E_SCHEMA_VERSION",
+    "DEFAULT_FRESH_SESSION_INVOKE",
+    "DEFAULT_SCENARIO_TIMEOUT_SECONDS",
     "TraceError",
     "TraceValidationError",
     "TraceValidationResult",
@@ -110,6 +121,7 @@ __all__ = [
     "enforce_guardrails",
     "estimate_budget",
     "fetch_claims",
+    "run_fresh_session_e2e",
     "ingest_run",
     "ingest_manual_sources",
     "ingest_vision_observations",

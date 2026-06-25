@@ -29,6 +29,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/evidence_schema.py",
     "plugins/codex-deepresearch/src/deepresearch/execution_mode.py",
     "plugins/codex-deepresearch/src/deepresearch/fetch_claims.py",
+    "plugins/codex-deepresearch/src/deepresearch/fresh_session_e2e.py",
     "plugins/codex-deepresearch/src/deepresearch/guardrails.py",
     "plugins/codex-deepresearch/src/deepresearch/manual_sources.py",
     "plugins/codex-deepresearch/src/deepresearch/modality_router.py",
@@ -49,6 +50,7 @@ REQUIRED_FILES = [
     "tests/test_evidence_schema.py",
     "tests/test_execution_mode.py",
     "tests/test_fetch_claims.py",
+    "tests/test_fresh_session_e2e.py",
     "tests/test_guardrails.py",
     "tests/test_manual_sources.py",
     "tests/test_modality_router.py",
@@ -238,6 +240,57 @@ def run_parallel_orchestration_validation(runner: Path) -> None:
             fail("parallel shard merge did not leave schema-valid evidence")
 
 
+def run_fresh_session_e2e_validation(runner: Path) -> None:
+    """Validate the CI-safe P3-UX3 fresh-session transcript gate."""
+
+    with tempfile.TemporaryDirectory() as runs_dir:
+        suite_id = "validate-fresh-session-suite"
+        result = subprocess.run(
+            [
+                str(runner),
+                "fresh-session-e2e",
+                "--runs-dir",
+                runs_dir,
+                "--suite-id",
+                suite_id,
+                "--clean",
+                "--real-codex-exec",
+                "skip",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        results_path = Path(runs_dir) / suite_id / "fresh_session_e2e_results.json"
+        if result.returncode != 0:
+            fail("runner fresh-session-e2e CI-safe gate must exit 0")
+        raw_payload = result.stdout.strip() or results_path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        fail(f"runner fresh-session-e2e must output valid JSON: {exc}")
+    if payload.get("status") != "passed":
+        fail("runner fresh-session-e2e did not report passed")
+    acceptance = payload.get("acceptance")
+    if not isinstance(acceptance, dict) or not all(acceptance.values()):
+        fail("runner fresh-session-e2e acceptance checks did not all pass")
+    scenarios = {scenario.get("id"): scenario for scenario in payload.get("scenarios", [])}
+    fixture = scenarios.get("fixture_full_runner", {})
+    if fixture.get("terminal_outcome") != "completed_fixture":
+        fail("fresh-session gate fixture scenario did not complete through artifacts")
+    if "run_status" not in fixture.get("artifacts", {}):
+        fail("fresh-session gate fixture scenario did not expose run_status.json")
+    if "report_status" not in fixture.get("artifacts", {}):
+        fail("fresh-session gate fixture scenario did not expose report_status.json")
+    serial = scenarios.get("serial_fallback_blocked", {})
+    if serial.get("terminal_outcome") != "blocked_explicit":
+        fail("fresh-session gate serial fallback must be an explicit blocked state")
+    real = scenarios.get("real_codex_exec_skipped", {})
+    if real.get("terminal_outcome") != "blocked_explicit":
+        fail("fresh-session gate skipped real codex-exec scenario must be explicit blocked")
+
+
 def main() -> None:
     for relative_path in REQUIRED_FILES:
         if not (ROOT / relative_path).exists():
@@ -319,6 +372,7 @@ def main() -> None:
         fail("runner validate-evidence did not report valid fixture artifacts")
 
     run_parallel_orchestration_validation(runner)
+    run_fresh_session_e2e_validation(runner)
 
     with tempfile.TemporaryDirectory() as manual_runs_dir:
         manual_result = subprocess.run(

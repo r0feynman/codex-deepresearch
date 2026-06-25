@@ -30,6 +30,22 @@ By default, `mvp-smoke` requires the `codex` CLI on `PATH` so the plugin install
 
 The invocation smoke also validates that `--invoke` starts with `$deep-research:`. Invalid invocations fail the suite and still write `mvp_smoke_results.json` with failed check details.
 
+## Fresh Session E2E
+
+`fresh-session-e2e` is the P3-UX3 scripted transcript gate. It invokes the plugin-local runner through `$deep-research: <question>` semantics, renders a fresh-session assistant response, and fails if a successful-looking response omits the run directory, `run_status.json`, or synthesized-run `report_status.json`.
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-e2e \
+  --runs-dir /tmp/codex-deepresearch-fresh-session-e2e \
+  --suite-id fresh-session-e2e \
+  --clean \
+  --real-codex-exec skip
+```
+
+The gate scenarios cover fixture full-runner completion, serial fallback as an explicit blocked state, and a real `codex-exec` scenario. Use `--real-codex-exec=skip` for CI/no-private-artifact validation; it records a blocked diagnostic instead of pretending real child execution occurred. Use `--real-codex-exec=require` for a local strict gate that fails unless real `codex-exec` produces `accepted_shards > 0`.
+
+The CLI default is public-safe `--real-codex-exec=skip`. Use `--real-codex-exec=auto` to attempt real child execution when Codex CLI is available. Real and fixture scenarios are bounded by `--scenario-timeout-seconds` (default `120`); auto mode records a timeout as an explicit blocked diagnostic, while require mode fails unless real execution completes with accepted shards.
+
 ## Resolve Config
 
 Use `resolve-config` to normalize execution mode, provider flags, and budget preset before runner work starts:
@@ -216,6 +232,7 @@ After changing plugin files, rerun validation and the smoke command:
 python3 scripts/validate_repo.py
 python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/codex-deepresearch
 plugins/codex-deepresearch/scripts/codex-deepresearch mvp-smoke --runs-dir /tmp/codex-deepresearch-mvp-smoke --suite-id mvp-smoke --clean --invoke '$deep-research: MVP smoke text-only fixture'
+plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-e2e --runs-dir /tmp/codex-deepresearch-fresh-session-e2e --suite-id fresh-session-e2e --clean --real-codex-exec skip
 tmpdir=/tmp/codex-deepresearch-parallel-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Parallel orchestration validation" --runs-dir "$tmpdir" --route text_only | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel --run "$run_dir" --adapter fixture --min-tasks 3
 plugins/codex-deepresearch/scripts/codex-deepresearch smoke --install --invoke '$deep-research: Codex DeepResearch smoke test'
 codex plugin add codex-deepresearch@codex-deepresearch-local
