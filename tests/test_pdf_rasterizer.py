@@ -22,6 +22,7 @@ from deepresearch import (  # noqa: E402
     validate_visual_artifacts,
 )
 from deepresearch import pdf_rasterizer  # noqa: E402
+from deepresearch import visual_acquisition  # noqa: E402
 
 
 class PdfRasterizerTests(unittest.TestCase):
@@ -298,6 +299,66 @@ class PdfRasterizerTests(unittest.TestCase):
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertEqual(evidence["images"], [])
         self.assertFalse((run_dir / "images" / "pdf").exists())
+
+    @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
+    def test_pdf_render_failure_records_diagnostics_without_crashing(self) -> None:
+        prepared = prepare_run(
+            question="PDF render failure diagnostics",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=2,
+        )
+        run_dir = Path(prepared["run_dir"])
+        pdf_path = self.write_pdf(run_dir, "render-failure.pdf")
+        source = self.pdf_source(run_dir, "src_render_failure", pdf_path)
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [source]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            visual_acquisition,
+            "render_pdf_candidate_artifact",
+            side_effect=RuntimeError("deterministic render failure"),
+        ):
+            result = acquire_visual_candidates(
+                run=run_dir,
+                providers=["local-pdf-rasterizer"],
+            )
+
+        self.assertEqual(result["status"], "visual_candidates_collected")
+        self.assertEqual(result["selected_observations"], 0)
+        self.assertTrue((run_dir / "visual_candidates.jsonl").is_file())
+        self.assertTrue((run_dir / "image_fetch_status.jsonl").is_file())
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate["candidate_status"], "fetch_failed")
+        self.assertEqual(candidate["rejection_reason"], "render_failed_pdf")
+        self.assertEqual(candidate["removal_reasons"], ["render_failed_pdf"])
+        self.assertIsNone(candidate.get("local_artifact_path"))
+        self.assertIsNone(candidate.get("image_url"))
+        self.assertIsNone(candidate.get("hash"))
+        self.assertEqual(candidate["pdf_diagnostic"]["reason"], "render_failed_pdf")
+        self.assertEqual(candidate["pdf_diagnostic"]["error_type"], "RuntimeError")
+        self.assertEqual(candidate["compute_counters"]["pdf_pages_rasterized"], 0)
+        self.assertEqual(candidate["compute_counters"]["pdf_pages_skipped"], 1)
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(fetches[0]["fetch_status"], "failed")
+        self.assertEqual(fetches[0]["failure_code"], "render_failed_pdf")
+        self.assertIsNone(fetches[0].get("local_artifact_path"))
+        provider = self.read_json(run_dir / "visual_provider_status.json")["providers"][0]
+        self.assertEqual(provider["artifacts_fetched"], 0)
+        self.assertEqual(provider["pdf_pages_rasterized"], 0)
+        self.assertEqual(provider["pdf_pages_skipped"], 1)
+        self.assertEqual(provider["last_error"], "render_failed_pdf")
+        self.assertEqual(provider["diagnostics"][0]["failure_code"], "render_failed_pdf")
+        self.assertEqual(
+            result["pdf_rasterization"]["diagnostics"][0]["failure_code"],
+            "render_failed_pdf",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+        self.assertFalse(list((run_dir / "images" / "pdf").glob("*.png")))
 
     def test_pdf_diagnostics_are_explicit_for_blocked_and_unsupported_sources(self) -> None:
         prepared = prepare_run(

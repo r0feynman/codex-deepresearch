@@ -1256,7 +1256,15 @@ def _validate_and_select_candidates(
             records.append(_persistable_candidate(record))
             continue
         if "status" not in record:
-            artifact = _materialize_candidate_artifact(run_dir, record)
+            try:
+                artifact = _materialize_candidate_artifact(run_dir, record)
+            except Exception as exc:
+                if record.get("provider_kind") != "pdf_rasterizer":
+                    raise
+                _remove_failed_pdf_artifact(run_dir, record)
+                _mark_pdf_render_failed(record, exc)
+                records.append(_persistable_candidate(record))
+                continue
             record["local_artifact_path"] = artifact.relative_to(run_dir).as_posix()
             if (
                 record.get("origin") in {"pdf_page", "pdf_figure"}
@@ -1384,6 +1392,7 @@ def _validate_and_select_candidates(
                 "local_pdf_outside_run_dir",
                 "missing_pdf_artifact",
                 "policy_manual_review_pdf",
+                "render_failed_pdf",
                 "renderer_unavailable_pdf",
                 "too_large_pdf",
                 "unsupported_pdf",
@@ -1497,6 +1506,71 @@ def _mark_unmaterialized_pdf_budget_pruned(record: dict[str, Any]) -> None:
     _mark_pdf_budget_pruned(record)
 
 
+def _mark_pdf_render_failed(record: dict[str, Any], exc: BaseException) -> None:
+    reason = "render_failed_pdf"
+    flags = _dedupe([*_string_list(record.get("policy_flags")), "pdf_render_failed"])
+    record["status"] = "removed"
+    record["removal_reasons"] = [reason]
+    record["analysis_status"] = "skipped"
+    record["candidate_status"] = "fetch_failed"
+    record["policy_decision"] = "manual_review"
+    record["policy_flags"] = flags
+    record["rejection_reason"] = reason
+    record["local_artifact_path"] = None
+    record["image_url"] = None
+    record["artifact_size_bytes"] = None
+    record["hash"] = None
+    record["observations"] = []
+    record["inferences"] = []
+    record["validation_checks"] = {
+        "artifact_render": {
+            "status": "failed",
+            "reason": reason,
+            "error_type": exc.__class__.__name__,
+        }
+    }
+    counters = (
+        dict(record.get("compute_counters"))
+        if isinstance(record.get("compute_counters"), Mapping)
+        else {}
+    )
+    counters["pdf_pages_attempted"] = int(counters.get("pdf_pages_attempted") or 1)
+    counters["pdf_pages_rasterized"] = 0
+    counters["pdf_pages_skipped"] = max(1, int(counters.get("pdf_pages_skipped") or 0))
+    record["compute_counters"] = counters
+    rasterizer = (
+        dict(record.get("rasterizer")) if isinstance(record.get("rasterizer"), Mapping) else {}
+    )
+    rasterizer["render_failed"] = True
+    rasterizer["render_failure_code"] = reason
+    record["rasterizer"] = rasterizer
+    record["pdf_diagnostic"] = {
+        "reason": reason,
+        "policy_decision": record["policy_decision"],
+        "policy_flags": flags,
+        "error_type": exc.__class__.__name__,
+    }
+
+
+def _remove_failed_pdf_artifact(run_dir: Path, record: Mapping[str, Any]) -> None:
+    local_path = record.get("local_artifact_path")
+    if not isinstance(local_path, str) or not local_path:
+        return
+    relative = Path(local_path)
+    if relative.is_absolute() or any(part == ".." for part in relative.parts):
+        return
+    artifact = (run_dir / relative).resolve(strict=False)
+    try:
+        artifact.relative_to(run_dir.resolve())
+    except ValueError:
+        return
+    try:
+        if artifact.is_file():
+            artifact.unlink()
+    except OSError:
+        return
+
+
 def _provider_statuses_after_selection(
     *,
     provider_statuses: Sequence[Mapping[str, Any]],
@@ -1506,6 +1580,7 @@ def _provider_statuses_after_selection(
     fetched_by_provider: dict[str, int] = {}
     pdf_rasterized_by_provider: dict[str, int] = {}
     pdf_skipped_by_provider: dict[str, int] = {}
+    pdf_diagnostics_by_provider: dict[str, list[dict[str, Any]]] = {}
     for fetch in image_fetch_records:
         provider = _string(fetch.get("provider"))
         if provider and fetch.get("fetch_status") == "fetched":
@@ -1520,6 +1595,19 @@ def _provider_statuses_after_selection(
             pdf_rasterized_by_provider[provider] = pdf_rasterized_by_provider.get(provider, 0) + 1
         else:
             pdf_skipped_by_provider[provider] = pdf_skipped_by_provider.get(provider, 0) + 1
+            pdf_diagnostics_by_provider.setdefault(provider, []).append(
+                {
+                    "candidate_id": record.get("candidate_id"),
+                    "source_id": record.get("source_id"),
+                    "pdf_url": record.get("pdf_url"),
+                    "page_number": record.get("page_number"),
+                    "failure_code": _failure_code(record),
+                    "policy_decision": record.get("policy_decision"),
+                    "policy_flags": list(record.get("policy_flags", []))
+                    if isinstance(record.get("policy_flags"), list)
+                    else [],
+                }
+            )
 
     updated: list[dict[str, Any]] = []
     for provider_status in provider_statuses:
@@ -1529,6 +1617,10 @@ def _provider_statuses_after_selection(
             record["artifacts_fetched"] = fetched_by_provider.get(provider, 0)
             record["pdf_pages_rasterized"] = pdf_rasterized_by_provider.get(provider, 0)
             record["pdf_pages_skipped"] = pdf_skipped_by_provider.get(provider, 0)
+            diagnostics = pdf_diagnostics_by_provider.get(provider, [])
+            if diagnostics:
+                record["diagnostics"] = diagnostics
+                record["last_error"] = diagnostics[0].get("failure_code")
         updated.append(record)
     return updated
 
@@ -2017,6 +2109,9 @@ def _visual_provider_status(
             "captures_validated",
             "captures_rejected_after_validation",
             "captures_skipped",
+            "pdf_pages_configured",
+            "pdf_pages_rasterized",
+            "pdf_pages_skipped",
         ):
             if counter in provider_status:
                 providers[-1][counter] = _int_or_zero(provider_status.get(counter))
@@ -2132,6 +2227,7 @@ def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
         "local_pdf_outside_run_dir",
         "missing_pdf_artifact",
         "policy_manual_review_pdf",
+        "render_failed_pdf",
         "renderer_unavailable_pdf",
         "unsupported_pdf",
     }:
