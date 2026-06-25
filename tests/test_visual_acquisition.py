@@ -19,6 +19,7 @@ from deepresearch import (  # noqa: E402
     prepare_run,
     synthesize_report,
     validate_artifacts,
+    validate_visual_artifacts,
     verify_claims,
 )
 from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
@@ -489,6 +490,18 @@ class VisualAcquisitionTests(unittest.TestCase):
             verifier_votes_path=run_dir / "verifier_votes.jsonl",
         )
         self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(
+            visual_validation.valid,
+            [error.to_dict() for error in visual_validation.errors],
+        )
+        linked_observation = next(
+            observation
+            for observation in self.read_jsonl(run_dir / "visual_observations.jsonl")
+            if observation.get("evidence_image_id") == image_id
+        )
+        self.assertTrue(linked_observation["verifier_links"])
+        self.assertTrue(linked_observation["report_links"])
 
     def test_policy_blocked_and_inference_only_observations_do_not_create_supported_claims(self) -> None:
         run_dir = self.prepared_visual_run_with_html_source()
@@ -555,6 +568,81 @@ class VisualAcquisitionTests(unittest.TestCase):
                 for claim in evidence["claims"]
             )
         )
+
+    def test_blocked_policy_decision_image_cannot_be_supported_or_cited(self) -> None:
+        run_dir = self.prepared_visual_run_with_html_source()
+        images_dir = run_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        (images_dir / "blocked-decision.png").write_bytes(b"\x89PNG\r\n\x1a\nblocked-decision")
+        record = {
+            "id": "img_policy_decision_blocked",
+            "source_id": "src_visual_page",
+            "origin": "screenshot",
+            "local_artifact_path": "images/blocked-decision.png",
+            "mime_type": "image/png",
+            "width": 640,
+            "height": 360,
+            "observations": ["A blocked-policy screenshot contains visible product evidence."],
+            "inferences": [],
+            "visual_tasks": ["screenshot_support"],
+            "analysis_status": "analyzed",
+            "policy_decision": "blocked",
+            "policy_flags": [],
+            "route": "visual_required",
+            "angle_id": "angle_001",
+        }
+        (run_dir / "visual_observations.jsonl").write_text(
+            json.dumps(record, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        ingest = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(ingest["observation_claims_created"], 0)
+        evidence = self.read_json(run_dir / "evidence.json")
+        image = next(image for image in evidence["images"] if image["id"] == record["id"])
+        support = {
+            "image_id": image["id"],
+            "observation_ref": f"images.{image['id']}.observations[0]",
+            "observation_index": 0,
+            "observation_text": image["observations"][0],
+            "relation_type": "screenshot_support",
+            "provider": "codex-interactive",
+            "rationale": "Regression fixture for blocked policy_decision image.",
+            "confidence": 0.74,
+        }
+        evidence["claims"] = [
+            {
+                "id": "claim_blocked_policy_decision_visual",
+                "text": "Visual observation: A blocked-policy screenshot contains visible product evidence.",
+                "claim_type": "visual",
+                "supporting_sources": ["src_visual_page"],
+                "supporting_images": [image["id"]],
+                "visual_supports": [support],
+                "quote_spans": [],
+                "votes": [],
+                "verification_status": "unverified",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "low",
+                "caveats": [],
+                "route": "visual_required",
+                "angle_id": "angle_001",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verified = verify_claims(run=run_dir)
+        report_status = synthesize_report(run=run_dir)
+
+        self.assertEqual(verified["status"], "completed")
+        evidence = self.read_json(run_dir / "evidence.json")
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertNotEqual(claim["confidence"], "high")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(report_status["claims_included"], 0)
+        self.assertNotIn(image["id"], report_status["used_images"])
 
     def test_text_only_route_collects_zero_visual_work(self) -> None:
         prepared = prepare_run(

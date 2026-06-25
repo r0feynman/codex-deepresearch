@@ -2031,6 +2031,7 @@ def _visual_claims_from_observations(
     if not isinstance(images, list) or not isinstance(claims, list):
         return []
 
+    sources_by_id = _sources_by_id(evidence.get("sources", []))
     used_claim_ids = _existing_ids(claims)
     existing_generated_keys = _existing_observation_claim_keys(claims)
     generated: list[dict[str, Any]] = []
@@ -2041,7 +2042,7 @@ def _visual_claims_from_observations(
         source_id = image.get("source_id")
         if not isinstance(image_id, str) or not isinstance(source_id, str):
             continue
-        if not _image_can_generate_visual_claim(image):
+        if not _image_can_generate_visual_claim(image, source=sources_by_id.get(source_id)):
             continue
         observation_index, observation_text = _first_observation(image)
         if observation_index is None or observation_text is None:
@@ -2110,13 +2111,37 @@ def _existing_observation_claim_keys(claims: Sequence[Any]) -> set[tuple[str, in
     return keys
 
 
-def _image_can_generate_visual_claim(image: Mapping[str, Any]) -> bool:
+def _image_can_generate_visual_claim(
+    image: Mapping[str, Any],
+    *,
+    source: Mapping[str, Any] | None,
+) -> bool:
     if image.get("analysis_status") != "analyzed":
+        return False
+    if _policy_record_blocks(image) or _policy_record_blocks(source):
         return False
     if _string_list(image, "policy_flags"):
         return False
     observations = _string_list(image, "observations")
     return bool(observations)
+
+
+def _policy_record_blocks(record: Mapping[str, Any] | None) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if record.get("policy_decision") in {
+        "blocked",
+        "budget_pruned",
+        "disallowed",
+        "manual_review",
+        "restricted",
+    }:
+        return True
+    if record.get("license_policy") in {"restricted", "manual_review"}:
+        return True
+    if record.get("robots_policy") in {"disallowed", "manual_review"}:
+        return True
+    return False
 
 
 def _visual_support_from_image(
@@ -2279,6 +2304,8 @@ def _image_matches_claim(
     if image.get("analysis_status") != "analyzed":
         return False
     if not isinstance(image.get("id"), str):
+        return False
+    if _policy_record_blocks(image):
         return False
     if _string_list(image, "policy_flags"):
         return False

@@ -51,6 +51,13 @@ IMAGE_REVIEW_GATE_POLICY_FLAGS = {
     "sensitive_possible",
     "unknown_license_image",
 }
+IMAGE_BLOCKING_POLICY_DECISIONS = {
+    "blocked",
+    "budget_pruned",
+    "disallowed",
+    "manual_review",
+    "restricted",
+}
 BOILERPLATE_PATTERNS = {
     "about us",
     "accept cookies",
@@ -260,6 +267,12 @@ def synthesize_report(
         "visual_evidence_unused": visual_evidence_unused,
         "external_model_call": False,
     }
+    status["visual_observation_report_links_written"] = (
+        _persist_visual_observation_report_links(
+            run_dir / "visual_observations.jsonl",
+            included,
+        )
+    )
     record_stage_trace(
         run_dir,
         stage="synthesize",
@@ -1211,6 +1224,90 @@ def _table_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ").strip() or "-"
 
 
+def _persist_visual_observation_report_links(
+    path: Path,
+    included: Sequence[Mapping[str, Any]],
+) -> int:
+    if not path.exists():
+        return 0
+    observations = _read_jsonl_records(path)
+    if observations is None:
+        return 0
+
+    links_by_image_id: dict[str, list[dict[str, Any]]] = {}
+    for item in included:
+        claim_id = item.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        for support in item.get("visual_supports", []):
+            if not isinstance(support, Mapping):
+                continue
+            image_id = support.get("image_id")
+            observation_ref = support.get("observation_ref")
+            if not isinstance(image_id, str) or not isinstance(observation_ref, str):
+                continue
+            if image_id not in item.get("image_ids", []):
+                continue
+            links_by_image_id.setdefault(image_id, []).append(
+                {
+                    "claim_id": claim_id,
+                    "visual_support_ref": observation_ref,
+                    "report_section_id": "visual-findings",
+                    "citation_id": f"img:{image_id}",
+                }
+            )
+
+    if not links_by_image_id:
+        return 0
+
+    link_count = 0
+    updated: list[dict[str, Any]] = []
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            continue
+        record = dict(observation)
+        image_id = record.get("evidence_image_id") or record.get("id")
+        links = links_by_image_id.get(image_id) if isinstance(image_id, str) else None
+        if links:
+            existing_links = record.get("report_links", [])
+            existing_count = len(existing_links) if isinstance(existing_links, list) else 0
+            merged = _merge_link_records(
+                existing_links,
+                links,
+                key_fields=("claim_id", "visual_support_ref", "citation_id"),
+            )
+            link_count += max(0, len(merged) - existing_count)
+            record["report_links"] = merged
+        updated.append(record)
+
+    if link_count:
+        _write_jsonl(path, updated)
+    return link_count
+
+
+def _merge_link_records(
+    existing: Any,
+    additions: Sequence[Mapping[str, Any]],
+    *,
+    key_fields: Sequence[str],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if isinstance(existing, list):
+        records = [dict(item) for item in existing if isinstance(item, Mapping)]
+    seen = {
+        tuple(record.get(field) for field in key_fields)
+        for record in records
+    }
+    for addition in additions:
+        record = dict(addition)
+        key = tuple(record.get(field) for field in key_fields)
+        if key in seen:
+            continue
+        records.append(record)
+        seen.add(key)
+    return records
+
+
 def _status_claim_record(item: Mapping[str, Any], *, include_evidence: bool) -> dict[str, Any]:
     claim = item["claim"]
     record = {
@@ -1426,6 +1523,12 @@ def _has_policy_blocked_image(
 def _image_policy_blocks(image: Mapping[str, Any], *, claim: Mapping[str, Any]) -> bool:
     if image.get("analysis_status") == "policy_blocked":
         return True
+    if image.get("policy_decision") in IMAGE_BLOCKING_POLICY_DECISIONS:
+        return True
+    if image.get("license_policy") in {"restricted", "manual_review"}:
+        return True
+    if image.get("robots_policy") in {"disallowed", "manual_review"}:
+        return True
     flags = set(_string_list(image.get("policy_flags")))
     if flags.intersection(IMAGE_BLOCKING_POLICY_FLAGS):
         return True
@@ -1466,6 +1569,22 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _read_jsonl_records(path: Path) -> list[Any] | None:
+    records: list[Any] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            return None
+    return records
+
+
 def _deterministic_generated_at(evidence: Mapping[str, Any]) -> str:
     report_generation = evidence.get("report_generation")
     if isinstance(report_generation, Mapping):
@@ -1487,6 +1606,17 @@ def _claim_count(claims: Any) -> int:
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not records:
+        path.write_text("", encoding="utf-8")
+        return
+    path.write_text(
+        "\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _remove_report_if_present(path: Path) -> None:
