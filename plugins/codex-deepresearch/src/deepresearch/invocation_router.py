@@ -84,6 +84,20 @@ _PARALLEL_SYNTHESIS_STATUSES = {
     "completed_partial_parallel",
     "completed_fixture",
 }
+_SYNTHESIZED_SUCCESS_STATUSES = {
+    "completed_parallel",
+    "completed_partial_parallel",
+    "completed_serial_handoff",
+    "completed_auto_visual",
+    "partial_auto_visual",
+    "completed_fixture",
+}
+_REQUIRED_SYNTHESIZED_ARTIFACTS = (
+    "report",
+    "evidence",
+    "run_status",
+    "report_status",
+)
 _STAGE_OK_STATUSES = {
     "completed",
     "completed_fixture",
@@ -739,9 +753,143 @@ def _artifact_paths(run_dir: Path, extra_artifacts: Mapping[str, Any] | None = N
 
 
 def _write_run_status(run_dir: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
-    output = dict(payload)
+    output = _finalize_handoff_payload(run_dir, payload)
     _write_json(run_dir / RUN_STATUS_FILENAME, output)
     return output
+
+
+def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    output = dict(payload)
+    output["artifacts"] = _artifact_paths(
+        run_dir,
+        output.get("artifacts") if isinstance(output.get("artifacts"), Mapping) else None,
+    )
+    missing_required = _missing_required_synthesized_artifacts(run_dir, output)
+    if missing_required:
+        diagnostics = (
+            dict(output.get("diagnostics", {}))
+            if isinstance(output.get("diagnostics"), Mapping)
+            else {}
+        )
+        diagnostics["actionable_cause"] = (
+            "successful synthesized run is missing required artifact paths: "
+            + ", ".join(missing_required)
+        )
+        diagnostics["missing_required_artifacts"] = missing_required
+        output["status"] = "failed_synthesis"
+        output["ok"] = False
+        output["terminal"] = True
+        output["diagnostics"] = diagnostics
+    output["shard_summary"] = _shard_summary(output)
+    output["fallback"] = _fallback_summary(output)
+    output["artifact_handoff"] = {
+        "run_dir": output.get("run_dir"),
+        "status": output.get("status"),
+        "ok": output.get("ok"),
+        "terminal": output.get("terminal"),
+        "artifact_paths": dict(output["artifacts"]),
+        "missing_required_artifacts": list(
+            output.get("diagnostics", {}).get("missing_required_artifacts", [])
+        )
+        if isinstance(output.get("diagnostics"), Mapping)
+        else [],
+        "shards": dict(output["shard_summary"]),
+        "fallback": dict(output["fallback"]),
+        "diagnostics": dict(output.get("diagnostics", {}))
+        if isinstance(output.get("diagnostics"), Mapping)
+        else {},
+    }
+    return output
+
+
+def _missing_required_synthesized_artifacts(
+    run_dir: Path, payload: Mapping[str, Any]
+) -> list[str]:
+    if not _requires_synthesized_artifact_validation(payload):
+        return []
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        artifacts = {}
+    missing: list[str] = []
+    for key in _REQUIRED_SYNTHESIZED_ARTIFACTS:
+        artifact_path = artifacts.get(key)
+        if not isinstance(artifact_path, str) or not artifact_path.strip():
+            missing.append(key)
+            continue
+        if key == "run_status":
+            continue
+        if not _resolve_artifact_path(run_dir, artifact_path).is_file():
+            missing.append(key)
+    return missing
+
+
+def _requires_synthesized_artifact_validation(payload: Mapping[str, Any]) -> bool:
+    if payload.get("selected_mode") != "full-runner":
+        return False
+    if payload.get("ok") is not True or payload.get("terminal") is not True:
+        return False
+    if str(payload.get("status") or "") not in _SYNTHESIZED_SUCCESS_STATUSES:
+        return False
+    stages = payload.get("stages")
+    if not isinstance(stages, Mapping):
+        return False
+    synthesize_stage = stages.get("synthesize")
+    return (
+        isinstance(synthesize_stage, Mapping)
+        and synthesize_stage.get("status") == "completed"
+    )
+
+
+def _shard_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    parallel = payload.get("parallel")
+    if not isinstance(parallel, Mapping):
+        return {
+            "planned_task_count": None,
+            "accepted_shard_count": 0,
+            "merged_shard_count": 0,
+            "failed_task_count": 0,
+            "blocked_task_count": 0,
+            "rejected_shard_count": 0,
+            "discarded_task_count": 0,
+        }
+    return {
+        "planned_task_count": parallel.get("planned_task_count"),
+        "accepted_shard_count": _int_or_zero(parallel.get("accepted_shard_count")),
+        "merged_shard_count": _int_or_zero(parallel.get("merged_shard_count")),
+        "failed_task_count": _int_or_zero(parallel.get("failed_task_count")),
+        "blocked_task_count": _int_or_zero(parallel.get("blocked_task_count")),
+        "rejected_shard_count": _int_or_zero(parallel.get("rejected_shard_count")),
+        "discarded_task_count": _int_or_zero(parallel.get("discarded_task_count")),
+    }
+
+
+def _fallback_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    parallel = payload.get("parallel")
+    if not isinstance(parallel, Mapping):
+        return {
+            "parallel_degraded": None,
+            "needs_serial_handoff": None,
+            "degraded_reason": None,
+        }
+    return {
+        "parallel_degraded": parallel.get("parallel_degraded"),
+        "needs_serial_handoff": parallel.get("needs_serial_handoff"),
+        "degraded_reason": parallel.get("degraded_reason"),
+    }
+
+
+def _resolve_artifact_path(run_dir: Path, artifact_path: str) -> Path:
+    path = Path(artifact_path)
+    if path.is_absolute():
+        return path
+    return run_dir / path
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _question_from_invocation(invocation: str) -> str:
@@ -809,17 +957,26 @@ def _parallel_summary(parallel_status: Mapping[str, Any]) -> dict[str, Any]:
         accepted = merge.get("accepted_shards")
         if isinstance(accepted, list):
             accepted_shards = accepted
+    failure_counts = (
+        dict(parallel_status.get("failure_counts", {}))
+        if isinstance(parallel_status.get("failure_counts"), Mapping)
+        else {}
+    )
     return {
         "status": parallel_status.get("status"),
         "ok": parallel_status.get("ok"),
         "adapter": parallel_status.get("adapter"),
         "parallel_degraded": parallel_status.get("parallel_degraded"),
+        "degraded_reason": parallel_status.get("degraded_reason"),
         "needs_serial_handoff": parallel_status.get("needs_serial_handoff"),
         "planned_task_count": parallel_status.get("planned_task_count"),
         "accepted_shard_count": len(accepted_shards),
-        "failure_counts": dict(parallel_status.get("failure_counts", {}))
-        if isinstance(parallel_status.get("failure_counts"), Mapping)
-        else {},
+        "merged_shard_count": len(accepted_shards),
+        "failed_task_count": _int_or_zero(failure_counts.get("failed_tasks")),
+        "blocked_task_count": _int_or_zero(failure_counts.get("blocked_tasks")),
+        "rejected_shard_count": _int_or_zero(failure_counts.get("rejected_shards")),
+        "discarded_task_count": _int_or_zero(failure_counts.get("discarded_tasks")),
+        "failure_counts": failure_counts,
     }
 
 

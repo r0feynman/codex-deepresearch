@@ -47,10 +47,19 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertIn("report", result["artifacts"])
         self.assertIn("report_status", result["artifacts"])
         self.assertGreaterEqual(result["parallel"]["accepted_shard_count"], 1)
+        self.assertEqual(result["artifact_handoff"]["run_dir"], result["run_dir"])
+        self.assertIn("report_status", result["artifact_handoff"]["artifact_paths"])
+        self.assertEqual(
+            result["shard_summary"]["accepted_shard_count"],
+            result["parallel"]["accepted_shard_count"],
+        )
+        self.assertFalse(result["fallback"]["parallel_degraded"])
+        self.assertFalse(result["fallback"]["needs_serial_handoff"])
 
         persisted = self.read_json(Path(result["artifacts"]["run_status"]))
         self.assertEqual(persisted["status"], "completed_fixture")
         self.assertEqual(persisted["provenance"]["type"], "fixture")
+        self.assertIn("report_status", persisted["artifact_handoff"]["artifact_paths"])
 
     def test_quick_chat_is_explicit_and_declares_no_evidence_bundle(self) -> None:
         result = run_skill_invocation(
@@ -132,6 +141,12 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertFalse(persisted["ok"])
         self.assertTrue(persisted["terminal"])
         self.assertEqual(persisted["diagnostics"]["actionable_cause"], result["diagnostics"]["actionable_cause"])
+        self.assertNotIn("report_status", result["artifacts"])
+        self.assertEqual(result["artifact_handoff"]["status"], "blocked_preflight")
+        self.assertEqual(
+            result["artifact_handoff"]["diagnostics"]["actionable_cause"],
+            "codex exec is not available on PATH",
+        )
 
     def test_manual_handoff_provenance_is_explicit_in_run_status(self) -> None:
         result = run_skill_invocation(
@@ -207,6 +222,29 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertIn("parallel_orchestration_status", result["artifacts"])
         persisted = self.read_json(Path(result["artifacts"]["run_status"]))
         self.assertEqual(persisted["provenance"]["type"], "serial_handoff")
+        self.assertNotIn("report_status", result["artifacts"])
+        self.assertTrue(result["fallback"]["needs_serial_handoff"])
+        self.assertEqual(result["shard_summary"]["accepted_shard_count"], 0)
+
+    def test_visual_attempted_success_includes_visual_provider_status_artifact(self) -> None:
+        result = run_skill_invocation(
+            "$deep-research: inspect product screenshots for evidence",
+            runs_dir=self.temp_runs_dir(),
+            adapter_name="fixture",
+            route="visual_required",
+            budget_preset="quick",
+            min_tasks=1,
+            max_tasks=1,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "completed_fixture")
+        self.assertIn("visual_provider_status", result["artifacts"])
+        self.assertIn("visual_provider_status", result["artifact_handoff"]["artifact_paths"])
+
+        visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
+        self.assertTrue(visual_provider_status["ok"])
+        self.assertEqual(visual_provider_status["status"], "fixture_visual_provider")
 
     def test_real_parallel_provenance_is_preserved_in_final_status(self) -> None:
         runs_dir = self.temp_runs_dir()
@@ -278,6 +316,81 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertTrue(result["provenance"]["real_use_e2e_eligible"])
         self.assertIn("run_status", result["artifacts"])
         self.assertIn("report_status", result["artifacts"])
+        self.assertEqual(result["shard_summary"]["accepted_shard_count"], 1)
+        self.assertFalse(result["fallback"]["parallel_degraded"])
+
+    def test_successful_synthesis_without_report_status_fails_handoff_validation(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            payload = {
+                "status": "completed_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 1,
+                "failure_counts": {},
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 1,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "attempted_real_child_execution": True,
+                    "real_child_execution": True,
+                    "real_use_e2e_eligible": True,
+                },
+                "merge": {"accepted_shards": [{"task_id": "task_research_001"}]},
+                "artifacts": {
+                    "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json")
+                },
+            }
+            (run_dir / "parallel_orchestration_status.json").write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return payload
+
+        def fake_synthesize_without_report_status(*, run, **_kwargs):
+            run_dir = Path(run)
+            (run_dir / "report.md").write_text("# Report\n", encoding="utf-8")
+            return {
+                "status": "completed",
+                "artifacts": {"report": str(run_dir / "report.md")},
+            }
+
+        with (
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch("deepresearch.invocation_router.enforce_guardrails", return_value={"status": "completed"}),
+            mock.patch("deepresearch.invocation_router.verify_claims", return_value={"status": "completed"}),
+            mock.patch(
+                "deepresearch.invocation_router.synthesize_report",
+                side_effect=fake_synthesize_without_report_status,
+            ),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: missing report status regression",
+                runs_dir=runs_dir,
+                route="text_only",
+                budget_preset="quick",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["status"], "failed_synthesis")
+        self.assertIn("report_status", result["diagnostics"]["missing_required_artifacts"])
+        self.assertIn("report_status", result["artifact_handoff"]["missing_required_artifacts"])
+        self.assertIn("report", result["artifacts"])
+        self.assertIn("evidence", result["artifacts"])
+        self.assertIn("run_status", result["artifacts"])
+        self.assertNotIn("report_status", result["artifacts"])
+
+        persisted = self.read_json(Path(result["artifacts"]["run_status"]))
+        self.assertFalse(persisted["ok"])
+        self.assertEqual(persisted["status"], "failed_synthesis")
+        self.assertIn("report_status", persisted["diagnostics"]["missing_required_artifacts"])
 
 
 if __name__ == "__main__":
