@@ -543,6 +543,55 @@ class RunStateTests(unittest.TestCase):
         self.assertTrue(cancelled_status["terminal"])
         self.assertFalse(cancelled_status["ok"])
 
+    def test_terminal_run_status_blocks_pause_resume_cancel_without_mutation(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        for persisted_status, expected_code, ok in (
+            ("completed_fixture", "run_completed", True),
+            ("cancelled", "run_cancelled", False),
+            ("failed_synthesis", "run_terminal", False),
+        ):
+            with self.subTest(persisted_status=persisted_status):
+                prepared = prepare_run(
+                    question=f"terminal {persisted_status} control rejection",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                terminal_status = {
+                    "schema_version": "codex-deepresearch.run-status.v0",
+                    "run_id": prepared["run_id"],
+                    "run_dir": str(run_dir),
+                    "invocation": "$deep-research: terminal control",
+                    "question": f"terminal {persisted_status} control rejection",
+                    "selected_mode": "fixture",
+                    "status": persisted_status,
+                    "ok": ok,
+                    "terminal": True,
+                    "updated_at": "2026-06-25T00:00:00Z",
+                    "provenance": {"type": "fixture"},
+                    "diagnostics": {},
+                    "artifacts": {"run_status": str(run_dir / "run_status.json")},
+                }
+                self.write_json(run_dir / "run_status.json", terminal_status)
+                run_steps_before = self.read_json(run_steps_path(run_dir))
+
+                for control_action in (pause_run, resume_run, cancel_run):
+                    with self.assertRaises(RunStepStateError) as control_error:
+                        control_action(run_dir, timestamp="2026-06-25T00:01:00Z")
+                    self.assertEqual(
+                        control_error.exception.to_dict()["code"],
+                        expected_code,
+                    )
+                    self.assertEqual(
+                        self.read_json(run_dir / "run_status.json"),
+                        terminal_status,
+                    )
+                    self.assertEqual(
+                        self.read_json(run_steps_path(run_dir)),
+                        run_steps_before,
+                    )
+                    self.assertFalse(run_control_path(run_dir).exists())
+
     def test_resume_rejects_completed_terminal_run_status_without_mutation(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(

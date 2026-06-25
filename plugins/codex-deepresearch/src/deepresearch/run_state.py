@@ -478,6 +478,7 @@ def pause_run(
     """Persist a durable paused control state for an inspectable run."""
 
     run_dir = Path(run_dir)
+    _raise_if_persisted_terminal_run_status_blocks_control(run_dir, action="pause")
     now = timestamp or _utc_now()
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=now)
     control_status = _control_status(state)
@@ -532,6 +533,7 @@ def resume_run(
     """Clear a paused control gate and report the next safe stage."""
 
     run_dir = Path(run_dir)
+    _raise_if_persisted_terminal_run_status_blocks_control(run_dir, action="resume")
     now = timestamp or _utc_now()
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=now)
     control_status = _control_status(state)
@@ -582,6 +584,7 @@ def cancel_run(
     """Persist terminal cancellation diagnostics without deleting artifacts."""
 
     run_dir = Path(run_dir)
+    _raise_if_persisted_terminal_run_status_blocks_control(run_dir, action="cancel")
     now = timestamp or _utc_now()
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=now)
     if _control_status(state) == "cancelled":
@@ -1599,6 +1602,26 @@ def _write_control_artifact(
     return payload
 
 
+def _raise_if_persisted_terminal_run_status_blocks_control(
+    run_dir: Path,
+    *,
+    action: str,
+) -> None:
+    run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
+    persisted_status = _string_value(run_status.get("status")) or "terminal"
+    if (
+        run_status.get("terminal") is not True
+        and not _is_terminal_run_status_name(persisted_status)
+    ):
+        return
+    raise RunStepStateError(
+        code=_terminal_run_status_error_code(persisted_status),
+        message=f"terminal runs cannot be controlled with {action}-run",
+        from_status=persisted_status,
+        to_status=_control_action_target_status(action),
+    )
+
+
 def _raise_if_resume_blocked_by_terminal_run(
     run_dir: Path,
     state: Mapping[str, Any],
@@ -1626,26 +1649,32 @@ def _raise_if_resume_blocked_by_terminal_run(
             return
         return
     persisted_status = _string_value(run_status.get("status")) or "terminal"
-    if persisted_status == "cancelled":
-        raise RunStepStateError(
-            code="run_cancelled",
-            message="cancelled runs cannot be resumed",
-            from_status=persisted_status,
-            to_status="resumed",
-        )
-    if persisted_status.startswith("completed"):
-        raise RunStepStateError(
-            code="run_completed",
-            message="completed runs cannot be resumed",
-            from_status=persisted_status,
-            to_status="resumed",
-        )
     raise RunStepStateError(
-        code="run_terminal",
+        code=_terminal_run_status_error_code(persisted_status),
         message="terminal runs cannot be resumed unless they are paused",
         from_status=persisted_status,
         to_status="resumed",
     )
+
+
+def _is_terminal_run_status_name(status: str) -> bool:
+    return status.startswith(("completed", "cancelled", "failed"))
+
+
+def _terminal_run_status_error_code(status: str) -> str:
+    if status.startswith("completed"):
+        return "run_completed"
+    if status.startswith("cancelled"):
+        return "run_cancelled"
+    return "run_terminal"
+
+
+def _control_action_target_status(action: str) -> str:
+    return {
+        "pause": "paused",
+        "resume": "resumed",
+        "cancel": "cancelled",
+    }.get(action, action)
 
 
 def _write_control_run_status(
