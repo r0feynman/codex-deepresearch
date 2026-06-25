@@ -206,6 +206,54 @@ class VisualArtifactTests(unittest.TestCase):
             {error.code for error in result.errors},
         )
 
+    def test_completed_auto_visual_rejects_empty_run_dir_artifacts(self) -> None:
+        run_dir = self.temp_dir() / "dr_empty_completed_visual"
+        run_dir.mkdir()
+        created_at = "2026-06-25T00:00:00Z"
+        self.write_json(
+            run_dir / VISUAL_SEARCH_PLAN_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": created_at,
+                "tasks": [],
+            },
+        )
+        self.write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, [])
+        self.write_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME, [])
+        self.write_jsonl(run_dir / "visual_observations.jsonl", [])
+        self.write_json(
+            run_dir / VISUAL_PROVIDER_STATUS_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_dir.name,
+                "status": "completed_auto_visual",
+                "ok": True,
+                "terminal": True,
+                "metric_classification": "success",
+                "providers": [
+                    self.provider_status(
+                        provider="real-image-provider",
+                        provider_kind="web_image_search",
+                        provider_mode="real",
+                        invocations=1,
+                        candidates_discovered=0,
+                        artifacts_fetched=0,
+                        vlm_images_analyzed=0,
+                    )
+                ],
+            },
+        )
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        errors = [error for error in result.errors if error.code == "completed_auto_visual_prerequisites"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("real_fetched_visual_artifact", errors[0].message)
+        self.assertIn("real_vlm_observation", errors[0].message)
+        self.assertIn("report_cited_supported_visual_claim", errors[0].message)
+
     def test_candidate_provider_kind_rejects_vlm_and_counts_do_not_inflate(self) -> None:
         run_dir = self.write_phase3_fixture()
         candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)

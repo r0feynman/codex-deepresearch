@@ -107,6 +107,7 @@ class _Collector:
 
 class _VisualContext:
     def __init__(self) -> None:
+        self.run_dir_validation = False
         self.task_by_id: dict[str, Mapping[str, Any]] = {}
         self.plan_by_id: dict[str, Mapping[str, Any]] = {}
         self.candidate_by_id: dict[str, Mapping[str, Any]] = {}
@@ -351,6 +352,7 @@ def validate_visual_artifacts(
         return _result(collector)
 
     context = _VisualContext()
+    context.run_dir_validation = base is not None
     research_tasks = _load_optional_json(research_tasks_path, "$.research_tasks", collector)
     visual_tasks = _load_optional_json(visual_tasks_path, "$.visual_tasks", collector)
     evidence = _load_optional_json(evidence_path, "$.evidence", collector)
@@ -900,11 +902,14 @@ def _validate_completed_auto_visual_prerequisites(
     missing: list[str] = []
     if not real_acquisition_ran:
         missing.append("real_non_fixture_visual_provider")
-    if fetch_records and not real_fetched_artifact:
+    if (context.run_dir_validation or fetch_records) and not real_fetched_artifact:
         missing.append("real_fetched_visual_artifact")
-    if observation_records and not real_vlm_observation:
+    if (context.run_dir_validation or observation_records) and not real_vlm_observation:
         missing.append("real_vlm_observation")
-    if context.claim_by_id and context.report_used_image_ids and not report_cited_supported_claim:
+    if (
+        context.run_dir_validation
+        or (context.claim_by_id and context.report_used_image_ids)
+    ) and not report_cited_supported_claim:
         missing.append("report_cited_supported_visual_claim")
     if missing:
         collector.add(
