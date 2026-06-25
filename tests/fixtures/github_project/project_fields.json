@@ -1,0 +1,65 @@
+{
+  "fields": [
+    {
+      "id": "field_status",
+      "name": "Status",
+      "options": [
+        {"id": "status_todo", "name": "Todo"},
+        {"id": "status_in_progress", "name": "In Progress"},
+        {"id": "status_done", "name": "Done"}
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    {
+      "id": "field_phase",
+      "name": "Phase",
+      "options": [
+        {"id": "phase_3", "name": "Phase 3 - Public Beta"}
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    {
+      "id": "field_work_type",
+      "name": "Work Type",
+      "options": [
+        {"id": "work_task", "name": "Task"},
+        {"id": "work_docs", "name": "Docs"},
+        {"id": "work_epic", "name": "Epic"}
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    {
+      "id": "field_component",
+      "name": "Component",
+      "options": [
+        {"id": "component_skill", "name": "Skill"},
+        {"id": "component_visual", "name": "Visual"},
+        {"id": "component_vlm", "name": "VLM"},
+        {"id": "component_evidence", "name": "Evidence"},
+        {"id": "component_docs", "name": "Docs"}
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    {
+      "id": "field_priority",
+      "name": "Priority",
+      "options": [
+        {"id": "priority_p1", "name": "P1"},
+        {"id": "priority_p2", "name": "P2"}
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    {
+      "id": "field_workflow",
+      "name": "Workflow Status",
+      "options": [
+        {"id": "workflow_backlog", "name": "Backlog"},
+        {"id": "workflow_ready", "name": "Ready"},
+        {"id": "workflow_in_progress", "name": "In Progress"},
+        {"id": "workflow_blocked", "name": "Blocked"},
+        {"id": "workflow_done", "name": "Done"}
+      ],
+      "type": "ProjectV2SingleSelectField"
+    }
+  ]
+}

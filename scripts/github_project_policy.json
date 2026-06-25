@@ -1,0 +1,38 @@
+{
+  "repository": "r0feynman/codex-deepresearch",
+  "current_ready": [58, 63],
+  "deferred_backlog": [
+    57,
+    59,
+    60,
+    61,
+    62,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    74,
+    75
+  ],
+  "active_blocked": [],
+  "intentionally_blank_fields": {
+    "76": ["phase", "component"]
+  },
+  "or_dependency_groups": {
+    "68": [[64, 65, 66, 67]]
+  },
+  "safe_apply_fields": [
+    "status",
+    "workflow_status",
+    "phase",
+    "work_type",
+    "component",
+    "priority"
+  ]
+}
