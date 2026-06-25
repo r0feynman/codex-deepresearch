@@ -193,6 +193,7 @@ def acquire_visual_candidates(
 
     provider_instances = _providers(
         provider_names,
+        explicit_provider_request=explicit_provider_request,
         real_image_search_transport=real_image_search_transport,
         real_image_search_config=real_image_search_config,
         browser_transport=browser_transport,
@@ -1070,11 +1071,19 @@ class _BraveImageSearchProvider:
 class _LocalPdfRasterizerProvider:
     name = DEFAULT_PDF_RASTERIZER_PROVIDER
 
-    def __init__(self) -> None:
+    def __init__(self, *, explicit_provider_request: bool = False) -> None:
+        self.explicit_provider_request = explicit_provider_request
         self.last_status: dict[str, Any] = {}
 
     def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
-        requested_provider_mode = "real" if pdf_renderer_available() else "manual"
+        renderer_available = pdf_renderer_available()
+        requested_provider_mode = (
+            "real"
+            if self.explicit_provider_request and renderer_available
+            else "manual"
+            if self.explicit_provider_request
+            else "fixture"
+        )
         result = collect_pdf_rasterizer_candidates(
             run_dir=context.run_dir,
             sources=tuple(context.source_by_id.values()),
@@ -1089,9 +1098,9 @@ class _LocalPdfRasterizerProvider:
         )
         provider_mode = (
             "real"
-            if result.pages_rasterized > 0
+            if self.explicit_provider_request and result.pages_rasterized > 0
             else "manual"
-            if renderer_unavailable
+            if self.explicit_provider_request and renderer_unavailable
             else "fixture"
         )
         self.last_status = {
@@ -3268,6 +3277,7 @@ def _source_html_path(run_dir: Path, source: Mapping[str, Any]) -> Path | None:
 def _providers(
     names: Sequence[str],
     *,
+    explicit_provider_request: bool,
     real_image_search_transport: _BraveImageSearchTransport | None,
     real_image_search_config: Mapping[str, Any] | None,
     browser_transport: BrowserScreenshotTransport | None,
@@ -3295,7 +3305,11 @@ def _providers(
                 )
             )
         elif name == DEFAULT_PDF_RASTERIZER_PROVIDER:
-            providers.append(_LocalPdfRasterizerProvider())
+            providers.append(
+                _LocalPdfRasterizerProvider(
+                    explicit_provider_request=explicit_provider_request,
+                )
+            )
         else:
             raise VisualAcquisitionError(f"unknown visual provider: {name}")
     return providers

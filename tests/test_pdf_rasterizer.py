@@ -253,6 +253,68 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(counts["real_observations"], 2)
         self.assertEqual(counts["real_artifacts_fetched"], 2)
 
+    @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
+    def test_default_fixture_stack_pdf_records_do_not_count_as_real(self) -> None:
+        prepared = prepare_run(
+            question="Default fixture stack should not count PDF rasterization as real",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=20,
+        )
+        run_dir = Path(prepared["run_dir"])
+        pdf_path = self.write_pdf(run_dir, "default-fixture-public.pdf")
+        source = self.pdf_source(run_dir, "src_pdf_default_fixture", pdf_path)
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [source]
+        evidence["budget"]["max_images"] = 20
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = acquire_visual_candidates(run=run_dir)
+
+        self.assertEqual(result["status"], "visual_candidates_collected")
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        pdf_candidates = [
+            candidate for candidate in candidates if candidate["provider"] == "local-pdf-rasterizer"
+        ]
+        pdf_fetches = [
+            fetch for fetch in fetches if fetch["provider"] == "local-pdf-rasterizer"
+        ]
+        pdf_observations = [
+            observation
+            for observation in observations
+            if observation["provider"] == "local-pdf-rasterizer"
+        ]
+        self.assertEqual(len(pdf_candidates), 1)
+        self.assertEqual(len(pdf_fetches), 1)
+        self.assertEqual(len(pdf_observations), 1)
+        self.assertEqual(pdf_candidates[0]["provider_mode"], "fixture")
+        self.assertTrue(pdf_candidates[0]["provider_provenance"]["fixture_only"])
+        self.assertEqual(pdf_fetches[0]["provider_mode"], "fixture")
+        self.assertEqual(pdf_observations[0]["provider_mode"], "fixture")
+        self.assertTrue(pdf_observations[0]["provider_provenance"]["fixture_only"])
+        provider = next(
+            provider
+            for provider in provider_status["providers"]
+            if provider["provider"] == "local-pdf-rasterizer"
+        )
+        self.assertEqual(provider["provider_mode"], "fixture")
+        self.assertEqual(provider["provider_kind"], "pdf_rasterizer")
+        self.assertEqual(provider["artifacts_fetched"], 1)
+
+        counts = real_automatic_visual_release_counts(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            visual_provider_status=provider_status,
+        )
+        self.assertEqual(counts["real_candidates"], 0)
+        self.assertEqual(counts["real_fetches"], 0)
+        self.assertEqual(counts["real_observations"], 0)
+        self.assertEqual(counts["real_artifacts_fetched"], 0)
+
     def test_renderer_unavailable_prevents_accepted_pdf_evidence(self) -> None:
         prepared = prepare_run(
             question="Renderer unavailable PDF rasterization",
