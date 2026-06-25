@@ -53,13 +53,28 @@ _FULL_RUNNER_INTENT_MARKERS = (
     "durable artifacts",
     "run_status.json",
 )
-_NEGATION_PATTERNS = (
-    r"\bdo\s+not\b",
-    r"\bdon't\b",
-    r"\bnot\b",
-    r"\bnever\b",
+_NO_FULL_RUNNER_PATTERNS = (
+    r"\bdo\s+not\s+run\s+(?:the\s+)?full[-\s]?pipeline\b",
+    r"\bdon't\s+run\s+(?:the\s+)?full[-\s]?pipeline\b",
+    r"\bno\s+full[-\s]?pipeline\b",
+    r"\bwithout\s+(?:the\s+)?full[-\s]?pipeline\b",
+    r"\bdo\s+not\s+use\s+(?:the\s+)?full[-\s]?runner\b",
+    r"\bdon't\s+use\s+(?:the\s+)?full[-\s]?runner\b",
+    r"\bno\s+full[-\s]?runner\b",
+    r"\bwithout\s+(?:the\s+)?full[-\s]?runner\b",
+)
+_NEGATED_QUICK_CHAT_PATTERNS = (
+    r"\bdo\s+not\s+(?:give\s+me\s+|provide\s+|return\s+|use\s+)?(?:a\s+)?quick\s+(?:answer|chat)\b",
+    r"\bdon't\s+(?:give\s+me\s+|provide\s+|return\s+|use\s+)?(?:a\s+)?quick\s+(?:answer|chat)\b",
+    r"\bnot\s+(?:a\s+)?quick\s+(?:answer|chat)\b",
+    r"\bnever\s+(?:give\s+me\s+|provide\s+|return\s+|use\s+)?(?:a\s+)?quick\s+(?:answer|chat)\b",
+    r"\bwithout\s+(?:a\s+)?quick\s+(?:answer|chat)\b",
     r"\bwithout\s+quick\b",
-    r"\bno\s+quick\b",
+    r"\bno\s+quick\s+(?:answer|chat)\b",
+    r"\bdo\s+not\s+(?:give\s+me\s+|provide\s+|return\s+|use\s+)?chat[-\s]?only\b",
+    r"\bdon't\s+(?:give\s+me\s+|provide\s+|return\s+|use\s+)?chat[-\s]?only\b",
+    r"\bnot\s+chat[-\s]?only\b",
+    r"\bno\s+chat[-\s]?only\b",
 )
 _PARALLEL_SYNTHESIS_STATUSES = {
     "completed_parallel",
@@ -751,17 +766,25 @@ def _question_from_invocation(invocation: str) -> str:
 
 def _has_quick_chat_marker(invocation: str) -> bool:
     normalized = invocation.strip().lower()
-    if _has_full_runner_intent(normalized) or _has_negation(normalized):
+    if _negates_quick_chat(normalized):
+        return False
+    if _has_no_full_runner_intent(normalized):
+        return True
+    if _has_full_runner_intent(normalized):
         return False
     return any(marker in normalized for marker in _QUICK_CHAT_MARKERS)
+
+
+def _has_no_full_runner_intent(normalized_invocation: str) -> bool:
+    return any(re.search(pattern, normalized_invocation) for pattern in _NO_FULL_RUNNER_PATTERNS)
 
 
 def _has_full_runner_intent(normalized_invocation: str) -> bool:
     return any(marker in normalized_invocation for marker in _FULL_RUNNER_INTENT_MARKERS)
 
 
-def _has_negation(normalized_invocation: str) -> bool:
-    return any(re.search(pattern, normalized_invocation) for pattern in _NEGATION_PATTERNS)
+def _negates_quick_chat(normalized_invocation: str) -> bool:
+    return any(re.search(pattern, normalized_invocation) for pattern in _NEGATED_QUICK_CHAT_PATTERNS)
 
 
 def _manual_provenance(manual_status: Mapping[str, Any]) -> dict[str, Any]:

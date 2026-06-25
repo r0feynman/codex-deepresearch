@@ -66,6 +66,19 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertIn("no DeepResearch evidence bundle was produced", result["response_notice"])
         self.assertEqual(result["artifacts"], {})
 
+    def test_no_full_pipeline_with_quick_answer_routes_quick_chat(self) -> None:
+        result = run_skill_invocation(
+            "$deep-research: do not run the full pipeline; give me a quick answer about cache eviction",
+            runs_dir=self.temp_runs_dir(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["selected_mode"], "quick-chat")
+        self.assertEqual(result["status"], "quick_chat_only")
+        self.assertTrue(result["no_evidence_bundle"])
+        self.assertEqual(result["artifacts"], {})
+
     def test_negated_quick_answer_with_full_pipeline_intent_runs_full_runner(self) -> None:
         result = run_skill_invocation(
             "$deep-research: do not give me a quick answer about cache eviction; run the full pipeline",
