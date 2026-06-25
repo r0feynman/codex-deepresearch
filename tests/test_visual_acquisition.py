@@ -201,7 +201,12 @@ class VisualAcquisitionTests(unittest.TestCase):
         provider_names = {provider["provider"] for provider in result["providers"]}
         self.assertEqual(
             provider_names,
-            {"local-page", "local-image-fixture", "local-screenshot-fixture"},
+            {
+                "local-page",
+                "local-image-fixture",
+                "local-screenshot-fixture",
+                "local-pdf-rasterizer",
+            },
         )
         self.assertGreaterEqual(result["candidate_counts"]["open_graph_image"], 1)
         self.assertGreaterEqual(result["candidate_counts"]["body_image"], 1)
@@ -351,7 +356,12 @@ class VisualAcquisitionTests(unittest.TestCase):
         )
         self.assertIn(
             first_support["provider"],
-            {"local-page", "local-image-fixture", "local-screenshot-fixture"},
+            {
+                "local-page",
+                "local-image-fixture",
+                "local-screenshot-fixture",
+                "local-pdf-rasterizer",
+            },
         )
         self.assertEqual(report_status["status"], "completed")
         self.assertTrue(report_status["used_images"])

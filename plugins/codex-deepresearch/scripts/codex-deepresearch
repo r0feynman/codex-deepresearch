@@ -439,6 +439,7 @@ def run_acquire_visual(args: argparse.Namespace) -> int:
                 providers=args.provider,
                 screenshot_modes=args.screenshot_mode,
                 max_image_bytes=args.max_image_bytes,
+                max_pdf_bytes=args.max_pdf_bytes,
             )
     except (
         PageImageExtractionError,
@@ -1276,7 +1277,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help=(
             "Visual provider. Repeatable or comma-separated. Defaults to "
-            "local-page, local-image-fixture, local-screenshot-fixture. Use "
+            "local-page, local-image-fixture, local-screenshot-fixture, "
+            "local-pdf-rasterizer. Use "
             "brave-image-search for the credential- and storage-confirmation-gated "
             "real web image search adapter. Use page-image-extractor alone to "
             "run the page image fetch/cache provider."
@@ -1301,6 +1303,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Maximum image fetch attempts for --provider page-image-extractor.",
+    )
+    acquire_visual.add_argument(
+        "--max-pdf-bytes",
+        type=int,
+        default=25_000_000,
+        help="Maximum allowed local PDF artifact size in bytes before rasterization is skipped.",
     )
     acquire_visual.set_defaults(func=run_acquire_visual)
 

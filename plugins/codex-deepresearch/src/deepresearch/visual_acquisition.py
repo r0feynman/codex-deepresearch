@@ -19,6 +19,11 @@ from urllib.request import Request, urlopen
 
 from .cache_keys import normalize_url
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, SEARCH_ROUTES, validate_artifacts
+from .pdf_rasterizer import (
+    DEFAULT_MAX_PDF_BYTES,
+    DEFAULT_PDF_RASTERIZER_PROVIDER,
+    collect_pdf_rasterizer_candidates,
+)
 from .search_handoff import resolve_run_dir
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
@@ -35,6 +40,7 @@ DEFAULT_VISUAL_PROVIDERS = (
     "local-page",
     "local-image-fixture",
     "local-screenshot-fixture",
+    DEFAULT_PDF_RASTERIZER_PROVIDER,
 )
 BRAVE_IMAGE_PROVIDER = "brave-image-search"
 BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
@@ -83,6 +89,7 @@ class _VisualContext:
     source_by_id: Mapping[str, Mapping[str, Any]]
     created_at: str
     screenshot_modes: tuple[str, ...]
+    max_pdf_bytes: int
 
 
 class _VisualProvider(Protocol):
@@ -137,6 +144,7 @@ def acquire_visual_candidates(
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
     real_image_search_transport: _BraveImageSearchTransport | None = None,
     real_image_search_config: Mapping[str, Any] | None = None,
+    max_pdf_bytes: int = DEFAULT_MAX_PDF_BYTES,
 ) -> dict[str, Any]:
     """Collect visual candidates for visual routes.
 
@@ -149,6 +157,8 @@ def acquire_visual_candidates(
 
     if max_image_bytes < 1:
         raise VisualAcquisitionError("max_image_bytes must be positive")
+    if max_pdf_bytes < 1:
+        raise VisualAcquisitionError("max_pdf_bytes must be positive")
 
     run_dir = resolve_run_dir(run, runs_dir=runs_dir)
     evidence_path = run_dir / "evidence.json"
@@ -212,6 +222,7 @@ def acquire_visual_candidates(
         source_by_id=source_by_id,
         created_at=now,
         screenshot_modes=normalized_modes,
+        max_pdf_bytes=max_pdf_bytes,
     )
 
     candidates: list[dict[str, Any]] = []
@@ -316,6 +327,7 @@ def acquire_visual_candidates(
     candidate_counts = _candidate_counts(candidate_records)
     removal_counts = _removal_counts(candidate_records)
     screenshot_capture = _screenshot_capture_summary(candidate_records, provider_statuses)
+    pdf_rasterization = _pdf_rasterization_summary(candidate_records, provider_statuses)
     route_summary = _route_summary(routes)
     evidence["visual_acquisition"] = {
         "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
@@ -338,8 +350,10 @@ def acquire_visual_candidates(
         "removal_counts": removal_counts,
         "near_duplicate_groups": near_duplicate_groups,
         "screenshot_capture": screenshot_capture,
+        "pdf_rasterization": pdf_rasterization,
         "validation": {
             "max_image_bytes": max_image_bytes,
+            "max_pdf_bytes": max_pdf_bytes,
             "mime_types": list(SUPPORTED_MIME_TYPES),
             "url_duplicate_check": True,
             "content_hash_check": True,
@@ -403,6 +417,7 @@ def acquire_visual_candidates(
             "removal_counts": removal_counts,
             "near_duplicate_groups": near_duplicate_groups,
             "screenshot_capture": screenshot_capture,
+            "pdf_rasterization": pdf_rasterization,
             "validation": validation.to_dict(),
             "visual_artifact_validation": visual_artifact_validation.to_dict(),
             "image_search_invocations": evidence["visual_acquisition"][
@@ -628,7 +643,6 @@ class _LocalScreenshotFixtureProvider:
                 )
             )
         return records
-
 
 class _HttpBraveImageSearchTransport:
     def fetch(
@@ -951,6 +965,48 @@ class _BraveImageSearchProvider:
         return records
 
 
+class _LocalPdfRasterizerProvider:
+    name = DEFAULT_PDF_RASTERIZER_PROVIDER
+
+    def __init__(self) -> None:
+        self.last_status: dict[str, Any] = {}
+
+    def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
+        result = collect_pdf_rasterizer_candidates(
+            run_dir=context.run_dir,
+            sources=tuple(context.source_by_id.values()),
+            routes=context.routes,
+            created_at=context.created_at,
+            max_pdf_bytes=context.max_pdf_bytes,
+            provider=self.name,
+            provider_mode="fixture",
+        )
+        self.last_status = {
+            "provider": self.name,
+            "provider_kind": "pdf_rasterizer",
+            "provider_mode": "fixture",
+            "configured": True,
+            "available": True,
+            "blocked_reason": None,
+            "invoked": True,
+            "invocations": 1,
+            "candidates": len(result.candidates),
+            "candidates_discovered": len(result.candidates),
+            "artifacts_fetched": result.pages_rasterized,
+            "vlm_images_analyzed": 0,
+            "diagnostics": result.diagnostics,
+            "pdf_pages_configured": result.pages_configured,
+            "pdf_pages_rasterized": result.pages_rasterized,
+            "pdf_pages_skipped": result.pages_skipped,
+            "estimated_cost_usd": result.estimated_cost_usd,
+            "actual_cost_usd": result.actual_cost_usd,
+            "last_error": result.diagnostics[0]["reason"] if result.diagnostics else None,
+            "external_network_call": False,
+            "external_vlm_call": False,
+        }
+        return result.candidates
+
+
 class _ImageHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -1095,6 +1151,12 @@ def _validate_and_select_candidates(
         if "status" not in record:
             artifact = _materialize_candidate_artifact(run_dir, record)
             record["local_artifact_path"] = artifact.relative_to(run_dir).as_posix()
+            if (
+                record.get("origin") in {"pdf_page", "pdf_figure"}
+                and not _string(record.get("image_url"))
+                and artifact.is_file()
+            ):
+                record["image_url"] = artifact.as_uri()
         else:
             artifact = run_dir / str(record.get("local_artifact_path", ""))
 
@@ -1210,12 +1272,24 @@ def _validate_and_select_candidates(
         record["validation_checks"] = validation_checks
 
         if removal_reasons:
+            pdf_failure_reasons = {
+                "encrypted_pdf",
+                "missing_pdf_artifact",
+                "policy_manual_review_pdf",
+                "too_large_pdf",
+                "unsupported_pdf",
+            }
             record["status"] = "removed"
             record["removal_reasons"] = removal_reasons
             record["analysis_status"] = "skipped"
             if "budget_pruned" in removal_reasons:
                 record["candidate_status"] = "budget_pruned"
                 record["policy_decision"] = "budget_pruned"
+            elif record.get("policy_decision") == "blocked":
+                record["candidate_status"] = "policy_blocked"
+                record["analysis_status"] = "policy_blocked"
+            elif set(removal_reasons) & pdf_failure_reasons:
+                record["candidate_status"] = "fetch_failed"
             else:
                 record["candidate_status"] = "rejected"
             record.setdefault("observations", [])
@@ -1308,6 +1382,12 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     }
     if isinstance(candidate.get("screenshot"), Mapping):
         observation["screenshot"] = dict(candidate["screenshot"])
+    for key in ("pdf_url", "pdf_local_path", "page_number"):
+        if key in candidate:
+            observation[key] = candidate.get(key)
+    for key in ("figure_hint", "rasterizer", "compute_counters", "cost_counters", "pdf_diagnostic"):
+        if isinstance(candidate.get(key), Mapping):
+            observation[key] = dict(candidate[key])
     return observation
 
 
@@ -1409,39 +1489,44 @@ def _image_fetch_records_from_candidates(
         candidate_id = str(candidate["candidate_id"])
         status = _fetch_status_for_candidate(candidate)
         fetched = status == "fetched"
-        records.append(
-            {
-                "fetch_id": _fetch_id_for_candidate_id(candidate_id),
-                "candidate_id": candidate_id,
-                "task_id": candidate.get("task_id"),
-                "angle_id": candidate.get("angle_id"),
-                "source_search_result_id": candidate.get("source_search_result_id"),
-                "provider": candidate.get("provider"),
-                "provider_kind": candidate.get("provider_kind"),
-                "provider_mode": candidate.get("provider_mode"),
-                "provider_run_id": candidate.get("provider_run_id"),
-                "provider_provenance": dict(candidate.get("provider_provenance", {}))
-                if isinstance(candidate.get("provider_provenance"), Mapping)
-                else {},
-                "fetch_status": status,
-                "http_status": None,
-                "mime_type": candidate.get("mime_type") if fetched else None,
-                "byte_size": candidate.get("artifact_size_bytes") if fetched else None,
-                "width": candidate.get("width") if fetched else None,
-                "height": candidate.get("height") if fetched else None,
-                "hash": candidate.get("hash") if fetched else None,
-                "phash": candidate.get("phash") if fetched else None,
-                "local_artifact_path": candidate.get("local_artifact_path") if fetched else None,
-                "evidence_image_id": _image_id_for_candidate_id(candidate_id) if fetched else None,
-                "policy_decision": candidate.get("policy_decision", "allowed"),
-                "policy_flags": list(candidate.get("policy_flags", []))
-                if isinstance(candidate.get("policy_flags"), list)
-                else [],
-                "failure_code": None if fetched else _failure_code(candidate),
-                "estimated_cost_usd": candidate.get("estimated_cost_usd", 0.0),
-                "actual_cost_usd": candidate.get("actual_cost_usd", 0.0),
-            }
-        )
+        record = {
+            "fetch_id": _fetch_id_for_candidate_id(candidate_id),
+            "candidate_id": candidate_id,
+            "task_id": candidate.get("task_id"),
+            "angle_id": candidate.get("angle_id"),
+            "source_search_result_id": candidate.get("source_search_result_id"),
+            "provider": candidate.get("provider"),
+            "provider_kind": candidate.get("provider_kind"),
+            "provider_mode": candidate.get("provider_mode"),
+            "provider_run_id": candidate.get("provider_run_id"),
+            "provider_provenance": dict(candidate.get("provider_provenance", {}))
+            if isinstance(candidate.get("provider_provenance"), Mapping)
+            else {},
+            "fetch_status": status,
+            "http_status": None,
+            "mime_type": candidate.get("mime_type") if fetched else None,
+            "byte_size": candidate.get("artifact_size_bytes") if fetched else None,
+            "width": candidate.get("width") if fetched else None,
+            "height": candidate.get("height") if fetched else None,
+            "hash": candidate.get("hash") if fetched else None,
+            "phash": candidate.get("phash") if fetched else None,
+            "local_artifact_path": candidate.get("local_artifact_path") if fetched else None,
+            "evidence_image_id": _image_id_for_candidate_id(candidate_id) if fetched else None,
+            "policy_decision": candidate.get("policy_decision", "allowed"),
+            "policy_flags": list(candidate.get("policy_flags", []))
+            if isinstance(candidate.get("policy_flags"), list)
+            else [],
+            "failure_code": None if fetched else _failure_code(candidate),
+            "estimated_cost_usd": candidate.get("estimated_cost_usd", 0.0),
+            "actual_cost_usd": candidate.get("actual_cost_usd", 0.0),
+        }
+        for key in ("pdf_url", "pdf_local_path", "page_number"):
+            if key in candidate:
+                record[key] = candidate.get(key)
+        for key in ("figure_hint", "rasterizer", "compute_counters", "cost_counters", "pdf_diagnostic"):
+            if isinstance(candidate.get(key), Mapping):
+                record[key] = dict(candidate[key])
+        records.append(record)
     return records
 
 
@@ -1465,7 +1550,7 @@ def _visual_search_plan(
                 "task_id": task_id,
                 "angle_id": route.get("id"),
                 "route": route.get("modality"),
-                "target_evidence_type": "web_image",
+                "target_evidence_type": _target_evidence_type(provider_names),
                 "query": str(evidence.get("question") or ""),
                 "providers": list(provider_names),
                 "source_search_result_ids": [],
@@ -1531,6 +1616,9 @@ def _visual_provider_status(
             item for item in observations if item.get("provider") == provider
         ]
         invoked = provider_status.get("invoked")
+        provider_mode = _string(provider_status.get("provider_mode")) or "fixture"
+        estimated_cost = _number_or_zero(provider_status.get("estimated_cost_usd"))
+        actual_cost = _number_or_zero(provider_status.get("actual_cost_usd"))
         providers.append(
             {
                 "provider": provider,
@@ -1614,6 +1702,17 @@ def _provider_kind(provider: str) -> str:
     return "visual_acquisition"
 
 
+def _target_evidence_type(provider_names: Sequence[str]) -> str:
+    provider_kinds = {_provider_kind(provider) for provider in provider_names}
+    if provider_kinds == {"pdf_rasterizer"}:
+        return "pdf_figure"
+    if provider_kinds == {"screenshot"}:
+        return "screenshot"
+    if provider_kinds == {"page_extractor"}:
+        return "page_image"
+    return "web_image"
+
+
 def _task_id_for_angle(angle_id: Any) -> str:
     raw = _string(angle_id) or "angle_001"
     suffix = raw.removeprefix("angle_")
@@ -1638,12 +1737,24 @@ def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
     if candidate.get("status") == "accepted":
         return "fetched"
     reasons = set(_string_list(candidate.get("removal_reasons")))
+    if candidate.get("policy_decision") == "blocked" or reasons & {
+        "policy_blocked_pdf",
+        "paywalled_pdf",
+    }:
+        return "policy_blocked"
     if "budget_pruned" in reasons:
         return "budget_pruned"
     if "unsupported_mime_type" in reasons:
         return "unsupported_mime"
-    if "size_limit_exceeded" in reasons:
+    if reasons & {"size_limit_exceeded", "too_large_pdf"}:
         return "too_large"
+    if reasons & {
+        "encrypted_pdf",
+        "missing_pdf_artifact",
+        "policy_manual_review_pdf",
+        "unsupported_pdf",
+    }:
+        return "failed"
     if reasons & {"duplicate_image_url", "duplicate_content_hash", "near_duplicate"}:
         return "deduped"
     return "skipped"
@@ -2651,6 +2762,8 @@ def _providers(
                     transport=real_image_search_transport,
                 )
             )
+        elif name == DEFAULT_PDF_RASTERIZER_PROVIDER:
+            providers.append(_LocalPdfRasterizerProvider())
         else:
             raise VisualAcquisitionError(f"unknown visual provider: {name}")
     return providers
@@ -2662,6 +2775,8 @@ def _normalize_provider_names(providers: Sequence[str] | None) -> tuple[str, ...
     for provider in raw:
         for item in str(provider).split(","):
             name = item.strip().lower().replace("_", "-")
+            if name == "pdf-rasterizer":
+                name = DEFAULT_PDF_RASTERIZER_PROVIDER
             if name:
                 normalized.append(name)
     if not normalized:
@@ -2766,6 +2881,48 @@ def _screenshot_capture_summary(
     }
 
 
+def _pdf_rasterization_summary(
+    records: Sequence[Mapping[str, Any]],
+    provider_statuses: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    pdf_records = [record for record in records if record.get("provider_kind") == "pdf_rasterizer"]
+    diagnostics = []
+    for record in pdf_records:
+        if record.get("status") == "accepted":
+            continue
+        diagnostics.append(
+            {
+                "candidate_id": record.get("candidate_id"),
+                "source_id": record.get("source_id"),
+                "pdf_url": record.get("pdf_url"),
+                "page_number": record.get("page_number"),
+                "failure_code": _failure_code(record),
+                "policy_decision": record.get("policy_decision"),
+                "policy_flags": list(record.get("policy_flags", []))
+                if isinstance(record.get("policy_flags"), list)
+                else [],
+            }
+        )
+    provider_diagnostics = []
+    for status in provider_statuses:
+        if status.get("provider") != DEFAULT_PDF_RASTERIZER_PROVIDER:
+            continue
+        raw = status.get("diagnostics")
+        if isinstance(raw, list):
+            provider_diagnostics.extend(item for item in raw if isinstance(item, Mapping))
+    return {
+        "provider": DEFAULT_PDF_RASTERIZER_PROVIDER,
+        "candidates": len(pdf_records),
+        "pages_rasterized": sum(1 for record in pdf_records if record.get("status") == "accepted"),
+        "pages_skipped": len(diagnostics),
+        "diagnostics": diagnostics or [dict(item) for item in provider_diagnostics],
+        "estimated_cost_usd": sum(
+            float(record.get("estimated_cost_usd") or 0.0) for record in pdf_records
+        ),
+        "actual_cost_usd": sum(float(record.get("actual_cost_usd") or 0.0) for record in pdf_records),
+    }
+
+
 def _route_summary(routes: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -2808,6 +2965,27 @@ def _normalized_candidate_url(record: Mapping[str, Any]) -> str | None:
         screenshot = record.get("screenshot")
         mode = screenshot.get("mode") if isinstance(screenshot, Mapping) else None
         return normalize_url(page_url) + "#screenshot:" + str(mode or record.get("local_artifact_path"))
+    if record.get("origin") in {"pdf_page", "pdf_figure"}:
+        page_url = _string(record.get("page_url")) or _string(record.get("pdf_url"))
+        if not page_url:
+            return None
+        figure_hint = record.get("figure_hint")
+        figure_key = ""
+        if isinstance(figure_hint, Mapping):
+            figure_key = ":" + _safe_id(
+                str(
+                    figure_hint.get("label")
+                    or figure_hint.get("figure")
+                    or figure_hint.get("caption")
+                    or "figure"
+                )
+            )
+        return (
+            normalize_url(page_url)
+            + "#pdf-page:"
+            + str(record.get("page_number") or record.get("local_artifact_path"))
+            + figure_key
+        )
     value = _string(record.get("image_url")) or _string(record.get("page_url"))
     if not value:
         return None
@@ -2872,6 +3050,19 @@ def _int_or_zero(value: Any) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _number_or_zero(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _string(value: Any) -> str | None:
