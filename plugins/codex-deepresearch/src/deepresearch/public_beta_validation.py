@@ -173,10 +173,15 @@ def run_public_beta_validation(
     )
     outcome_counts = _outcome_counts(evaluated_runs)
     classification_counts = _classification_counts(evaluated_runs)
-    release_gate_ready = all(
+    prompt_release_gate_ready = all(
         metric.get("release_gate_ready") is True
         for metric in prompt_metrics.values()
     )
+    external_release_gate_ready = all(
+        result.get("release_gate_ready") is True
+        for result in external_gate_results.values()
+    )
+    release_gate_ready = prompt_release_gate_ready and external_release_gate_ready
     pre_summary_acceptance = {
         key: value
         for key, value in acceptance.items()
@@ -199,6 +204,10 @@ def run_public_beta_validation(
         "public_safe": True,
         "raw_run_bundles_copied": False,
         "release_gate_ready": release_gate_ready and status == "passed",
+        "release_gate_components": {
+            "prompt_metrics_ready": prompt_release_gate_ready,
+            "external_gates_ready": external_release_gate_ready,
+        },
         "prompt_coverage": {
             "total_prompts": len(prompts),
             "visual_prompts": sum(
@@ -336,6 +345,7 @@ def evaluate_public_beta_prompt_run(
         detail = "run_status.json is missing or invalid"
     else:
         classification, status = _metric_classification(
+            prompt,
             terminal_status,
             run_status if isinstance(run_status, Mapping) else {},
         )
@@ -803,11 +813,17 @@ def _required_status_artifacts(
 
 
 def _metric_classification(
+    prompt: Mapping[str, Any],
     terminal_status: str,
     run_status: Mapping[str, Any],
 ) -> tuple[str, str]:
     ok = run_status.get("ok") is True
     terminal = run_status.get("terminal") is True
+    route = prompt.get("route")
+    if route in VISUAL_ROUTES and terminal_status in PASS_TERMINAL_STATUSES:
+        if terminal_status == "completed_auto_visual" and ok and terminal:
+            return "success", "passed"
+        return "included_failure", "failed"
     if terminal_status in PASS_TERMINAL_STATUSES and ok and terminal:
         return "success", "passed"
     if terminal_status in BLOCKED_TERMINAL_STATUSES:

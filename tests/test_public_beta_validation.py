@@ -17,6 +17,7 @@ sys.path.insert(0, str(PLUGIN_SRC))
 from deepresearch.public_beta_validation import (  # noqa: E402
     DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
     PublicBetaValidationError,
+    evaluate_public_beta_prompt_run,
     load_public_beta_prompt_manifest,
     run_public_beta_validation,
 )
@@ -113,6 +114,58 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(metric["denominator_completed_non_blocked"], 2)
         self.assertEqual(metric["pass_rate"], 0.5)
 
+    def test_visual_prompt_requires_completed_auto_visual_to_pass(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "visual-text-terminal",
+            run_status="completed_parallel",
+            provider_status="blocked_missing_visual_provider",
+        )
+
+        result = evaluate_public_beta_prompt_run(prompt, run_dir)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["metric_classification"], "included_failure")
+        self.assertEqual(result["failure_category"], "provider_failure")
+
+    def test_missing_external_gate_results_prevent_release_ready(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        runs_dir = self.temp_dir()
+        prompt_runs = {}
+        for prompt in manifest["prompts"]:
+            if prompt["route"] in {"visual_required", "visual_optional"}:
+                prompt_runs[prompt["id"]] = self.write_visual_run(
+                    runs_dir / prompt["id"],
+                    run_status="completed_auto_visual",
+                    provider_status="completed_auto_visual",
+                )
+            else:
+                prompt_runs[prompt["id"]] = self.write_text_run(
+                    runs_dir / prompt["id"],
+                    status="completed_parallel",
+                )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id="missing-external-gates",
+                clean=True,
+                prompt_runs=prompt_runs,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["outcome_counts"]["passed"], 20)
+        self.assertFalse(payload["release_gate_ready"])
+        self.assertTrue(payload["release_gate_components"]["prompt_metrics_ready"])
+        self.assertFalse(payload["release_gate_components"]["external_gates_ready"])
+        self.assertTrue(
+            any("External gate result artifacts were not supplied" in gap for gap in payload["remaining_gaps"])
+        )
+
     def test_cli_allow_blocked_outputs_sanitized_results_and_exits_zero(self) -> None:
         runs_dir = self.temp_dir()
         command = subprocess.run(
@@ -163,6 +216,61 @@ class PublicBetaValidationTests(unittest.TestCase):
                 {"schema_version": "codex-deepresearch.report-status.v0", "used_images": []},
             )
             (run_dir / "report.md").write_text("# Public-safe report\n", encoding="utf-8")
+        return run_dir
+
+    def write_visual_run(
+        self,
+        run_dir: Path,
+        *,
+        run_status: str,
+        provider_status: str,
+    ) -> Path:
+        run_dir.mkdir(parents=True)
+        self.write_json(
+            run_dir / "run_status.json",
+            {
+                "schema_version": "codex-deepresearch.run-status.v0",
+                "status": run_status,
+                "ok": run_status == "completed_auto_visual",
+                "terminal": True,
+                "selected_mode": "automated-cli",
+            },
+        )
+        self.write_json(
+            run_dir / "evidence.json",
+            {"schema_version": "0.1.0", "mode": "automated-cli"},
+        )
+        self.write_json(
+            run_dir / "report_status.json",
+            {"schema_version": "codex-deepresearch.report-status.v0", "used_images": ["img_001"]},
+        )
+        self.write_json(
+            run_dir / "visual_provider_status.json",
+            {
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "status": provider_status,
+                "ok": provider_status == "completed_auto_visual",
+                "terminal": True,
+                "providers": [
+                    {
+                        "provider": "openai-responses-vision",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "configured": provider_status == "completed_auto_visual",
+                        "available": provider_status == "completed_auto_visual",
+                        "vlm_images_analyzed": 3 if provider_status == "completed_auto_visual" else 0,
+                    }
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {"schema_version": "codex-deepresearch.visual-artifacts.v0", "tasks": []},
+        )
+        (run_dir / "visual_candidates.jsonl").write_text("{}\n", encoding="utf-8")
+        (run_dir / "image_fetch_status.jsonl").write_text("{}\n", encoding="utf-8")
+        (run_dir / "visual_observations.jsonl").write_text("{}\n", encoding="utf-8")
+        (run_dir / "report.md").write_text("# Public-safe visual report\n", encoding="utf-8")
         return run_dir
 
 
