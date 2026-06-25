@@ -166,7 +166,16 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertEqual(provider_status["providers"][0]["provider_kind"], "screenshot")
         self.assertEqual(provider_status["providers"][0]["provider_mode"], "fixture")
         self.assertEqual(provider_status["providers"][0]["artifacts_fetched"], 2)
+        self.assertEqual(provider_status["providers"][0]["captures_completed"], 2)
+        self.assertEqual(provider_status["providers"][0]["captures_succeeded"], 2)
+        self.assertEqual(provider_status["providers"][0]["captures_validated"], 2)
+        self.assertEqual(
+            provider_status["providers"][0]["captures_rejected_after_validation"], 0
+        )
         self.assertEqual(provider_status["providers"][0]["vlm_images_analyzed"], 0)
+        self.assertEqual(result["providers"][0]["captures_completed"], 2)
+        self.assertEqual(result["providers"][0]["captures_succeeded"], 2)
+        self.assertEqual(result["providers"][0]["captures_validated"], 2)
 
         for candidate in candidates:
             self.assertEqual(candidate["policy_decision"], "allowed")
@@ -327,7 +336,16 @@ class BrowserScreenshotTests(unittest.TestCase):
         fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
         self.assertEqual(candidates[0]["status"], "removed")
         self.assertIn("missing_content_hash", candidates[0]["removal_reasons"])
+        self.assertEqual(candidates[0]["candidate_status"], "rejected")
+        self.assertEqual(candidates[0]["rejection_reason"], "missing_content_hash")
         self.assertNotEqual(candidates[0]["candidate_status"], "fetched")
+        screenshot = candidates[0]["screenshot"]
+        self.assertFalse(screenshot["supported"])
+        self.assertEqual(screenshot["unsupported_reason"], "missing_content_hash")
+        self.assertEqual(screenshot["candidate_status"], "rejected")
+        self.assertEqual(screenshot["rejection_reason"], "missing_content_hash")
+        self.assertEqual(screenshot["failure_code"], "missing_content_hash")
+        self.assertEqual(screenshot["policy_decision"], "allowed")
         self.assertNotEqual(fetches[0]["fetch_status"], "fetched")
         self.assertIsNone(fetches[0]["local_artifact_path"])
         self.assertIsNone(fetches[0]["hash"])
@@ -338,7 +356,22 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertFalse(provider_status["ok"])
         self.assertTrue(provider_status["terminal"])
         self.assertEqual(provider["artifacts_fetched"], 0)
-        self.assertEqual(result["providers"][0]["captures_succeeded"], 1)
+        self.assertEqual(provider["captures_completed"], 1)
+        self.assertEqual(provider["captures_succeeded"], 0)
+        self.assertEqual(provider["captures_validated"], 0)
+        self.assertEqual(provider["captures_rejected_after_validation"], 1)
+        self.assertEqual(result["providers"][0]["captures_completed"], 1)
+        self.assertEqual(result["providers"][0]["captures_succeeded"], 0)
+        self.assertEqual(result["providers"][0]["captures_validated"], 0)
+        self.assertEqual(result["providers"][0]["captures_rejected_after_validation"], 1)
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence_provider = evidence["visual_acquisition"]["providers"][0]
+        self.assertEqual(evidence_provider["captures_completed"], 1)
+        self.assertEqual(evidence_provider["captures_succeeded"], 0)
+        self.assertEqual(evidence_provider["captures_validated"], 0)
+        self.assertEqual(
+            evidence_provider["captures_rejected_after_validation"], 1
+        )
 
     def test_access_denied_http_status_after_navigation_is_policy_blocked(self) -> None:
         run_dir = self.prepared_visual_run()
@@ -480,7 +513,9 @@ class BrowserScreenshotTests(unittest.TestCase):
         provider = self.read_json(run_dir / "visual_provider_status.json")["providers"][0]
         self.assertEqual(provider["artifacts_fetched"], 1)
         self.assertFalse(provider["external_network_call"])
+        self.assertEqual(provider["captures_completed"], 1)
         self.assertEqual(result["providers"][0]["captures_succeeded"], 1)
+        self.assertEqual(result["providers"][0]["captures_validated"], 1)
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertFalse(evidence["visual_acquisition"]["external_network_call"])
 

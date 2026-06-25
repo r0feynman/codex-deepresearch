@@ -332,6 +332,7 @@ def collect_browser_screenshot_candidates(
         "invocations": captures_attempted,
         "candidates": len(candidates),
         "captures_attempted": captures_attempted,
+        "captures_completed": captures_succeeded,
         "captures_succeeded": captures_succeeded,
         "captures_skipped": captures_skipped,
         "external_network_call": confirmed_external_network_call

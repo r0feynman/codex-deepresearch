@@ -280,6 +280,11 @@ def acquire_visual_candidates(
     visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
     image_fetch_records = _image_fetch_records_from_candidates(candidate_records)
+    provider_statuses = _reconcile_screenshot_provider_statuses_after_validation(
+        provider_statuses=provider_statuses,
+        candidate_records=candidate_records,
+        image_fetch_records=image_fetch_records,
+    )
     real_provider_succeeded = _real_provider_succeeded(
         provider_statuses=provider_statuses,
         image_fetch_records=image_fetch_records,
@@ -1346,9 +1351,32 @@ def _validate_and_select_candidates(
         record["rejection_reason"] = (
             record["removal_reasons"][0] if record.get("removal_reasons") else None
         )
+        _sync_nested_screenshot_validation_metadata(record)
         records.append(_persistable_candidate(record))
 
     return selected, records, list(near_duplicate_groups.values())
+
+
+def _sync_nested_screenshot_validation_metadata(record: dict[str, Any]) -> None:
+    screenshot = record.get("screenshot")
+    if not isinstance(screenshot, Mapping) or record.get("status") != "removed":
+        return
+    reason = _string(record.get("rejection_reason")) or _string(
+        record.get("candidate_status")
+    ) or "removed"
+    updated = dict(screenshot)
+    updated.update(
+        {
+            "supported": False,
+            "unsupported_reason": reason,
+            "candidate_status": record.get("candidate_status"),
+            "rejection_reason": reason,
+            "failure_code": reason,
+            "policy_decision": record.get("policy_decision", "allowed"),
+            "policy_flags": list(_string_list(record.get("policy_flags"))),
+        }
+    )
+    record["screenshot"] = updated
 
 
 def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -1605,6 +1633,65 @@ def _real_provider_succeeded(
     )
 
 
+def _reconcile_screenshot_provider_statuses_after_validation(
+    *,
+    provider_statuses: Sequence[Mapping[str, Any]],
+    candidate_records: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    fetched_by_provider: dict[str, int] = {}
+    rejected_after_validation_by_provider: dict[str, int] = {}
+    for fetch in image_fetch_records:
+        if fetch.get("provider_kind") != "screenshot":
+            continue
+        provider = _string(fetch.get("provider"))
+        if not provider:
+            continue
+        if (
+            fetch.get("fetch_status") == "fetched"
+            and bool(_string(fetch.get("local_artifact_path")))
+            and bool(_string(fetch.get("hash")))
+        ):
+            fetched_by_provider[provider] = fetched_by_provider.get(provider, 0) + 1
+    for candidate in candidate_records:
+        if candidate.get("provider_kind") != "screenshot":
+            continue
+        if not isinstance(candidate.get("raw_provider_metadata"), Mapping):
+            continue
+        if candidate.get("candidate_status") == "fetched":
+            continue
+        provider = _string(candidate.get("provider"))
+        if not provider:
+            continue
+        rejected_after_validation_by_provider[provider] = (
+            rejected_after_validation_by_provider.get(provider, 0) + 1
+        )
+
+    reconciled: list[dict[str, Any]] = []
+    for status in provider_statuses:
+        updated = dict(status)
+        provider = _string(updated.get("provider"))
+        provider_kind = _string(updated.get("provider_kind")) or _provider_kind(provider)
+        has_browser_capture_counters = any(
+            counter in updated
+            for counter in ("captures_attempted", "captures_completed", "captures_succeeded")
+        )
+        if provider and provider_kind == "screenshot" and has_browser_capture_counters:
+            completed = _int_or_zero(updated.get("captures_completed"))
+            if completed == 0:
+                completed = _int_or_zero(updated.get("captures_succeeded"))
+            validated = fetched_by_provider.get(provider, 0)
+            updated["captures_completed"] = completed
+            updated["captures_succeeded"] = validated
+            updated["captures_validated"] = validated
+            updated["captures_rejected_after_validation"] = (
+                rejected_after_validation_by_provider.get(provider, 0)
+            )
+            updated["artifacts_fetched"] = validated
+        reconciled.append(updated)
+    return reconciled
+
+
 def _visual_search_plan(
     *,
     run_dir: Path,
@@ -1738,6 +1825,16 @@ def _visual_provider_status(
                 ),
             }
         )
+        for counter in (
+            "captures_attempted",
+            "captures_completed",
+            "captures_succeeded",
+            "captures_validated",
+            "captures_rejected_after_validation",
+            "captures_skipped",
+        ):
+            if counter in provider_status:
+                providers[-1][counter] = _int_or_zero(provider_status.get(counter))
     return {
         "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
         "run_id": run_dir.name,
