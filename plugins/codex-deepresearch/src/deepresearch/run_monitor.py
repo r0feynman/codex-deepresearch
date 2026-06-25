@@ -14,6 +14,7 @@ _KNOWN_ARTIFACTS = {
     "planning_status": "status.json",
     "ingest_status": "ingest_status.json",
     "run_steps": "run_steps.json",
+    "run_control": "run_control.json",
     "run_trace": "run_trace.jsonl",
     "evidence": "evidence.json",
     "budget_estimate": "budget_estimate.json",
@@ -103,6 +104,7 @@ def inspect_run_monitor(run_dir: str | Path) -> dict[str, Any]:
     run_status = _mapping(payloads.get("run_status"))
     planning_status = _mapping(payloads.get("planning_status"))
     run_steps = _mapping(payloads.get("run_steps"))
+    run_control = _control_payload(payloads, run_steps)
     evidence = _mapping(payloads.get("evidence"))
     budget_estimate = _mapping(payloads.get("budget_estimate"))
     research_tasks = _mapping(payloads.get("research_tasks"))
@@ -113,16 +115,17 @@ def inspect_run_monitor(run_dir: str | Path) -> dict[str, Any]:
     image_fetch_status = _list(payloads.get("image_fetch_status"))
     run_trace = _list(payloads.get("run_trace"))
     subagent_assignments = _list(payloads.get("subagent_assignments"))
-    phase = _phase_summary(run_steps, run_status, planning_status, run_trace)
+    phase = _phase_summary(run_steps, run_status, planning_status, run_control, run_trace)
 
     return {
         "schema_version": RUN_MONITOR_SCHEMA_VERSION,
         "run_id": _run_id(run_dir, run_status, planning_status, evidence, parallel_status),
         "run_dir": str(run_dir),
-        "status": _monitor_status(run_status, planning_status, parallel_status, phase, payloads),
+        "status": _monitor_status(run_status, planning_status, parallel_status, run_control, phase, payloads),
         "ok": _monitor_ok(run_status, parallel_status, phase, payloads),
-        "terminal": _monitor_terminal(run_status, phase, payloads),
+        "terminal": _monitor_terminal(run_status, run_control, phase, payloads),
         "phase": phase,
+        "control": _control_summary(run_control, run_steps),
         "mode": _mode_summary(run_status, evidence, parallel_status, merge_status),
         "shards": _shard_summary(
             research_tasks,
@@ -200,6 +203,7 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
     """Render one run monitor detail view."""
 
     phase = _mapping(payload.get("phase"))
+    control = _mapping(payload.get("control"))
     mode = _mapping(payload.get("mode"))
     shards = _mapping(payload.get("shards"))
     counts = _mapping(payload.get("evidence_counts"))
@@ -215,6 +219,7 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
         f"Run directory: {payload.get('run_dir') or '<unknown>'}",
         f"Status: {payload.get('status') or '<unknown>'}; ok={_display_bool(payload.get('ok'))}; terminal={_display_bool(payload.get('terminal'))}",
         f"Phase: {_phase_label(phase)}; next_safe_stage={phase.get('next_safe_stage') or '<none>'}",
+        _control_detail_line(control),
         f"Mode: {mode.get('label') or 'unknown'}; adapter={mode.get('adapter') or '<none>'}; degraded={_display_bool(mode.get('parallel_degraded'))}; serial_handoff={_display_bool(mode.get('needs_serial_handoff'))}",
         (
             "Shards: "
@@ -319,9 +324,13 @@ def _monitor_status(
     run_status: Mapping[str, Any],
     planning_status: Mapping[str, Any],
     parallel_status: Mapping[str, Any],
+    run_control: Mapping[str, Any],
     phase: Mapping[str, Any],
     payloads: Mapping[str, Any],
 ) -> str:
+    control_status = _status_text(run_control.get("status"))
+    if control_status in {"paused", "cancelled"}:
+        return control_status
     if run_status.get("terminal") is True:
         return _run_status(run_status)
 
@@ -356,9 +365,14 @@ def _monitor_ok(
 
 def _monitor_terminal(
     run_status: Mapping[str, Any],
+    run_control: Mapping[str, Any],
     phase: Mapping[str, Any],
     payloads: Mapping[str, Any],
 ) -> bool | None:
+    if run_control.get("status") == "cancelled" or run_control.get("terminal") is True:
+        return True
+    if run_control.get("status") == "paused":
+        return False
     phase_payload = _phase_status_payload(phase, payloads)
     if run_status.get("terminal") is True:
         return True
@@ -401,12 +415,69 @@ def _status_text(value: Any) -> str | None:
     return None
 
 
+def _control_payload(
+    payloads: Mapping[str, Any],
+    run_steps: Mapping[str, Any],
+) -> dict[str, Any]:
+    artifact_payload = _mapping(payloads.get("run_control"))
+    if artifact_payload:
+        return artifact_payload
+    return _mapping(run_steps.get("control"))
+
+
+def _control_summary(
+    run_control: Mapping[str, Any],
+    run_steps: Mapping[str, Any],
+) -> dict[str, Any]:
+    history = _list(run_control.get("history"))
+    if not history:
+        history = _list(run_steps.get("control_history"))
+    diagnostics = _mapping(run_control.get("diagnostics"))
+    close_records = _list(diagnostics.get("child_context_close_records"))
+    known_contexts = _list(run_control.get("known_child_contexts"))
+    status = _status_text(run_control.get("status"))
+    return {
+        "status": status,
+        "action": _status_text(run_control.get("action")),
+        "terminal": _first_present_bool(run_control.get("terminal")),
+        "requested_at": _status_text(run_control.get("requested_at")),
+        "requested_by": _status_text(run_control.get("requested_by")),
+        "reason": _status_text(run_control.get("reason")),
+        "resume_next_safe_stage": _status_text(
+            run_control.get("resume_next_safe_stage")
+            or run_control.get("next_safe_stage")
+        ),
+        "history_count": len(history),
+        "known_child_contexts": len(known_contexts),
+        "child_close_records": len(close_records),
+        "actionable_cause": _status_text(diagnostics.get("actionable_cause")),
+    }
+
+
 def _phase_summary(
     run_steps: Mapping[str, Any],
     run_status: Mapping[str, Any],
     planning_status: Mapping[str, Any],
+    run_control: Mapping[str, Any],
     run_trace: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    control_status = _status_text(run_control.get("status"))
+    if control_status == "cancelled":
+        return {
+            "stage": "cancelled",
+            "status": "cancelled",
+            "next_safe_stage": None,
+            "source": "run_control",
+        }
+    if control_status == "paused":
+        next_stage = run_steps.get("next_safe_stage") or run_control.get("resume_next_safe_stage")
+        return {
+            "stage": "paused",
+            "status": str(next_stage or "paused"),
+            "next_safe_stage": next_stage,
+            "next_stage_retryable": bool(run_steps.get("next_stage_retryable")),
+            "source": "run_control",
+        }
     stages = run_steps.get("stages")
     if isinstance(stages, Mapping):
         running = _first_stage_with_status(stages, {"running"})
@@ -914,6 +985,18 @@ def _phase_label(phase: Mapping[str, Any]) -> str:
     stage = phase.get("stage") or "<unknown>"
     status = phase.get("status") or "unknown"
     return f"{stage}/{status}"
+
+
+def _control_detail_line(control: Mapping[str, Any]) -> str:
+    status = control.get("status") or "active"
+    return (
+        "Control: "
+        f"status={status}; "
+        f"action={control.get('action') or '<none>'}; "
+        f"resume_next_safe_stage={control.get('resume_next_safe_stage') or '<none>'}; "
+        f"child_contexts={_int(control.get('known_child_contexts'))}; "
+        f"close_records={_int(control.get('child_close_records'))}"
+    )
 
 
 def _budget_label(budget: Mapping[str, Any]) -> str:

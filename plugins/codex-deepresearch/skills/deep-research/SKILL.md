@@ -59,6 +59,16 @@ In plugin mode, do not assume a hidden Codex search API is available to the runn
 10. Run `plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run <run_id_or_path>` to write `report.md` and `report_status.json` from supported, reviewed claims only. This runner stage uses only local evidence and must not call external models, VLMs, web search, or APIs.
 11. Continue only from the normalized `evidence.json`, `fetch_queue.json`, `visual_observations.jsonl`, `guardrails_status.json`, `verifier_votes.jsonl`, fetched source artifacts, `report.md`, and `report_status.json`.
 
+## Run Controls
+
+Use `plugins/codex-deepresearch/scripts/codex-deepresearch pause-run --run <run_id_or_path>` when the operator asks to pause an active run. Pause records `run_control.json`, updates `run_steps.json`, preserves evidence and cache artifacts, and blocks new stage starts until resume.
+
+Use `plugins/codex-deepresearch/scripts/codex-deepresearch resume-run --run <run_id_or_path>` to clear the pause gate. Resume does not rerun completed stages by itself; continue from the reported `next_safe_stage` so existing run steps/cache remain authoritative.
+
+Use `plugins/codex-deepresearch/scripts/codex-deepresearch cancel-run --run <run_id_or_path>` when the operator asks to stop a run permanently. Cancel records terminal `run_status.json` diagnostics, persists requested/attempted child-context close records from known run artifacts, and must not delete evidence, source, visual, shard, or report artifacts.
+
+Use `monitor-list`, `monitor-detail`, or `run-status` to inspect paused or cancelled runs. Interrupted runs must remain visible and their control status should be reported honestly.
+
 ## Manual Sources Fallback
 
 When the user provides URLs, PDF URLs, image URLs, or local image files directly, or when Codex-native search handoff is blocked, do not call external search. Use the manual source path:

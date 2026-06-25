@@ -19,6 +19,7 @@ from deepresearch.run_monitor import (  # noqa: E402
     render_run_detail,
     render_run_list,
 )
+from deepresearch.run_state import cancel_run, pause_run  # noqa: E402
 
 
 class RunMonitorTests(unittest.TestCase):
@@ -57,6 +58,71 @@ class RunMonitorTests(unittest.TestCase):
             },
         )
         return run_dir
+
+    def test_interrupted_controls_are_visible_in_list_and_detail(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        paused_dir = self.make_run(runs_dir, "run-paused-001")
+        pause_run(
+            paused_dir,
+            reason="monitor_pause",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+
+        paused_detail = inspect_run_monitor(paused_dir)
+        paused_list = list_run_monitors(runs_dir)
+        rendered_paused_detail = render_run_detail(paused_detail)
+        rendered_paused_list = render_run_list(paused_list)
+
+        self.assertEqual(paused_detail["status"], "paused")
+        self.assertFalse(paused_detail["terminal"])
+        self.assertEqual(paused_detail["phase"]["stage"], "paused")
+        self.assertEqual(paused_detail["control"]["status"], "paused")
+        self.assertIn("Control: status=paused", rendered_paused_detail)
+        self.assertIn("paused", rendered_paused_list)
+
+        cancelled_dir = self.make_run(runs_dir, "run-cancelled-001")
+        self.write_json(
+            cancelled_dir / "research_tasks.json",
+            {
+                "run_id": "run-cancelled-001",
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task_001",
+                        "state": "running",
+                        "last_child_thread_id": "codex-task_001-attempt-1",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            cancelled_dir / "subagent_assignments.jsonl",
+            [
+                {
+                    "task_id": "task_001",
+                    "state": "assigned",
+                    "child_thread_id": "codex-task_001-attempt-1",
+                    "timestamp": "2026-06-25T00:00:05Z",
+                }
+            ],
+        )
+        cancel_run(
+            cancelled_dir,
+            reason="monitor_cancel",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+
+        cancelled_detail = inspect_run_monitor(cancelled_dir)
+        rendered_cancelled_detail = render_run_detail(cancelled_detail)
+        rendered_cancelled_list = render_run_list(list_run_monitors(runs_dir))
+
+        self.assertEqual(cancelled_detail["status"], "cancelled")
+        self.assertTrue(cancelled_detail["terminal"])
+        self.assertEqual(cancelled_detail["phase"]["stage"], "cancelled")
+        self.assertEqual(cancelled_detail["control"]["status"], "cancelled")
+        self.assertEqual(cancelled_detail["control"]["child_close_records"], 1)
+        self.assertIn("Control: status=cancelled", rendered_cancelled_detail)
+        self.assertIn("cancelled", rendered_cancelled_list)
 
     def test_detail_classifies_shards_serial_fallback_budget_and_paths(self) -> None:
         runs_dir = self.temp_runs_dir()

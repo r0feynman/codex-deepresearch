@@ -118,6 +118,24 @@ Every state-managed pipeline stage writes `run_steps.json` with `pending`, `runn
 plugins/codex-deepresearch/scripts/codex-deepresearch run-status --run <run_id_or_path>
 ```
 
+Use `pause-run` to persist a durable pause gate without deleting or rewriting evidence artifacts. While paused, stage commands fail before starting new work and `run-status` keeps reporting the next safe stage for resume:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch pause-run --run <run_id_or_path> --reason "operator pause"
+```
+
+Use `resume-run` to clear the pause gate. Resume does not rerun completed stages by itself; continue with the reported `next_safe_stage` command so existing run steps and cache artifacts remain authoritative:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch resume-run --run <run_id_or_path>
+```
+
+Use `cancel-run` to record terminal cancellation diagnostics. Cancellation writes `run_control.json`, updates `run_steps.json`, writes terminal `run_status.json`, enumerates known child contexts from `research_tasks.json`, `subagent_assignments.jsonl`, and `run_trace.jsonl`, and records requested/attempted close records. It does not delete evidence, source, visual, shard, or report artifacts:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch cancel-run --run <run_id_or_path> --reason "operator cancel"
+```
+
 Most completed stages rerun and revalidate their inputs until M15 cache keys exist. Stages that explicitly skip a completed rerun keep the primary stage state as `completed` and record the skipped rerun in `run_steps.json` history plus `run_trace.jsonl`.
 
 ## Run Monitor
@@ -134,7 +152,7 @@ Use `monitor-detail` to inspect one run without opening implementation files:
 plugins/codex-deepresearch/scripts/codex-deepresearch monitor-detail --run <run_id_or_path>
 ```
 
-The monitor reads existing status artifacts only: `run_status.json`, `status.json`, `run_steps.json`, `parallel_orchestration_status.json`, `research_tasks.json`, `subagent_assignments.jsonl`, `merge_status.json`, `run_trace.jsonl`, visual status artifacts, `evidence.json`, and `budget_estimate.json`. Compact shard output is ordered as queued/active/completed/failed/accepted/merged/retried/blocked. List output uses run IDs and paths relative to `--runs-dir`; detail output may show the selected run directory but renders nested artifacts run-relative or as `<outside-run-dir>` when a status payload points elsewhere. Pass `--json` to either command for deterministic machine-readable output.
+The monitor reads existing status artifacts only: `run_status.json`, `status.json`, `run_steps.json`, `run_control.json`, `parallel_orchestration_status.json`, `research_tasks.json`, `subagent_assignments.jsonl`, `merge_status.json`, `run_trace.jsonl`, visual status artifacts, `evidence.json`, and `budget_estimate.json`. Compact shard output is ordered as queued/active/completed/failed/accepted/merged/retried/blocked. Paused and cancelled runs remain visible in list and detail views, with detail output showing the control action and child-close record counts. List output uses run IDs and paths relative to `--runs-dir`; detail output may show the selected run directory but renders nested artifacts run-relative or as `<outside-run-dir>` when a status payload points elsewhere. Pass `--json` to either command for deterministic machine-readable output.
 
 ## Visual Acquisition
 

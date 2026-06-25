@@ -21,14 +21,18 @@ from deepresearch import (  # noqa: E402
     RunStepStateError,
     acquire_visual_candidates,
     begin_stage,
+    cancel_run,
     enforce_guardrails,
     fetch_claims,
     ingest_manual_sources,
     ingest_run,
     ingest_vision_observations,
     inspect_run_state,
+    pause_run,
     prepare_run,
     read_trace_records,
+    resume_run,
+    run_control_path,
     run_steps_path,
     synthesize_report,
     transition_stage,
@@ -79,6 +83,19 @@ class RunStateTests(unittest.TestCase):
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    def write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+    def relative_files(self, path: Path) -> set[str]:
+        return {
+            item.relative_to(path).as_posix()
+            for item in path.rglob("*")
+            if item.is_file()
+        }
 
     def set_status_timestamps(
         self,
@@ -321,6 +338,193 @@ class RunStateTests(unittest.TestCase):
         )
         trace = read_trace_records(run_dir / "run_trace.jsonl")
         self.assertIn("run_steps", trace[0]["artifacts"])
+
+    def test_pause_resume_preserves_artifacts_and_next_safe_stage(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="pause resume control state",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_search_results(run_dir, [self.base_search_result()])
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+        evidence_before = self.read_json(run_dir / "evidence.json")
+        files_before_pause = self.relative_files(run_dir)
+
+        paused = pause_run(
+            run_dir,
+            reason="test_pause",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        paused_state = inspect_run_state(run_dir)
+
+        self.assertEqual(paused["status"], "paused")
+        self.assertTrue(run_control_path(run_dir).is_file())
+        self.assertEqual(paused_state["status"], "paused")
+        self.assertEqual(paused_state["next_safe_stage"], "fetch_claims")
+        self.assertEqual(paused_state["control"]["status"], "paused")
+        self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
+        self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+        with self.assertRaises(RunStepStateError) as paused_error:
+            begin_stage(run_dir, "fetch_claims")
+        self.assertEqual(paused_error.exception.to_dict()["code"], "run_paused")
+
+        resumed = resume_run(
+            run_dir,
+            reason="test_resume",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+        resumed_state = inspect_run_state(run_dir)
+        control = self.read_json(run_control_path(run_dir))
+
+        self.assertEqual(resumed["status"], "active")
+        self.assertEqual(resumed_state["status"], "in_progress")
+        self.assertEqual(resumed_state["next_safe_stage"], "fetch_claims")
+        self.assertEqual(resumed_state["control"]["status"], "active")
+        self.assertEqual(control["history"][-2]["action"], "pause")
+        self.assertEqual(control["history"][-1]["action"], "resume")
+        self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
+        self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+
+    def test_resume_continue_does_not_duplicate_completed_evidence(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="resume continue no duplicate evidence",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        page = runs_dir / "resume-source.html"
+        page.write_text(
+            (
+                "<html><body><p>The resume continue test extracts a "
+                "source linked claim.</p></body></html>"
+            ),
+            encoding="utf-8",
+        )
+        self.write_search_results(
+            run_dir,
+            [self.base_search_result(title="Resume Source")],
+        )
+        ingest = ingest_run(run=run_dir)
+        self.assertEqual(ingest["status"], "ingested")
+        evidence_path = run_dir / "evidence.json"
+        evidence = self.read_json(evidence_path)
+        evidence["sources"][0]["url"] = page.resolve().as_uri()
+        self.write_json(evidence_path, evidence)
+        fetch_queue_path = run_dir / "fetch_queue.json"
+        fetch_queue = self.read_json(fetch_queue_path)
+        fetch_queue["entries"][0]["url"] = page.resolve().as_uri()
+        self.write_json(fetch_queue_path, fetch_queue)
+        sources_before = [source["id"] for source in evidence["sources"]]
+        files_before_pause = self.relative_files(run_dir)
+
+        pause_run(run_dir, timestamp="2026-06-25T00:00:00Z")
+        resume = resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+        self.assertEqual(resume["next_safe_stage"], "fetch_claims")
+        with mock.patch.object(
+            fetch_claims_module,
+            "urlopen",
+            return_value=FakeResponse(
+                page.read_bytes(),
+                url=page.resolve().as_uri(),
+            ),
+        ):
+            fetch = fetch_claims(run=run_dir)
+
+        continued = self.read_json(evidence_path)
+        self.assertEqual(fetch["status"], "completed")
+        self.assertEqual([source["id"] for source in continued["sources"]], sources_before)
+        self.assertEqual(len(continued["sources"]), 1)
+        self.assertEqual(len(continued["claims"]), 1)
+        self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
+
+    def test_cancel_records_terminal_diagnostics_and_child_close_records(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="cancel control state",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence_before = self.read_json(run_dir / "evidence.json")
+        files_before_cancel = self.relative_files(run_dir)
+        transition_stage(
+            run_dir,
+            "parallel_orchestration",
+            "running",
+            reason="test_child_context_active",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "run_id": prepared["run_id"],
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task_001",
+                        "state": "running",
+                        "last_child_thread_id": "codex-task_001-attempt-1",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "subagent_assignments.jsonl",
+            [
+                {
+                    "task_id": "task_001",
+                    "state": "assigned",
+                    "child_thread_id": "codex-task_001-attempt-1",
+                    "timestamp": "2026-06-25T00:00:05Z",
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "run_trace.jsonl",
+            [
+                {
+                    "stage": "parallel_orchestration",
+                    "event_type": "spawn_agent",
+                    "status": "running",
+                    "child_status": "running",
+                    "task_id": "task_001",
+                    "child_thread_id": "codex-task_001-attempt-1",
+                    "timestamp": "2026-06-25T00:00:10Z",
+                }
+            ],
+        )
+
+        cancelled = cancel_run(
+            run_dir,
+            reason="test_cancel",
+            timestamp="2026-06-25T00:01:00Z",
+        )
+        cancelled_state = inspect_run_state(run_dir)
+        control = self.read_json(run_control_path(run_dir))
+        run_status = self.read_json(run_dir / "run_status.json")
+        close_records = control["diagnostics"]["child_context_close_records"]
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled_state["status"], "cancelled")
+        self.assertIsNone(cancelled_state["next_safe_stage"])
+        self.assertTrue(cancelled_state["control"]["terminal"])
+        self.assertTrue(run_status["terminal"])
+        self.assertFalse(run_status["ok"])
+        self.assertEqual(run_status["status"], "cancelled")
+        self.assertEqual(control["diagnostics"]["child_contexts_known"], 1)
+        self.assertEqual(len(close_records), 1)
+        self.assertTrue(close_records[0]["requested"])
+        self.assertFalse(close_records[0]["attempted"])
+        self.assertEqual(close_records[0]["result"], "no_local_child_context_closer")
+        self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
+        self.assertTrue(files_before_cancel.issubset(self.relative_files(run_dir)))
+        with self.assertRaises(RunStepStateError) as cancelled_error:
+            begin_stage(run_dir, "fetch_claims")
+        self.assertEqual(cancelled_error.exception.to_dict()["code"], "run_cancelled")
 
     def test_run_status_reconstructs_deleted_run_steps_from_trace(self) -> None:
         runs_dir = self.temp_runs_dir()
