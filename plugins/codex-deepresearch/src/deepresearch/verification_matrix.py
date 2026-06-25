@@ -143,7 +143,14 @@ def verify_claims(
             claim["votes"] = claim_votes
             claim["verification_route"] = route
             _update_vote_reference_fields(claim, claim_votes)
-            _update_report_eligibility(claim)
+            if _current_policy_blocks(
+                claim,
+                sources_by_id=sources_by_id,
+                images_by_id=images_by_id,
+            ):
+                _apply_current_policy_block(claim)
+            else:
+                _update_report_eligibility(claim)
             all_votes.extend(claim_votes)
             claim_statuses.append(_claim_status_record(claim, route, 0, cache_hit=True))
             reused_count += 1
@@ -483,6 +490,29 @@ def _report_exclusion_reason(claim: Mapping[str, Any]) -> str:
     if isinstance(status, str) and status:
         return status
     return "not_report_eligible"
+
+
+def _current_policy_blocks(
+    claim: Mapping[str, Any],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    source_refs = _string_list(claim.get("supporting_sources"))
+    image_refs = _string_list(claim.get("supporting_images"))
+    return (
+        _has_policy_block(source_refs, sources_by_id)
+        or _has_policy_image(image_refs, images_by_id, claim=claim)
+        or _has_claim_policy_block(claim)
+    )
+
+
+def _apply_current_policy_block(claim: dict[str, Any]) -> None:
+    claim["verification_status"] = "policy_blocked"
+    claim["review_status"] = "needs_more_evidence"
+    claim["promotion_status"] = "not_eligible"
+    claim["confidence"] = "low"
+    _update_report_eligibility(claim)
 
 
 def _has_required_support(

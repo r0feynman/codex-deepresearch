@@ -15,7 +15,8 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import validate_artifacts, verify_claims
+from deepresearch import synthesize_report, validate_artifacts, verify_claims
+from deepresearch.cache_keys import claim_cache_key
 
 verification_matrix_module = importlib.import_module("deepresearch.verification_matrix")
 
@@ -583,6 +584,87 @@ class VerificationMatrixTests(unittest.TestCase):
             {vote["created_at"] for vote in self.votes_for(run_dir, "claim_changed_image")},
             {"2026-06-22T00:20:00Z"},
         )
+
+    def test_changed_image_policy_decision_invalidates_visual_verification_cache(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_changed_image_policy",
+                claim_type="visual",
+                supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:00:00Z",
+        ):
+            verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        old_cache_key = evidence["claims"][0]["verification_cache_key"]
+        evidence["images"][0]["policy_decision"] = "blocked"
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(
+            verification_matrix_module,
+            "_utc_now",
+            return_value="2026-06-22T00:25:00Z",
+        ):
+            result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertNotEqual(claim["verification_cache_key"], old_cache_key)
+        self.assertEqual(result["claims_reused"], 0)
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["confidence"], "low")
+
+    def test_visual_cache_hit_reapplies_current_image_policy_block(self) -> None:
+        run_dir = self.temp_run(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [self.image()]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_stale_policy_cache",
+                claim_type="visual",
+                supporting_images=["img_001"],
+                visual_supports=[self.visual_support()],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["claims"][0]["verification_status"], "supported")
+        evidence["images"][0]["policy_decision"] = "blocked"
+        evidence["claims"][0]["verification_cache_key"] = claim_cache_key(
+            evidence["claims"][0],
+            sources_by_id={source["id"]: source for source in evidence["sources"]},
+            images_by_id={image["id"]: image for image in evidence["images"]},
+            verification_route="visual_required",
+        )
+        evidence["claims"][0]["cache_key"] = evidence["claims"][0]["verification_cache_key"]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        self.assertEqual(result["claims_reused"], 1)
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(claim["confidence"], "low")
+        report_status = synthesize_report(run=run_dir)
+        self.assertEqual(report_status["claims_included"], 0)
+        self.assertNotIn("img_001", report_status["used_images"])
 
     def test_added_visual_supports_invalidate_stale_needs_visual_cache(self) -> None:
         run_dir = self.temp_run(route="visual_required")
