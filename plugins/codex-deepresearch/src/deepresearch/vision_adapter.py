@@ -836,6 +836,8 @@ def _copy_optional_visual_metadata(
         "near_duplicate_group_id",
         "near_duplicate_of",
         "observation_id",
+        "pdf_local_path",
+        "pdf_url",
         "provider",
         "provider_kind",
         "provider_mode",
@@ -848,12 +850,17 @@ def _copy_optional_visual_metadata(
         "visual_acquisition_provider",
     )
     list_keys = ("removal_reasons",)
-    number_keys = ("estimated_cost_usd", "actual_cost_usd")
+    number_keys = ("estimated_cost_usd", "actual_cost_usd", "page_number")
     mapping_keys = (
         "provider_provenance",
         "visual_validation",
         "validation_checks",
         "screenshot",
+        "figure_hint",
+        "rasterizer",
+        "compute_counters",
+        "cost_counters",
+        "pdf_diagnostic",
     )
     for key in scalar_keys:
         value = _first_optional_string(record, key) or _first_optional_string(image, key)
@@ -1005,6 +1012,7 @@ def _phase3_observation_records(
         }
         if isinstance(image.get("screenshot"), Mapping):
             phase3["screenshot"] = dict(image["screenshot"])
+        _copy_optional_visual_metadata(raw, image, phase3)
         observations.append(phase3)
     return observations
 

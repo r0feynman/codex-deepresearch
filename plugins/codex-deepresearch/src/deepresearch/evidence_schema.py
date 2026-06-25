@@ -50,7 +50,15 @@ PROMOTION_STATUSES = (
     "promotion_rejected",
 )
 CONFIDENCE_LEVELS = ("high", "medium", "low")
-VISUAL_ORIGINS = ("page_image", "image_search", "screenshot", "user_upload", "manual")
+VISUAL_ORIGINS = (
+    "page_image",
+    "image_search",
+    "screenshot",
+    "pdf_page",
+    "pdf_figure",
+    "user_upload",
+    "manual",
+)
 ANALYSIS_STATUSES = (
     "analyzed",
     "failed",
