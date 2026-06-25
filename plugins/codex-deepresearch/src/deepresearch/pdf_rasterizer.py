@@ -12,9 +12,10 @@ from urllib.parse import unquote, urlparse
 
 DEFAULT_PDF_RASTERIZER_PROVIDER = "local-pdf-rasterizer"
 DEFAULT_MAX_PDF_BYTES = 25_000_000
-PDF_RASTERIZER_MODE = "deterministic-public-safe"
+PDF_RASTERIZER_MODE = "pypdfium2-page-render"
 PDF_RASTER_WIDTH = 1240
-PDF_RASTER_HEIGHT = 1754
+PDF_RENDERER_NAME = "pypdfium2"
+_PDFIUM_IMPORT_ERROR: str | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,137 @@ class PdfRasterizerResult:
     pages_skipped: int
     estimated_cost_usd: float
     actual_cost_usd: float
+
+
+def pdf_renderer_available() -> bool:
+    """Return whether the optional local PDF renderer can produce PNG artifacts."""
+
+    return _load_pdfium() is not None
+
+
+def render_pdf_candidate_artifact(
+    *,
+    run_dir: Path,
+    output_path: Path,
+    candidate: Mapping[str, Any],
+) -> None:
+    """Render a PDF candidate's actual page pixels into a PNG artifact."""
+
+    pdfium = _load_pdfium()
+    if pdfium is None:
+        raise RuntimeError(f"{PDF_RENDERER_NAME} renderer is unavailable: {_PDFIUM_IMPORT_ERROR}")
+    pdf_path = _candidate_pdf_path(run_dir, candidate)
+    page_number = _int_value(candidate.get("page_number")) or 1
+    width = _int_value(candidate.get("width")) or PDF_RASTER_WIDTH
+    height = _int_value(candidate.get("height")) or max(1, int(round(width * 1.414)))
+    doc = None
+    page = None
+    bitmap = None
+    try:
+        doc = pdfium.PdfDocument(str(pdf_path))
+        page_index = page_number - 1
+        if page_index < 0 or page_index >= len(doc):
+            raise RuntimeError(f"PDF page {page_number} is outside document range")
+        page = doc[page_index]
+        page_width, _page_height = page.get_size()
+        if page_width <= 0:
+            raise RuntimeError("PDF page has invalid width")
+        bitmap = page.render(scale=width / page_width)
+        image = bitmap.to_pil().convert("RGB")
+        if image.size != (width, height):
+            image = image.resize((width, height))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(output_path, format="PNG")
+    finally:
+        for item in (bitmap, page, doc):
+            close = getattr(item, "close", None)
+            if callable(close):
+                close()
+
+
+def _load_pdfium() -> Any | None:
+    global _PDFIUM_IMPORT_ERROR
+    try:
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]
+
+        __import__("PIL.Image")
+    except Exception as exc:
+        _PDFIUM_IMPORT_ERROR = f"{exc.__class__.__name__}: {exc}"
+        return None
+    _PDFIUM_IMPORT_ERROR = None
+    return pdfium
+
+
+def _candidate_pdf_path(run_dir: Path, candidate: Mapping[str, Any]) -> Path:
+    local_path = candidate.get("pdf_local_path")
+    if not isinstance(local_path, str) or not local_path:
+        raise RuntimeError("PDF candidate is missing run-relative pdf_local_path")
+    relative = Path(local_path)
+    if relative.is_absolute() or any(part == ".." for part in relative.parts):
+        raise RuntimeError("PDF candidate pdf_local_path must be run-relative")
+    pdf_path = (run_dir / relative).resolve(strict=False)
+    try:
+        pdf_path.relative_to(run_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError("PDF candidate pdf_local_path escapes the run directory") from exc
+    if not pdf_path.is_file():
+        raise RuntimeError("PDF candidate pdf_local_path does not exist")
+    return pdf_path
+
+
+def _page_render_info(
+    pdf_path: Path,
+    page_number: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    pdfium = _load_pdfium()
+    if pdfium is None:
+        return {}, {
+            "reason": "renderer_unavailable_pdf",
+            "message": f"{PDF_RENDERER_NAME} renderer is unavailable: {_PDFIUM_IMPORT_ERROR}",
+            "policy_decision": "manual_review",
+            "policy_flags": ["pdf_renderer_unavailable"],
+        }
+    doc = None
+    page = None
+    try:
+        doc = pdfium.PdfDocument(str(pdf_path))
+        page_index = page_number - 1
+        if page_index < 0 or page_index >= len(doc):
+            return {}, {
+                "reason": "unsupported_pdf",
+                "message": f"PDF page {page_number} is outside the document range.",
+                "policy_decision": "manual_review",
+                "policy_flags": ["unsupported_pdf_page"],
+            }
+        page = doc[page_index]
+        page_width, page_height = page.get_size()
+        if page_width <= 0 or page_height <= 0:
+            return {}, {
+                "reason": "unsupported_pdf",
+                "message": "PDF page has invalid dimensions.",
+                "policy_decision": "manual_review",
+                "policy_flags": ["unsupported_pdf_page"],
+            }
+        width = PDF_RASTER_WIDTH
+        height = max(1, int(round(width * page_height / page_width)))
+        return {
+            "width": width,
+            "height": height,
+            "page_width_points": page_width,
+            "page_height_points": page_height,
+        }, None
+    except Exception as exc:
+        return {}, {
+            "reason": "unsupported_pdf",
+            "message": f"PDF renderer could not inspect the requested page: {exc}",
+            "policy_decision": "manual_review",
+            "policy_flags": ["pdf_render_failed"],
+        }
+    finally:
+        for item in (page, doc):
+            close = getattr(item, "close", None)
+            if callable(close):
+                close()
 
 
 def collect_pdf_rasterizer_candidates(
@@ -96,6 +228,22 @@ def collect_pdf_rasterizer_candidates(
         pdf_size = pdf_path.stat().st_size if pdf_path is not None else 0
         pdf_hash = _sha256_file(pdf_path) if pdf_path is not None else None
         for spec in page_specs:
+            render_info, render_blocker = _page_render_info(pdf_path, int(spec["page_number"]))
+            if render_blocker is not None:
+                diagnostic = _diagnostic_candidate(
+                    provider=provider,
+                    provider_mode=provider_mode,
+                    source=source,
+                    route=route,
+                    spec=spec,
+                    reason=render_blocker["reason"],
+                    policy_decision=render_blocker["policy_decision"],
+                    policy_flags=render_blocker["policy_flags"],
+                    created_at=created_at,
+                )
+                candidates.append(diagnostic)
+                diagnostics.append(_diagnostic_from_candidate(diagnostic, render_blocker["message"]))
+                continue
             candidates.append(
                 _page_candidate(
                     provider=provider,
@@ -106,6 +254,7 @@ def collect_pdf_rasterizer_candidates(
                     pdf_path=pdf_path,
                     pdf_size=pdf_size,
                     pdf_hash=pdf_hash,
+                    render_info=render_info,
                     created_at=created_at,
                 )
             )
@@ -133,6 +282,7 @@ def _page_candidate(
     pdf_path: Path | None,
     pdf_size: int,
     pdf_hash: str | None,
+    render_info: Mapping[str, Any],
     created_at: str,
 ) -> dict[str, Any]:
     page_number = int(spec["page_number"])
@@ -195,8 +345,8 @@ def _page_candidate(
         "page_url": page_url,
         "local_artifact_path": local_artifact_path,
         "mime_type": "image/png",
-        "width": PDF_RASTER_WIDTH,
-        "height": PDF_RASTER_HEIGHT,
+        "width": int(render_info["width"]),
+        "height": int(render_info["height"]),
         "alt_text": f"PDF page {page_number}" if origin == "pdf_page" else f"PDF figure on page {page_number}",
         "content_seed": content_seed,
         "phash": "pdf_" + _safe_id(f"{source['id']}_{page_number}{figure_suffix}"),
@@ -212,7 +362,7 @@ def _page_candidate(
         "policy_flags": list(_string_list(source.get("policy_flags"))),
         "policy_decision": "allowed",
         "caveats": [
-            "Deterministic public-safe PDF rasterizer artifact; no external raster library or network call was used."
+            "PDF artifact rendered from an existing run-local PDF page; no network call was used."
         ],
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
@@ -222,13 +372,17 @@ def _page_candidate(
         "figure_hint": dict(figure_hint) if isinstance(figure_hint, Mapping) else None,
         "rasterizer": {
             "mode": PDF_RASTERIZER_MODE,
-            "optional_raster_library": None,
-            "optional_raster_library_available": False,
+            "optional_raster_library": PDF_RENDERER_NAME,
+            "optional_raster_library_available": True,
             "external_network_call": False,
             "input_pdf_bytes": pdf_size,
             "input_pdf_hash": pdf_hash,
             "page_number": page_number,
             "figure_hint": dict(figure_hint) if isinstance(figure_hint, Mapping) else None,
+            "page_width_points": render_info.get("page_width_points"),
+            "page_height_points": render_info.get("page_height_points"),
+            "output_width": render_info.get("width"),
+            "output_height": render_info.get("height"),
         },
         "compute_counters": {
             "pdf_pages_attempted": 1,
@@ -607,8 +761,8 @@ def _provider_provenance(
         "provider_run_id": provider_run_id,
         "fixture_only": provider_mode != "real",
         "rasterizer_mode": PDF_RASTERIZER_MODE,
-        "optional_raster_library": None,
-        "optional_raster_library_available": False,
+        "optional_raster_library": PDF_RENDERER_NAME,
+        "optional_raster_library_available": pdf_renderer_available(),
         "external_network_call": False,
         "external_vlm_call": False,
     }

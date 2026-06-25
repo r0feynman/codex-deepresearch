@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ from deepresearch import (  # noqa: E402
     validate_artifacts,
     validate_visual_artifacts,
 )
+from deepresearch import pdf_rasterizer  # noqa: E402
 
 
 class PdfRasterizerTests(unittest.TestCase):
@@ -46,17 +48,65 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(data[12:16], b"IHDR")
         return struct.unpack(">II", data[16:24])
 
-    def write_pdf(self, run_dir: Path, name: str, body: bytes = b"") -> Path:
+    def png_pixel(self, path: Path, x: int, y: int) -> tuple[int, int, int]:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return image.convert("RGB").getpixel((x, y))
+
+    def write_pdf(self, run_dir: Path, name: str, body: bytes = b"", pages: int = 3) -> Path:
         path = run_dir / "sources" / name
         path.parent.mkdir(exist_ok=True)
-        path.write_bytes(
-            b"%PDF-1.4\n"
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n"
-            + body
-            + b"\n%%EOF\n"
-        )
+        page_ids = list(range(3, 3 + pages))
+        font_id = 3 + pages
+        content_ids = list(range(font_id + 1, font_id + 1 + pages))
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            (
+                b"<< /Type /Pages /Kids ["
+                + b" ".join(f"{page_id} 0 R".encode("ascii") for page_id in page_ids)
+                + f"] /Count {pages} >>".encode("ascii")
+            ),
+        ]
+        for page_id, content_id in zip(page_ids, content_ids):
+            objects.append(
+                (
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+                    + f"/Resources << /Font << /F1 {font_id} 0 R >> >> ".encode("ascii")
+                    + f"/Contents {content_id} 0 R >>".encode("ascii")
+                )
+            )
+        objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        for page_index in range(1, pages + 1):
+            content = (
+                b"q\n"
+                b"1 0 0 rg\n72 620 220 80 re f\n"
+                b"0 0 1 rg\n72 500 320 50 re f\n"
+                + f"0 0 0 rg\nBT /F1 32 Tf 72 740 Td (PDF FIXTURE {page_index}) Tj ET\n".encode("ascii")
+                + b"BT /F1 18 Tf 72 585 Td (REAL PAGE PIXELS) Tj ET\n"
+                b"Q\n"
+            )
+            objects.append(
+                b"<< /Length "
+                + str(len(content)).encode("ascii")
+                + b" >>\nstream\n"
+                + content
+                + b"endstream"
+            )
+        pdf = b"%PDF-1.4\n"
+        offsets = [0]
+        for index, obj in enumerate(objects, start=1):
+            offsets.append(len(pdf))
+            pdf += f"{index} 0 obj\n".encode("ascii") + obj + b"\nendobj\n"
+        xref_offset = len(pdf)
+        pdf += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii")
+        for offset in offsets[1:]:
+            pdf += f"{offset:010d} 00000 n \n".encode("ascii")
+        pdf += (
+            f"trailer << /Root 1 0 R /Size {len(objects) + 1} >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+        path.write_bytes(pdf + body)
         return path
 
     def pdf_source(self, run_dir: Path, source_id: str, pdf_path: Path, **overrides: object) -> dict:
@@ -82,6 +132,7 @@ class PdfRasterizerTests(unittest.TestCase):
         source.update(overrides)
         return source
 
+    @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
     def test_allowed_pdf_pages_and_figures_link_to_visual_evidence(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(
@@ -96,7 +147,7 @@ class PdfRasterizerTests(unittest.TestCase):
             run_dir,
             "src_pdf_public",
             pdf_path,
-            pdf_pages=[1, 2],
+            pdf_pages=[1],
             figure_hints=[
                 {
                     "page_number": 2,
@@ -118,8 +169,8 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(result["status"], "visual_candidates_collected")
         self.assertTrue(result["validation"]["valid"], result["validation"]["errors"])
         self.assertTrue(result["visual_artifact_validation"]["valid"], result["visual_artifact_validation"]["errors"])
-        self.assertEqual(result["candidate_counts"], {"pdf_page": 2, "pdf_figure": 1})
-        self.assertEqual(result["pdf_rasterization"]["pages_rasterized"], 3)
+        self.assertEqual(result["candidate_counts"], {"pdf_page": 1, "pdf_figure": 1})
+        self.assertEqual(result["pdf_rasterization"]["pages_rasterized"], 2)
 
         plan = self.read_json(run_dir / "visual_search_plan.json")
         self.assertEqual(plan["tasks"][0]["target_evidence_type"], "pdf_figure")
@@ -134,6 +185,12 @@ class PdfRasterizerTests(unittest.TestCase):
             )
             self.assertNotEqual((candidate["width"], candidate["height"]), (1, 1))
             self.assertGreater(artifact.stat().st_size, 1_000)
+            red_pixel = self.png_pixel(artifact, 220, 350)
+            self.assertGreater(red_pixel[0], 180)
+            self.assertLess(red_pixel[1], 90)
+            self.assertLess(red_pixel[2], 90)
+            self.assertEqual(candidate["rasterizer"]["optional_raster_library"], "pypdfium2")
+            self.assertTrue(candidate["rasterizer"]["optional_raster_library_available"])
         self.assertEqual({fetch["fetch_status"] for fetch in fetches}, {"fetched"})
         self.assertTrue(all(fetch["hash"].startswith("sha256:") for fetch in fetches))
         self.assertTrue(all(fetch["pdf_url"] == source["url"] for fetch in fetches))
@@ -168,6 +225,38 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(figure_observation["rasterizer"], figure["rasterizer"])
         self.assertEqual(figure_observation["compute_counters"], figure["compute_counters"])
         self.assertEqual(figure_observation["cost_counters"], figure["cost_counters"])
+
+    def test_renderer_unavailable_prevents_accepted_pdf_evidence(self) -> None:
+        prepared = prepare_run(
+            question="Renderer unavailable PDF rasterization",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=2,
+        )
+        run_dir = Path(prepared["run_dir"])
+        pdf_path = self.write_pdf(run_dir, "renderer-unavailable.pdf")
+        source = self.pdf_source(run_dir, "src_renderer_unavailable", pdf_path)
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [source]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        with mock.patch.object(pdf_rasterizer, "_load_pdfium", return_value=None):
+            result = acquire_visual_candidates(
+                run=run_dir,
+                providers=["local-pdf-rasterizer"],
+            )
+
+        self.assertEqual(result["selected_observations"], 0)
+        self.assertEqual(result["pdf_rasterization"]["pages_rasterized"], 0)
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(fetches[0]["fetch_status"], "failed")
+        self.assertEqual(fetches[0]["failure_code"], "renderer_unavailable_pdf")
+        provider = self.read_json(run_dir / "visual_provider_status.json")["providers"][0]
+        self.assertFalse(provider["available"])
+        self.assertEqual(provider["blocked_reason"], "renderer_unavailable_pdf")
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+        self.assertFalse((run_dir / "images" / "pdf").exists())
 
     def test_pdf_diagnostics_are_explicit_for_blocked_and_unsupported_sources(self) -> None:
         prepared = prepare_run(
@@ -345,6 +434,7 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(status_by_reason["paywalled_pdf"], {"policy_blocked"})
         self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 7)
 
+    @unittest.skipUnless(pdf_rasterizer.pdf_renderer_available(), "optional PDF renderer unavailable")
     def test_pdf_budget_pruning_records_skipped_pages(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(
@@ -391,9 +481,14 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(pruned_pages, [2, 3])
         for candidate in candidates:
             if candidate["candidate_status"] == "budget_pruned":
+                self.assertIsNone(candidate.get("local_artifact_path"))
+                self.assertIsNone(candidate.get("image_url"))
+                self.assertIsNone(candidate.get("hash"))
                 self.assertEqual(candidate["compute_counters"]["pdf_pages_rasterized"], 0)
                 self.assertEqual(candidate["compute_counters"]["pdf_pages_skipped"], 1)
                 self.assertTrue(candidate["rasterizer"]["budget_pruned"])
+        rendered_artifacts = list((run_dir / "images" / "pdf").glob("*.png"))
+        self.assertEqual(len(rendered_artifacts), 1)
         self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 2)
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         provider = provider_status["providers"][0]
