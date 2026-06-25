@@ -56,7 +56,7 @@ class PdfRasterizerTests(unittest.TestCase):
         source = {
             "id": source_id,
             "type": "pdf",
-            "url": pdf_path.resolve().as_uri(),
+            "url": f"https://example.com/{pdf_path.name}",
             "title": f"PDF fixture {source_id}",
             "published_at": None,
             "accessed_at": "2026-06-25T00:00:00Z",
@@ -142,7 +142,17 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(figure["figure_hint"]["label"], "Figure 1")
         self.assertEqual(figure["provider_kind"], "pdf_rasterizer")
         self.assertEqual(figure["pdf_url"], source["url"])
+        self.assertEqual(figure["pdf_local_path"], source["local_artifact_path"])
         self.assertTrue(figure["hash"].startswith("sha256:"))
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        figure_observation = next(item for item in observations if item["origin"] == "pdf_figure")
+        self.assertEqual(figure_observation["pdf_url"], figure["pdf_url"])
+        self.assertEqual(figure_observation["pdf_local_path"], figure["pdf_local_path"])
+        self.assertEqual(figure_observation["page_number"], figure["page_number"])
+        self.assertEqual(figure_observation["figure_hint"], figure["figure_hint"])
+        self.assertEqual(figure_observation["rasterizer"], figure["rasterizer"])
+        self.assertEqual(figure_observation["compute_counters"], figure["compute_counters"])
+        self.assertEqual(figure_observation["cost_counters"], figure["cost_counters"])
 
     def test_pdf_diagnostics_are_explicit_for_blocked_and_unsupported_sources(self) -> None:
         prepared = prepare_run(
@@ -155,8 +165,8 @@ class PdfRasterizerTests(unittest.TestCase):
         sources_dir = run_dir / "sources"
         blocked_pdf = self.write_pdf(run_dir, "blocked.pdf")
         paywalled_pdf = self.write_pdf(run_dir, "paywalled.pdf")
-        encrypted_pdf = self.write_pdf(run_dir, "encrypted.pdf", b"/Encrypt <<>>\n")
-        too_large_pdf = self.write_pdf(run_dir, "too-large.pdf", b"x" * 1024)
+        encrypted_pdf = self.write_pdf(run_dir, "encrypted.pdf", b"x" * 5000 + b"/Encrypt <<>>\n")
+        too_large_pdf = self.write_pdf(run_dir, "too-large.pdf", b"x" * 10_000)
         unsupported_pdf = sources_dir / "unsupported.pdf"
         unsupported_pdf.write_bytes(b"not a pdf\n")
 
@@ -186,7 +196,7 @@ class PdfRasterizerTests(unittest.TestCase):
         result = acquire_visual_candidates(
             run=run_dir,
             providers=["local-pdf-rasterizer"],
-            max_pdf_bytes=300,
+            max_pdf_bytes=8_000,
         )
 
         self.assertTrue(result["visual_artifact_validation"]["valid"], result["visual_artifact_validation"]["errors"])
@@ -210,6 +220,115 @@ class PdfRasterizerTests(unittest.TestCase):
         self.assertEqual(by_code["unsupported_pdf"]["fetch_status"], "failed")
         diagnostics = result["pdf_rasterization"]["diagnostics"]
         self.assertEqual({item["failure_code"] for item in diagnostics}, set(by_code))
+
+    def test_file_pdf_outside_run_dir_is_not_read_or_persisted(self) -> None:
+        prepared = prepare_run(
+            question="Block outside local PDF file URLs",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=2,
+        )
+        run_dir = Path(prepared["run_dir"])
+        outside_dir = self.temp_runs_dir()
+        outside_pdf = outside_dir / "outside.pdf"
+        outside_pdf.write_bytes(b"%PDF-1.4\noutside\n%%EOF\n")
+        inside_pdf = self.write_pdf(run_dir, "inside-copy.pdf")
+        source = self.pdf_source(
+            run_dir,
+            "src_outside_file_uri",
+            inside_pdf,
+            url=outside_pdf.resolve().as_uri(),
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [source]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["local-pdf-rasterizer"],
+        )
+
+        self.assertEqual(result["selected_observations"], 0)
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(fetches[0]["failure_code"], "local_pdf_outside_run_dir")
+        self.assertEqual(fetches[0].get("pdf_url"), "")
+        self.assertIsNone(fetches[0].get("pdf_local_path"))
+        persisted = (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8")
+        persisted += (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(outside_pdf.resolve().as_uri(), persisted)
+        self.assertNotIn(str(outside_pdf.resolve()), persisted)
+
+    def test_policy_manual_review_and_access_gates_do_not_rasterize(self) -> None:
+        prepared = prepare_run(
+            question="Policy and access gated PDFs",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            max_images=10,
+        )
+        run_dir = Path(prepared["run_dir"])
+        manual_license_pdf = self.write_pdf(run_dir, "manual-license.pdf")
+        manual_robots_pdf = self.write_pdf(run_dir, "manual-robots.pdf")
+        login_pdf = self.write_pdf(run_dir, "login.pdf")
+        captcha_pdf = self.write_pdf(run_dir, "captcha.pdf")
+        subscription_pdf = self.write_pdf(run_dir, "subscription.pdf")
+        sources = [
+            self.pdf_source(
+                run_dir,
+                "src_manual_license",
+                manual_license_pdf,
+                license_policy="manual_review",
+                pdf_pages=[1, 2, 3],
+            ),
+            self.pdf_source(
+                run_dir,
+                "src_manual_robots",
+                manual_robots_pdf,
+                robots_policy="manual_review",
+            ),
+            self.pdf_source(
+                run_dir,
+                "src_login",
+                login_pdf,
+                policy_flags=["login-gated"],
+            ),
+            self.pdf_source(
+                run_dir,
+                "src_captcha",
+                captcha_pdf,
+                raw_provider_metadata={"access": "CAPTCHA required"},
+            ),
+            self.pdf_source(
+                run_dir,
+                "src_subscription",
+                subscription_pdf,
+                raw_provider_metadata={"availability": "subscription only"},
+            ),
+        ]
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = sources
+        evidence["budget"]["max_images"] = 10
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["local-pdf-rasterizer"],
+        )
+
+        self.assertEqual(result["selected_observations"], 0)
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        reason_counts: dict[str, int] = {}
+        status_by_reason: dict[str, set[str]] = {}
+        for fetch in fetches:
+            reason = fetch["failure_code"]
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            status_by_reason.setdefault(reason, set()).add(fetch["fetch_status"])
+        self.assertEqual(reason_counts["policy_manual_review_pdf"], 4)
+        self.assertEqual(reason_counts["access_blocked_pdf"], 2)
+        self.assertEqual(reason_counts["paywalled_pdf"], 1)
+        self.assertEqual(status_by_reason["policy_manual_review_pdf"], {"failed"})
+        self.assertEqual(status_by_reason["access_blocked_pdf"], {"policy_blocked"})
+        self.assertEqual(status_by_reason["paywalled_pdf"], {"policy_blocked"})
+        self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 7)
 
     def test_pdf_budget_pruning_records_skipped_pages(self) -> None:
         runs_dir = self.temp_runs_dir()
@@ -255,6 +374,11 @@ class PdfRasterizerTests(unittest.TestCase):
             if candidate["candidate_status"] == "budget_pruned"
         ]
         self.assertEqual(pruned_pages, [2, 3])
+        for candidate in candidates:
+            if candidate["candidate_status"] == "budget_pruned":
+                self.assertEqual(candidate["compute_counters"]["pdf_pages_rasterized"], 0)
+                self.assertEqual(candidate["compute_counters"]["pdf_pages_skipped"], 1)
+                self.assertTrue(candidate["rasterizer"]["budget_pruned"])
         self.assertEqual(result["pdf_rasterization"]["pages_skipped"], 2)
         visual_validation = validate_visual_artifacts(run_dir=run_dir, evidence_path=None)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])

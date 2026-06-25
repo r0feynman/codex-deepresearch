@@ -1274,6 +1274,7 @@ def _validate_and_select_candidates(
         if removal_reasons:
             pdf_failure_reasons = {
                 "encrypted_pdf",
+                "local_pdf_outside_run_dir",
                 "missing_pdf_artifact",
                 "policy_manual_review_pdf",
                 "too_large_pdf",
@@ -1294,12 +1295,15 @@ def _validate_and_select_candidates(
                 record["candidate_status"] = "rejected"
             record.setdefault("observations", [])
             record.setdefault("inferences", [])
+            if "budget_pruned" in removal_reasons:
+                _mark_pdf_budget_pruned(record)
         elif len(selected) >= max_selected:
             record["status"] = "removed"
             record["removal_reasons"] = ["budget_pruned"]
             record["analysis_status"] = "skipped"
             record["candidate_status"] = "budget_pruned"
             record["policy_decision"] = "budget_pruned"
+            _mark_pdf_budget_pruned(record)
         else:
             record["status"] = "accepted"
             record["candidate_status"] = "analyzed"
@@ -1311,6 +1315,25 @@ def _validate_and_select_candidates(
         records.append(_persistable_candidate(record))
 
     return selected, records, list(near_duplicate_groups.values())
+
+
+def _mark_pdf_budget_pruned(record: dict[str, Any]) -> None:
+    if record.get("provider_kind") != "pdf_rasterizer":
+        return
+    counters = (
+        dict(record.get("compute_counters"))
+        if isinstance(record.get("compute_counters"), Mapping)
+        else {}
+    )
+    counters["pdf_pages_attempted"] = int(counters.get("pdf_pages_attempted") or 1)
+    counters["pdf_pages_rasterized"] = 0
+    counters["pdf_pages_skipped"] = max(1, int(counters.get("pdf_pages_skipped") or 0))
+    record["compute_counters"] = counters
+    rasterizer = (
+        dict(record.get("rasterizer")) if isinstance(record.get("rasterizer"), Mapping) else {}
+    )
+    rasterizer["budget_pruned"] = True
+    record["rasterizer"] = rasterizer
 
 
 def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -1738,6 +1761,7 @@ def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
         return "fetched"
     reasons = set(_string_list(candidate.get("removal_reasons")))
     if candidate.get("policy_decision") == "blocked" or reasons & {
+        "access_blocked_pdf",
         "policy_blocked_pdf",
         "paywalled_pdf",
     }:
@@ -1750,6 +1774,7 @@ def _fetch_status_for_candidate(candidate: Mapping[str, Any]) -> str:
         return "too_large"
     if reasons & {
         "encrypted_pdf",
+        "local_pdf_outside_run_dir",
         "missing_pdf_artifact",
         "policy_manual_review_pdf",
         "unsupported_pdf",

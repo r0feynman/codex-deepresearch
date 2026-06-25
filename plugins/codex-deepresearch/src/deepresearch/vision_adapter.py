@@ -1012,6 +1012,7 @@ def _phase3_observation_records(
         }
         if isinstance(image.get("screenshot"), Mapping):
             phase3["screenshot"] = dict(image["screenshot"])
+        _copy_optional_visual_metadata(raw, image, phase3)
         observations.append(phase3)
     return observations
 

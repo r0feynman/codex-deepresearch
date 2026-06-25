@@ -70,21 +70,27 @@ def collect_pdf_rasterizer_candidates(
         page_specs = _page_specs(source)
         pages_configured += len(page_specs)
         pdf_path = _source_pdf_path(run_dir, source)
-        blocker = _source_blocker(source, pdf_path=pdf_path, max_pdf_bytes=max_pdf_bytes)
+        blocker = _source_blocker(
+            source,
+            run_dir=run_dir,
+            pdf_path=pdf_path,
+            max_pdf_bytes=max_pdf_bytes,
+        )
         if blocker is not None:
-            diagnostic = _diagnostic_candidate(
-                provider=provider,
-                provider_mode=provider_mode,
-                source=source,
-                route=route,
-                page_number=page_specs[0]["page_number"] if page_specs else 1,
-                reason=blocker["reason"],
-                policy_decision=blocker["policy_decision"],
-                policy_flags=blocker["policy_flags"],
-                created_at=created_at,
-            )
-            candidates.append(diagnostic)
-            diagnostics.append(_diagnostic_from_candidate(diagnostic, blocker["message"]))
+            for spec in page_specs:
+                diagnostic = _diagnostic_candidate(
+                    provider=provider,
+                    provider_mode=provider_mode,
+                    source=source,
+                    route=route,
+                    spec=spec,
+                    reason=blocker["reason"],
+                    policy_decision=blocker["policy_decision"],
+                    policy_flags=blocker["policy_flags"],
+                    created_at=created_at,
+                )
+                candidates.append(diagnostic)
+                diagnostics.append(_diagnostic_from_candidate(diagnostic, blocker["message"]))
             continue
 
         pdf_size = pdf_path.stat().st_size if pdf_path is not None else 0
@@ -152,7 +158,7 @@ def _page_candidate(
         f"{figure_suffix}:{pdf_hash or source.get('url')}"
     )
     provider_run_id = _provider_run_id(source, route)
-    pdf_url = str(source.get("url") or "")
+    pdf_url = _pdf_url_value(source)
     page_url = _http_url_or_none(pdf_url)
     pdf_local_path = _pdf_local_path_value(pdf_path, source)
     observation = (
@@ -246,16 +252,31 @@ def _diagnostic_candidate(
     provider_mode: str,
     source: Mapping[str, Any],
     route: Mapping[str, Any],
-    page_number: int,
+    spec: Mapping[str, Any],
     reason: str,
     policy_decision: str,
     policy_flags: Sequence[str],
     created_at: str,
 ) -> dict[str, Any]:
+    page_number = int(spec["page_number"])
+    figure_hint = spec.get("figure_hint")
+    origin = "pdf_figure" if isinstance(figure_hint, Mapping) else "pdf_page"
+    figure_suffix = ""
+    if isinstance(figure_hint, Mapping):
+        figure_suffix = "_" + _safe_id(
+            str(
+                figure_hint.get("label")
+                or figure_hint.get("figure")
+                or figure_hint.get("caption")
+                or "figure"
+            )
+        )
     provider_run_id = _provider_run_id(source, route)
-    pdf_url = str(source.get("url") or "")
+    pdf_url = _pdf_url_value(source)
     page_url = _http_url_or_none(pdf_url)
-    candidate_id = "cand_" + _safe_id(f"{provider}_{source['id']}_diagnostic_{reason}_{page_number}")
+    candidate_id = "cand_" + _safe_id(
+        f"{provider}_{source['id']}_diagnostic_{reason}_{page_number}{figure_suffix}"
+    )
     record = {
         "id": candidate_id,
         "candidate_id": candidate_id,
@@ -274,11 +295,14 @@ def _diagnostic_candidate(
         "route": route["modality"],
         "angle_id": route["id"],
         "task_id": _task_id(route),
-        "candidate_class": "pdf_page",
-        "origin": "pdf_page",
+        "candidate_class": origin,
+        "origin": origin,
         "image_url": None,
         "page_url": page_url,
-        "local_artifact_path": f"images/pdf/{_safe_id(str(source['id']))}_diagnostic_{_safe_id(reason)}.png",
+        "local_artifact_path": (
+            f"images/pdf/{_safe_id(str(source['id']))}_diagnostic_{_safe_id(reason)}"
+            f"_page_{page_number:03d}{figure_suffix}.png"
+        ),
         "mime_type": "image/png",
         "width": 0,
         "height": 0,
@@ -299,9 +323,11 @@ def _diagnostic_candidate(
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
         "pdf_url": pdf_url,
-        "pdf_local_path": _pdf_local_path_value(None, source),
+        "pdf_local_path": None
+        if reason == "local_pdf_outside_run_dir"
+        else _pdf_local_path_value(None, source),
         "page_number": page_number,
-        "figure_hint": None,
+        "figure_hint": dict(figure_hint) if isinstance(figure_hint, Mapping) else None,
         "pdf_diagnostic": {
             "reason": reason,
             "policy_decision": policy_decision,
@@ -339,15 +365,18 @@ def _diagnostic_from_candidate(candidate: Mapping[str, Any], message: str) -> di
 def _source_blocker(
     source: Mapping[str, Any],
     *,
+    run_dir: Path,
     pdf_path: Path | None,
     max_pdf_bytes: int,
 ) -> dict[str, Any] | None:
     policy_flags = list(_string_list(source.get("policy_flags")))
-    policy_decision = str(source.get("policy_decision") or "allowed")
+    policy_decision = _normalized_policy_value(source.get("policy_decision")) or "allowed"
+    license_policy = _normalized_policy_value(source.get("license_policy"))
+    robots_policy = _normalized_policy_value(source.get("robots_policy"))
     if (
         policy_decision == "blocked"
-        or source.get("license_policy") == "restricted"
-        or source.get("robots_policy") == "disallowed"
+        or license_policy in {"blocked", "restricted", "disallowed", "denied"}
+        or robots_policy in {"blocked", "restricted", "disallowed", "denied"}
     ):
         flags = _dedupe(policy_flags + ["policy_blocked"])
         return {
@@ -356,7 +385,11 @@ def _source_blocker(
             "policy_decision": "blocked",
             "policy_flags": flags,
         }
-    if policy_decision == "manual_review":
+    if (
+        policy_decision == "manual_review"
+        or license_policy == "manual_review"
+        or robots_policy == "manual_review"
+    ):
         flags = _dedupe(policy_flags + ["manual_review_required"])
         return {
             "reason": "policy_manual_review_pdf",
@@ -364,13 +397,22 @@ def _source_blocker(
             "policy_decision": "manual_review",
             "policy_flags": flags,
         }
-    if _is_paywalled(source):
-        flags = _dedupe(policy_flags + ["paywalled"])
+    access_blocker = _access_blocker(source)
+    if access_blocker is not None:
+        flags = _dedupe(policy_flags + [access_blocker["flag"]])
         return {
-            "reason": "paywalled_pdf",
-            "message": "PDF source appears paywalled or login-gated.",
+            "reason": access_blocker["reason"],
+            "message": access_blocker["message"],
             "policy_decision": "blocked",
             "policy_flags": flags,
+        }
+    unsafe_local_reason = _unsafe_local_pdf_reason(run_dir, source)
+    if unsafe_local_reason is not None:
+        return {
+            "reason": unsafe_local_reason,
+            "message": "PDF source must use a run-relative local_artifact_path inside the run directory.",
+            "policy_decision": "manual_review",
+            "policy_flags": _dedupe(policy_flags + ["unsafe_local_pdf_artifact"]),
         }
     if pdf_path is None or not pdf_path.is_file():
         return {
@@ -388,7 +430,7 @@ def _source_blocker(
             "policy_flags": policy_flags,
         }
     try:
-        prefix = pdf_path.read_bytes()[:4096]
+        pdf_bytes = pdf_path.read_bytes()
     except OSError as exc:
         return {
             "reason": "unsupported_pdf",
@@ -396,14 +438,14 @@ def _source_blocker(
             "policy_decision": "manual_review",
             "policy_flags": _dedupe(policy_flags + ["read_failed"]),
         }
-    if not prefix.startswith(b"%PDF-"):
+    if not pdf_bytes.startswith(b"%PDF-"):
         return {
             "reason": "unsupported_pdf",
             "message": "PDF artifact does not start with a PDF header.",
             "policy_decision": "manual_review",
             "policy_flags": _dedupe(policy_flags + ["unsupported_pdf"]),
         }
-    if b"/Encrypt" in prefix:
+    if b"/Encrypt" in pdf_bytes:
         return {
             "reason": "encrypted_pdf",
             "message": "PDF artifact is encrypted and cannot be rasterized.",
@@ -495,17 +537,14 @@ def _page_values(value: Any) -> list[int]:
 def _source_pdf_path(run_dir: Path, source: Mapping[str, Any]) -> Path | None:
     local_path = source.get("local_artifact_path")
     if isinstance(local_path, str) and local_path:
+        relative = Path(local_path)
+        if relative.is_absolute() or any(part == ".." for part in relative.parts):
+            return None
         candidate = (run_dir / local_path).resolve(strict=False)
-        if candidate.is_file() and candidate.suffix.lower() == ".pdf":
-            try:
-                candidate.relative_to(run_dir.resolve())
-                return candidate
-            except ValueError:
-                return None
-    url = str(source.get("url") or "")
-    parsed = urlparse(url)
-    if parsed.scheme == "file" and parsed.path:
-        candidate = Path(unquote(parsed.path))
+        try:
+            candidate.relative_to(run_dir.resolve())
+        except ValueError:
+            return None
         if candidate.is_file() and candidate.suffix.lower() == ".pdf":
             return candidate
     return None
@@ -516,9 +555,13 @@ def _pdf_local_path_value(pdf_path: Path | None, source: Mapping[str, Any]) -> s
         local_path = source.get("local_artifact_path")
         if isinstance(local_path, str) and local_path:
             return local_path
-        return pdf_path.as_uri()
+        return None
     local_path = source.get("local_artifact_path")
-    return str(local_path) if isinstance(local_path, str) and local_path else None
+    if isinstance(local_path, str) and local_path:
+        relative = Path(local_path)
+        if not relative.is_absolute() and not any(part == ".." for part in relative.parts):
+            return local_path
+    return None
 
 
 def _source_route(
@@ -578,16 +621,139 @@ def _analysis_provider(source: Mapping[str, Any]) -> str:
     return "codex-interactive"
 
 
-def _is_paywalled(source: Mapping[str, Any]) -> bool:
-    if source.get("paywalled") is True or source.get("is_paywalled") is True:
-        return True
-    flags = " ".join(_string_list(source.get("policy_flags"))).lower()
-    if any(token in flags for token in ("paywall", "login_required", "subscription_required")):
-        return True
-    raw = source.get("raw_provider_metadata")
-    if isinstance(raw, Mapping):
-        return raw.get("paywalled") is True or raw.get("is_paywalled") is True
-    return False
+def _unsafe_local_pdf_reason(run_dir: Path, source: Mapping[str, Any]) -> str | None:
+    parsed = urlparse(str(source.get("url") or ""))
+    if parsed.scheme == "file" and parsed.path:
+        file_path = Path(unquote(parsed.path)).resolve(strict=False)
+        try:
+            file_path.relative_to(run_dir.resolve())
+        except ValueError:
+            return "local_pdf_outside_run_dir"
+    local_path = source.get("local_artifact_path")
+    if isinstance(local_path, str) and local_path:
+        relative = Path(local_path)
+        if relative.is_absolute() or any(part == ".." for part in relative.parts):
+            return "local_pdf_outside_run_dir"
+        candidate = (run_dir / relative).resolve(strict=False)
+        try:
+            candidate.relative_to(run_dir.resolve())
+        except ValueError:
+            return "local_pdf_outside_run_dir"
+        return None
+    if parsed.scheme == "file":
+        return "missing_pdf_artifact"
+    return None
+
+
+def _access_blocker(source: Mapping[str, Any]) -> dict[str, str] | None:
+    values = _access_values(source)
+    paywall_tokens = (
+        "metered",
+        "paid",
+        "pay_wall",
+        "paywall",
+        "paywalled",
+        "premium",
+        "subscriber",
+        "subscription",
+        "subscription_required",
+    )
+    access_tokens = (
+        "access_control",
+        "access_controlled",
+        "auth",
+        "auth_required",
+        "authentication_required",
+        "captcha",
+        "login",
+        "login_gated",
+        "login_required",
+        "members_only",
+        "registration_required",
+        "restricted_access",
+    )
+    if any(_contains_access_token(value, paywall_tokens) for value in values):
+        return {
+            "reason": "paywalled_pdf",
+            "flag": "paywalled",
+            "message": "PDF source appears paywalled or subscription-gated.",
+        }
+    if any(_contains_access_token(value, access_tokens) for value in values):
+        return {
+            "reason": "access_blocked_pdf",
+            "flag": "access_controlled",
+            "message": "PDF source appears login-gated, CAPTCHA-gated, or access-controlled.",
+        }
+    return None
+
+
+def _access_values(source: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for container in _source_containers(source):
+        for key in (
+            "access",
+            "access_policy",
+            "access_status",
+            "access_type",
+            "availability",
+            "content_access",
+            "gate",
+            "license_policy",
+            "policy_flags",
+            "raw_access",
+            "retrieval_status",
+            "robots_policy",
+        ):
+            values.extend(_access_value_strings(container.get(key)))
+        for key in (
+            "access_controlled",
+            "captcha",
+            "login_gated",
+            "login_required",
+            "paywalled",
+            "requires_auth",
+            "requires_login",
+            "subscription_required",
+        ):
+            if container.get(key) is True:
+                values.append(key)
+    return values
+
+
+def _access_value_strings(value: Any) -> list[str]:
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (str, int, float)):
+        return [str(value)]
+    if isinstance(value, Mapping):
+        values: list[str] = []
+        for item in value.values():
+            values.extend(_access_value_strings(item))
+        return values
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        values: list[str] = []
+        for item in value:
+            values.extend(_access_value_strings(item))
+        return values
+    return []
+
+
+def _contains_access_token(value: str, tokens: Sequence[str]) -> bool:
+    normalized = _normalized_policy_value(value) or ""
+    compact = normalized.replace("_", "")
+    return any(token in normalized or token.replace("_", "") in compact for token in tokens)
+
+
+def _normalized_policy_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    return normalized or None
+
+
+def _pdf_url_value(source: Mapping[str, Any]) -> str:
+    url = str(source.get("url") or "")
+    return url if _http_url_or_none(url) else ""
 
 
 def _http_url_or_none(value: str) -> str | None:
