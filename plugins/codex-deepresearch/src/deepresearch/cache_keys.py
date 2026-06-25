@@ -142,7 +142,12 @@ def claim_cache_key(
 
     sources_by_id = sources_by_id or {}
     images_by_id = images_by_id or {}
-    source_refs = _normalized_string_set(_string_list(claim.get("supporting_sources")))
+    source_refs = _normalized_string_set(
+        [
+            *_string_list(claim.get("supporting_sources")),
+            *_quote_source_refs(claim.get("quote_spans")),
+        ]
+    )
     image_refs = _normalized_string_set(_string_list(claim.get("supporting_images")))
     payload = {
         "kind": "claim",
@@ -259,6 +264,19 @@ def _quote_span_inputs(value: Any) -> list[dict[str, str]]:
             }
         )
     return sorted(spans, key=lambda span: (span["source_id"], span["quote"], span["location"]))
+
+
+def _quote_source_refs(value: Any) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray, str)):
+        return []
+    refs: list[str] = []
+    for span in value:
+        if not isinstance(span, Mapping):
+            continue
+        source_id = _first_string(span, "source_id")
+        if source_id is not None:
+            refs.append(source_id)
+    return refs
 
 
 def _visual_support_inputs(value: Any) -> list[dict[str, Any]]:

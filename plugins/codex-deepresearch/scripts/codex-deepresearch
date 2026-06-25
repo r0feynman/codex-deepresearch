@@ -21,8 +21,12 @@ from deepresearch import (
     ConfigResolutionError,
     DEFAULT_FRESH_SESSION_INVOKE,
     DEFAULT_SCENARIO_TIMEOUT_SECONDS,
+    EvidenceReviewError,
     FreshSessionE2EError,
     resolve_config,
+    inspect_evidence,
+    list_reusable_claims,
+    review_claim,
     run_fresh_session_e2e,
     run_skill_invocation,
     validate_artifacts,
@@ -566,6 +570,53 @@ def run_export_report(args: argparse.Namespace) -> int:
             include_excluded_caveats=args.include_excluded_caveats,
         )
     except (ReportExportError, ReportGenerationError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_browse_evidence(args: argparse.Namespace) -> int:
+    try:
+        result = inspect_evidence(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            claim_id=args.claim_id,
+        )
+    except (EvidenceReviewError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_review_claim(args: argparse.Namespace) -> int:
+    try:
+        result = review_claim(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+            claim_id=args.claim_id,
+            decision=args.decision,
+            reviewer=args.reviewer,
+            rationale=args.rationale,
+        )
+    except (EvidenceReviewError, SearchHandoffError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("status") == "completed" else 2
+
+
+def run_reuse_evidence(args: argparse.Namespace) -> int:
+    try:
+        result = list_reusable_claims(
+            run=args.run,
+            runs_dir=resolve_repo_path(args.runs_dir),
+        )
+    except (EvidenceReviewError, SearchHandoffError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -1643,6 +1694,77 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     export.set_defaults(func=run_export_report)
+
+    browse_evidence = subparsers.add_parser(
+        "browse-evidence",
+        help="Inspect source, image, visual observation, vote, claim, and report provenance.",
+    )
+    browse_evidence.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    browse_evidence.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    browse_evidence.add_argument(
+        "--claim-id",
+        help="Limit provenance output to one claim id.",
+    )
+    browse_evidence.set_defaults(func=run_browse_evidence)
+
+    review_claim_parser = subparsers.add_parser(
+        "review-claim",
+        help="Persist a local human review decision for one claim.",
+    )
+    review_claim_parser.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    review_claim_parser.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    review_claim_parser.add_argument(
+        "--claim-id",
+        required=True,
+        help="Claim id to review.",
+    )
+    review_claim_parser.add_argument(
+        "--decision",
+        required=True,
+        choices=("accepted", "rejected", "needs_more_evidence"),
+        help="Human review decision to persist.",
+    )
+    review_claim_parser.add_argument(
+        "--reviewer",
+        help="Reviewer identifier to record in the public-safe review artifact.",
+    )
+    review_claim_parser.add_argument(
+        "--rationale",
+        help="Optional public-safe rationale for the review decision.",
+    )
+    review_claim_parser.set_defaults(func=run_review_claim)
+
+    reuse_evidence = subparsers.add_parser(
+        "reuse-evidence",
+        help="List claims currently eligible for downstream Codex reuse or promotion.",
+    )
+    reuse_evidence.add_argument(
+        "--run",
+        required=True,
+        help="Run id under --runs-dir, or a direct path to a run directory.",
+    )
+    reuse_evidence.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for run artifacts, relative to the repo root by default.",
+    )
+    reuse_evidence.set_defaults(func=run_reuse_evidence)
     return parser
 
 

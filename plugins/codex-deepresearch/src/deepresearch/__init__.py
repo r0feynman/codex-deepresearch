@@ -11,6 +11,14 @@ from .budget_estimator import (
     write_budget_estimate,
 )
 from .evidence_schema import ValidationError, ValidationResult, validate_artifacts
+from .evidence_review import (
+    EVIDENCE_REVIEW_SCHEMA_VERSION,
+    REVIEW_STATUS_FILENAME,
+    EvidenceReviewError,
+    inspect_evidence,
+    list_reusable_claims,
+    review_claim,
+)
 from .execution_mode import ConfigResolutionError, RunConfig, resolve_config
 from .fetch_claims import FetchClaimsError, fetch_claims
 from .fresh_session_e2e import (
@@ -100,6 +108,7 @@ __all__ = [
     "FetchClaimsError",
     "FreshSessionE2EError",
     "GuardrailsError",
+    "EvidenceReviewError",
     "ManualSourcesError",
     "ModalityDecision",
     "MvpSmokeError",
@@ -119,6 +128,8 @@ __all__ = [
     "SearchHandoffError",
     "TRACE_FILENAME",
     "TRACE_SCHEMA_VERSION",
+    "EVIDENCE_REVIEW_SCHEMA_VERSION",
+    "REVIEW_STATUS_FILENAME",
     "FRESH_SESSION_E2E_SCHEMA_VERSION",
     "DEFAULT_FRESH_SESSION_INVOKE",
     "DEFAULT_SCENARIO_TIMEOUT_SECONDS",
@@ -147,10 +158,12 @@ __all__ = [
     "extract_page_image_candidates",
     "FetchResponse",
     "fetch_claims",
+    "inspect_evidence",
     "run_fresh_session_e2e",
     "ingest_run",
     "ingest_manual_sources",
     "ingest_vision_observations",
+    "list_reusable_claims",
     "inspect_run_state",
     "is_real_automatic_visual_record",
     "merge_evidence_shards",
@@ -168,6 +181,7 @@ __all__ = [
     "run_parallel_orchestration",
     "run_skill_invocation",
     "export_report",
+    "review_claim",
     "synthesize_report",
     "transition_stage",
     "validate_artifacts",

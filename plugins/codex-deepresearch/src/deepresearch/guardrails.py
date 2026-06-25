@@ -258,7 +258,7 @@ def _enforce_claims(
         if not isinstance(claim, dict):
             continue
         claim_flags = _string_list(claim.get("policy_flags"))
-        source_ids = _string_list(claim.get("supporting_sources"))
+        source_ids = _claim_source_refs(claim)
         image_ids = _string_list(claim.get("supporting_images"))
         source_flags = _evidence_flags(source_ids, sources_by_id)
         image_flags = _evidence_flags(image_ids, images_by_id)
@@ -420,6 +420,18 @@ def _evidence_flags(
         if isinstance(record, Mapping)
         for flag in _string_list(record.get("policy_flags"))
     )
+
+
+def _claim_source_refs(claim: Mapping[str, Any]) -> list[str]:
+    refs = [*_string_list(claim.get("supporting_sources"))]
+    quote_spans = claim.get("quote_spans", [])
+    if isinstance(quote_spans, list):
+        refs.extend(
+            str(span.get("source_id"))
+            for span in quote_spans
+            if isinstance(span, Mapping) and isinstance(span.get("source_id"), str)
+        )
+    return _ordered_unique(refs)
 
 
 def _high_risk_domains(claim: Mapping[str, Any]) -> list[str]:

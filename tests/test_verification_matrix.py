@@ -209,6 +209,30 @@ class VerificationMatrixTests(unittest.TestCase):
         self.assertEqual(claim["verification_status"], "supported")
         self.assertEqual(claim["confidence"], "medium")
 
+    def test_quote_span_only_blocked_source_is_policy_blocked(self) -> None:
+        run_dir = self.temp_run(route="text_only")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["sources"][0]["robots_policy"] = "disallowed"
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_quote_only_policy",
+                supporting_sources=[],
+            )
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        verify_claims(run=run_dir)
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = evidence["claims"][0]
+        votes = self.votes_for(run_dir, "claim_quote_only_policy")
+        policy_votes = [vote for vote in votes if vote["verifier_type"] == "policy"]
+        self.assertEqual(claim["verification_status"], "policy_blocked")
+        self.assertEqual(claim["promotion_status"], "not_eligible")
+        self.assertFalse(claim["include_in_final_report"])
+        self.assertEqual(policy_votes[0]["vote"], "blocked")
+        self.assertEqual(policy_votes[0]["evidence_refs"], ["src_001"])
+
     def test_visual_required_claim_gets_visual_vote(self) -> None:
         run_dir = self.temp_run(route="visual_required")
         evidence = self.load_json(run_dir / "evidence.json")
