@@ -97,6 +97,7 @@ class ProjectState:
     items: dict[int, ProjectItem]
     fields: dict[str, ProjectField]
     dependencies: DependencyState
+    issues: dict[int, IssueRecord] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -313,11 +314,14 @@ def load_fixture_state(fixture_dir: Path, policy: Policy) -> ProjectState:
             fields=item_fields_from_raw(raw_item),
         )
 
+    issues = dict(issue_overrides)
+    issues.update({number: item.issue for number, item in items.items()})
     return ProjectState(
         project_id=project_payload.get("id") if isinstance(project_payload, dict) else None,
         items=items,
         fields=fields_from_raw(fields_payload),
         dependencies=dependencies_from_raw(dependencies_payload),
+        issues=issues,
     )
 
 
@@ -409,6 +413,7 @@ def load_live_state(
                 ),
                 fallback_repo=repository,
             )
+        issues[issue.number] = issue
         items[issue.number] = ProjectItem(
             item_id=str(raw_item.get("id") or ""),
             issue=issue,
@@ -421,6 +426,7 @@ def load_live_state(
         items=items,
         fields=fields_from_raw(fields_payload),
         dependencies=dependencies,
+        issues=issues,
     )
 
 
@@ -619,10 +625,146 @@ def expected_status(workflow_status: str, issue_state: str) -> str:
 
 def verify_project_state(state: ProjectState, policy: Policy) -> list[Finding]:
     findings: list[Finding] = []
+    findings.extend(verify_policy_issue_coverage(state, policy))
+    findings.extend(verify_or_dependency_groups(state, policy))
     for item in sorted(state.items.values(), key=lambda project_item: project_item.issue.number):
         findings.extend(verify_dependencies(item, state))
         findings.extend(verify_workflow_fields(item, state, policy))
         findings.extend(verify_metadata_fields(item, state, policy))
+    return findings
+
+
+def policy_issue_numbers(policy: Policy) -> set[int]:
+    numbers = set(policy.current_ready)
+    numbers.update(policy.deferred_backlog)
+    numbers.update(policy.active_blocked)
+    numbers.update(policy.intentionally_blank_fields)
+    for dependent, groups in policy.or_dependency_groups.items():
+        numbers.add(dependent)
+        for group in groups:
+            numbers.update(group)
+    return numbers
+
+
+def verify_policy_issue_coverage(state: ProjectState, policy: Policy) -> list[Finding]:
+    findings: list[Finding] = []
+    for issue_number in sorted(policy_issue_numbers(policy)):
+        if issue_number in state.items:
+            continue
+        issue = state.issues.get(issue_number)
+        findings.append(
+            Finding(
+                check="policy_issue_missing_from_project",
+                issue_number=issue_number,
+                title=issue.title if issue else "",
+                field_name=None,
+                current="missing",
+                expected="Project item",
+                message=(
+                    f"Policy lists #{issue_number}, but that issue is absent from "
+                    "the GitHub Project items."
+                ),
+                safe_fix=False,
+            )
+        )
+    return findings
+
+
+def verify_or_dependency_groups(state: ProjectState, policy: Policy) -> list[Finding]:
+    findings: list[Finding] = []
+    for dependent, groups in sorted(policy.or_dependency_groups.items()):
+        dependent_item = state.items.get(dependent)
+        dependent_issue = state.issues.get(dependent)
+        title = (
+            dependent_item.issue.title
+            if dependent_item is not None
+            else dependent_issue.title if dependent_issue is not None else ""
+        )
+        if not groups:
+            findings.append(
+                Finding(
+                    check="or_dependency_group_invalid",
+                    issue_number=dependent,
+                    title=title,
+                    field_name=None,
+                    current="no OR groups",
+                    expected="at least one OR group",
+                    message=f"Policy OR dependency entry for #{dependent} has no candidate groups.",
+                    safe_fix=False,
+                )
+            )
+            continue
+
+        actual_hard_blockers = state.dependencies.blocked_by.get(dependent, set())
+        for index, group in enumerate(groups, start=1):
+            if len(group) < 2:
+                findings.append(
+                    Finding(
+                        check="or_dependency_group_invalid",
+                        issue_number=dependent,
+                        title=title,
+                        field_name=None,
+                        current=format_numbers(group),
+                        expected="two or more candidate issues",
+                        message=(
+                            f"Policy OR dependency group {index} for #{dependent} "
+                            "must contain at least two candidate issues."
+                        ),
+                        safe_fix=False,
+                    )
+                )
+            if dependent in group:
+                findings.append(
+                    Finding(
+                        check="or_dependency_group_invalid",
+                        issue_number=dependent,
+                        title=title,
+                        field_name=None,
+                        current=format_numbers(group),
+                        expected=f"candidates excluding #{dependent}",
+                        message=(
+                            f"Policy OR dependency group {index} for #{dependent} "
+                            "must not include the dependent issue itself."
+                        ),
+                        safe_fix=False,
+                    )
+                )
+            for candidate in sorted(group):
+                if candidate not in state.issues:
+                    findings.append(
+                        Finding(
+                            check="or_dependency_candidate_missing",
+                            issue_number=dependent,
+                            title=title,
+                            field_name=None,
+                            current=f"#{candidate}",
+                            expected="known GitHub issue",
+                            message=(
+                                f"Policy OR dependency group {index} for #{dependent} "
+                                f"references #{candidate}, but that issue was not found "
+                                "in GitHub issue state."
+                            ),
+                            safe_fix=False,
+                        )
+                    )
+
+            false_hard_blockers = group & actual_hard_blockers
+            for candidate in sorted(false_hard_blockers):
+                findings.append(
+                    Finding(
+                        check="or_dependency_hard_blocker",
+                        issue_number=dependent,
+                        title=title,
+                        field_name=None,
+                        current=format_numbers(actual_hard_blockers),
+                        expected="no OR candidates as hard blockers",
+                        message=(
+                            f"#{candidate} is an OR dependency candidate for #{dependent}, "
+                            "so it must not be present as a GitHub hard blocker."
+                        ),
+                        safe_fix=False,
+                    )
+                )
     return findings
 
 
@@ -767,7 +909,11 @@ def is_safe_field_fix(
         return False
     if field_key == "workflow_status" and expected == "In Progress":
         return False
-    if item.fields.get("workflow_status") == "In Progress" and expected != "In Progress":
+    if (
+        item.issue.state != "CLOSED"
+        and item.fields.get("workflow_status") == "In Progress"
+        and expected != "In Progress"
+    ):
         return False
     return True
 
@@ -951,6 +1097,18 @@ def load_state_from_args(args: argparse.Namespace, policy: Policy) -> tuple[Proj
     )
 
 
+def reload_state_after_apply(
+    args: argparse.Namespace,
+    policy: Policy,
+    state: ProjectState,
+    fixture_mode: bool,
+) -> ProjectState:
+    if fixture_mode:
+        return state
+    reloaded_state, _fixture_mode = load_state_from_args(args, policy)
+    return reloaded_state
+
+
 def verify_main(argv: list[str] | None = None) -> int:
     parser = build_parser("Verify GitHub Project policy without writing.", sync=False)
     args = parser.parse_args(argv)
@@ -973,11 +1131,12 @@ def sync_main(argv: list[str] | None = None) -> int:
         state, fixture_mode = load_state_from_args(args, policy)
         before = verify_project_state(state, policy)
         changes = planned_changes(before, state, policy)
-        if args.apply and changes:
-            apply_changes(changes, state, fixture_mode=fixture_mode)
+        after = None
+        if args.apply:
+            if changes:
+                apply_changes(changes, state, fixture_mode=fixture_mode)
+                state = reload_state_after_apply(args, policy, state, fixture_mode)
             after = verify_project_state(state, policy)
-        else:
-            after = None
         print_sync_report(before, changes, after, applied=args.apply)
         if args.apply:
             return 1 if after else 0

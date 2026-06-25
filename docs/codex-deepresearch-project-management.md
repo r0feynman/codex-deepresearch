@@ -279,11 +279,12 @@ python3 scripts/verify_github_project.py --project-owner r0feynman --project-num
 - unresolved hard blocker가 있는 미착수 이슈는 `Ready`나 `Blocked`가 아니라 `Backlog`이어야 한다.
 - 현재 safe wave만 `Ready`이어야 하고, later/deferred wave는 `Backlog`이어야 한다.
 - `Blocked`는 선택되었거나 시작된 작업의 실제 impediment에만 쓴다.
+- Project policy에 열거된 이슈는 모두 Project item으로 존재해야 한다.
 - 이슈 본문의 hard blocker 계획과 GitHub dependency API 상태가 맞아야 한다.
-- OR-shaped soft dependency는 GitHub hard blocker로 만들지 않는다.
+- OR-shaped soft dependency policy는 candidate 이슈 존재 여부와 group 형태를 검증하며, OR candidate는 GitHub hard blocker로 만들지 않는다.
 - Project field가 지원하는 값은 이슈 본문의 `Metadata / Project Plan`과 맞아야 한다. Project operations 이슈처럼 `Phase`나 `Component`가 의도적으로 비어 있는 경우는 blank 상태를 유지한다.
 
-안전한 Project field 보정만 자동 적용하려면 maintainer가 로컬에서 아래 명령을 실행한다. 이 명령은 dependency link를 만들거나 지우지 않고, 임의의 이슈를 `In Progress`로 옮기지 않는다.
+안전한 Project field 보정만 자동 적용하려면 maintainer가 로컬에서 아래 명령을 실행한다. 이 명령은 dependency link를 만들거나 지우지 않고, 임의의 이슈를 `In Progress`로 옮기지 않는다. 적용 후에는 Project/GitHub state를 다시 읽어 `After` mismatch를 계산하며, 수동 조치가 필요한 mismatch가 남아 있으면 non-zero로 종료한다.
 
 ```bash
 python3 scripts/sync_github_project.py --project-owner r0feynman --project-number 1 --apply

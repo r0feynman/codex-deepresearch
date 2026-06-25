@@ -50,6 +50,18 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
                 return
         raise AssertionError(f"missing fixture issue #{number}")
 
+    def remove_project_item(self, fixture_dir: Path, number: int) -> None:
+        path = fixture_dir / "project_items.json"
+        payload = json.loads(path.read_text())
+        kept_items = [
+            item for item in payload["items"]
+            if item.get("content", {}).get("number") != number
+        ]
+        if len(kept_items) == len(payload["items"]):
+            raise AssertionError(f"missing fixture issue #{number}")
+        payload["items"] = kept_items
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
     def mutate_dependencies(self, fixture_dir: Path, payload: dict) -> None:
         (fixture_dir / "dependencies.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -111,8 +123,8 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
             self.mutate_project_item(
                 fixture_dir,
                 6,
-                status="Todo",
-                **{"workflow Status": "Backlog"},
+                status="In Progress",
+                **{"workflow Status": "In Progress"},
             )
             policy, state = self.load_state(fixture_dir)
             findings = common.verify_project_state(state, policy)
@@ -123,6 +135,66 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
             self.assertEqual(2, len(changes))
             common.apply_changes(changes, state, fixture_mode=True)
             self.assertEqual([], common.verify_project_state(state, policy))
+
+    def test_apply_mode_manual_only_mismatch_exits_nonzero(self) -> None:
+        with self.copy_fixture() as tmp:
+            fixture_dir = Path(tmp)
+            dependencies = json.loads((fixture_dir / "dependencies.json").read_text())
+            dependencies["blocked_by"]["68"] = [64]
+            self.mutate_dependencies(fixture_dir, dependencies)
+
+            sync = subprocess.run(
+                [
+                    sys.executable,
+                    str(SYNC_SCRIPT),
+                    "--project-owner",
+                    "r0feynman",
+                    "--project-number",
+                    "1",
+                    "--fixture-dir",
+                    str(fixture_dir),
+                    "--apply",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(1, sync.returncode, sync.stdout + sync.stderr)
+            self.assertIn("Manual-only mismatch(es):", sync.stdout)
+            self.assertIn("After:", sync.stdout)
+
+    def test_live_apply_after_reload_uses_fresh_state(self) -> None:
+        policy, state = self.load_state()
+        reloaded_state = common.ProjectState(
+            project_id="PVT_reloaded",
+            items={},
+            fields={},
+            dependencies=common.DependencyState(blocked_by={}, blocking={}),
+            issues={},
+        )
+        calls = []
+        args = object()
+        original_load_state_from_args = common.load_state_from_args
+
+        def fake_load_state_from_args(fake_args, fake_policy):
+            calls.append((fake_args, fake_policy))
+            return reloaded_state, False
+
+        try:
+            common.load_state_from_args = fake_load_state_from_args
+            self.assertIs(
+                reloaded_state,
+                common.reload_state_after_apply(args, policy, state, fixture_mode=False),
+            )
+            self.assertIs(
+                state,
+                common.reload_state_after_apply(args, policy, state, fixture_mode=True),
+            )
+        finally:
+            common.load_state_from_args = original_load_state_from_args
+
+        self.assertEqual([(args, policy)], calls)
 
     def test_open_issue_with_unresolved_blocker_cannot_be_ready(self) -> None:
         with self.copy_fixture() as tmp:
@@ -179,6 +251,62 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
         checks = self.finding_checks()
         self.assertNotIn(("dependency_missing", 68), checks)
         self.assertNotIn(("dependency_extra", 68), checks)
+
+    def test_or_dependency_policy_catches_false_hard_blocker(self) -> None:
+        with self.copy_fixture() as tmp:
+            fixture_dir = Path(tmp)
+            dependencies = json.loads((fixture_dir / "dependencies.json").read_text())
+            dependencies["blocked_by"]["68"] = [64]
+            self.mutate_dependencies(fixture_dir, dependencies)
+            checks = self.finding_checks(fixture_dir)
+            self.assertIn(("or_dependency_hard_blocker", 68), checks)
+
+    def test_or_dependency_policy_catches_missing_candidate_issue(self) -> None:
+        policy, state = self.load_state()
+        policy = common.Policy(
+            repository=policy.repository,
+            current_ready=set(policy.current_ready),
+            deferred_backlog=set(policy.deferred_backlog),
+            active_blocked=set(policy.active_blocked),
+            intentionally_blank_fields={
+                issue_number: set(fields)
+                for issue_number, fields in policy.intentionally_blank_fields.items()
+            },
+            or_dependency_groups={68: [{64, 999}]},
+            safe_apply_fields=set(policy.safe_apply_fields),
+        )
+        checks = {
+            (finding.check, finding.issue_number)
+            for finding in common.verify_project_state(state, policy)
+        }
+        self.assertIn(("or_dependency_candidate_missing", 68), checks)
+
+    def test_or_dependency_policy_catches_malformed_group(self) -> None:
+        policy, state = self.load_state()
+        policy = common.Policy(
+            repository=policy.repository,
+            current_ready=set(policy.current_ready),
+            deferred_backlog=set(policy.deferred_backlog),
+            active_blocked=set(policy.active_blocked),
+            intentionally_blank_fields={
+                issue_number: set(fields)
+                for issue_number, fields in policy.intentionally_blank_fields.items()
+            },
+            or_dependency_groups={68: [{64}]},
+            safe_apply_fields=set(policy.safe_apply_fields),
+        )
+        checks = {
+            (finding.check, finding.issue_number)
+            for finding in common.verify_project_state(state, policy)
+        }
+        self.assertIn(("or_dependency_group_invalid", 68), checks)
+
+    def test_policy_listed_issue_missing_from_project_is_detected(self) -> None:
+        with self.copy_fixture() as tmp:
+            fixture_dir = Path(tmp)
+            self.remove_project_item(fixture_dir, 58)
+            checks = self.finding_checks(fixture_dir)
+            self.assertIn(("policy_issue_missing_from_project", 58), checks)
 
     def test_intentionally_blank_phase_and_component_are_supported(self) -> None:
         with self.copy_fixture() as tmp:

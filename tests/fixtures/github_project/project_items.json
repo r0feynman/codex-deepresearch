@@ -18,6 +18,25 @@
       "workflow Status": "Done"
     },
     {
+      "id": "item_57",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Epic`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 57,
+        "state": "OPEN",
+        "title": "[Epic] Phase 3 Public Beta backlog",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/57"
+      },
+      "labels": ["type:epic", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Epic",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
       "id": "item_58",
       "content": {
         "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Ready`.\n",
@@ -35,6 +54,82 @@
       "component": "Skill",
       "priority": "P1",
       "workflow Status": "Ready"
+    },
+    {
+      "id": "item_59",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 59,
+        "state": "OPEN",
+        "title": "[P3-UX2] Final response artifact handoff",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/59"
+      },
+      "labels": ["type:task", "component:skill", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Skill",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_60",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 60,
+        "state": "OPEN",
+        "title": "[P3-UX3] Fresh-session skill E2E gate",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/60"
+      },
+      "labels": ["type:task", "component:skill", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Skill",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_61",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 61,
+        "state": "OPEN",
+        "title": "[P3-UX4] Progress and shard monitor shell",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/61"
+      },
+      "labels": ["type:task", "component:skill", "priority:P2"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Skill",
+      "priority": "P2",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_62",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Skill`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 62,
+        "state": "OPEN",
+        "title": "[P3-UX5] Pause, resume, and cancel controls",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/62"
+      },
+      "labels": ["type:task", "component:skill", "priority:P2"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Skill",
+      "priority": "P2",
+      "workflow Status": "Backlog"
     },
     {
       "id": "item_63",
@@ -72,6 +167,63 @@
       "work Type": "Task",
       "component": "Visual",
       "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_65",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 65,
+        "state": "OPEN",
+        "title": "[P3-AV3] Page image extraction and fetch/cache",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/65"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_66",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 66,
+        "state": "OPEN",
+        "title": "[P3-AV4] Browser screenshot collector",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/66"
+      },
+      "labels": ["type:task", "component:visual", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_67",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Visual`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 67,
+        "state": "OPEN",
+        "title": "[P3-AV5] PDF figure and page rasterizer",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/67"
+      },
+      "labels": ["type:task", "component:visual", "priority:P2"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Visual",
+      "priority": "P2",
       "workflow Status": "Backlog"
     },
     {
@@ -148,6 +300,63 @@
       "work Type": "Task",
       "component": "Visual",
       "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_72",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Evidence`.\n- Project Priority: `P1`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 72,
+        "state": "OPEN",
+        "title": "[P3-ER1] Evidence browser and human review workflow",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/72"
+      },
+      "labels": ["type:task", "component:evidence", "priority:P1"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Evidence",
+      "priority": "P1",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_73",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Task`.\n- Project Component: `Evidence`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 73,
+        "state": "OPEN",
+        "title": "[P3-RT1] Report templates and export bundle",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/73"
+      },
+      "labels": ["type:task", "component:evidence", "priority:P2"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Task",
+      "component": "Evidence",
+      "priority": "P2",
+      "workflow Status": "Backlog"
+    },
+    {
+      "id": "item_74",
+      "content": {
+        "body": "## Dependencies / Ordering\n\n### Hard Blockers\n\n- None.\n\n## Metadata / Project Plan\n\n- Project Status: `Todo`.\n- Project Phase: `Phase 3 - Public Beta`.\n- Project Work Type: `Docs`.\n- Project Component: `Docs`.\n- Project Priority: `P2`.\n- Project Workflow Status: `Backlog`.\n",
+        "number": 74,
+        "state": "OPEN",
+        "title": "[P3-DOC1] Install/update docs, quickstart, and beta examples",
+        "type": "Issue",
+        "url": "https://github.com/r0feynman/codex-deepresearch/issues/74"
+      },
+      "labels": ["type:docs", "component:docs", "priority:P2"],
+      "milestone": {"title": "Phase 3 - Public Beta"},
+      "status": "Todo",
+      "phase": "Phase 3 - Public Beta",
+      "work Type": "Docs",
+      "component": "Docs",
+      "priority": "P2",
       "workflow Status": "Backlog"
     },
     {
