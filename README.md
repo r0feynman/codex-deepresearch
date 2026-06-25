@@ -11,6 +11,7 @@ Pre-MVP scaffold.
 Current contents:
 
 - Product requirements in `docs/codex-deepresearch-prd.md`
+- Phase 3 install, quickstart, troubleshooting, and examples in `docs/codex-deepresearch-plugin-guide.md`
 - Development management plan in `docs/codex-deepresearch-project-management.md`
 - Visual project-management explainer in `docs/codex-deepresearch-project-management.html`
 - Session handoff notes in `docs/session-handoff.md`
@@ -100,6 +101,8 @@ The board script creates or reuses the `Codex DeepResearch` project, links it to
 - `Workflow Status`
 
 ## Codex Usage During Development
+
+For local plugin install, update, remove, first-run verification, troubleshooting, and beta examples, see `docs/codex-deepresearch-plugin-guide.md`.
 
 From this repository, Codex can use the repo-local skill mirror:
 

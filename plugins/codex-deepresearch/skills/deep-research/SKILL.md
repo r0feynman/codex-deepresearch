@@ -23,6 +23,8 @@ When the user provides URLs, PDF URLs/files, image URLs, or local images and ask
 
 If preflight, search handoff, Codex execution, VLM, auth, sandbox, approval, or policy capability is blocked, report the terminal blocked status from `run_status.json`. Blocked statuses must expose `ok=false`, `terminal=true`, final `status`, and `diagnostics.actionable_cause`; do not silently return a chat-only answer.
 
+Repository operators can use `docs/codex-deepresearch-plugin-guide.md` for local install/update/remove, first-run verification, artifact inspection, troubleshooting, and beta example workflows. The installed skill remains artifact-first: fixture, local, manual, and user-provided evidence must be labeled as such and must not be presented as release-eligible real-provider evidence.
+
 ## Workflow
 
 1. Restate the research question and identify constraints.
