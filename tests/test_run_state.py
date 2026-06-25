@@ -161,7 +161,11 @@ class RunStateTests(unittest.TestCase):
         payload = "\n".join(json.dumps(record) for record in records) + "\n"
         (run_dir / "search_results.jsonl").write_text(payload, encoding="utf-8")
 
-    def write_full_runner_handoff_status(self, run_dir: Path, run_id: str) -> dict:
+    def write_full_runner_handoff_status(
+        self,
+        run_dir: Path,
+        run_id: str,
+    ) -> tuple[dict[str, str], dict[str, str]]:
         artifact_files = {
             "planning_status": "status.json",
             "search_tasks": "search_tasks.json",
@@ -189,6 +193,13 @@ class RunStateTests(unittest.TestCase):
                 for key, filename in artifact_files.items()
             },
         }
+        handoff_only_artifacts = {
+            "handoff_only_custom": str(run_dir / "handoff_only_custom.json"),
+        }
+        self.write_json(
+            run_dir / "handoff_only_custom.json",
+            {"fixture": "handoff_only_custom.json"},
+        )
         payload = {
             "schema_version": "codex-deepresearch.run-status.v0",
             "run_id": run_id,
@@ -213,7 +224,7 @@ class RunStateTests(unittest.TestCase):
                 "status": "running",
                 "ok": True,
                 "terminal": False,
-                "artifact_paths": dict(artifacts),
+                "artifact_paths": {**artifacts, **handoff_only_artifacts},
                 "missing_required_artifacts": ["report_status"],
                 "shards": {"accepted": 2},
                 "fallback": {"needs_serial_handoff": False},
@@ -224,16 +235,20 @@ class RunStateTests(unittest.TestCase):
             },
         }
         self.write_json(run_dir / "run_status.json", payload)
-        return artifacts
+        return artifacts, handoff_only_artifacts
 
     def assert_handoff_artifacts_preserved(
         self,
         run_dir: Path,
         expected_artifacts: dict[str, str],
+        expected_handoff_only_artifacts: dict[str, str],
     ) -> dict:
         run_status = self.read_json(run_dir / "run_status.json")
         for key, value in expected_artifacts.items():
             self.assertEqual(run_status["artifacts"][key], value)
+            self.assertEqual(run_status["artifact_handoff"]["artifact_paths"][key], value)
+        for key, value in expected_handoff_only_artifacts.items():
+            self.assertNotIn(key, run_status["artifacts"])
             self.assertEqual(run_status["artifact_handoff"]["artifact_paths"][key], value)
         self.assertIn("run_control", run_status["artifacts"])
         self.assertIn("run_control", run_status["artifact_handoff"]["artifact_paths"])
@@ -480,7 +495,10 @@ class RunStateTests(unittest.TestCase):
             route="text_only",
         )
         run_dir = Path(prepared["run_dir"])
-        expected_artifacts = self.write_full_runner_handoff_status(
+        (
+            expected_artifacts,
+            expected_handoff_only_artifacts,
+        ) = self.write_full_runner_handoff_status(
             run_dir,
             prepared["run_id"],
         )
@@ -493,6 +511,7 @@ class RunStateTests(unittest.TestCase):
         paused_status = self.assert_handoff_artifacts_preserved(
             run_dir,
             expected_artifacts,
+            expected_handoff_only_artifacts,
         )
         self.assertEqual(paused_status["status"], "paused")
         self.assertFalse(paused_status["terminal"])
@@ -505,6 +524,7 @@ class RunStateTests(unittest.TestCase):
         resumed_status = self.assert_handoff_artifacts_preserved(
             run_dir,
             expected_artifacts,
+            expected_handoff_only_artifacts,
         )
         self.assertEqual(resumed_status["status"], "resumed")
         self.assertFalse(resumed_status["terminal"])
@@ -517,6 +537,7 @@ class RunStateTests(unittest.TestCase):
         cancelled_status = self.assert_handoff_artifacts_preserved(
             run_dir,
             expected_artifacts,
+            expected_handoff_only_artifacts,
         )
         self.assertEqual(cancelled_status["status"], "cancelled")
         self.assertTrue(cancelled_status["terminal"])
@@ -592,6 +613,53 @@ class RunStateTests(unittest.TestCase):
                 self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
                 self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
                 self.assertFalse(run_control_path(run_dir).exists())
+
+    def test_resume_rejects_terminal_run_status_with_paused_control_without_mutation(
+        self,
+    ) -> None:
+        runs_dir = self.temp_runs_dir()
+        for persisted_status, expected_code, ok in (
+            ("completed_fixture", "run_completed", True),
+            ("cancelled", "run_cancelled", False),
+            ("failed_synthesis", "run_terminal", False),
+        ):
+            with self.subTest(persisted_status=persisted_status):
+                prepared = prepare_run(
+                    question=f"paused terminal {persisted_status} resume rejection",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                pause_run(
+                    run_dir,
+                    reason="paused_terminal_guard",
+                    timestamp="2026-06-25T00:00:00Z",
+                )
+                terminal_status = self.read_json(run_dir / "run_status.json")
+                terminal_status["status"] = persisted_status
+                terminal_status["ok"] = ok
+                terminal_status["terminal"] = True
+                terminal_status["updated_at"] = "2026-06-25T00:00:30Z"
+                terminal_status["diagnostics"] = {
+                    "actionable_cause": f"terminal {persisted_status} fixture"
+                }
+                terminal_status["artifact_handoff"]["status"] = persisted_status
+                terminal_status["artifact_handoff"]["ok"] = ok
+                terminal_status["artifact_handoff"]["terminal"] = True
+                terminal_status["artifact_handoff"]["diagnostics"] = dict(
+                    terminal_status["diagnostics"]
+                )
+                self.write_json(run_dir / "run_status.json", terminal_status)
+                run_steps_before = self.read_json(run_steps_path(run_dir))
+                run_control_before = self.read_json(run_control_path(run_dir))
+
+                with self.assertRaises(RunStepStateError) as resume_error:
+                    resume_run(run_dir, timestamp="2026-06-25T00:01:00Z")
+
+                self.assertEqual(resume_error.exception.to_dict()["code"], expected_code)
+                self.assertEqual(self.read_json(run_dir / "run_status.json"), terminal_status)
+                self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before)
+                self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
 
     def test_resume_continue_does_not_duplicate_completed_evidence(self) -> None:
         runs_dir = self.temp_runs_dir()

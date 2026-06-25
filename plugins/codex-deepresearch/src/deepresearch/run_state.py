@@ -1619,11 +1619,11 @@ def _raise_if_resume_blocked_by_terminal_run(
             from_status=state_status,
             to_status="resumed",
         )
-    if control_status == "paused":
-        return
 
     run_status = _read_json_artifact(run_dir / RUN_STATUS_FILENAME) or {}
     if run_status.get("terminal") is not True:
+        if control_status == "paused":
+            return
         return
     persisted_status = _string_value(run_status.get("status")) or "terminal"
     if persisted_status == "cancelled":
@@ -1712,12 +1712,21 @@ def _write_control_run_status(
         if isinstance(existing.get("artifact_handoff"), Mapping)
         else {}
     )
+    handoff_artifact_paths = (
+        {
+            str(key): value
+            for key, value in artifact_handoff["artifact_paths"].items()
+        }
+        if isinstance(artifact_handoff.get("artifact_paths"), Mapping)
+        else {}
+    )
+    handoff_artifact_paths.update(artifacts)
     artifact_handoff.update({
         "run_dir": payload["run_dir"],
         "status": status,
         "ok": payload["ok"],
         "terminal": payload["terminal"],
-        "artifact_paths": dict(artifacts),
+        "artifact_paths": handoff_artifact_paths,
         "diagnostics": dict(diagnostics),
     })
     payload["artifact_handoff"] = artifact_handoff
