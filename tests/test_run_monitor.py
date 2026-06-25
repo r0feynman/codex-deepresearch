@@ -124,6 +124,44 @@ class RunMonitorTests(unittest.TestCase):
         self.assertIn("Control: status=cancelled", rendered_cancelled_detail)
         self.assertIn("cancelled", rendered_cancelled_list)
 
+    def test_terminal_run_status_takes_precedence_over_paused_control(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        run_dir = self.make_run(runs_dir, "run-paused-terminal-001")
+        pause_run(
+            run_dir,
+            reason="monitor_paused_terminal",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        run_status = json.loads(
+            (run_dir / "run_status.json").read_text(encoding="utf-8")
+        )
+        run_status["status"] = "completed_fixture"
+        run_status["ok"] = True
+        run_status["terminal"] = True
+        run_status["updated_at"] = "2026-06-25T00:00:30Z"
+        run_status["diagnostics"] = {
+            "actionable_cause": "completed fixture should win over stale paused control"
+        }
+        run_status["artifact_handoff"]["status"] = "completed_fixture"
+        run_status["artifact_handoff"]["ok"] = True
+        run_status["artifact_handoff"]["terminal"] = True
+        run_status["artifact_handoff"]["diagnostics"] = dict(
+            run_status["diagnostics"]
+        )
+        self.write_json(run_dir / "run_status.json", run_status)
+
+        detail = inspect_run_monitor(run_dir)
+        rendered = render_run_detail(detail)
+
+        self.assertEqual(detail["status"], "completed_fixture")
+        self.assertTrue(detail["terminal"])
+        self.assertEqual(detail["phase"]["stage"], "completed")
+        self.assertEqual(detail["phase"]["status"], "completed_fixture")
+        self.assertEqual(detail["phase"]["source"], "run_status")
+        self.assertEqual(detail["control"]["status"], "paused")
+        self.assertIn("Status: completed_fixture", rendered)
+        self.assertIn("terminal=yes", rendered)
+
     def test_detail_classifies_shards_serial_fallback_budget_and_paths(self) -> None:
         runs_dir = self.temp_runs_dir()
         run_dir = self.make_run(runs_dir, "run-serial-001")

@@ -328,11 +328,12 @@ def _monitor_status(
     phase: Mapping[str, Any],
     payloads: Mapping[str, Any],
 ) -> str:
+    terminal_status = _terminal_run_status(run_status)
+    if terminal_status is not None:
+        return terminal_status
     control_status = _status_text(run_control.get("status"))
     if control_status in {"paused", "cancelled"}:
         return control_status
-    if run_status.get("terminal") is True:
-        return _run_status(run_status)
 
     phase_payload = _phase_status_payload(phase, payloads)
     status = _status_text(phase_payload.get("status"))
@@ -369,13 +370,13 @@ def _monitor_terminal(
     phase: Mapping[str, Any],
     payloads: Mapping[str, Any],
 ) -> bool | None:
+    if _terminal_run_status(run_status) is not None:
+        return True
     if run_control.get("status") == "cancelled" or run_control.get("terminal") is True:
         return True
     if run_control.get("status") == "paused":
         return False
     phase_payload = _phase_status_payload(phase, payloads)
-    if run_status.get("terminal") is True:
-        return True
     terminal = _first_present_bool(phase_payload.get("terminal"))
     if terminal is not None:
         return terminal
@@ -412,6 +413,15 @@ def _phase_status_payload(
 def _status_text(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
+    return None
+
+
+def _terminal_run_status(run_status: Mapping[str, Any]) -> str | None:
+    status = _status_text(run_status.get("status"))
+    if run_status.get("terminal") is True:
+        return status or "terminal"
+    if status and status.startswith(("completed", "cancelled", "failed")):
+        return status
     return None
 
 
@@ -462,6 +472,10 @@ def _phase_summary(
     run_trace: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     control_status = _status_text(run_control.get("status"))
+    if control_status in {"cancelled", "paused"}:
+        terminal_phase = _terminal_run_status_phase(run_status)
+        if terminal_phase is not None:
+            return terminal_phase
     if control_status == "cancelled":
         return {
             "stage": "cancelled",
@@ -514,6 +528,25 @@ def _phase_summary(
         "status": str(status),
         "next_safe_stage": None,
         "source": "status",
+    }
+
+
+def _terminal_run_status_phase(run_status: Mapping[str, Any]) -> dict[str, Any] | None:
+    status = _terminal_run_status(run_status)
+    if status is None:
+        return None
+    stage = "run_status"
+    if status.startswith("completed"):
+        stage = "completed"
+    elif status.startswith("cancelled"):
+        stage = "cancelled"
+    elif status.startswith("failed"):
+        stage = "failed"
+    return {
+        "stage": stage,
+        "status": status,
+        "next_safe_stage": None,
+        "source": "run_status",
     }
 
 

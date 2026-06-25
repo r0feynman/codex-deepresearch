@@ -308,6 +308,7 @@ def transition_stage(
     run_dir = Path(run_dir)
     path = run_steps_path(run_dir)
     state = initialize_run_steps(run_dir, run_id=run_id, created_at=timestamp)
+    _raise_if_control_blocks_stage(state, stage)
     _apply_stage_transition(
         state,
         stage,

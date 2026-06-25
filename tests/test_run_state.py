@@ -942,6 +942,112 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(self.read_json(run_control_path(run_dir)), run_control_before)
         self.assertEqual(self.read_json(run_steps_path(run_dir)), run_steps_before_ingest)
 
+    def test_transition_stage_rejects_reconstructed_paused_and_cancelled_runs_without_reopening(
+        self,
+    ) -> None:
+        runs_dir = self.temp_runs_dir()
+        for control_action, expected_status, expected_code in (
+            (pause_run, "paused", "run_paused"),
+            (cancel_run, "cancelled", "run_cancelled"),
+        ):
+            with self.subTest(expected_status=expected_status):
+                prepared = prepare_run(
+                    question=f"{expected_status} transition reconstruction gate",
+                    runs_dir=runs_dir,
+                    route="text_only",
+                )
+                run_dir = Path(prepared["run_dir"])
+                control_action(
+                    run_dir,
+                    reason="transition_reconstruction_guard",
+                    timestamp="2026-06-25T00:00:00Z",
+                )
+                run_status_before = self.read_json(run_dir / "run_status.json")
+                run_control_before = self.read_json(run_control_path(run_dir))
+                run_steps_path(run_dir).unlink()
+
+                with self.assertRaises(RunStepStateError) as transition_error:
+                    transition_stage(
+                        run_dir,
+                        "ingest",
+                        "running",
+                        reason="direct_public_transition",
+                        timestamp="2026-06-25T00:01:00Z",
+                    )
+
+                reconstructed = self.read_json(run_steps_path(run_dir))
+                stages = reconstructed["stages"]
+                self.assertEqual(
+                    transition_error.exception.to_dict()["code"],
+                    expected_code,
+                )
+                self.assertEqual(reconstructed["status"], expected_status)
+                self.assertEqual(stages["ingest"]["status"], "pending")
+                self.assertEqual(
+                    self.read_json(run_dir / "run_status.json"),
+                    run_status_before,
+                )
+                self.assertEqual(
+                    self.read_json(run_control_path(run_dir)),
+                    run_control_before,
+                )
+
+    def test_transition_stage_rejects_reconstructed_terminal_run_status_before_paused_control(
+        self,
+    ) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepared = prepare_run(
+            question="terminal transition reconstruction gate",
+            runs_dir=runs_dir,
+            route="text_only",
+        )
+        run_dir = Path(prepared["run_dir"])
+        pause_run(
+            run_dir,
+            reason="paused_terminal_transition_guard",
+            timestamp="2026-06-25T00:00:00Z",
+        )
+        terminal_status = self.read_json(run_dir / "run_status.json")
+        terminal_status["status"] = "completed_fixture"
+        terminal_status["ok"] = True
+        terminal_status["terminal"] = True
+        terminal_status["updated_at"] = "2026-06-25T00:00:30Z"
+        terminal_status["diagnostics"] = {
+            "actionable_cause": "completed fixture should win over paused control"
+        }
+        terminal_status["artifact_handoff"]["status"] = "completed_fixture"
+        terminal_status["artifact_handoff"]["ok"] = True
+        terminal_status["artifact_handoff"]["terminal"] = True
+        terminal_status["artifact_handoff"]["diagnostics"] = dict(
+            terminal_status["diagnostics"]
+        )
+        self.write_json(run_dir / "run_status.json", terminal_status)
+        run_control_before = self.read_json(run_control_path(run_dir))
+        run_steps_path(run_dir).unlink()
+
+        with self.assertRaises(RunStepStateError) as transition_error:
+            transition_stage(
+                run_dir,
+                "ingest",
+                "running",
+                reason="direct_public_transition",
+                timestamp="2026-06-25T00:01:00Z",
+            )
+
+        reconstructed = self.read_json(run_steps_path(run_dir))
+        stages = reconstructed["stages"]
+        self.assertEqual(transition_error.exception.to_dict()["code"], "run_completed")
+        self.assertEqual(reconstructed["status"], "completed")
+        self.assertEqual(stages["ingest"]["status"], "pending")
+        self.assertEqual(
+            self.read_json(run_dir / "run_status.json"),
+            terminal_status,
+        )
+        self.assertEqual(
+            self.read_json(run_control_path(run_dir)),
+            run_control_before,
+        )
+
     def test_run_status_reconstructs_deleted_run_steps_from_trace(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(
