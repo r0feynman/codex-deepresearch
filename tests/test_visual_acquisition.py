@@ -23,6 +23,7 @@ from deepresearch import (  # noqa: E402
     verify_claims,
 )
 from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
+from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
 from deepresearch.visual_acquisition import _BraveImageSearchResponse  # noqa: E402
 
 
@@ -767,6 +768,108 @@ class VisualAcquisitionTests(unittest.TestCase):
                 sort_keys=True,
             ),
         )
+
+    def test_child_discovered_provider_resolves_legacy_nasa_alsj_image_urls(self) -> None:
+        prepared = prepare_run(
+            question="Find Apollo 11 image evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        source = {
+            "id": "src_nasa_alsj",
+            "type": "web",
+            "url": "https://www.hq.nasa.gov/alsj/a11/images11.html",
+            "title": "Apollo 11 Image Library",
+            "published_at": None,
+            "accessed_at": "2026-06-26T00:00:00Z",
+            "quality": "primary",
+            "retrieval_status": "fetched",
+            "local_artifact_path": "sources/src_nasa_alsj.html",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "angle_id": "angle_001",
+            "route": "visual_required",
+        }
+        original_url = "https://www.hq.nasa.gov/alsj/a11/AS11-40-5868HR.jpg"
+        evidence["sources"] = [source]
+        evidence["images"] = [
+            {
+                "id": "img_apollo11_001",
+                "source_id": source["id"],
+                "origin": "page_image",
+                "page_url": source["url"],
+                "image_url": original_url,
+                "local_artifact_path": "evidence_shards/task_research_001/image_001.jpg",
+                "mime_type": "image/jpeg",
+                "width": 0,
+                "height": 0,
+                "observations": [],
+                "inferences": [],
+                "visual_tasks": ["image_claim_alignment"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "skipped",
+                "policy_flags": [],
+                "caveats": [],
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "merge_status.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "status": "completed",
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "real_child_execution": True,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "accepted_shards": 1,
+                },
+            },
+        )
+        calls: list[str] = []
+
+        def fake_child_fetch(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(
+                content=(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                    b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                ),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["child-discovered-image-url"],
+            child_image_transport=fake_child_fetch,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        self.assertEqual(
+            calls,
+            ["https://images-assets.nasa.gov/image/as11-40-5868/as11-40-5868~orig.jpg"],
+        )
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(candidates[0]["provider"], "child-discovered-image-url")
+        self.assertEqual(candidates[0]["candidate_status"], "fetched")
+        self.assertEqual(candidates[0]["provider_provenance"]["original_child_image_url"], original_url)
+        self.assertEqual(candidates[0]["provider_provenance"]["url_resolution"], "nasa_alsj_images_assets")
+        self.assertTrue(candidates[0]["local_artifact_path"].startswith("images/cand_apollo11_001"))
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(fetches[0]["fetch_status"], "fetched")
+        self.assertEqual(fetches[0]["provider"], "child-discovered-image-url")
+        updated = self.read_json(run_dir / "evidence.json")
+        self.assertEqual(updated["images"][0]["image_url"], calls[0])
+        self.assertEqual(updated["images"][0]["provider_provenance"]["original_child_image_url"], original_url)
 
     def test_real_brave_missing_config_blocks_without_fixture_candidates(self) -> None:
         prepared = prepare_run(

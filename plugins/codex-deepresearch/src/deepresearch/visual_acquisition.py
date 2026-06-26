@@ -14,7 +14,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import unquote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from .browser_screenshot import (
@@ -33,8 +33,11 @@ from .pdf_rasterizer import (
 )
 from .page_image_extraction import (
     PROVIDER_NAME as PAGE_IMAGE_EXTRACTOR_PROVIDER,
+    DEFAULT_TIMEOUT_SECONDS as PAGE_IMAGE_FETCH_TIMEOUT_SECONDS,
     ImageTransport,
     extract_and_fetch_page_images,
+    _fetch_candidates as _fetch_page_image_candidates,
+    _max_fetches as _page_image_max_fetches,
 )
 from .search_handoff import resolve_run_dir
 from .visual_artifacts import (
@@ -55,6 +58,7 @@ DEFAULT_VISUAL_PROVIDERS = (
     DEFAULT_PDF_RASTERIZER_PROVIDER,
 )
 BRAVE_IMAGE_PROVIDER = "brave-image-search"
+CHILD_DISCOVERED_IMAGE_PROVIDER = "child-discovered-image-url"
 BROWSER_SCREENSHOT_PROVIDER = "browser-screenshot"
 BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
 BRAVE_DEFAULT_SEARCH_LANG = "en"
@@ -79,8 +83,17 @@ SECRET_FIELD_PATTERN = re.compile(
 TRUE_CONFIG_VALUES = {"1", "true", "yes", "on"}
 FALSE_CONFIG_VALUES = {"0", "false", "no", "off"}
 SCREENSHOT_MODES = ("first_viewport", "full_page", "scroll", "interaction")
-DEFAULT_MAX_IMAGE_BYTES = 1_000_000
+DEFAULT_MAX_IMAGE_BYTES = 5_000_000
 SUPPORTED_MIME_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+NASA_ALSJ_IMAGE_HOSTS = {
+    "hq.nasa.gov",
+    "www.hq.nasa.gov",
+    "history.nasa.gov",
+    "www.history.nasa.gov",
+    "nasa.gov",
+    "www.nasa.gov",
+}
+NASA_ALSJ_IMAGE_RE = re.compile(r"^(AS\d{2}-\d{2}-\d{4})(?:HR)?\.(jpe?g)$", re.IGNORECASE)
 PNG_1X1 = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
     b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02"
@@ -158,6 +171,7 @@ def acquire_visual_candidates(
     browser_transport: BrowserScreenshotTransport | None = None,
     max_pdf_bytes: int = DEFAULT_MAX_PDF_BYTES,
     page_image_transport: ImageTransport | None = None,
+    child_image_transport: ImageTransport | None = None,
     max_fetches: int | None = None,
 ) -> dict[str, Any]:
     """Collect visual candidates for visual routes.
@@ -212,6 +226,7 @@ def acquire_visual_candidates(
             real_image_search_config=real_image_search_config,
             browser_transport=browser_transport,
             page_image_transport=page_image_transport,
+            child_image_transport=child_image_transport,
             max_fetches=max_fetches,
             created_at=now,
         )
@@ -222,6 +237,9 @@ def acquire_visual_candidates(
         real_image_search_transport=real_image_search_transport,
         real_image_search_config=real_image_search_config,
         browser_transport=browser_transport,
+        child_image_transport=child_image_transport,
+        max_image_bytes=max_image_bytes,
+        max_fetches=max_fetches,
         evidence=evidence,
     )
     real_provider_requested = any(
@@ -537,6 +555,7 @@ def _acquire_with_page_image_extractor(
     real_image_search_config: Mapping[str, Any] | None,
     browser_transport: BrowserScreenshotTransport | None,
     page_image_transport: ImageTransport | None,
+    child_image_transport: ImageTransport | None,
     max_fetches: int | None,
     created_at: str,
 ) -> dict[str, Any]:
@@ -559,6 +578,9 @@ def _acquire_with_page_image_extractor(
             real_image_search_config=real_image_search_config,
             browser_transport=browser_transport,
             max_pdf_bytes=max_pdf_bytes,
+            page_image_transport=page_image_transport,
+            child_image_transport=child_image_transport,
+            max_fetches=max_fetches,
         )
         core_candidates = _read_jsonl(run_dir / "visual_candidates.jsonl")
         core_fetches = _read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
@@ -1019,6 +1041,528 @@ class _LocalScreenshotFixtureProvider:
                 )
             )
         return records
+
+
+class _ChildDiscoveredImageUrlProvider:
+    name = CHILD_DISCOVERED_IMAGE_PROVIDER
+
+    def __init__(
+        self,
+        *,
+        evidence: Mapping[str, Any],
+        transport: ImageTransport | None,
+        max_image_bytes: int,
+        max_fetches: int | None,
+    ) -> None:
+        self._evidence = evidence
+        self._transport = transport
+        self._max_image_bytes = max_image_bytes
+        self._max_fetches = max_fetches
+        self.last_status = self.initial_status()
+
+    def initial_status(self) -> dict[str, Any]:
+        candidates = _eligible_child_image_url_records(self._evidence)
+        return {
+            "provider": self.name,
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "configured": True,
+            "available": bool(candidates),
+            "blocked_reason": None if candidates else "no_child_discovered_image_urls",
+            "invoked": False,
+            "invocations": 0,
+            "candidates": 0,
+            "candidates_discovered": 0,
+            "artifacts_fetched": 0,
+            "vlm_images_analyzed": 0,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "last_error": None,
+            "external_network_call": False,
+            "external_vlm_call": False,
+            "diagnostics": {
+                "input": "evidence.images[].image_url",
+                "eligible_image_urls": len(candidates),
+                "requires_real_child_execution": True,
+            },
+        }
+
+    def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
+        real_child_execution = _run_has_real_child_execution(context.run_dir)
+        candidates = _child_discovered_image_candidates(
+            context=context,
+            provider=self.name,
+            real_child_execution=real_child_execution,
+        )
+        if not real_child_execution:
+            self.last_status = self._status(
+                candidates=[],
+                fetch_records=[],
+                invoked=False,
+                blocked_reason="not_real_child_execution",
+                last_error="run evidence was not produced by accepted real child execution",
+            )
+            return []
+        if not candidates:
+            self.last_status = self._status(
+                candidates=[],
+                fetch_records=[],
+                invoked=True,
+                blocked_reason="no_child_discovered_image_urls",
+                last_error="accepted real child execution did not produce eligible image URLs",
+            )
+            return []
+
+        fetch_records, fetched_images = _fetch_page_image_candidates(
+            run_dir=context.run_dir,
+            candidates=candidates,
+            source_by_id=context.source_by_id,
+            transport=self._transport,
+            max_image_bytes=self._max_image_bytes,
+            max_fetches=_page_image_max_fetches(context.evidence, self._max_fetches),
+            timeout_seconds=PAGE_IMAGE_FETCH_TIMEOUT_SECONDS,
+        )
+        _apply_child_fetch_results(candidates, fetch_records)
+        _merge_child_discovered_images(
+            evidence=context.evidence,
+            fetched_images=fetched_images,
+            candidates=candidates,
+        )
+        fetched_count = sum(
+            1 for record in fetch_records if record.get("fetch_status") == "fetched"
+        )
+        blocked_reason = None if fetched_count else _first_fetch_failure(fetch_records)
+        self.last_status = self._status(
+            candidates=candidates,
+            fetch_records=fetch_records,
+            invoked=True,
+            blocked_reason=blocked_reason,
+            last_error=blocked_reason,
+        )
+        return candidates
+
+    def _status(
+        self,
+        *,
+        candidates: Sequence[Mapping[str, Any]],
+        fetch_records: Sequence[Mapping[str, Any]],
+        invoked: bool,
+        blocked_reason: str | None,
+        last_error: str | None,
+    ) -> dict[str, Any]:
+        fetched_count = sum(
+            1 for record in fetch_records if record.get("fetch_status") == "fetched"
+        )
+        return {
+            "provider": self.name,
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "configured": True,
+            "available": blocked_reason is None or bool(candidates),
+            "blocked_reason": blocked_reason if not fetched_count else None,
+            "invoked": invoked,
+            "invocations": 1 if invoked else 0,
+            "candidates": len(candidates),
+            "candidates_discovered": len(candidates),
+            "artifacts_fetched": fetched_count,
+            "vlm_images_analyzed": 0,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "last_error": None if fetched_count else last_error,
+            "external_network_call": bool(candidates),
+            "external_vlm_call": False,
+            "diagnostics": {
+                "input": "evidence.images[].image_url",
+                "fetch_status_counts": _count_by_key(fetch_records, "fetch_status"),
+                "requires_real_child_execution": True,
+                "release_eligible": True,
+            },
+        }
+
+
+def _eligible_child_image_url_records(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    images = evidence.get("images")
+    if not isinstance(images, list):
+        return []
+    sources = _source_by_id(evidence)
+    return [
+        image
+        for image in images
+        if isinstance(image, Mapping)
+        and _child_image_url_is_eligible(image, sources=sources)
+    ]
+
+
+def _child_image_url_is_eligible(
+    image: Mapping[str, Any],
+    *,
+    sources: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    provider_mode = _string(image.get("provider_mode"))
+    if provider_mode in {"fixture", "manual", "user_provided"}:
+        return False
+    origin = _string(image.get("origin"))
+    if origin in {"manual", "user_upload", "user_provided"}:
+        return False
+    source_id = _string(image.get("source_id"))
+    if not source_id or source_id not in sources:
+        return False
+    image_url = _string(image.get("image_url"))
+    if not image_url:
+        return False
+    try:
+        parsed = urlparse(image_url)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _child_discovered_image_candidates(
+    *,
+    context: _VisualContext,
+    provider: str,
+    real_child_execution: bool,
+) -> list[dict[str, Any]]:
+    if not real_child_execution:
+        return []
+    records = _eligible_child_image_url_records(context.evidence)
+    candidates: list[dict[str, Any]] = []
+    used_candidate_ids: set[str] = set()
+    provider_run_id = str(context.evidence.get("run_id") or context.run_dir.name)
+    for ordinal, image in enumerate(records, start=1):
+        source = context.source_by_id.get(str(image.get("source_id"))) or {}
+        route = _source_route(context.routes, source)
+        candidate_id = _child_candidate_id(image, ordinal, used_candidate_ids)
+        image_url = _string(image.get("image_url"))
+        fetch_image_url, url_resolution = _resolve_child_image_fetch_url(image_url)
+        source_policy_decision, source_policy_flags = _child_source_policy(source, image)
+        provider_provenance = {
+            "provider": provider,
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "provider_run_id": provider_run_id,
+            "source": "real_child_evidence_images",
+            "source_image_id": image.get("id"),
+            "source_id": image.get("source_id"),
+            "external_network_call": True,
+            "external_vlm_call": False,
+            "real_child_execution": True,
+            "fixture_only": False,
+            "manual_handoff": False,
+            "user_provided": False,
+        }
+        if url_resolution:
+            provider_provenance.update(url_resolution)
+        task_id = _string(image.get("task_id")) or _string(route.get("task_id")) or _task_id_for_angle(
+            route.get("id") or image.get("angle_id")
+        )
+        angle_id = _string(image.get("angle_id")) or _string(route.get("id")) or "angle_001"
+        candidates.append(
+            {
+                "id": candidate_id,
+                "candidate_id": candidate_id,
+                "plan_id": f"plan_{task_id}",
+                "task_id": task_id,
+                "angle_id": angle_id,
+                "source_search_result_id": image.get("source_search_result_id")
+                or source.get("search_result_id"),
+                "source_id": image.get("source_id"),
+                "source_url": source.get("url") or image.get("source_url"),
+                "provider": provider,
+                "provider_kind": "web_image_search",
+                "provider_mode": "real",
+                "provider_run_id": provider_run_id,
+                "provider_provenance": provider_provenance,
+                "route": _string(image.get("route")) or _string(route.get("modality")) or "visual_required",
+                "candidate_class": "child_discovered_image_url",
+                "origin": _string(image.get("origin")) or "image_search",
+                "candidate_origin": _string(image.get("origin")) or "image_search",
+                "image_url": fetch_image_url,
+                "page_url": _string(image.get("page_url")) or source.get("url"),
+                "rank": ordinal,
+                "score": _score_from_rank(ordinal),
+                "width": _int_or_zero(image.get("width")),
+                "height": _int_or_zero(image.get("height")),
+                "alt_text": _string(image.get("alt_text")) or _string(image.get("title")),
+                "caption_text": _string(image.get("caption_text")),
+                "surrounding_text": _string(image.get("surrounding_text")),
+                "phash_hint": _string(image.get("phash")),
+                "visual_tasks": _dedupe(
+                    _string_list(image.get("visual_tasks"))
+                    + list(route.get("visual_tasks", []))
+                    if isinstance(route.get("visual_tasks"), list)
+                    else _string_list(image.get("visual_tasks"))
+                ),
+                "analysis_status": "skipped",
+                "observations": [],
+                "inferences": [],
+                "policy_flags": source_policy_flags,
+                "policy_decision": source_policy_decision,
+                "candidate_status": "discovered",
+                "rejection_reason": None,
+                "removal_reasons": [],
+                "caveats": _dedupe(
+                    _string_list(image.get("caveats"))
+                    + ["discovered_by_real_codex_child_execution"]
+                ),
+                "requires_vlm_observation": True,
+                "supportable_evidence": False,
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "raw_provider_metadata": {
+                    "source_image_id": image.get("id"),
+                    "source_image_origin": image.get("origin"),
+                    "source_image_provider": image.get("provider"),
+                    "source_image_provider_mode": image.get("provider_mode"),
+                    "original_child_image_url": image_url,
+                    **url_resolution,
+                },
+                "created_at": context.created_at,
+            }
+        )
+    return candidates
+
+
+def _resolve_child_image_fetch_url(image_url: str) -> tuple[str, dict[str, Any]]:
+    """Return a fetchable image URL while preserving child-discovered provenance.
+
+    Apollo Lunar Surface Journal links historically used hq.nasa.gov/alsj image paths.
+    In current NASA infrastructure those URLs can redirect to a generic HTML landing page
+    even when the same asset exists on images-assets.nasa.gov. Keep this compatibility
+    scoped to child-discovered visual evidence so generic web extraction behavior stays
+    conservative.
+    """
+
+    try:
+        parsed = urlparse(image_url)
+    except ValueError:
+        return image_url, {}
+    host = parsed.netloc.lower()
+    path = unquote(parsed.path or "")
+    if host not in NASA_ALSJ_IMAGE_HOSTS or "/alsj/" not in path.lower():
+        return image_url, {}
+    filename = path.rsplit("/", 1)[-1]
+    match = NASA_ALSJ_IMAGE_RE.match(filename)
+    if not match:
+        return image_url, {}
+    asset_id = match.group(1).lower()
+    extension = match.group(2).lower()
+    resolved_url = f"https://images-assets.nasa.gov/image/{asset_id}/{asset_id}~orig.{extension}"
+    return resolved_url, {
+        "original_child_image_url": image_url,
+        "resolved_image_url": resolved_url,
+        "url_resolution": "nasa_alsj_images_assets",
+    }
+
+
+def _child_candidate_id(
+    image: Mapping[str, Any],
+    ordinal: int,
+    used: set[str],
+) -> str:
+    image_id = _string(image.get("id"))
+    if image_id:
+        base = "cand_" + _safe_id(image_id.removeprefix("img_"))
+    else:
+        digest = hashlib.sha1(
+            f"{image.get('source_id')}|{image.get('image_url')}|{ordinal}".encode("utf-8")
+        ).hexdigest()[:16]
+        base = "cand_child_image_" + digest
+    candidate = base
+    suffix = 1
+    while candidate in used:
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+    used.add(candidate)
+    return candidate
+
+
+def _child_source_policy(
+    source: Mapping[str, Any],
+    image: Mapping[str, Any],
+) -> tuple[str, list[str]]:
+    flags = _dedupe(
+        _string_list(source.get("policy_flags")) + _string_list(image.get("policy_flags"))
+    )
+    robots_policy = _string(source.get("robots_policy"))
+    license_policy = _string(source.get("license_policy"))
+    if robots_policy == "disallowed":
+        flags.append("robots_disallowed")
+    elif robots_policy == "manual_review":
+        flags.append("robots_manual_review")
+    if license_policy == "restricted":
+        flags.append("copyright_restricted")
+    elif license_policy == "manual_review":
+        flags.append("copyright_manual_review")
+    flags = _dedupe(flags)
+    decision = _string(image.get("policy_decision")) or _string(source.get("policy_decision")) or "allowed"
+    if decision == "blocked" or set(flags) & {
+        "access_controlled",
+        "captcha_protected",
+        "copyright_restricted",
+        "login_gated",
+        "paywall",
+        "pii_detected",
+        "robots_disallowed",
+    }:
+        return "blocked", _dedupe(flags or ["policy_blocked"])
+    if decision == "manual_review" or set(flags) & {"copyright_manual_review", "robots_manual_review"}:
+        return "manual_review", flags
+    return "allowed", flags
+
+
+def _run_has_real_child_execution(run_dir: Path) -> bool:
+    for filename in ("parallel_orchestration_status.json", "merge_status.json"):
+        path = run_dir / filename
+        if not path.exists():
+            continue
+        payload = _read_json_object(path)
+        evidence_source = (
+            payload.get("evidence_source")
+            if isinstance(payload.get("evidence_source"), Mapping)
+            else {}
+        )
+        if evidence_source.get("real_child_execution") is True:
+            return True
+    return False
+
+
+def _apply_child_fetch_results(
+    candidates: Sequence[dict[str, Any]],
+    fetch_records: Sequence[Mapping[str, Any]],
+) -> None:
+    fetch_by_candidate = {
+        str(record.get("candidate_id")): record
+        for record in fetch_records
+        if isinstance(record.get("candidate_id"), str)
+    }
+    for candidate in candidates:
+        fetch = fetch_by_candidate.get(str(candidate.get("candidate_id")))
+        if not fetch:
+            continue
+        status = str(fetch.get("fetch_status") or "")
+        if status == "fetched":
+            candidate["status"] = "accepted"
+            candidate["candidate_status"] = "fetched"
+            candidate["analysis_status"] = "skipped"
+            candidate["local_artifact_path"] = fetch.get("local_artifact_path")
+            candidate["mime_type"] = fetch.get("mime_type")
+            candidate["artifact_size_bytes"] = fetch.get("byte_size")
+            candidate["byte_size"] = fetch.get("byte_size")
+            candidate["width"] = fetch.get("width") or candidate.get("width") or 0
+            candidate["height"] = fetch.get("height") or candidate.get("height") or 0
+            candidate["hash"] = fetch.get("hash")
+            candidate["phash"] = fetch.get("phash")
+            candidate["http_status"] = fetch.get("http_status")
+            candidate["normalized_image_url"] = fetch.get("normalized_image_url")
+            candidate["removal_reasons"] = []
+            candidate["rejection_reason"] = None
+            continue
+        reason = str(fetch.get("failure_code") or status or "fetch_failed")
+        candidate["status"] = "removed"
+        candidate["analysis_status"] = "skipped"
+        candidate["rejection_reason"] = reason
+        candidate["removal_reasons"] = _dedupe([*_string_list(candidate.get("removal_reasons")), reason])
+        if status == "policy_blocked":
+            candidate["candidate_status"] = "policy_blocked"
+            candidate["policy_decision"] = "blocked"
+            candidate["analysis_status"] = "policy_blocked"
+        elif status == "budget_pruned":
+            candidate["candidate_status"] = "budget_pruned"
+            candidate["policy_decision"] = "budget_pruned"
+        elif status == "unsupported_mime":
+            candidate["candidate_status"] = "fetch_failed"
+            candidate["removal_reasons"] = _dedupe(
+                [*_string_list(candidate.get("removal_reasons")), "unsupported_mime_type"]
+            )
+        elif status == "too_large":
+            candidate["candidate_status"] = "fetch_failed"
+            candidate["removal_reasons"] = _dedupe(
+                [*_string_list(candidate.get("removal_reasons")), "size_limit_exceeded"]
+            )
+        elif status == "deduped":
+            candidate["candidate_status"] = "rejected"
+            candidate["duplicate_of"] = fetch.get("dedupe_target_candidate_id")
+        else:
+            candidate["candidate_status"] = "fetch_failed"
+
+
+def _merge_child_discovered_images(
+    *,
+    evidence: Mapping[str, Any],
+    fetched_images: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+) -> None:
+    images = evidence.get("images")
+    if not isinstance(images, list) or not fetched_images:
+        return
+    candidate_by_image_id = {
+        _image_id_for_candidate_id(str(candidate.get("candidate_id"))): candidate
+        for candidate in candidates
+        if candidate.get("candidate_id")
+    }
+    positions = {
+        image.get("id"): index
+        for index, image in enumerate(images)
+        if isinstance(image, Mapping) and isinstance(image.get("id"), str)
+    }
+    for fetched in fetched_images:
+        image_id = fetched.get("id")
+        if not isinstance(image_id, str):
+            continue
+        candidate = candidate_by_image_id.get(image_id, {})
+        existing = images[positions[image_id]] if image_id in positions else {}
+        merged = dict(existing) if isinstance(existing, Mapping) else {}
+        merged.update(dict(fetched))
+        merged["origin"] = _string(candidate.get("origin")) or merged.get("origin") or "image_search"
+        merged["provider"] = CHILD_DISCOVERED_IMAGE_PROVIDER
+        merged["provider_kind"] = "web_image_search"
+        merged["provider_mode"] = "real"
+        if isinstance(candidate.get("provider_provenance"), Mapping):
+            merged["provider_provenance"] = dict(candidate["provider_provenance"])
+        merged["analysis_provider"] = "codex-interactive"
+        merged["analysis_status"] = "failed"
+        merged["observations"] = _dedupe(
+            _string_list(existing.get("observations") if isinstance(existing, Mapping) else [])
+            + _string_list(fetched.get("observations"))
+        )
+        merged["inferences"] = _dedupe(
+            _string_list(existing.get("inferences") if isinstance(existing, Mapping) else [])
+            + _string_list(fetched.get("inferences"))
+        )
+        merged["visual_tasks"] = _dedupe(
+            _string_list(existing.get("visual_tasks") if isinstance(existing, Mapping) else [])
+            + _string_list(fetched.get("visual_tasks"))
+            + _string_list(candidate.get("visual_tasks"))
+        )
+        merged["caveats"] = _dedupe(
+            _string_list(existing.get("caveats") if isinstance(existing, Mapping) else [])
+            + _string_list(fetched.get("caveats"))
+            + ["automatic_child_image_url_cached_pending_codex_vlm_analysis"]
+        )
+        if "cache_key" in merged:
+            merged["acquisition_cache_key"] = merged.pop("cache_key")
+        if image_id in positions:
+            images[positions[image_id]] = merged
+        else:
+            positions[image_id] = len(images)
+            images.append(merged)
+
+
+def _first_fetch_failure(fetch_records: Sequence[Mapping[str, Any]]) -> str | None:
+    for record in fetch_records:
+        status = _string(record.get("fetch_status"))
+        if status and status != "fetched":
+            return _string(record.get("failure_code")) or status
+    return None
+
+
+def _count_by_key(records: Sequence[Mapping[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        value = _string(record.get(key)) or "unknown"
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 class _BrowserScreenshotProvider:
     name = BROWSER_SCREENSHOT_PROVIDER
@@ -2182,6 +2726,11 @@ def _requires_local_artifact_validation(candidate: Mapping[str, Any]) -> bool:
         or candidate.get("provider_kind") == "screenshot"
         or candidate.get("provider_kind") == "pdf_rasterizer"
         or candidate.get("origin") == "screenshot"
+        or (
+            candidate.get("provider") == CHILD_DISCOVERED_IMAGE_PROVIDER
+            and isinstance(candidate.get("local_artifact_path"), str)
+            and bool(candidate.get("local_artifact_path"))
+        )
     )
 
 
@@ -2572,7 +3121,7 @@ def _visual_provider_status(
 
 
 def _provider_kind(provider: str) -> str:
-    if provider == BRAVE_IMAGE_PROVIDER:
+    if provider in {BRAVE_IMAGE_PROVIDER, CHILD_DISCOVERED_IMAGE_PROVIDER}:
         return "web_image_search"
     if provider in {"local-page", PAGE_IMAGE_EXTRACTOR_PROVIDER}:
         return "page_extractor"
@@ -3580,6 +4129,7 @@ def _sanitized_result_metadata(
 def _is_real_provider_name(provider: str) -> bool:
     return provider in {
         BRAVE_IMAGE_PROVIDER,
+        CHILD_DISCOVERED_IMAGE_PROVIDER,
         PAGE_IMAGE_EXTRACTOR_PROVIDER,
         BROWSER_SCREENSHOT_PROVIDER,
         DEFAULT_PDF_RASTERIZER_PROVIDER,
@@ -3644,7 +4194,8 @@ def _default_provider_status(
         "estimated_cost_usd": 0.0,
         "actual_cost_usd": 0.0,
         "last_error": None,
-        "external_network_call": provider == BRAVE_IMAGE_PROVIDER and invoked,
+        "external_network_call": provider in {BRAVE_IMAGE_PROVIDER, CHILD_DISCOVERED_IMAGE_PROVIDER}
+        and invoked,
         "external_vlm_call": False,
         "diagnostics": {},
     }
@@ -3693,6 +4244,9 @@ def _providers(
     real_image_search_transport: _BraveImageSearchTransport | None,
     real_image_search_config: Mapping[str, Any] | None,
     browser_transport: BrowserScreenshotTransport | None,
+    child_image_transport: ImageTransport | None,
+    max_image_bytes: int,
+    max_fetches: int | None,
     evidence: Mapping[str, Any],
 ) -> list[_VisualProvider]:
     providers: list[_VisualProvider] = []
@@ -3714,6 +4268,15 @@ def _providers(
                 _BraveImageSearchProvider(
                     config=brave_config,
                     transport=real_image_search_transport,
+                )
+            )
+        elif name == CHILD_DISCOVERED_IMAGE_PROVIDER:
+            providers.append(
+                _ChildDiscoveredImageUrlProvider(
+                    evidence=evidence,
+                    transport=child_image_transport,
+                    max_image_bytes=max_image_bytes,
+                    max_fetches=max_fetches,
                 )
             )
         elif name == DEFAULT_PDF_RASTERIZER_PROVIDER:

@@ -194,6 +194,19 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("Verifier vote `method` must be one of", command[-1])
         self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", command[-1])
 
+        visual_task = dict(task)
+        visual_task["route"] = "visual_required"
+        visual_task["max_images"] = 10
+        visual_command = CodexExecAdapter(project_root=ROOT).build_command(
+            visual_task,
+            max_threads=8,
+            run_dir=run_dir,
+        )
+        self.assertIn("discover and write as many public HTTP(S) image_url records", visual_command[-1])
+        self.assertIn("targeting 10 when available", visual_command[-1])
+        self.assertIn("analysis_status `skipped`", visual_command[-1])
+        self.assertIn("later runner VLM analysis", visual_command[-1])
+
         korean_task = dict(task)
         korean_task["query"] = "한국어 질문은 한국어 claim으로 작성해야 한다."
         korean_command = CodexExecAdapter(project_root=ROOT).build_command(
@@ -205,6 +218,21 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("translate/summarize English source findings into Korean", korean_command[-1])
         self.assertIn("Only direct quote_spans.quote values should remain verbatim", korean_command[-1])
         self.assertIn("Prioritize a compact shard", korean_command[-1])
+
+    def test_visual_research_tasks_inherit_image_budget(self) -> None:
+        run_dir = self.prepare(route="visual_required")
+
+        tasks = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"]
+
+        self.assertEqual(tasks[0]["route"], "visual_required")
+        self.assertGreaterEqual(tasks[0]["max_images"], 10)
+        command = CodexExecAdapter(project_root=ROOT).build_command(
+            tasks[0],
+            max_threads=8,
+            run_dir=run_dir,
+        )
+        self.assertIn("targeting", command[-1])
+        self.assertIn("public HTTP(S) image_url records", command[-1])
 
     def test_invalid_output_shard_paths_are_rejected_before_child_execution(self) -> None:
         run_dir = self.prepare()

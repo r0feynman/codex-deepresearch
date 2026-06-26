@@ -676,6 +676,8 @@ def _search_task(
         "modality": route_record["modality"],
         "route": route_record["modality"],
         "max_results": max_results,
+        "visual_tasks": list(route_record.get("visual_tasks", [])),
+        "max_images": int(route_record.get("max_images", 0)),
         "source_policy": {
             "decision": "allowed",
             "flags": [],

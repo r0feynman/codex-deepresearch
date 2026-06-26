@@ -43,10 +43,12 @@ RUN_STATUS_FILENAME = "run_status.json"
 INVOCATION_MODES = ("full-runner", "quick-chat", "manual-handoff", "blocked")
 CODEX_INTERACTIVE_PROVIDER = "codex-interactive"
 BRAVE_IMAGE_PROVIDER = "brave-image-search"
+CHILD_DISCOVERED_IMAGE_PROVIDER = "child-discovered-image-url"
 PAGE_IMAGE_EXTRACTOR_PROVIDER = "page-image-extractor"
 BROWSER_SCREENSHOT_PROVIDER = "browser-screenshot"
 PDF_RASTERIZER_PROVIDER = "local-pdf-rasterizer"
 DEFAULT_AUTOMATIC_VISUAL_PROVIDERS = (
+    CHILD_DISCOVERED_IMAGE_PROVIDER,
     BRAVE_IMAGE_PROVIDER,
     PAGE_IMAGE_EXTRACTOR_PROVIDER,
     BROWSER_SCREENSHOT_PROVIDER,
@@ -1055,6 +1057,7 @@ def _automatic_visual_providers(run_dir: Path) -> tuple[str, ...]:
         ):
             providers.extend(
                 [
+                    CHILD_DISCOVERED_IMAGE_PROVIDER,
                     BRAVE_IMAGE_PROVIDER,
                     PAGE_IMAGE_EXTRACTOR_PROVIDER,
                     BROWSER_SCREENSHOT_PROVIDER,

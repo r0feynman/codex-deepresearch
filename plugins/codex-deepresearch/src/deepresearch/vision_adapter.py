@@ -598,14 +598,13 @@ class _SubprocessCodexInteractiveVisionClient:
             str(Path(str(metadata.get("run_dir") or image_path.parent)).resolve()),
             "--image",
             str(image_path.resolve()),
-            prompt,
         ]
         completed = subprocess.run(
             command,
             cwd=config.project_root,
             check=False,
             capture_output=True,
-            stdin=subprocess.DEVNULL,
+            input=prompt,
             text=True,
             timeout=config.timeout_seconds,
         )
@@ -763,9 +762,10 @@ def _codex_payload_texts(payload: Any) -> list[str]:
             texts.append(value.strip())
         elif isinstance(value, (Mapping, list)):
             texts.extend(_codex_payload_texts(value))
-    output = payload.get("output")
-    if isinstance(output, (Mapping, list)):
-        texts.extend(_codex_payload_texts(output))
+    for key in ("output", "item", "result", "data"):
+        value = payload.get(key)
+        if isinstance(value, (Mapping, list)):
+            texts.extend(_codex_payload_texts(value))
     return texts
 
 

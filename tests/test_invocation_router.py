@@ -384,7 +384,12 @@ class InvocationRouterTests(unittest.TestCase):
             call_order.append("acquire")
             self.assertEqual(
                 tuple(providers),
-                ("brave-image-search", "page-image-extractor", "browser-screenshot"),
+                (
+                    "child-discovered-image-url",
+                    "brave-image-search",
+                    "page-image-extractor",
+                    "browser-screenshot",
+                ),
             )
             run_dir = Path(run)
             self.write_json(
@@ -1025,6 +1030,7 @@ class InvocationRouterTests(unittest.TestCase):
         )
         self.assertEqual(provider_status["status"], "completed_auto_visual")
         provider_names = {provider["provider"] for provider in provider_status["providers"]}
+        self.assertIn("child-discovered-image-url", provider_names)
         self.assertIn("brave-image-search", provider_names)
         self.assertIn("page-image-extractor", provider_names)
         self.assertIn("browser-screenshot", provider_names)
@@ -1037,6 +1043,250 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(codex_provider["vlm_images_analyzed"], len(codex_client.calls))
         self.assertTrue(codex_provider["codex_native_handoff"])
         self.assertFalse(codex_provider["hidden_codex_api_call"])
+
+    def test_visual_required_full_runner_fetches_child_discovered_image_urls(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        class FakeCodexClient:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def analyze_image(self, *, image_path, mime_type, prompt, config, metadata):
+                self.calls.append(
+                    {
+                        "image_path": image_path,
+                        "mime_type": mime_type,
+                        "prompt": prompt,
+                        "metadata": dict(metadata),
+                    }
+                )
+                ordinal = len(self.calls)
+                return OpenAIResponsesVisionResult(
+                    observations=(
+                        f"Apollo 11 public image {ordinal} shows mission visual evidence.",
+                        f"The image contains a visible Apollo 11 spacecraft or lunar scene {ordinal}.",
+                    ),
+                    inferences=("The public image can support an Apollo 11 visual claim.",),
+                    caveats=(),
+                    ocr_text=f"Apollo 11 visual {ordinal}",
+                    confidence=0.88,
+                    response_id=f"codex_apollo_visual_{ordinal:03d}",
+                    model=config.model,
+                    usage={"events": 2},
+                    raw_provider_metadata={"response_id": f"codex_apollo_visual_{ordinal:03d}"},
+                    actual_cost_usd=0.0,
+                )
+
+        def png_bytes(index: int) -> bytes:
+            return (
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                + f"apollo-visual-{index}".encode("ascii")
+            )
+
+        def image_url(index: int) -> str:
+            return f"https://commons.wikimedia.org/wiki/Special:FilePath/Apollo_11_visual_{index}.png"
+
+        def fake_default_fetch_image(url: str, *, timeout_seconds: float, max_image_bytes: int):
+            index = int(url.rsplit("_", 1)[1].split(".", 1)[0])
+            return FetchResponse(
+                content=png_bytes(index),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            sources_dir = run_dir / "sources"
+            sources_dir.mkdir(exist_ok=True)
+            page_path = sources_dir / "apollo-child-notes.html"
+            page_path.write_text(
+                "<html><body><p>Codex child notes list Apollo 11 image URLs separately.</p></body></html>",
+                encoding="utf-8",
+            )
+            evidence = self.read_json(run_dir / "evidence.json")
+            evidence["sources"] = [
+                {
+                    "id": "src_apollo_child_notes",
+                    "type": "web",
+                    "url": "https://en.wikipedia.org/wiki/Apollo_11",
+                    "title": "Apollo 11 public source",
+                    "published_at": None,
+                    "accessed_at": "2026-06-26T00:00:00Z",
+                    "quality": "primary",
+                    "retrieval_status": "fetched",
+                    "local_artifact_path": "sources/apollo-child-notes.html",
+                    "license_policy": "allowed",
+                    "robots_policy": "allowed",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "route": "visual_required",
+                    "angle_id": "angle_001",
+                    "task_id": "task_search_001",
+                    "search_result_id": "search_apollo_child_notes",
+                }
+            ]
+            evidence["images"] = [
+                {
+                    "id": f"img_apollo_child_{index:03d}",
+                    "source_id": "src_apollo_child_notes",
+                    "origin": "image_search",
+                    "image_url": image_url(index),
+                    "page_url": "https://en.wikipedia.org/wiki/Apollo_11",
+                    "local_artifact_path": f"evidence_shards/task_research_001/apollo_{index:03d}.json",
+                    "mime_type": "image/png",
+                    "width": 640,
+                    "height": 480,
+                    "observations": [f"Child-discovered Apollo 11 image URL {index}."],
+                    "inferences": [],
+                    "visual_tasks": ["image_claim_alignment"],
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "skipped",
+                    "policy_flags": [],
+                    "caveats": [],
+                    "task_id": "task_search_001",
+                    "angle_id": "angle_001",
+                    "source_search_result_id": "search_apollo_child_notes",
+                }
+                for index in range(1, 11)
+            ]
+            evidence.setdefault("budget", {})["max_images"] = 12
+            self.write_json(run_dir / "evidence.json", evidence)
+            payload = {
+                "status": "completed_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 1,
+                "failure_counts": {},
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 1,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "attempted_real_child_execution": True,
+                    "real_child_execution": True,
+                    "real_use_e2e_eligible": True,
+                },
+                "merge": {"accepted_shards": [{"task_id": "task_research_001"}]},
+                "artifacts": {
+                    "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json")
+                },
+            }
+            self.write_json(run_dir / "parallel_orchestration_status.json", payload)
+            return payload
+
+        codex_client = FakeCodexClient()
+        with (
+            mock.patch("deepresearch.invocation_router.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.vision_adapter.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.page_image_extraction._default_fetch_image",
+                side_effect=fake_default_fetch_image,
+            ),
+            mock.patch(
+                "deepresearch.page_image_extraction._is_private_or_reserved_http_url",
+                return_value=False,
+            ),
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch(
+                "deepresearch.vision_adapter._SubprocessCodexInteractiveVisionClient",
+                return_value=codex_client,
+            ),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: find and cite at least ten public Apollo 11 images",
+                runs_dir=runs_dir,
+                route="visual_required",
+                budget_preset="standard",
+                max_images=12,
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "completed_auto_visual")
+        self.assertTrue(result["visual_release_gate"]["valid"], result["visual_release_gate"])
+        self.assertGreaterEqual(result["visual_release_gate"]["counts"]["real_candidates"], 10)
+        self.assertGreaterEqual(
+            result["visual_release_gate"]["counts"]["codex_interactive_real_analyzed_images"],
+            3,
+        )
+        self.assertGreaterEqual(len(codex_client.calls), 3)
+
+        run_dir = Path(result["run_dir"])
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        evidence = self.read_json(run_dir / "evidence.json")
+        report_status = self.read_json(run_dir / "report_status.json")
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        child_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["provider"] == "child-discovered-image-url"
+        ]
+        child_fetches = [
+            fetch
+            for fetch in fetches
+            if fetch["provider"] == "child-discovered-image-url"
+            and fetch["fetch_status"] == "fetched"
+        ]
+
+        self.assertGreaterEqual(len(child_candidates), 10)
+        self.assertGreaterEqual(len(child_fetches), 3)
+        self.assertFalse(
+            [
+                candidate
+                for candidate in candidates
+                if candidate["provider"] == "page-image-extractor"
+            ],
+            "page-image-extractor should not fabricate candidates from child notes without img tags",
+        )
+        self.assertTrue(
+            all((run_dir / fetch["local_artifact_path"]).is_file() for fetch in child_fetches)
+        )
+        self.assertGreaterEqual(
+            len(
+                [
+                    observation
+                    for observation in observations
+                    if observation["provider"] == "codex-interactive"
+                    and observation["provider_mode"] == "real"
+                    and observation["observation_status"] == "analyzed"
+                ]
+            ),
+            3,
+        )
+        self.assertTrue(report_status["used_images"])
+        self.assertTrue(
+            any(
+                claim.get("claim_type") in {"visual", "mixed"}
+                and claim.get("verification_status") == "supported"
+                and set(claim.get("supporting_images", [])) & set(report_status["used_images"])
+                for claim in evidence["claims"]
+                if isinstance(claim, dict)
+            )
+        )
+        self.assertEqual(provider_status["status"], "completed_auto_visual")
+        provider_names = {provider["provider"] for provider in provider_status["providers"]}
+        self.assertIn("child-discovered-image-url", provider_names)
+        child_provider = next(
+            provider
+            for provider in provider_status["providers"]
+            if provider["provider"] == "child-discovered-image-url"
+        )
+        self.assertEqual(child_provider["provider_mode"], "real")
+        self.assertGreaterEqual(child_provider["candidates_discovered"], 10)
+        self.assertGreaterEqual(child_provider["artifacts_fetched"], 3)
+        self.assertTrue(
+            all(call["metadata"]["candidate_id"].startswith("cand_apollo_child") for call in codex_client.calls)
+        )
 
     def test_visual_required_blocks_before_synthesis_when_codex_vlm_provider_is_missing(self) -> None:
         runs_dir = self.temp_runs_dir()

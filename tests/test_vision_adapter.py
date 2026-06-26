@@ -722,15 +722,11 @@ class VisionAdapterTests(unittest.TestCase):
             for record in [
                 {"type": "session.started", "session_id": "sess_visual_test"},
                 {
-                    "type": "agent_message",
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(visual_payload, sort_keys=True),
-                            }
-                        ],
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_visual_test",
+                        "type": "agent_message",
+                        "text": json.dumps(visual_payload, sort_keys=True),
                     },
                 },
                 {"type": "turn.completed", "usage": {"input_tokens": 12, "output_tokens": 34}},
@@ -765,6 +761,9 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(command[:3], ["codex", "exec", "--json"])
         self.assertIn("--image", command)
         self.assertIn(str((run_dir / "images/checkout.png").resolve()), command)
+        self.assertNotIn("Inspect the attached image artifact", command)
+        self.assertIn("Inspect the attached image artifact", run_mock.call_args.kwargs["input"])
+        self.assertNotIn("stdin", run_mock.call_args.kwargs)
 
         evidence = self.assert_valid_run(run_dir)
         image = evidence["images"][0]

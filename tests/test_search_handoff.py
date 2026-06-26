@@ -118,6 +118,14 @@ class SearchHandoffTests(unittest.TestCase):
             [task["route"] for task in evidence["search_tasks"]],
             ["text_only", "visual_required", "visual_optional"],
         )
+        self.assertEqual(evidence["search_tasks"][0]["max_images"], 0)
+        self.assertEqual(evidence["search_tasks"][0]["visual_tasks"], [])
+        self.assertGreater(evidence["search_tasks"][1]["max_images"], 0)
+        self.assertGreater(evidence["search_tasks"][2]["max_images"], 0)
+        self.assertEqual(
+            evidence["search_tasks"][1]["visual_tasks"],
+            evidence["routing"][1]["visual_tasks"],
+        )
 
         visual_tasks = self.load_json(run_dir / "visual_tasks.json")
         self.assertEqual(
