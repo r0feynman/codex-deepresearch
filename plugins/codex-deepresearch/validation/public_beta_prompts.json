@@ -136,206 +136,199 @@
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-001",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Compare above-the-fold public documentation screenshots for Python, Node.js, and Rust and cite visible layout differences.",
       "public_safe": true,
       "public_safe_justification": "Uses public documentation pages and generated screenshots only.",
       "route": "visual_required",
       "visual_provider_requirements": [
+        "codex-native",
         "screenshot",
-        "codex-interactive",
-        "openai-responses-vision"
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-002",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Compare visible product page imagery for three public code editor products and cite image-backed differences.",
       "public_safe": true,
       "public_safe_justification": "Uses public product pages and image metadata only.",
       "route": "visual_required",
       "visual_provider_requirements": [
+        "codex-native",
         "web_image_search",
         "page_extractor",
-        "openai-responses-vision"
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-003",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Extract a supported visual claim from a public chart on an international organization or open-data report page.",
       "public_safe": true,
       "public_safe_justification": "Uses public chart/report pages and avoids personal datasets.",
       "route": "visual_required",
       "visual_provider_requirements": [
+        "codex-native",
         "page_extractor",
         "screenshot",
-        "openai-responses-vision"
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-004",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Extract and cite one figure-level claim from a public open-access research paper PDF.",
       "public_safe": true,
       "public_safe_justification": "Uses public open-access papers and generated figure/page artifacts only.",
       "route": "visual_required",
       "visual_provider_requirements": [
+        "codex-native",
         "pdf_rasterizer",
-        "openai-responses-vision"
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-005",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Compare public dashboard screenshots from observability product documentation and cite layout or chart differences.",
       "public_safe": true,
       "public_safe_justification": "Uses public documentation screenshots and product pages only.",
       "route": "visual_required",
       "visual_provider_requirements": [
+        "codex-native",
         "web_image_search",
         "page_extractor",
-        "openai-responses-vision"
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-006",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Compare visual evidence from public accessibility contrast examples and cite the image-backed observations.",
       "public_safe": true,
       "public_safe_justification": "Uses public accessibility documentation and examples.",
       "route": "visual_required",
       "visual_provider_requirements": [
+        "codex-native",
         "page_extractor",
         "screenshot",
-        "openai-responses-vision"
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-007",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Research public plugin marketplace examples and optionally compare listing screenshots for onboarding cues.",
       "public_safe": true,
       "public_safe_justification": "Uses public marketplace pages and screenshots only.",
       "route": "visual_optional",
       "visual_provider_requirements": [
+        "codex-native",
         "screenshot",
-        "page_extractor"
+        "page_extractor",
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-008",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Compare public map visualization examples and optionally cite visual differences in legends or color scales.",
       "public_safe": true,
       "public_safe_justification": "Uses public map examples and screenshots; no private location history.",
       "route": "visual_optional",
       "visual_provider_requirements": [
+        "codex-native",
         "page_extractor",
-        "screenshot"
+        "screenshot",
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-009",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Research public design-system documentation and optionally compare component screenshots for navigation patterns.",
       "public_safe": true,
       "public_safe_justification": "Uses public design-system documentation and screenshots only.",
       "route": "visual_optional",
       "visual_provider_requirements": [
+        "codex-native",
         "page_extractor",
-        "screenshot"
+        "screenshot",
+        "codex-interactive"
       ]
     },
     {
       "gate_tags": [
         "automatic_web_visual_e2e",
-        "codex_plugin_interactive_visual_e2e",
-        "automated_cli_real_provider_visual_e2e"
+        "codex_plugin_interactive_visual_e2e"
       ],
       "id": "pb-visual-010",
       "mode_targets": [
-        "codex-plugin",
-        "automated-cli"
+        "codex-plugin"
       ],
       "prompt": "Research public changelog pages and optionally compare embedded screenshots for feature announcement evidence.",
       "public_safe": true,
       "public_safe_justification": "Uses public changelogs and screenshots; no private release notes.",
       "route": "visual_optional",
       "visual_provider_requirements": [
+        "codex-native",
         "page_extractor",
-        "web_image_search"
+        "web_image_search",
+        "codex-interactive"
       ]
     }
   ],

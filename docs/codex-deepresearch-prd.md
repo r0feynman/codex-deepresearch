@@ -306,22 +306,22 @@ Visual artifact validation rules:
 
 Provider requirements:
 
-- `codex-plugin` mode may use Codex-native search and `codex-interactive` VLM through handoff artifacts, but Public Beta automatic visual E2E must also have an `automated-cli` path using explicit provider adapters.
-- `automated-cli` mode must support at least one real web/image search provider and the `openai-responses-vision` VLM adapter before Public Beta can claim complete automatic web image research.
+- `codex-plugin` mode uses Codex-native search and `codex-interactive` VLM through explicit handoff artifacts. Public Beta automatic visual completion is judged on those Codex-native run artifacts by default.
+- `automated-cli` mode should support at least one real web/image search provider and the `openai-responses-vision` VLM adapter for reproducible diagnostics, but those provider/API gates are not mandatory for Codex-native Public Beta completion.
 - Fixture, local test, manual, or user-provided image evidence may validate mechanics, but cannot satisfy the Public Beta automatic web visual E2E gate.
 - Text-only routes must still perform zero image search, screenshot capture, image fetch, or VLM analysis.
 
 Public Beta provider and scenario gates:
 
-- Public Beta cannot claim complete automatic web visual research from one acquisition path. It must pass separate real-provider gates for web/image search candidate discovery, page image extraction plus fetch/cache, browser screenshot capture, PDF page/figure rasterization, `openai-responses-vision` analysis, visual verifier linkage, and report citation.
+- Public Beta cannot claim complete automatic web visual research from fixture/manual/user-provided-only evidence. It must pass Codex-native real-use gates for search handoff, visual candidate/fetch artifacts, `codex-interactive` observations, visual verifier linkage, and report citation.
 - The `codex-plugin` interactive visual E2E gate proves product UX: a fresh `$deep-research` visual-required prompt uses Codex-native search/VLM handoff artifacts and exposes `report.md`, `evidence.json`, `run_status.json`, `report_status.json`, `visual_provider_status.json`, and shard/status summary without hidden Codex APIs. A diagnostic run may end in an explicit blocked terminal status, but the release gate passes only with `completed_auto_visual`.
-- The `automated-cli` real provider E2E gate proves reproducible automation: a no-user-image visual-required run uses at least one real web/image provider plus `openai-responses-vision`, records non-fixture provider provenance and cost, and reaches `completed_auto_visual`. This gate is required for Public Beta release readiness.
+- The `automated-cli` real provider E2E gate proves reproducible automation: a no-user-image visual-required run uses at least one real web/image provider plus `openai-responses-vision`, records non-fixture provider provenance and cost, and reaches `completed_auto_visual`. This gate is a separate diagnostic and is required only as an external gate result artifact when the release is intentionally evaluated in external-gated mode; it is not a prompt-manifest metric.
 - Scenario gates must include at least: product/image-centric web image discovery, UI/webpage screenshot comparison, public chart or market/report visual extraction, and public PDF/paper figure extraction. Each scenario needs at least one supported visual or mixed claim cited in `report.md`, except when it ends in an explicit blocked policy/capability state.
 - A provider blocked by auth, policy, terms, rate limit, or missing configuration may produce a correct blocked run, but that blocked run does not satisfy the Public Beta release gate for the provider/scenario it was meant to cover.
 
 Automatic visual completion states:
 
-- `completed_auto_visual`: at least one non-fixture web visual provider ran, at least one allowed visual artifact was fetched or captured, at least one VLM observation was ingested, and at least one supported visual/mixed claim was cited in `report.md`.
+- `completed_auto_visual`: at least one non-fixture Codex-native visual candidate/fetch path ran, at least one allowed visual artifact was fetched or captured, at least one `codex-interactive` VLM handoff observation was ingested, and at least one supported visual/mixed claim was cited in `report.md`.
 - `partial_auto_visual`: providers ran and candidates were found, but no image-backed claim reached supported status because of policy, quality, or cost limits.
 - `blocked_missing_visual_provider`: the selected mode requires automatic visual research but no real image/search/screenshot provider is configured.
 - `blocked_missing_vlm_provider`: visual artifacts exist but no allowed VLM path is executable.
@@ -341,9 +341,9 @@ Automatic visual status envelope:
 
 Public Beta automatic visual acceptance:
 
-- A visual-required run with no user-provided images can complete through real web image/page/screenshot/PDF visual acquisition.
+- A visual-required run with no user-provided images can complete through Codex-native search plus real web image/page/screenshot/PDF visual acquisition artifacts.
 - At least 10 web visual candidates are collected for image-centric questions unless policy or provider failure blocks the run with an explicit state.
-- At least 3 non-fixture images/screenshots/figures are analyzed by `openai-responses-vision` in the automated-cli release gate, and at least 3 are analyzed by Codex interactive handoff in the codex-plugin release gate. Explicit blocked terminal states are valid diagnostics but do not count as release-gate passes.
+- At least 3 non-fixture images/screenshots/figures are analyzed through Codex interactive handoff in the default codex-plugin release gate. `openai-responses-vision` analysis remains the equivalent automated-cli diagnostic requirement. Explicit blocked terminal states are valid diagnostics but do not count as release-gate passes.
 - At least one supported visual or mixed claim has `supporting_images[]`, valid `visual_supports[]`, a visual verifier vote, and is cited in `report.md`.
 - The report clearly distinguishes observed image facts from text-source facts and records image caveats.
 - The evidence browser can show the source page, image artifact, VLM observation, visual verifier vote, linked claim, and report citation together.
@@ -2054,7 +2054,7 @@ Deliverables:
 - `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
 - text-only 작업은 VLM 비용을 쓰지 않는다.
 - visual-required 작업은 VLM 분석과 visual verifier를 생략하지 않는다.
-- Public Beta visual-required 작업은 사용자 제공 이미지 없이도 codex-plugin interactive E2E와 automated-cli real provider E2E를 모두 통과해야 한다. automated-cli gate는 real web/image/page/screenshot/PDF visual acquisition과 `openai-responses-vision`을 통해 `completed_auto_visual` 상태에 도달해야 한다.
+- Public Beta visual-required 작업은 사용자 제공 이미지 없이 Codex-native search handoff와 `codex-interactive` VLM handoff artifacts를 통해 `completed_auto_visual` 상태에 도달해야 한다. automated-cli real provider E2E와 `openai-responses-vision`은 별도 재현성/diagnostic gate로 유지하되 Codex-native completion의 필수 조건은 아니다.
 - Public Beta automatic visual gate는 fixture, local test provider, manual review, user-provided-only image evidence만으로 통과할 수 없다.
 - 최종 보고서의 모든 high-confidence claim은 quote 또는 image evidence를 가진다.
 - high-risk domain claim은 primary source 또는 caveat 없이는 high confidence가 될 수 없다.
@@ -2078,7 +2078,7 @@ Deliverables:
 - VLM adapters: `codex-interactive`, `openai-responses-vision`, `manual-visual-review`.
 - Storage: JSONL + Markdown, 나중에 SQLite로 확장.
 - Image processing: perceptual hash, EXIF 추출, screenshot 캡처, OCR/VLM 결과 병합.
-- Web visual acquisition: image search provider, page image extractor, browser screenshot collector, PDF figure/page rasterizer, image fetch/cache, visual candidate ranker를 분리된 adapter로 구현한다. Public Beta automatic visual E2E는 최소 하나의 real web/image provider와 `openai-responses-vision` path로 재현 가능해야 한다.
+- Web visual acquisition: Codex-native search handoff, page image extractor, browser screenshot collector, PDF figure/page rasterizer, image fetch/cache, visual candidate ranker를 분리된 adapter로 구현한다. Public Beta automatic visual E2E의 기본 completion path는 Codex-native search artifacts와 `codex-interactive` VLM handoff records이며, external provider/API path는 automated-cli diagnostic으로 별도 검증한다.
 
 ## Search Provider Modes and Cost Model
 
@@ -2235,9 +2235,9 @@ Metric definitions:
 
 - `real codex-exec E2E accepted shard success rate`: percentage of non-blocked real `adapter=codex-exec` E2E runs where `accepted_shards > 0`; fixture adapter runs are excluded from numerator and denominator.
 - `visual evidence used in visual-required report`: percentage of non-blocked visual-required runs where at least one supported claim has `supporting_images`, `visual_supports[]`, and `report_status.used_images > 0`.
-- `automatic web visual E2E pass rate`: aggregate percentage of non-blocked visual-required real-use runs with no user-provided images where `run_status.json.status` reaches `completed_auto_visual`, at least 3 non-fixture VLM-analyzed images exist, provider scenario gates are satisfied, and at least one visual/mixed claim is cited in `report.md`.
+- `automatic web visual E2E pass rate`: aggregate percentage of non-blocked visual-required real-use runs with no user-provided images where `run_status.json.status` reaches `completed_auto_visual`, Codex-native visual candidate/fetch artifacts exist, at least 3 non-fixture `codex-interactive` VLM handoff observations exist, and at least one visual/mixed claim is cited in `report.md`.
 - `codex-plugin interactive visual E2E pass rate`: percentage of fresh-session `$deep-research` visual E2E runs where Codex-native search/VLM handoff artifacts are filled, ingested, reported, and surfaced in the final response without hidden Codex API assumptions. Explicit blocked terminal statuses are tracked separately and do not count as passes.
-- `automated-cli real provider visual E2E pass rate`: percentage of no-user-image automated CLI visual E2E runs where real provider acquisition plus `openai-responses-vision` reaches `completed_auto_visual` with required provider provenance, cost fields, and report citation linkage.
+- `automated-cli real provider visual E2E pass rate`: percentage of no-user-image automated CLI visual E2E diagnostic runs where real provider acquisition plus `openai-responses-vision` reaches `completed_auto_visual` with required provider provenance, cost fields, and report citation linkage. This is separate from the default Codex-native Public Beta completion path.
 - `real visual provider provenance coverage`: percentage of image/screenshot/PDF visual artifacts with provider, origin, source page, local artifact, hash, policy state, VLM path, and real-vs-fixture provenance recorded.
 - `user-requested report shape adherence`: percentage of sampled real-use reports scoring `>=9/10` on the report quality gate.
 - `fresh-session skill full-runner artifact handoff pass rate`: percentage of fresh Codex session `$deep-research` E2E runs where the final response includes a run artifact path, `report.md`, `evidence.json`, `run_status.json`, `report_status.json` after synthesis, status/shard summary, and the backing files exist after the response.
