@@ -1249,7 +1249,11 @@ def _skip_serial_handoff_after_parallel(
     run_dir: Path,
     status_payload: Mapping[str, Any],
 ) -> None:
-    for stage in ("ingest", "fetch_claims", "ingest_vision"):
+    stages = ["ingest", "fetch_claims"]
+    adapter = str(status_payload.get("adapter") or "").strip().lower().replace("_", "-")
+    if adapter != "codex-exec" or not _run_has_visual_routes(run_dir):
+        stages.append("ingest_vision")
+    for stage in stages:
         try:
             skip_stage(
                 run_dir,
@@ -1258,6 +1262,23 @@ def _skip_serial_handoff_after_parallel(
             )
         except Exception:
             continue
+
+
+def _run_has_visual_routes(run_dir: Path) -> bool:
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    routing = evidence.get("routing") if isinstance(evidence, Mapping) else None
+    if not isinstance(routing, list):
+        return False
+    for route in routing:
+        if not isinstance(route, Mapping) or route.get("modality") == "text_only":
+            continue
+        try:
+            max_images = int(route.get("max_images") or 0)
+        except (TypeError, ValueError):
+            max_images = 0
+        if max_images > 0:
+            return True
+    return False
 
 
 def _enforce_parallel_budget_gate(

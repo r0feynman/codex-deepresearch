@@ -408,6 +408,37 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(result["evidence_source"]["real_use_e2e_eligible"])
         self.assertEqual(result["failure_counts"]["failed_tasks"], 0)
 
+    def test_codex_exec_visual_parallel_keeps_ingest_vision_runnable(self) -> None:
+        run_dir = self.prepare(route="visual_required")
+
+        class SuccessfulCodexAdapter:
+            name = "codex-exec"
+
+            def run_task(inner_self, task, *, run_dir, max_threads):
+                shard_path = run_dir / task["output_shard_path"]
+                shard_path.parent.mkdir(parents=True, exist_ok=True)
+                self.write_json(shard_path, self.shard(run_dir, task))
+                return type("Result", (), {
+                    "task_id": task["id"],
+                    "status": "completed",
+                    "child_thread_id": f"codex-{task['id']}",
+                    "events": (),
+                    "shard_path": str(shard_path),
+                    "failure_category": None,
+                    "message": None,
+                })()
+
+        with mock.patch("deepresearch.parallel_orchestrator._adapter", return_value=SuccessfulCodexAdapter()):
+            result = run_parallel_orchestration(run=run_dir, adapter_name="codex-exec", min_tasks=1)
+
+        self.assertEqual(result["status"], "completed_parallel")
+        state = inspect_run_state(run_dir)
+        stages = {stage["stage"]: stage for stage in state["stages"]}
+        self.assertEqual(stages["ingest"]["status"], "skipped")
+        self.assertEqual(stages["fetch_claims"]["status"], "skipped")
+        self.assertEqual(stages["ingest_vision"]["status"], "pending")
+        self.assertEqual(state["next_safe_stage"], "ingest_vision")
+
     def test_partial_codex_exec_success_status_is_completed_partial_parallel(self) -> None:
         run_dir = self.prepare()
 
