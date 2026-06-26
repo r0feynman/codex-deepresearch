@@ -30,6 +30,7 @@ from deepresearch import (
     parse_scenario_run,
     parse_public_beta_gate_result,
     parse_public_beta_run,
+    normalize_public_beta_completion_mode,
     resolve_config,
     inspect_evidence,
     list_reusable_claims,
@@ -882,6 +883,7 @@ def run_public_beta_validation_command(args: argparse.Namespace) -> int:
             prompt_manifest=resolve_repo_path(args.prompt_manifest),
             prompt_runs=prompt_runs,
             gate_results=gate_results,
+            completion_mode=normalize_public_beta_completion_mode(args.completion_mode),
         )
     except (PublicBetaValidationError, OSError, json.JSONDecodeError) as exc:
         results_path = getattr(exc, "results_path", None)
@@ -1148,6 +1150,16 @@ def build_parser() -> argparse.ArgumentParser:
             "gate ids are fresh_session_full_runner_artifact_handoff, "
             "codex_plugin_interactive_visual_e2e, automated_cli_real_provider_visual_e2e, "
             "and automatic_web_visual_e2e."
+        ),
+    )
+    public_beta.add_argument(
+        "--completion-mode",
+        default="codex-native",
+        choices=["codex-native", "external-gated"],
+        help=(
+            "Release completion path. codex-native requires supplied Codex-plugin "
+            "handoff runs and treats external/provider gates as diagnostics; "
+            "external-gated also requires every supplied gate result to pass."
         ),
     )
     public_beta.add_argument(

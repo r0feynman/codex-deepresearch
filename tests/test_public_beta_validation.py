@@ -39,6 +39,13 @@ class PublicBetaValidationTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def read_jsonl(self, path: Path) -> list[dict[str, Any]]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def test_prompt_manifest_covers_public_safe_real_use_set(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompts = manifest["prompts"]
@@ -54,6 +61,9 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         self.assertTrue(
             all("automatic_web_visual_e2e" in prompt["gate_tags"] for prompt in visual_prompts)
+        )
+        self.assertTrue(
+            all("automated_cli_real_provider_visual_e2e" not in prompt["gate_tags"] for prompt in visual_prompts)
         )
 
     def test_default_suite_records_blocked_runs_separately_from_failures(self) -> None:
@@ -76,6 +86,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(payload["classification_counts"]["excluded_blocked"], 20)
         self.assertFalse(payload["release_gate_ready"])
         self.assertFalse(payload["issue_75_completion_ready"])
+        self.assertEqual(payload["completion_mode"], "codex-native")
         self.assertEqual(payload["validation_mode"], "diagnostic_harness")
         self.assertFalse(
             payload["acceptance"]["all_prompt_runs_are_supplied_sanitized_real_runs"]
@@ -181,8 +192,8 @@ class PublicBetaValidationTests(unittest.TestCase):
             failure["check"]
             for failure in result["visual_release_checks"]["failures"]
         }
-        self.assertIn("non_fixture_visual_acquisition_evidence", checks)
-        self.assertIn("vlm_analyzed_observations", checks)
+        self.assertIn("codex_native_visual_acquisition_evidence", checks)
+        self.assertIn("codex_interactive_vlm_handoff_observations", checks)
         self.assertIn("report_cited_visual_or_mixed_claim", checks)
 
     def test_supplied_run_must_match_prompt_suite_and_fresh_timestamp(self) -> None:
@@ -257,6 +268,29 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(any("run_id values disagree" in failure for failure in failures), failures)
         self.assertTrue(any("report_status=other-run" in failure for failure in failures), failures)
 
+    def test_supplied_run_rejects_hidden_codex_native_api_assumption(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "hidden-api",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        run_status = self.read_json(run_dir / "run_status.json")
+        run_status["hidden_codex_api_call"] = True
+        self.write_json(run_dir / "run_status.json", run_status)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+        self.assertIn("hidden Codex-native API call", result["failure_detail"])
+
     def test_visual_supplied_run_rejects_mismatched_visual_provider_run_id(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = next(
@@ -287,10 +321,40 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
-    def test_missing_external_gate_results_prevent_release_ready(self) -> None:
+    def test_visual_run_rejects_hidden_codex_interactive_api_assumption(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "hidden-vlm-api",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["hidden_codex_api_call"] = True
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("codex_interactive_vlm_handoff_observations", checks)
+
+    def test_codex_native_runs_can_complete_without_external_gate_results(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
-        suite_id = "missing-external-gates"
+        suite_id = "codex-native-no-external-gates"
         prompt_runs = {}
         for prompt in manifest["prompts"]:
             if prompt["route"] in {"visual_required", "visual_optional"}:
@@ -309,25 +373,31 @@ class PublicBetaValidationTests(unittest.TestCase):
                     status="completed_parallel",
                 )
 
-        with self.assertRaises(PublicBetaValidationError) as raised:
-            run_public_beta_validation(
-                runs_dir=self.temp_dir(),
-                suite_id=suite_id,
-                clean=True,
-                prompt_runs=prompt_runs,
-            )
-
-        payload = self.read_json(raised.exception.results_path)
-        self.assertEqual(payload["status"], "blocked")
+        payload = run_public_beta_validation(
+            runs_dir=self.temp_dir(),
+            suite_id=suite_id,
+            clean=True,
+            prompt_runs=prompt_runs,
+        )
+        self.assertEqual(payload["status"], "passed")
         self.assertEqual(payload["outcome_counts"]["passed"], 20)
-        self.assertFalse(payload["release_gate_ready"])
+        self.assertTrue(payload["release_gate_ready"])
+        self.assertTrue(payload["issue_75_completion_ready"])
         self.assertTrue(payload["release_gate_components"]["prompt_metrics_ready"])
-        self.assertFalse(payload["release_gate_components"]["external_gates_ready"])
-        self.assertTrue(
-            any("External gate result artifacts were not supplied" in gap for gap in payload["remaining_gaps"])
+        self.assertFalse(payload["release_gate_components"]["external_gates_required"])
+        self.assertTrue(payload["release_gate_components"]["external_gates_ready"])
+        self.assertEqual(
+            payload["external_gate_results"][
+                "automated_cli_real_provider_visual_e2e"
+            ]["status"],
+            "not_supplied",
+        )
+        self.assertEqual(
+            payload["remaining_gaps"],
+            ["No remaining release-gate gaps were detected."],
         )
 
-    def test_minimal_spoofed_external_gate_results_are_rejected(self) -> None:
+    def test_minimal_spoofed_external_gate_results_are_rejected_as_diagnostics(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
         suite_id = "spoofed-external-gates"
@@ -342,18 +412,17 @@ class PublicBetaValidationTests(unittest.TestCase):
             self.write_json(spoofed_gate, self.minimal_spoofed_gate_payload(gate_id))
             gate_results[gate_id] = spoofed_gate
 
-        with self.assertRaises(PublicBetaValidationError) as raised:
-            run_public_beta_validation(
-                runs_dir=self.temp_dir(),
-                suite_id=suite_id,
-                clean=True,
-                prompt_runs=prompt_runs,
-                gate_results=gate_results,
-            )
+        payload = run_public_beta_validation(
+            runs_dir=self.temp_dir(),
+            suite_id=suite_id,
+            clean=True,
+            prompt_runs=prompt_runs,
+            gate_results=gate_results,
+        )
 
-        payload = self.read_json(raised.exception.results_path)
-        self.assertEqual(payload["status"], "failed")
-        self.assertFalse(payload["release_gate_ready"])
+        self.assertEqual(payload["status"], "passed")
+        self.assertTrue(payload["release_gate_ready"])
+        self.assertTrue(payload["issue_75_completion_ready"])
         for gate_id, gate in payload["external_gate_results"].items():
             self.assertEqual(gate["status"], "failed", gate_id)
             self.assertFalse(gate["release_gate_ready"], gate_id)
@@ -366,6 +435,10 @@ class PublicBetaValidationTests(unittest.TestCase):
                 ),
                 (gate_id, gate["failures"]),
             )
+        self.assertCountEqual(
+            payload["release_gate_components"]["optional_diagnostic_gates_failed"],
+            list(EXTERNAL_GATE_REQUIREMENTS),
+        )
 
     def test_summary_redacts_private_absolute_run_paths(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -415,6 +488,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(command.returncode, 0, command.stderr)
         payload = json.loads(command.stdout)
         self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["completion_mode"], "codex-native")
         self.assertFalse(payload["raw_run_bundles_copied"])
         self.assertTrue(Path(payload["artifacts"]["results"]).is_file())
         self.assertTrue(Path(payload["artifacts"]["summary"]).is_file())
@@ -448,8 +522,32 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "created_at": timestamp,
                 "completed_at": timestamp,
                 "selected_mode": "codex-plugin",
+                "search_provider": "codex-native",
                 "adapter": "codex-exec",
             },
+        )
+        self.write_json(
+            run_dir / "search_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.search-handoff.v0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "created_at": timestamp,
+                "tasks": [
+                    {
+                        "id": "task_search_001",
+                        "query": prompt["prompt"],
+                        "route": prompt["route"],
+                        "provider": "codex-native",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "search_results.jsonl",
+            [self.codex_native_search_result(prompt, suite_id=suite_id)],
         )
         if status.startswith("completed"):
             self.write_json(
@@ -463,6 +561,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "question": prompt["prompt"],
                     "created_at": timestamp,
                     "mode": "codex-plugin",
+                    "search_provider": "codex-native",
                 },
             )
             self.write_json(
@@ -510,8 +609,33 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "terminal": True,
                 "created_at": timestamp,
                 "completed_at": timestamp,
-                "selected_mode": "automated-cli",
+                "selected_mode": "codex-plugin",
+                "search_provider": "codex-native",
+                "vlm_provider": "codex-interactive",
             },
+        )
+        self.write_json(
+            run_dir / "search_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.search-handoff.v0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "created_at": timestamp,
+                "tasks": [
+                    {
+                        "id": "task_search_001",
+                        "query": prompt["prompt"],
+                        "route": prompt["route"],
+                        "provider": "codex-native",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "search_results.jsonl",
+            [self.codex_native_search_result(prompt, suite_id=suite_id)],
         )
         image_id = "img_real_001"
         candidate = self.visual_candidate_record()
@@ -527,7 +651,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "suite_id": suite_id,
                 "question": prompt["prompt"],
                 "created_at": timestamp,
-                "mode": "automated-cli",
+                "mode": "codex-plugin",
+                "search_provider": "codex-native",
+                "vlm_provider": "codex-interactive",
                 "images": [
                     {
                         "id": image_id,
@@ -586,9 +712,11 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "created_at": timestamp,
                 "providers": [
                     {
-                        "provider": "real-screenshot",
-                        "provider_kind": "screenshot",
+                        "provider": "codex-native",
+                        "provider_kind": "web_image_search",
                         "provider_mode": "real",
+                        "codex_native_handoff": True,
+                        "handoff_artifact": "visual_candidates.jsonl",
                         "configured": provider_status == "completed_auto_visual",
                         "available": provider_status == "completed_auto_visual",
                         "invocations": 1 if provider_status == "completed_auto_visual" else 0,
@@ -597,9 +725,11 @@ class PublicBetaValidationTests(unittest.TestCase):
                         "vlm_images_analyzed": 0,
                     },
                     {
-                        "provider": "openai-responses-vision",
+                        "provider": "codex-interactive",
                         "provider_kind": "vlm",
                         "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
                         "configured": provider_status == "completed_auto_visual",
                         "available": provider_status == "completed_auto_visual",
                         "invocations": 1 if provider_status == "completed_auto_visual" else 0,
@@ -698,17 +828,23 @@ class PublicBetaValidationTests(unittest.TestCase):
             "candidate_id": "cand_real_001",
             "task_id": "task_visual_001",
             "angle_id": "angle_001",
-            "provider": "real-screenshot",
-            "provider_kind": "screenshot",
+            "provider": "codex-native",
+            "provider_kind": "web_image_search",
             "provider_mode": "real",
             "provider_run_id": "run_real_001",
+            "search_provider": "codex-native",
+            "codex_native_handoff": True,
+            "handoff_artifact": "visual_candidates.jsonl",
             "provider_provenance": {
-                "provider": "real-screenshot",
-                "provider_kind": "screenshot",
+                "provider": "codex-native",
+                "provider_kind": "web_image_search",
                 "provider_mode": "real",
-                "external_network_call": True,
+                "search_provider": "codex-native",
+                "codex_native_handoff": True,
+                "handoff_artifact": "visual_candidates.jsonl",
+                "external_network_call": False,
             },
-            "origin": "screenshot",
+            "origin": "image_search",
             "policy_decision": "allowed",
             "candidate_status": "analyzed",
         }
@@ -723,6 +859,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             "provider_kind": candidate["provider_kind"],
             "provider_mode": "real",
             "provider_run_id": candidate["provider_run_id"],
+            "search_provider": "codex-native",
+            "codex_native_handoff": True,
+            "handoff_artifact": "image_fetch_status.jsonl",
             "provider_provenance": candidate["provider_provenance"],
             "origin": candidate["origin"],
             "fetch_status": "fetched",
@@ -745,15 +884,20 @@ class PublicBetaValidationTests(unittest.TestCase):
             "angle_id": candidate["angle_id"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
-            "provider": "openai-responses-vision",
+            "provider": "codex-interactive",
             "provider_kind": "vlm",
             "provider_mode": "real",
-            "provider_run_id": "openai-real-001",
+            "provider_run_id": "codex-interactive-real-001",
+            "analysis_provider": "codex-interactive",
+            "codex_interactive_handoff": True,
+            "handoff_artifact": "visual_observations.jsonl",
             "provider_provenance": {
-                "provider": "openai-responses-vision",
+                "provider": "codex-interactive",
                 "provider_kind": "vlm",
                 "provider_mode": "real",
-                "external_vlm_call": True,
+                "codex_interactive_handoff": True,
+                "handoff_artifact": "visual_observations.jsonl",
+                "external_vlm_call": False,
             },
             "observation_status": "analyzed",
             "observations": ["The image contains visible evidence."],
@@ -773,6 +917,31 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "citation_id": f"img:{image_id}",
                 }
             ],
+        }
+
+    def codex_native_search_result(
+        self,
+        prompt: dict[str, Any],
+        *,
+        suite_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "id": f"search_{prompt['id']}",
+            "task_id": "task_search_001",
+            "route": prompt["route"],
+            "provider": "codex-native",
+            "provider_mode": "real",
+            "query": prompt["prompt"],
+            "url": "https://example.com/public-beta-source",
+            "title": "Public beta source",
+            "snippet": "A public-safe source supports the validation prompt.",
+            "retrieval_status": "fetched",
+            "policy_decision": "allowed",
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "accessed_at": self.now(),
+            "handoff_artifact": "search_results.jsonl",
         }
 
     def prompt_hash(self, prompt: str) -> str:

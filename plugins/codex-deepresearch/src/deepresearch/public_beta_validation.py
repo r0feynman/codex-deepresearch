@@ -78,12 +78,20 @@ FAILURE_CATEGORIES = (
     "artifact_handoff_failure",
     "synthesis_shape_failure",
 )
+PUBLIC_BETA_COMPLETION_MODES = {"codex-native", "external-gated"}
+DEFAULT_PUBLIC_BETA_COMPLETION_MODE = "codex-native"
 GATE_THRESHOLDS = {
     "fresh_session_full_runner_artifact_handoff": 0.98,
     "codex_plugin_interactive_visual_e2e": 0.90,
     "automated_cli_real_provider_visual_e2e": 0.90,
     "automatic_web_visual_e2e": 0.90,
 }
+CODEX_NATIVE_COMPLETION_GATE_IDS = {
+    "fresh_session_full_runner_artifact_handoff",
+    "codex_plugin_interactive_visual_e2e",
+    "automatic_web_visual_e2e",
+}
+OPTIONAL_DIAGNOSTIC_GATE_IDS = set(GATE_THRESHOLDS) - CODEX_NATIVE_COMPLETION_GATE_IDS
 EXTERNAL_GATE_REQUIREMENTS = {
     "fresh_session_full_runner_artifact_handoff": {
         "schemas": {"codex-deepresearch.fresh-session-e2e.v0"},
@@ -122,6 +130,19 @@ _REAL_ACQUISITION_PROVIDER_KINDS = {
     "screenshot",
     "pdf_rasterizer",
     "visual_acquisition",
+}
+_CODEX_NATIVE_SEARCH_PROVIDERS = {
+    "codex-native",
+    "codex-native-search",
+    "codex-web-search",
+}
+_CODEX_NATIVE_VISUAL_ACQUISITION_PROVIDERS = _CODEX_NATIVE_SEARCH_PROVIDERS | {
+    "browser-screenshot",
+    "codex-browser-screenshot",
+    "page-image-extractor",
+    "page_extractor",
+    "pdf_rasterizer",
+    "screenshot",
 }
 _FRESH_SESSION_REQUIRED_ACCEPTANCE = {
     "fixture_scenario_completed",
@@ -214,6 +235,21 @@ def parse_public_beta_gate_result(value: str) -> tuple[str, Path]:
     return gate_id, Path(results_path)
 
 
+def normalize_public_beta_completion_mode(value: str | None) -> str:
+    """Normalize the Public Beta completion path."""
+
+    mode = (value or DEFAULT_PUBLIC_BETA_COMPLETION_MODE).strip().lower()
+    mode = mode.replace("_", "-")
+    if mode not in PUBLIC_BETA_COMPLETION_MODES:
+        raise PublicBetaValidationError(
+            "unknown public beta completion mode: "
+            + str(value)
+            + "; expected one of "
+            + ", ".join(sorted(PUBLIC_BETA_COMPLETION_MODES))
+        )
+    return mode
+
+
 def run_public_beta_validation(
     *,
     runs_dir: str | Path,
@@ -222,9 +258,11 @@ def run_public_beta_validation(
     prompt_manifest: str | Path = DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
     prompt_runs: Mapping[str, str | Path] | None = None,
     gate_results: Mapping[str, str | Path] | None = None,
+    completion_mode: str = DEFAULT_PUBLIC_BETA_COMPLETION_MODE,
 ) -> dict[str, Any]:
     """Classify the Phase 3 Public Beta real-use validation set."""
 
+    completion_mode = normalize_public_beta_completion_mode(completion_mode)
     root_runs_dir = Path(runs_dir)
     suite_dir = root_runs_dir / suite_id
     if suite_dir.exists():
@@ -269,6 +307,7 @@ def run_public_beta_validation(
         gate_results,
         validation_time=generated_at,
     )
+    required_gate_ids = _required_completion_gate_ids(completion_mode)
     acceptance = _acceptance(
         manifest=manifest,
         evaluated_runs=evaluated_runs,
@@ -278,12 +317,17 @@ def run_public_beta_validation(
     outcome_counts = _outcome_counts(evaluated_runs)
     classification_counts = _classification_counts(evaluated_runs)
     prompt_release_gate_ready = all(
-        metric.get("release_gate_ready") is True
-        for metric in prompt_metrics.values()
+        prompt_metrics[metric_id].get("release_gate_ready") is True
+        for metric_id in required_gate_ids
     )
-    external_release_gate_ready = all(
-        result.get("release_gate_ready") is True
-        for result in external_gate_results.values()
+    external_gates_required = completion_mode == "external-gated"
+    external_release_gate_ready = (
+        all(
+            result.get("release_gate_ready") is True
+            for result in external_gate_results.values()
+        )
+        if external_gates_required
+        else True
     )
     release_gate_ready = prompt_release_gate_ready and external_release_gate_ready
     external_gate_failed = any(
@@ -297,7 +341,8 @@ def run_public_beta_validation(
     }
     status = (
         "failed"
-        if outcome_counts["failed"] > 0 or external_gate_failed
+        if outcome_counts["failed"] > 0
+        or (external_gates_required and external_gate_failed)
         else "passed"
         if release_gate_ready and all(pre_summary_acceptance.values())
         else "blocked"
@@ -318,16 +363,30 @@ def run_public_beta_validation(
         "raw_run_bundles_copied": False,
         "release_gate_ready": release_gate_ready and status == "passed",
         "issue_75_completion_ready": issue_75_completion_ready,
+        "completion_mode": completion_mode,
         "validation_mode": (
             "release_validation" if issue_75_completion_ready else "diagnostic_harness"
         ),
         "release_gate_components": {
+            "completion_mode": completion_mode,
+            "required_codex_native_gate_ids": sorted(required_gate_ids),
             "prompt_metrics_ready": prompt_release_gate_ready,
+            "external_gates_required": external_gates_required,
             "external_gates_ready": external_release_gate_ready,
             "supplied_real_runs_ready": acceptance.get(
                 "all_prompt_runs_are_supplied_sanitized_real_runs",
                 False,
             ),
+            "optional_diagnostic_gate_ids": sorted(
+                set(GATE_THRESHOLDS)
+                if not external_gates_required
+                else OPTIONAL_DIAGNOSTIC_GATE_IDS
+            ),
+            "optional_diagnostic_gates_failed": [
+                gate_id
+                for gate_id, result in sorted(external_gate_results.items())
+                if result.get("status") == "failed"
+            ],
         },
         "prompt_coverage": {
             "total_prompts": len(prompts),
@@ -354,6 +413,8 @@ def run_public_beta_validation(
             evaluated_runs=evaluated_runs,
             prompt_metrics=prompt_metrics,
             external_gate_results=external_gate_results,
+            required_gate_ids=required_gate_ids,
+            external_gates_required=external_gates_required,
         ),
         "artifacts": {
             "results": str(results_path.resolve()),
@@ -472,6 +533,12 @@ def evaluate_public_beta_prompt_run(
         else {},
         report_status=report_status if isinstance(report_status, Mapping) else {},
     )
+    codex_native_checks = _codex_native_handoff_checks(
+        run_path=run_path,
+        artifacts=artifacts,
+        run_status=run_status if isinstance(run_status, Mapping) else {},
+        evidence=evidence if isinstance(evidence, Mapping) else {},
+    )
 
     provider_provenance = _provider_provenance(
         prompt=prompt,
@@ -538,6 +605,13 @@ def evaluate_public_beta_prompt_run(
         detail = "supplied run status artifacts are stale or inconsistent: " + "; ".join(
             status_consistency_failures
         )
+    if status == "passed" and not codex_native_checks["valid"]:
+        status = "failed"
+        classification = "included_failure"
+        failure_category = "artifact_handoff_failure"
+        detail = "supplied run lacks Codex-native handoff proof: " + "; ".join(
+            codex_native_checks["failures"]
+        )
     if (
         status == "passed"
         and visual_release_checks is not None
@@ -574,6 +648,7 @@ def evaluate_public_beta_prompt_run(
         "provider_provenance": provider_provenance,
         "supplied_run_binding": run_binding,
         "status_consistency_failures": status_consistency_failures,
+        "codex_native_handoff_checks": codex_native_checks,
         "failure_category": failure_category,
         "failure_detail": detail,
         "public_safe": prompt.get("public_safe") is True,
@@ -720,6 +795,8 @@ def _metric_summary(
     return {
         "metric_id": metric_id,
         "threshold": threshold,
+        "completion_required": metric_id in CODEX_NATIVE_COMPLETION_GATE_IDS,
+        "diagnostic_only": metric_id in OPTIONAL_DIAGNOSTIC_GATE_IDS,
         "prompt_count": len(runs),
         "passed": passed,
         "failed_non_blocked": failed,
@@ -736,6 +813,12 @@ def _metric_summary(
             str(run.get("id")) for run in runs if run.get("status") == "failed"
         ],
     }
+
+
+def _required_completion_gate_ids(completion_mode: str) -> set[str]:
+    if completion_mode == "codex-native":
+        return set(CODEX_NATIVE_COMPLETION_GATE_IDS)
+    return set(GATE_THRESHOLDS)
 
 
 def _external_gate_results(
@@ -1210,6 +1293,48 @@ def _acceptance(
             and run["supplied_run_binding"].get("valid") is True
             for run in evaluated_runs
         ),
+        "passed_runs_use_codex_plugin_mode": all(
+            run.get("status") != "passed"
+            or (
+                isinstance(run.get("codex_native_handoff_checks"), Mapping)
+                and run["codex_native_handoff_checks"].get("selected_mode")
+                == "codex-plugin"
+            )
+            for run in evaluated_runs
+        ),
+        "passed_runs_have_codex_native_search_handoff": all(
+            run.get("status") != "passed"
+            or (
+                isinstance(run.get("codex_native_handoff_checks"), Mapping)
+                and run["codex_native_handoff_checks"].get("valid") is True
+                and int(
+                    run["codex_native_handoff_checks"].get(
+                        "codex_native_search_results",
+                        0,
+                    )
+                    or 0
+                )
+                > 0
+            )
+            for run in evaluated_runs
+        ),
+        "passed_visual_runs_have_codex_interactive_handoff_evidence": all(
+            run.get("status") != "passed"
+            or run.get("route") not in VISUAL_ROUTES
+            or (
+                isinstance(run.get("visual_release_checks"), Mapping)
+                and run["visual_release_checks"].get("valid") is True
+                and int(
+                    run["visual_release_checks"].get("counts", {}).get(
+                        "real_vlm_observations",
+                        0,
+                    )
+                    or 0
+                )
+                > 0
+            )
+            for run in evaluated_runs
+        ),
         "blocked_runs_counted_separately_from_failed_non_blocked_runs": all(
             metric.get("blocked", 0) >= 0
             and metric.get("failed_non_blocked", 0) >= 0
@@ -1228,6 +1353,8 @@ def _remaining_gaps(
     evaluated_runs: Sequence[Mapping[str, Any]],
     prompt_metrics: Mapping[str, Mapping[str, Any]],
     external_gate_results: Mapping[str, Mapping[str, Any]],
+    required_gate_ids: set[str],
+    external_gates_required: bool,
 ) -> list[str]:
     gaps: list[str] = []
     blocked = [run for run in evaluated_runs if run.get("status") == "blocked"]
@@ -1241,7 +1368,8 @@ def _remaining_gaps(
         gaps.append(
             f"{len(failed)} non-blocked prompt run(s) failed and must be fixed or rerun."
         )
-    for metric_id, metric in prompt_metrics.items():
+    for metric_id in sorted(required_gate_ids):
+        metric = prompt_metrics[metric_id]
         if metric.get("release_gate_ready") is not True:
             gaps.append(
                 f"{metric_id} is not release-gate ready: "
@@ -1255,7 +1383,7 @@ def _remaining_gaps(
         for gate_id, result in external_gate_results.items()
         if result.get("status") == "not_supplied"
     ]
-    if missing_external:
+    if external_gates_required and missing_external:
         gaps.append(
             "External gate result artifacts were not supplied for: "
             + ", ".join(sorted(missing_external))
@@ -1266,7 +1394,7 @@ def _remaining_gaps(
         for gate_id, result in external_gate_results.items()
         if result.get("status") == "failed"
     ]
-    if failed_external:
+    if external_gates_required and failed_external:
         details = []
         for gate_id in sorted(failed_external):
             failures = external_gate_results[gate_id].get("failures")
@@ -1293,6 +1421,7 @@ def _render_summary(results: Mapping[str, Any]) -> str:
         f"Status: {results['status']}",
         f"Release gate ready: {str(results['release_gate_ready']).lower()}",
         f"Issue #75 completion ready: {str(results['issue_75_completion_ready']).lower()}",
+        f"Completion mode: {results['completion_mode']}",
         f"Validation mode: {results['validation_mode']}",
         f"Public safe: {str(results['public_safe']).lower()}",
         "Raw run bundles copied: false",
@@ -1308,16 +1437,17 @@ def _render_summary(results: Mapping[str, Any]) -> str:
         "",
         "## Metric Summary",
         "",
-        "| Gate | Threshold | Pass rate | Passed | Failed non-blocked | Blocked | Ready |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Gate | Role | Threshold | Pass rate | Passed | Failed non-blocked | Blocked | Ready |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for metric in results["prompt_metrics"].values():
         pass_rate = metric.get("pass_rate")
         rate = "n/a" if pass_rate is None else f"{pass_rate:.1%}"
         lines.append(
-            "| {metric_id} | {threshold:.0%} | {rate} | {passed} | "
+            "| {metric_id} | {role} | {threshold:.0%} | {rate} | {passed} | "
             "{failed} | {blocked} | {ready} |".format(
                 metric_id=metric["metric_id"],
+                role="required" if metric.get("completion_required") else "diagnostic",
                 threshold=metric["threshold"],
                 rate=rate,
                 passed=metric["passed"],
@@ -1408,6 +1538,8 @@ def _artifact_paths(run_dir: Path, *, route: str) -> dict[str, Path]:
     artifacts = {
         "run_status": run_dir / "run_status.json",
         "evidence": run_dir / "evidence.json",
+        "search_tasks": run_dir / "search_tasks.json",
+        "search_results": run_dir / "search_results.jsonl",
         "report": run_dir / "report.md",
         "report_status": run_dir / "report_status.json",
         "parallel_status": run_dir / "parallel_orchestration_status.json",
@@ -1433,7 +1565,7 @@ def _required_status_artifacts(
 ) -> list[str]:
     required = ["run_status"]
     if terminal_status in PASS_TERMINAL_STATUSES:
-        required.extend(["evidence", "report", "report_status"])
+        required.extend(["evidence", "search_tasks", "search_results", "report", "report_status"])
     if prompt.get("route") in VISUAL_ROUTES:
         required.append("visual_provider_status")
     if terminal_status == "completed_auto_visual":
@@ -1802,6 +1934,53 @@ def _status_consistency_failures(
     return failures
 
 
+def _codex_native_handoff_checks(
+    *,
+    run_path: Path,
+    artifacts: Mapping[str, Path],
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    failures: list[str] = []
+    selected_mode = _selected_mode(run_status, evidence)
+    if selected_mode != "codex-plugin":
+        failures.append(
+            "selected mode must be codex-plugin for Codex-native completion"
+        )
+    for payload_name, payload in (("run_status", run_status), ("evidence", evidence)):
+        hidden_api = payload.get("hidden_codex_api_call")
+        if hidden_api is True or payload.get("codex_native_api_call") is True:
+            failures.append(
+                f"{payload_name} claims a hidden Codex-native API call; "
+                "Codex-native runs must use handoff artifacts"
+            )
+
+    search_tasks_path = artifacts.get("search_tasks", run_path / "search_tasks.json")
+    search_results_path = artifacts.get("search_results", run_path / "search_results.jsonl")
+    search_tasks = _read_optional_json(search_tasks_path)
+    search_results = _mapping_list(_read_optional_jsonl(search_results_path))
+    if not isinstance(search_tasks, (Mapping, list)):
+        failures.append("search_tasks.json is missing or invalid")
+    codex_native_results = [
+        record for record in search_results if _is_codex_native_search_result(record)
+    ]
+    if not codex_native_results:
+        failures.append(
+            "search_results.jsonl lacks allowed Codex-native search handoff results"
+        )
+    if _has_non_release_handoff_records(search_results):
+        failures.append(
+            "search_results.jsonl contains fixture, manual, or user-provided-only records"
+        )
+    return {
+        "valid": not failures,
+        "selected_mode": selected_mode,
+        "codex_native_search_results": len(codex_native_results),
+        "search_results": len(search_results),
+        "failures": failures,
+    }
+
+
 def _visual_release_checks(
     *,
     run_path: Path,
@@ -1823,9 +2002,9 @@ def _visual_release_checks(
         observations=observations,
         visual_provider_status=visual_provider_status,
     )
-    real_candidates = _real_acquisition_records(candidates)
-    real_fetches = _real_fetch_records(fetches)
-    real_observations = _real_vlm_observations(observations)
+    real_candidates = _codex_native_acquisition_records(candidates)
+    real_fetches = _codex_native_fetch_records(fetches)
+    real_observations = _codex_interactive_observations(observations)
     report_claims = _report_cited_visual_claims(
         evidence=evidence,
         report_status=report_status,
@@ -1847,28 +2026,28 @@ def _visual_release_checks(
                 "detail": "run_status and visual_provider_status must both be completed_auto_visual",
             }
         )
-    if not _has_real_acquisition_provider(visual_provider_status):
+    if not _has_codex_native_acquisition_provider(visual_provider_status):
         failures.append(
             {
-                "check": "real_acquisition_provider",
+                "check": "codex_native_acquisition_provider",
                 "classification": "provider",
-                "detail": "visual_provider_status lacks a configured real acquisition provider",
+                "detail": "visual_provider_status lacks a configured Codex-native acquisition provider",
             }
         )
     if not real_candidates or not real_fetches:
         failures.append(
             {
-                "check": "non_fixture_visual_acquisition_evidence",
+                "check": "codex_native_visual_acquisition_evidence",
                 "classification": "fetch",
-                "detail": "visual artifacts lack non-fixture real candidates and fetched images",
+                "detail": "visual artifacts lack real Codex-native candidates and fetched images",
             }
         )
-    if not _has_real_vlm_provider(visual_provider_status) or not real_observations:
+    if not _has_codex_interactive_vlm_provider(visual_provider_status) or not real_observations:
         failures.append(
             {
-                "check": "vlm_analyzed_observations",
+                "check": "codex_interactive_vlm_handoff_observations",
                 "classification": "vlm",
-                "detail": "visual artifacts lack real VLM-analyzed observations",
+                "detail": "visual artifacts lack real Codex-interactive VLM handoff observations",
             }
         )
     if _policy_blocks_release(candidates, fetches, observations):
@@ -1939,6 +2118,9 @@ def _provider_provenance(
                 "vlm_images_analyzed": provider.get("vlm_images_analyzed", 0),
                 "estimated_cost_usd": provider.get("estimated_cost_usd", 0.0),
                 "actual_cost_usd": provider.get("actual_cost_usd", 0.0),
+                "codex_native_handoff": provider.get("codex_native_handoff"),
+                "codex_interactive_handoff": provider.get("codex_interactive_handoff"),
+                "handoff_artifact": provider.get("handoff_artifact"),
             }
         )
     expected_visual_providers = list(prompt.get("visual_provider_requirements", []))
@@ -1961,6 +2143,16 @@ def _provider_provenance(
             visual_provider_status,
             providers,
             "external_vlm_call",
+        ),
+        "codex_native_handoff": _truthy_provider_field(
+            visual_provider_status,
+            providers,
+            "codex_native_handoff",
+        ),
+        "codex_interactive_handoff": _truthy_provider_field(
+            visual_provider_status,
+            providers,
+            "codex_interactive_handoff",
         ),
     }
 
@@ -2093,34 +2285,35 @@ def _strict_int_count(payload: Mapping[str, Any], key: str) -> int | None:
     return None
 
 
-def _real_acquisition_records(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+def _codex_native_acquisition_records(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     return [
         record
         for record in records
-        if _is_real_policy_allowed_acquisition_record(record)
+        if _is_codex_native_policy_allowed_acquisition_record(record)
     ]
 
 
-def _real_fetch_records(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+def _codex_native_fetch_records(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     return [
         record
         for record in records
-        if _is_real_policy_allowed_acquisition_record(record)
+        if _is_codex_native_policy_allowed_acquisition_record(record)
         and record.get("fetch_status") == "fetched"
         and isinstance(record.get("evidence_image_id"), str)
         and record.get("evidence_image_id")
     ]
 
 
-def _real_vlm_observations(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    return [record for record in records if _is_real_vlm_observation(record)]
+def _codex_interactive_observations(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [record for record in records if _is_codex_interactive_vlm_observation(record)]
 
 
-def _has_real_acquisition_provider(payload: Mapping[str, Any]) -> bool:
+def _has_codex_native_acquisition_provider(payload: Mapping[str, Any]) -> bool:
     for provider in _mapping_list(payload.get("providers", [])):
         if (
             provider.get("provider_mode") == "real"
             and provider.get("provider_kind") in _REAL_ACQUISITION_PROVIDER_KINDS
+            and _is_codex_native_provider_record(provider)
             and provider.get("configured") is True
             and provider.get("available") is True
             and int(provider.get("invocations") or 0) > 0
@@ -2129,15 +2322,17 @@ def _has_real_acquisition_provider(payload: Mapping[str, Any]) -> bool:
     return False
 
 
-def _has_real_vlm_provider(payload: Mapping[str, Any]) -> bool:
+def _has_codex_interactive_vlm_provider(payload: Mapping[str, Any]) -> bool:
     for provider in _mapping_list(payload.get("providers", [])):
         if (
             provider.get("provider_mode") == "real"
             and provider.get("provider_kind") == "vlm"
+            and _provider_name(provider) == "codex-interactive"
             and provider.get("configured") is True
             and provider.get("available") is True
             and int(provider.get("invocations") or 0) > 0
             and int(provider.get("vlm_images_analyzed") or 0) > 0
+            and _is_explicit_codex_handoff(provider)
         ):
             return True
     return False
@@ -2256,12 +2451,12 @@ def _has_real_report_cited_observation(
     verifier_vote_ids: set[str],
 ) -> bool:
     image = images_by_id.get(image_id)
-    if image is None or not _is_real_policy_allowed_acquisition_record(image):
+    if image is None or not _is_codex_native_policy_allowed_acquisition_record(image):
         return False
     for observation in observations:
         if observation.get("evidence_image_id") != image_id:
             continue
-        if not _is_real_vlm_observation(observation):
+        if not _is_codex_interactive_vlm_observation(observation):
             continue
         if not _has_report_link(observation, claim_id):
             continue
@@ -2275,9 +2470,9 @@ def _has_real_report_cited_observation(
         fetch = fetches_by_id.get(fetch_id)
         if candidate is None or fetch is None:
             continue
-        if not _is_real_policy_allowed_acquisition_record(candidate):
+        if not _is_codex_native_policy_allowed_acquisition_record(candidate):
             continue
-        if not _is_real_policy_allowed_fetch(fetch, image_id=image_id, candidate_id=candidate_id):
+        if not _is_codex_native_policy_allowed_fetch(fetch, image_id=image_id, candidate_id=candidate_id):
             continue
         if image.get("candidate_id") not in {None, candidate_id}:
             continue
@@ -2289,7 +2484,7 @@ def _has_real_report_cited_observation(
     return False
 
 
-def _is_real_vlm_observation(record: Mapping[str, Any]) -> bool:
+def _is_codex_interactive_vlm_observation(record: Mapping[str, Any]) -> bool:
     provenance = record.get("provider_provenance")
     return (
         record.get("provider_kind") == "vlm"
@@ -2297,13 +2492,18 @@ def _is_real_vlm_observation(record: Mapping[str, Any]) -> bool:
         and record.get("observation_status") == "analyzed"
         and record.get("policy_decision") == "allowed"
         and isinstance(provenance, Mapping)
+        and _provider_name(record) == "codex-interactive"
         and provenance.get("provider_kind") == "vlm"
         and provenance.get("provider_mode") == "real"
-        and bool(record.get("external_vlm_call") or provenance.get("external_vlm_call"))
+        and _provider_name(provenance) == "codex-interactive"
+        and _is_explicit_codex_handoff(record)
+        and _is_explicit_codex_handoff(provenance)
+        and not _claims_hidden_codex_api(record)
+        and not _claims_hidden_codex_api(provenance)
     )
 
 
-def _is_real_policy_allowed_acquisition_record(record: Mapping[str, Any]) -> bool:
+def _is_codex_native_policy_allowed_acquisition_record(record: Mapping[str, Any]) -> bool:
     provenance = record.get("provider_provenance")
     return (
         record.get("provider_mode") == "real"
@@ -2312,17 +2512,21 @@ def _is_real_policy_allowed_acquisition_record(record: Mapping[str, Any]) -> boo
         and isinstance(provenance, Mapping)
         and provenance.get("provider_mode") == "real"
         and provenance.get("provider_kind") in _REAL_ACQUISITION_PROVIDER_KINDS
+        and _is_codex_native_provider_record(record)
+        and _is_codex_native_provider_record(provenance)
+        and not _claims_hidden_codex_api(record)
+        and not _claims_hidden_codex_api(provenance)
     )
 
 
-def _is_real_policy_allowed_fetch(
+def _is_codex_native_policy_allowed_fetch(
     fetch: Mapping[str, Any],
     *,
     image_id: str,
     candidate_id: str,
 ) -> bool:
     return (
-        _is_real_policy_allowed_acquisition_record(fetch)
+        _is_codex_native_policy_allowed_acquisition_record(fetch)
         and fetch.get("fetch_status") == "fetched"
         and fetch.get("candidate_id") == candidate_id
         and fetch.get("evidence_image_id") == image_id
@@ -2389,6 +2593,127 @@ def _truthy_provider_field(
     if provider_status.get(field) is True:
         return True
     return any(provider.get(field) is True for provider in providers)
+
+
+def _selected_mode(
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> str | None:
+    selected = run_status.get("selected_mode") or evidence.get("mode")
+    if isinstance(selected, list):
+        selected = selected[0] if selected else None
+    if isinstance(selected, str) and selected.strip():
+        return selected.strip()
+    return None
+
+
+def _provider_name(record: Mapping[str, Any]) -> str:
+    for name in ("provider", "search_provider", "analysis_provider", "vlm_provider"):
+        value = record.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower().replace("_", "-")
+    return ""
+
+
+def _is_codex_native_search_result(record: Mapping[str, Any]) -> bool:
+    provider = _provider_name(record)
+    retrieval_status = str(record.get("retrieval_status") or "fetched")
+    provider_mode = str(record.get("provider_mode") or "real")
+    return (
+        provider in _CODEX_NATIVE_SEARCH_PROVIDERS
+        and provider_mode == "real"
+        and record.get("policy_decision") in {None, "allowed"}
+        and retrieval_status not in {
+            "failed",
+            "blocked",
+            "policy_blocked",
+            "manual_review",
+        }
+        and not _claims_hidden_codex_api(record)
+    )
+
+
+def _has_non_release_handoff_records(records: Sequence[Mapping[str, Any]]) -> bool:
+    for record in records:
+        mode = record.get("provider_mode")
+        provider = _provider_name(record)
+        if mode in {"fixture", "manual", "user_provided"}:
+            return True
+        if provider in {"fixture", "manual", "manual-sources", "user-provided"}:
+            return True
+    return False
+
+
+def _is_codex_native_provider_record(record: Mapping[str, Any]) -> bool:
+    provider = _provider_name(record)
+    if provider in _CODEX_NATIVE_VISUAL_ACQUISITION_PROVIDERS:
+        return True
+    search_provider = record.get("search_provider")
+    if (
+        isinstance(search_provider, str)
+        and search_provider.strip().lower().replace("_", "-")
+        in _CODEX_NATIVE_SEARCH_PROVIDERS
+    ):
+        return True
+    return _handoff_artifact_mentions(
+        record,
+        {
+            "search_results.jsonl",
+            "visual_candidates.jsonl",
+            "image_fetch_status.jsonl",
+        },
+    )
+
+
+def _is_explicit_codex_handoff(record: Mapping[str, Any]) -> bool:
+    if record.get("codex_native_handoff") is True:
+        return True
+    if record.get("codex_interactive_handoff") is True:
+        return True
+    if record.get("handoff_recorded") is True:
+        return True
+    return _handoff_artifact_mentions(
+        record,
+        {
+            "search_results.jsonl",
+            "visual_candidates.jsonl",
+            "image_fetch_status.jsonl",
+            "visual_observations.jsonl",
+        },
+    )
+
+
+def _handoff_artifact_mentions(
+    record: Mapping[str, Any],
+    expected: set[str],
+) -> bool:
+    values: list[Any] = []
+    for name in (
+        "handoff_artifact",
+        "handoff_artifacts",
+        "handoff_path",
+        "handoff_paths",
+        "source_handoff_artifact",
+        "source_handoff_path",
+    ):
+        value = record.get(name)
+        if isinstance(value, list):
+            values.extend(value)
+        elif value is not None:
+            values.append(value)
+    return any(
+        isinstance(value, str)
+        and any(item in value.replace("\\", "/") for item in expected)
+        for value in values
+    )
+
+
+def _claims_hidden_codex_api(record: Mapping[str, Any]) -> bool:
+    return bool(
+        record.get("hidden_codex_api_call") is True
+        or record.get("codex_native_api_call") is True
+        or record.get("hidden_api_call") is True
+    )
 
 
 def _provider_kind(provider: str) -> str:

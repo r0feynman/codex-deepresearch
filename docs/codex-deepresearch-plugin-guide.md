@@ -138,7 +138,7 @@ Important run artifacts:
 
 `blocked_missing_search_handoff`: `prepare` created search tasks, but `search_results.jsonl` is missing, empty, invalid, or policy-blocked. Fill one valid `SearchResult` JSON object per line, use manual handoff for user-provided sources, or report the blocked status. Do not synthesize from search snippets alone.
 
-`blocked_missing_visual_provider`: the selected route requires automatic visual evidence, but no real visual acquisition provider is configured or available. Local fixtures can validate mechanics, but they cannot satisfy Public Beta automatic visual release gates. Use a text-only route when visual evidence is not required, or configure an allowed real provider outside the repository.
+`blocked_missing_visual_provider`: the selected route requires automatic visual evidence, but no release-eligible visual acquisition handoff is configured or available. Local fixtures can validate mechanics, but they cannot satisfy Public Beta automatic visual release gates. For Codex-native completion, fill Codex-native visual candidate/fetch artifacts through explicit handoff records; use automated-cli real providers only for separate diagnostics.
 
 `blocked_missing_vlm_provider`: visual artifacts exist, but no allowed VLM path can analyze them. Use explicit `codex-interactive` observation handoff, `manual-visual-review`, or an environment-configured `openai-responses-vision` run with real-provider permission. Do not claim that the runner can call hidden Codex interactive VLM APIs.
 
@@ -146,11 +146,13 @@ Policy blocks: robots, copyright, paywall, access control, CAPTCHA, PII, private
 
 Budget pruning: source, image, screenshot, PDF, subagent, model-call, or cost caps can mark work as pruned. Inspect `budget_estimate.json`, `visual_provider_status.json`, `verification_matrix_status.json`, and `report_status.json`. Pruned claims should carry `include_in_final_report=false` and stay out of final confident findings.
 
-Provider-gated real runs: real image search, browser/PDF acquisition, and Responses API vision can require credentials, operator confirmation, rate-limit headroom, and provider terms review. Keep secret values in the environment or a local secret manager, never in docs, commits, generated bundles, or issue comments.
+Provider-gated diagnostic runs: real image search, browser/PDF acquisition, and Responses API vision can require credentials, operator confirmation, rate-limit headroom, and provider terms review. These gates are useful diagnostics, but the default Public Beta completion path is Codex-native handoff artifacts plus `codex-interactive` visual observations. Keep secret values in the environment or a local secret manager, never in docs, commits, generated bundles, or issue comments.
 
 ## Provider Configuration
 
 `codex-plugin` search handoff uses the current Codex session. The runner records `search_tasks.json` and expects explicit `search_results.jsonl`; it does not call Codex-native search through a hidden library API.
+
+`codex-interactive` visual analysis is also a handoff path, not a hidden runner API. Release-eligible Codex-native visual runs must record real visual candidates/fetches, explicit `visual_observations.jsonl` handoff provenance, and report-cited supported visual or mixed claims.
 
 `brave-image-search` is the current real web image search adapter shape. It requires a Brave Search API key in `CODEX_DEEPRESEARCH_BRAVE_SEARCH_API_KEY` or `BRAVE_SEARCH_API_KEY`, plus the non-secret confirmation `CODEX_DEEPRESEARCH_BRAVE_ALLOW_RESULT_STORAGE=true` after the operator has verified their plan allows storing result metadata. Missing key, missing storage confirmation, provider unavailability, or rate limits should produce `blocked_missing_visual_provider` diagnostics instead of fixture candidates.
 
