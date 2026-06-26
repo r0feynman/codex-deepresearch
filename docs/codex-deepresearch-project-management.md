@@ -286,7 +286,7 @@ python3 scripts/verify_github_project.py --project-owner r0feynman --project-num
 - Project field가 지원하는 값은 이슈 본문의 `Metadata / Project Plan`과 맞아야 한다. Project operations 이슈처럼 `Phase`나 `Component`가 의도적으로 비어 있는 경우는 blank 상태를 유지한다.
 - Pull Request item에는 PR lifecycle 검증만 적용한다. 이슈 전용 hard blocker, safe wave, metadata 검증은 적용하지 않는다.
 
-안전한 Project field 보정만 자동 적용하려면 maintainer가 로컬에서 아래 명령을 실행한다. 이 명령은 dependency link를 만들거나 지우지 않고, 임의의 이슈나 열려 있는 PR을 `Done`/`In Progress`로 옮기지 않는다. 닫힌 이슈와 머지된 PR의 `Done` field 보정만 안전하게 적용한다. 적용 후에는 Project/GitHub state를 다시 읽어 `After` mismatch를 계산하며, 수동 조치가 필요한 mismatch가 남아 있으면 non-zero로 종료한다.
+안전한 Project field 보정만 자동 적용하려면 maintainer가 로컬에서 아래 명령을 실행한다. 이 명령은 dependency link를 만들거나 지우지 않고, 임의의 이슈나 열려 있는 PR을 `Done`/`In Progress`로 옮기지 않는다. `safe_apply_fields`와 verifier가 safe-fix로 판정한 field 보정만 적용하며, 일반 운영에서는 metadata/ready/backlog 같은 정책 허용 safe fix도 포함될 수 있다. post-merge cleanup에서는 닫힌 이슈 item과 머지된 PR item의 `Done` field 보정이 포함된다. 적용 후에는 Project/GitHub state를 다시 읽어 `After` mismatch를 계산하며, 수동 조치가 필요한 mismatch가 남아 있으면 non-zero로 종료한다.
 
 ```bash
 python3 scripts/sync_github_project.py --project-owner r0feynman --project-number 1 --apply
