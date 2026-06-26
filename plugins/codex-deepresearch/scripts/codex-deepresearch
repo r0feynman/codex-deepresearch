@@ -1788,7 +1788,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         required=True,
         choices=("codex-interactive", "openai-responses-vision", "manual-visual-review"),
-        help="Visual analysis provider that produced the observation artifact.",
+        help=(
+            "Visual analysis provider or worker mode. codex-interactive can hand "
+            "fetched local artifacts to codex exec --json --image."
+        ),
     )
     ingest_vision.add_argument(
         "--observations",
@@ -1802,8 +1805,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider-mode",
         choices=("real", "fixture", "manual", "user_provided"),
         help=(
-            "Provider mode for automated openai-responses-vision analysis. "
-            "Real mode is required for API-backed analysis."
+            "Provider mode for automated visual analysis. Real mode enables the "
+            "Codex-native codex-interactive image worker and is required for "
+            "API-backed providers."
         ),
     )
     ingest_vision.add_argument(
@@ -1811,8 +1815,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help=(
-            "Permit the openai-responses-vision adapter to make a real Responses API "
-            "vision call when OPENAI_API_KEY or CODEX_DEEPRESEARCH_OPENAI_API_KEY is set."
+            "Permit external API-backed VLM calls for providers that require it. "
+            "codex-interactive does not use this flag; it invokes codex exec "
+            "--json --image with fetched local artifacts."
         ),
     )
     ingest_vision.set_defaults(func=run_ingest_vision)

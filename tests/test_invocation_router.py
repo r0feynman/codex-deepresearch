@@ -24,6 +24,13 @@ class InvocationRouterTests(unittest.TestCase):
     def read_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def read_jsonl(self, path: Path) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def test_default_deep_research_invocation_runs_full_runner_fixture(self) -> None:
         result = run_skill_invocation(
             "$deep-research: investigate deterministic router fixture",
@@ -168,20 +175,25 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertTrue(result["manual_handoff"]["ok"])
 
     def test_visual_required_without_provider_blocks_with_visual_status_artifact(self) -> None:
-        result = run_skill_invocation(
-            "$deep-research: inspect product screenshots for evidence",
-            runs_dir=self.temp_runs_dir(),
-            route="visual_required",
-            budget_preset="quick",
-        )
+        with (
+            mock.patch("deepresearch.invocation_router.shutil.which", return_value=None),
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration") as parallel_mock,
+        ):
+            result = run_skill_invocation(
+                "$deep-research: inspect product screenshots for evidence",
+                runs_dir=self.temp_runs_dir(),
+                route="visual_required",
+                budget_preset="quick",
+            )
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["terminal"])
         self.assertEqual(result["status"], "blocked_missing_visual_provider")
         self.assertIn("actionable_cause", result["diagnostics"])
-        self.assertIn("explicit real visual acquisition provider", result["diagnostics"]["actionable_cause"])
+        self.assertIn("codex exec is not available on PATH", result["diagnostics"]["actionable_cause"])
         self.assertIn("run_status", result["artifacts"])
         self.assertIn("visual_provider_status", result["artifacts"])
+        parallel_mock.assert_not_called()
 
         run_status = self.read_json(Path(result["artifacts"]["run_status"]))
         self.assertFalse(run_status["ok"])
@@ -200,7 +212,101 @@ class InvocationRouterTests(unittest.TestCase):
             visual_provider_status["diagnostics"]["actionable_cause"],
             result["diagnostics"]["actionable_cause"],
         )
-        self.assertFalse(visual_provider_status["providers"][0]["configured"])
+        self.assertTrue(visual_provider_status["providers"][0]["configured"])
+        self.assertFalse(visual_provider_status["providers"][0]["available"])
+        self.assertEqual(visual_provider_status["providers"][0]["blocked_reason"], "codex_exec_unavailable")
+
+        trace = self.read_jsonl(Path(result["artifacts"]["run_trace"]))
+        self.assertEqual(trace[-1]["event_type"], "visual_provider_preflight")
+        self.assertEqual(trace[-1]["status"], "blocked_missing_visual_provider")
+        self.assertEqual(trace[-1]["provider"], "codex-interactive")
+        self.assertEqual(trace[-1]["adapter"], "codex-exec")
+
+    def test_visual_required_with_codex_worker_available_reaches_parallel_handoff(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        parallel_called = False
+
+        def fake_parallel(*, run, **_kwargs):
+            nonlocal parallel_called
+            parallel_called = True
+            run_dir = Path(run)
+            payload = {
+                "status": "blocked_parallel_execution",
+                "ok": False,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 1,
+                "failure_counts": {"blocked_tasks": 1},
+                "diagnostics": {
+                    "actionable_cause": (
+                        "Codex visual worker handoff was attempted, but no image artifacts "
+                        "were available for analysis"
+                    )
+                },
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 0,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "attempted_real_child_execution": True,
+                    "real_child_execution": False,
+                    "real_use_e2e_eligible": False,
+                },
+                "merge": {"accepted_shards": []},
+                "artifacts": {
+                    "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json")
+                },
+            }
+            (run_dir / "parallel_orchestration_status.json").write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return payload
+
+        with (
+            mock.patch("deepresearch.invocation_router.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: inspect product screenshots for evidence",
+                runs_dir=runs_dir,
+                route="visual_required",
+                budget_preset="quick",
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        self.assertTrue(parallel_called)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["status"], "blocked_parallel_execution")
+        self.assertIn("no image artifacts", result["diagnostics"]["actionable_cause"])
+        self.assertIn("visual_provider_status", result["artifacts"])
+
+        visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
+        self.assertTrue(visual_provider_status["ok"])
+        self.assertFalse(visual_provider_status["terminal"])
+        self.assertEqual(visual_provider_status["status"], "codex_native_visual_worker_available")
+        provider = visual_provider_status["providers"][0]
+        self.assertEqual(provider["provider"], "codex-interactive")
+        self.assertEqual(provider["provider_kind"], "vlm")
+        self.assertTrue(provider["configured"])
+        self.assertTrue(provider["available"])
+        self.assertEqual(provider["adapter"], "codex-exec")
+        self.assertTrue(provider["codex_native_handoff"])
+        self.assertTrue(provider["codex_interactive_handoff"])
+        self.assertFalse(provider["hidden_codex_api_call"])
+
+        trace = self.read_jsonl(Path(result["artifacts"]["run_trace"]))
+        preflight_events = [
+            record for record in trace if record["event_type"] == "visual_provider_preflight"
+        ]
+        self.assertEqual(len(preflight_events), 1)
+        self.assertEqual(preflight_events[0]["status"], "codex_native_visual_worker_available")
+        self.assertEqual(preflight_events[0]["provider"], "codex-interactive")
+        self.assertEqual(preflight_events[0]["adapter"], "codex-exec")
 
     def test_serial_fallback_provenance_is_distinguishable_when_no_shards_are_accepted(self) -> None:
         result = run_skill_invocation(
