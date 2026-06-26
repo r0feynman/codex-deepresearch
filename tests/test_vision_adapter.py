@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -702,6 +703,96 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertFalse(provider_status["providers"][-1]["external_vlm_call"])
         visual_validation = validate_visual_artifacts(run_dir=run_dir)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_subprocess_stdout_jsonl_ingests_worker_observations(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        visual_payload = {
+            "observations": [
+                "The screenshot visibly contains a Pay now button.",
+                "OCR text reads Pay now.",
+            ],
+            "inferences": ["The visible UI appears ready for checkout submission."],
+            "ocr_text": "Pay now",
+            "caveats": ["Small fixture image limits fine visual detail."],
+            "confidence": 0.91,
+        }
+        stdout = "\n".join(
+            json.dumps(record, sort_keys=True)
+            for record in [
+                {"type": "session.started", "session_id": "sess_visual_test"},
+                {
+                    "type": "agent_message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(visual_payload, sort_keys=True),
+                            }
+                        ],
+                    },
+                },
+                {"type": "turn.completed", "usage": {"input_tokens": 12, "output_tokens": 34}},
+            ]
+        )
+        completed = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout=stdout + "\n",
+            stderr="",
+        )
+
+        with (
+            mock.patch("deepresearch.vision_adapter.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.vision_adapter.subprocess.run",
+                return_value=completed,
+            ) as run_mock,
+        ):
+            result = ingest_vision_observations(
+                run=run_dir,
+                provider="codex-interactive",
+                codex_config={"codex_binary": "codex"},
+            )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["provider_mode"], "real")
+        self.assertEqual(result["vlm_images_analyzed"], 1)
+        self.assertFalse(result["external_vlm_call"])
+        self.assertEqual(run_mock.call_count, 1)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[:3], ["codex", "exec", "--json"])
+        self.assertIn("--image", command)
+        self.assertIn(str((run_dir / "images/checkout.png").resolve()), command)
+
+        evidence = self.assert_valid_run(run_dir)
+        image = evidence["images"][0]
+        self.assertEqual(image["analysis_provider"], "codex-interactive")
+        self.assertEqual(image["provider_mode"], "real")
+        self.assertEqual(image["provider_kind"], "vlm")
+        self.assertEqual(image["observations"], visual_payload["observations"])
+        self.assertEqual(image["ocr_text"], "Pay now")
+        self.assertTrue(image["provider_provenance"]["codex_native_handoff"])
+        self.assertFalse(image["provider_provenance"]["external_vlm_call"])
+        self.assertEqual(image["raw_provider_metadata"]["output_format"], "codex-exec-json")
+        self.assertEqual(
+            image["raw_provider_metadata"]["lineage"]["evidence_image_id"],
+            "img_checkout_001",
+        )
+
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(observations[0]["observations"], visual_payload["observations"])
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["providers"][-1]["provider"], "codex-interactive")
+        self.assertEqual(
+            provider_status["providers"][-1]["diagnostics"]["worker_command"],
+            "codex exec --json --image <artifact>",
+        )
 
     def test_codex_interactive_worker_output_reaches_report_citation(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")

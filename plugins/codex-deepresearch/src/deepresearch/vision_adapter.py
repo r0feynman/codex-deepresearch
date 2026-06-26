@@ -710,18 +710,28 @@ def _codex_result_from_stdout(
 
 
 def _looks_like_json_object_text(text: str) -> bool:
+    stripped = _strip_json_object_text(text)
+    return stripped.startswith("{") and stripped.endswith("}")
+
+
+def _strip_json_object_text(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
         stripped = re.sub(r"\s*```$", "", stripped)
         stripped = stripped.strip()
-    return stripped.startswith("{") and stripped.endswith("}")
+    return stripped
 
 
 def _codex_stdout_candidate_texts(stdout: str) -> list[str]:
     candidates: list[str] = []
     if _looks_like_json_object_text(stdout):
-        candidates.append(stdout.strip())
+        try:
+            parsed_stdout = json.loads(_strip_json_object_text(stdout))
+        except json.JSONDecodeError:
+            parsed_stdout = None
+        if isinstance(parsed_stdout, Mapping):
+            candidates.append(stdout.strip())
     for line in stdout.splitlines():
         stripped = line.strip()
         if not stripped:
