@@ -16,8 +16,10 @@ sys.path.insert(0, str(PLUGIN_SRC))
 from deepresearch import (
     ingest_vision_observations,
     prepare_run,
+    synthesize_report,
     validate_artifacts,
     validate_visual_artifacts,
+    verify_claims,
 )
 from deepresearch.vision_adapter import (
     OpenAIResponsesVisionResult,
@@ -77,6 +79,40 @@ class FakeOpenAIResponsesVisionClient:
                 },
             },
             actual_cost_usd=0.004,
+        )
+
+
+class FakeCodexInteractiveVisionClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def analyze_image(self, *, image_path, mime_type, prompt, config, metadata):
+        self.calls.append(
+            {
+                "image_path": image_path,
+                "mime_type": mime_type,
+                "prompt": prompt,
+                "model": config.model,
+                "metadata": dict(metadata),
+            }
+        )
+        return OpenAIResponsesVisionResult(
+            observations=(
+                "The screenshot visibly contains a checkout button.",
+                "The visible OCR text says Pay now.",
+            ),
+            inferences=("The UI likely supports checkout submission.",),
+            caveats=("Small text may be approximate.",),
+            ocr_text="Pay now",
+            confidence=0.83,
+            response_id="codex_fake_vision",
+            model=config.model,
+            usage={"events": 3},
+            raw_provider_metadata={
+                "response_id": "codex_fake_vision",
+                "source_path": "/home/user/private/codex-image.png",
+            },
+            actual_cost_usd=0.0,
         )
 
 
@@ -367,6 +403,18 @@ class VisionAdapterTests(unittest.TestCase):
             },
         )
 
+    def write_codex_vlm_handoff(self, run_dir: Path) -> None:
+        self.write_openai_vlm_handoff(run_dir)
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["mode"] = "codex-plugin"
+        evidence["vlm_provider"] = "codex-interactive"
+        for source in evidence.get("sources", []):
+            if isinstance(source, dict) and source.get("id") == "src_checkout":
+                source["policy_decision"] = "allowed"
+                source["license_policy"] = "allowed"
+                source["robots_policy"] = "allowed"
+        self.write_json(run_dir / "evidence.json", evidence)
+
     def assert_valid_run(self, run_dir: Path) -> dict:
         result = validate_artifacts(
             evidence_path=run_dir / "evidence.json",
@@ -598,6 +646,109 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertIn("[REDACTED]", serialized)
         visual_validation = validate_visual_artifacts(run_dir=run_dir)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_analyzes_local_artifact_with_worker_client(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        client = FakeCodexInteractiveVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["provider_mode"], "real")
+        self.assertEqual(result["model_or_tool"], "codex-exec-image-worker")
+        self.assertEqual(result["vlm_images_analyzed"], 1)
+        self.assertFalse(result["external_vlm_call"])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["image_path"], run_dir / "images/checkout.png")
+        self.assertIn("--image", client.calls[0]["prompt"])
+        self.assertEqual(client.calls[0]["metadata"]["evidence_image_id"], "img_checkout_001")
+
+        evidence = self.assert_valid_run(run_dir)
+        self.assertEqual(evidence["vision_adapter"]["provider"], "codex-interactive")
+        self.assertFalse(evidence["vision_adapter"]["external_vlm_call"])
+        image = evidence["images"][0]
+        self.assertEqual(image["id"], "img_checkout_001")
+        self.assertEqual(image["analysis_provider"], "codex-interactive")
+        self.assertEqual(image["provider_mode"], "real")
+        self.assertEqual(image["provider_kind"], "vlm")
+        self.assertEqual(image["provider_provenance"]["provider"], "codex-interactive")
+        self.assertTrue(image["provider_provenance"]["codex_native_handoff"])
+        self.assertTrue(image["provider_provenance"]["codex_interactive_handoff"])
+        self.assertFalse(image["provider_provenance"]["hidden_codex_api_call"])
+        self.assertIn("The screenshot visibly contains a checkout button.", image["observations"])
+
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(observations[0]["provider"], "codex-interactive")
+        self.assertEqual(observations[0]["evidence_image_id"], "img_checkout_001")
+        self.assertEqual(observations[0]["local_artifact_path"], "images/checkout.png")
+        self.assertTrue(observations[0]["provider_provenance"]["codex_native_handoff"])
+        self.assertFalse(observations[0]["provider_provenance"]["external_vlm_call"])
+
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "codex_interactive_visual_worker_analyzed")
+        self.assertEqual(provider_status["providers"][-1]["provider"], "codex-interactive")
+        self.assertEqual(provider_status["providers"][-1]["invocations"], 1)
+        self.assertEqual(provider_status["providers"][-1]["vlm_images_analyzed"], 1)
+        self.assertTrue(provider_status["providers"][-1]["codex_native_handoff"])
+        self.assertFalse(provider_status["providers"][-1]["external_vlm_call"])
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_worker_output_reaches_report_citation(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        self.assertIn("img_checkout_001", report["used_images"])
+        self.assertEqual(report["visual_observation_report_links_written"], 1)
+        evidence = self.assert_valid_run(run_dir)
+        visual_claims = [
+            claim for claim in evidence["claims"]
+            if "img_checkout_001" in claim.get("supporting_images", [])
+        ]
+        self.assertTrue(visual_claims)
+        self.assertEqual(visual_claims[0]["verification_status"], "supported")
+        self.assertTrue((run_dir / "report.md").is_file())
+
+    def test_codex_interactive_without_worker_blocks_when_artifacts_exist(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_config={"codex_binary": "definitely-missing-codex-binary"},
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertTrue(result["terminal"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["blocked_reason"], "codex_exec_unavailable")
+        self.assertFalse(result["external_vlm_call"])
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(provider_status["providers"][-1]["provider"], "codex-interactive")
+        self.assertFalse(provider_status["providers"][-1]["available"])
+        self.assertEqual(provider_status["providers"][-1]["blocked_reason"], "codex_exec_unavailable")
 
     def test_openai_responses_vision_requires_explicit_real_provider_mode(self) -> None:
         run_dir = self.prepared_visual_run(provider="openai-responses-vision")

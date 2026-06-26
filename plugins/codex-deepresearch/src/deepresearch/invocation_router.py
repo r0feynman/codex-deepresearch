@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -20,6 +21,7 @@ from .parallel_orchestrator import (
 )
 from .report_generation import ReportGenerationError, synthesize_report
 from .search_handoff import SearchHandoffError, prepare_run
+from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
@@ -233,6 +235,11 @@ def run_skill_invocation(
     )
     if visual_provider_status is not None:
         _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, visual_provider_status)
+        _record_visual_provider_preflight_trace(
+            run_dir=run_dir,
+            adapter_name=adapter_name,
+            visual_provider_status=visual_provider_status,
+        )
         if visual_provider_status.get("ok") is not True:
             status = _base_run_status(
                 invocation=normalized_invocation,
@@ -557,6 +564,61 @@ def _visual_provider_preflight_status(
                 "this is not eligible for real-use release metrics"
             ),
         )
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    mode = str(evidence.get("mode") or "") if isinstance(evidence, Mapping) else ""
+    vlm_provider = (
+        str(evidence.get("vlm_provider") or "") if isinstance(evidence, Mapping) else ""
+    )
+    if (
+        normalized_adapter == "codex-exec"
+        and mode == "codex-plugin"
+        and vlm_provider == "codex-interactive"
+    ):
+        if shutil.which("codex") is None:
+            status = _visual_provider_status(
+                run_dir=run_dir,
+                status="blocked_missing_visual_provider",
+                ok=False,
+                terminal=True,
+                metric_classification="excluded_blocked",
+                provider="codex-interactive",
+                provider_kind="vlm",
+                provider_mode="real",
+                configured=True,
+                available=False,
+                blocked_reason="codex_exec_unavailable",
+                actionable_cause=(
+                    "visual_required codex-plugin runs need Codex worker execution, "
+                    "but codex exec is not available on PATH"
+                ),
+            )
+            return _with_codex_visual_worker_provenance(
+                status,
+                adapter_name=normalized_adapter,
+                available=False,
+            )
+        status = _visual_provider_status(
+            run_dir=run_dir,
+            status="codex_native_visual_worker_available",
+            ok=True,
+            terminal=False,
+            metric_classification="codex_native_visual_worker_preflight",
+            provider="codex-interactive",
+            provider_kind="vlm",
+            provider_mode="real",
+            configured=True,
+            available=True,
+            blocked_reason=None,
+            actionable_cause=(
+                "visual_required codex-plugin run can continue through an explicit "
+                "Codex-native visual worker handoff using local artifacts"
+            ),
+        )
+        return _with_codex_visual_worker_provenance(
+            status,
+            adapter_name=normalized_adapter,
+            available=True,
+        )
     actionable_cause = (
         "visual_required route needs an explicit real visual acquisition provider; "
         "none is configured for the invocation router"
@@ -575,6 +637,100 @@ def _visual_provider_preflight_status(
         blocked_reason="missing_real_visual_acquisition_provider",
         actionable_cause=actionable_cause,
     )
+
+
+def _with_codex_visual_worker_provenance(
+    status: dict[str, Any],
+    *,
+    adapter_name: str,
+    available: bool,
+) -> dict[str, Any]:
+    provider = status["providers"][0]
+    provider.update(
+        {
+            "adapter": adapter_name,
+            "worker_command": "codex exec --json --image <artifact>",
+            "codex_native_handoff": True,
+            "codex_interactive_handoff": True,
+            "handoff_recorded": True,
+            "handoff_artifact": "visual_observations.jsonl",
+            "explicit_artifact_handoff": True,
+            "hidden_codex_api_call": False,
+            "external_vlm_call": False,
+        }
+    )
+    status["provenance"] = {
+        "type": "codex_native_visual_worker_preflight",
+        "adapter": adapter_name,
+        "provider": "codex-interactive",
+        "codex_native_handoff": True,
+        "codex_interactive_handoff": True,
+        "explicit_artifact_handoff": True,
+        "hidden_codex_api_call": False,
+        "available": available,
+    }
+    artifacts = status.setdefault("artifacts", {})
+    if isinstance(artifacts, dict):
+        run_dir = Path(str(status["run_dir"]))
+        artifacts["visual_tasks"] = str(run_dir / "visual_tasks.json")
+        artifacts["visual_observations"] = str(run_dir / "visual_observations.jsonl")
+        artifacts["run_trace"] = str(trace_path(run_dir))
+    return status
+
+
+def _record_visual_provider_preflight_trace(
+    *,
+    run_dir: Path,
+    adapter_name: str,
+    visual_provider_status: Mapping[str, Any],
+) -> None:
+    provider = _first_provider_record(visual_provider_status)
+    diagnostics = visual_provider_status.get("diagnostics")
+    actionable_cause = ""
+    if isinstance(diagnostics, Mapping):
+        actionable_cause = str(diagnostics.get("actionable_cause") or "")
+    status = str(visual_provider_status.get("status") or "visual_provider_preflight")
+    record = {
+        "schema_version": TRACE_SCHEMA_VERSION,
+        "run_id": run_dir.name,
+        "event_id": f"visual-provider-preflight-{uuid.uuid4().hex[:12]}",
+        "event_type": "visual_provider_preflight",
+        "timestamp": _utc_now(),
+        "stage": "parallel_orchestration",
+        "agent_role": "visual_provider_preflight",
+        "status": status,
+        "prompt_summary": (
+            "Check visual-required full-runner availability for an explicit "
+            "Codex-native visual worker handoff."
+        ),
+        "tool_call_summary": (
+            f"adapter={adapter_name}; provider={provider.get('provider')}; "
+            f"configured={provider.get('configured')}; available={provider.get('available')}"
+        ),
+        "output_preview": actionable_cause[:700] or status[:700],
+        "artifacts": {
+            "run_trace": str(trace_path(run_dir)),
+            "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
+        },
+        "provider": provider.get("provider"),
+        "provider_kind": provider.get("provider_kind"),
+        "provider_mode": provider.get("provider_mode"),
+        "adapter": adapter_name,
+        "codex_native_handoff": provider.get("codex_native_handoff"),
+        "codex_interactive_handoff": provider.get("codex_interactive_handoff"),
+        "hidden_codex_api_call": provider.get("hidden_codex_api_call"),
+        "blocked_reason": provider.get("blocked_reason"),
+    }
+    if visual_provider_status.get("ok") is not True:
+        record["failure_category"] = "adapter_unavailable"
+    append_trace_record(run_dir, record)
+
+
+def _first_provider_record(status: Mapping[str, Any]) -> Mapping[str, Any]:
+    providers = status.get("providers")
+    if isinstance(providers, list) and providers and isinstance(providers[0], Mapping):
+        return providers[0]
+    return {}
 
 
 def _visual_provider_status(
@@ -633,6 +789,13 @@ def _run_requires_visual_provider(run_dir: Path) -> bool:
         isinstance(route, Mapping) and route.get("modality") == "visual_required"
         for route in routing
     )
+
+
+def _read_optional_json(path: Path) -> dict[str, Any]:
+    try:
+        return _read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _quick_chat_status(invocation: str, question: str) -> dict[str, Any]:

@@ -8,6 +8,8 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +35,12 @@ from .visual_artifacts import (
 VISION_ADAPTER_SCHEMA_VERSION = "codex-deepresearch.vision-adapter.v0"
 MISSING_VISUAL_STAGE = "vision_adapter_missing_visual"
 VISION_ADAPTER_STAGE = "vision_adapter"
+CODEX_INTERACTIVE_PROVIDER = "codex-interactive"
+CODEX_INTERACTIVE_MODEL = "codex-exec-image-worker"
+CODEX_INTERACTIVE_RESPONSE_FILENAME = "codex_interactive_visual_observations.jsonl"
+CODEX_INTERACTIVE_BINARY_ENV = "CODEX_DEEPRESEARCH_CODEX_BINARY"
+CODEX_INTERACTIVE_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_CODEX_INTERACTIVE_TIMEOUT_SECONDS"
+CODEX_INTERACTIVE_MAX_IMAGES_ENV = "CODEX_DEEPRESEARCH_CODEX_INTERACTIVE_MAX_IMAGES"
 OPENAI_RESPONSES_VISION_PROVIDER = "openai-responses-vision"
 OPENAI_RESPONSES_VISION_MODEL = "gpt-4.1-mini"
 OPENAI_RESPONSES_VISION_ENDPOINT = "https://api.openai.com/v1/responses"
@@ -136,6 +144,18 @@ class OpenAIResponsesVisionResult:
     actual_cost_usd: float | None = None
 
 
+@dataclass(frozen=True)
+class CodexInteractiveVisionConfig:
+    """Resolved configuration for the Codex CLI image worker."""
+
+    codex_binary: str
+    timeout_seconds: float
+    provider_mode: str
+    max_images: int | None
+    model: str
+    project_root: Path
+
+
 class OpenAIResponsesVisionClient(Protocol):
     def analyze_image(
         self,
@@ -149,6 +169,19 @@ class OpenAIResponsesVisionClient(Protocol):
         """Analyze one image input and return separated observations/inferences."""
 
 
+class CodexInteractiveVisionClient(Protocol):
+    def analyze_image(
+        self,
+        *,
+        image_path: Path,
+        mime_type: str,
+        prompt: str,
+        config: CodexInteractiveVisionConfig,
+        metadata: Mapping[str, Any],
+    ) -> OpenAIResponsesVisionResult:
+        """Analyze one local image artifact with a Codex worker."""
+
+
 @dataclass(frozen=True)
 class _AutomatedVisionAnalysis:
     records: tuple[dict[str, Any], ...]
@@ -158,6 +191,8 @@ class _AutomatedVisionAnalysis:
     actual_cost_usd: float
     model: str
     provider_mode: str
+    provider: str
+    external_vlm_call: bool
 
 
 def ingest_vision_observations(
@@ -170,12 +205,16 @@ def ingest_vision_observations(
     allow_real_vlm: bool | None = None,
     openai_config: Mapping[str, Any] | None = None,
     openai_client: OpenAIResponsesVisionClient | None = None,
+    codex_config: Mapping[str, Any] | None = None,
+    codex_client: CodexInteractiveVisionClient | None = None,
 ) -> dict[str, Any]:
     """Normalize provider-specific visual observations into run evidence.
 
-    Explicit observation ingestion is dry. The openai-responses-vision provider
-    only calls the Responses API when no observations file is supplied and the
-    real-provider gates are satisfied.
+    Explicit observation ingestion is dry. Automated provider branches run only
+    when no observations file is supplied and fetched visual artifacts are
+    already present. openai-responses-vision may call the Responses API when
+    its real-provider gates are satisfied; codex-interactive uses a Codex CLI
+    worker with explicit ``--image`` artifacts.
     """
 
     normalized_provider = _normalize_provider(provider)
@@ -232,6 +271,25 @@ def ingest_vision_observations(
             allow_real_vlm=allow_real_vlm,
             openai_config=openai_config,
             openai_client=openai_client,
+        )
+        if isinstance(automated_result, dict):
+            return automated_result
+        automated_analysis = automated_result
+        records = list(automated_analysis.records)
+        input_path = automated_analysis.observations_path
+    elif (
+        normalized_provider == CODEX_INTERACTIVE_PROVIDER
+        and observations is None
+        and not records
+        and _has_openai_vision_handoff(run_dir)
+    ):
+        automated_result = _run_codex_interactive_vision_analysis(
+            run_dir=run_dir,
+            evidence=evidence,
+            now=now,
+            provider_mode=provider_mode,
+            codex_config=codex_config,
+            codex_client=codex_client,
         )
         if isinstance(automated_result, dict):
             return automated_result
@@ -380,6 +438,7 @@ def ingest_vision_observations(
                 "actual_cost_usd": automated_analysis.actual_cost_usd,
                 "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
                 "fetch_lineage_records_reconciled": fetch_lineage_records_reconciled,
+                "external_vlm_call": automated_analysis.external_vlm_call,
             }
         )
     handoff = evidence.get("handoff")
@@ -425,21 +484,21 @@ def ingest_vision_observations(
                 "vlm_images_analyzed": len(automated_analysis.records),
                 "estimated_cost_usd": automated_analysis.estimated_cost_usd,
                 "actual_cost_usd": automated_analysis.actual_cost_usd,
-                "external_vlm_call": True,
+                "external_vlm_call": automated_analysis.external_vlm_call,
                 "fetch_lineage_records_reconciled": fetch_lineage_records_reconciled,
             }
         )
         status["artifacts"]["visual_provider_status"] = str(
             run_dir / VISUAL_PROVIDER_STATUS_FILENAME
         )
-        _write_openai_visual_provider_status(
+        _write_visual_provider_status(
             run_dir=run_dir,
             provider_status=automated_analysis.provider_status,
-            status="openai_responses_vision_analyzed",
+            status=_automated_analysis_provider_status(automated_analysis),
             ok=True,
             terminal=False,
             metric_classification="vlm_analysis",
-            actionable_cause="openai-responses-vision analyzed fetched visual artifacts",
+            actionable_cause=_automated_analysis_actionable_cause(automated_analysis),
             created_at=now,
         )
         visual_artifact_validation = validate_visual_artifacts(
@@ -453,7 +512,7 @@ def ingest_vision_observations(
         agent_role="vision_adapter",
         status_payload=status,
         prompt_summary="Normalize visual handoff records into VisualEvidence.",
-        tool_call_summary="Read visual observations, reused unchanged image cache hits, normalized changed image evidence, and updated evidence.json without VLM calls.",
+        tool_call_summary=_vision_trace_tool_call_summary(automated_analysis),
     )
     _write_json(run_dir / "vision_ingest_status.json", status)
     return status
@@ -517,6 +576,54 @@ class _HttpOpenAIResponsesVisionClient:
         )
 
 
+class _SubprocessCodexInteractiveVisionClient:
+    def analyze_image(
+        self,
+        *,
+        image_path: Path,
+        mime_type: str,
+        prompt: str,
+        config: CodexInteractiveVisionConfig,
+        metadata: Mapping[str, Any],
+    ) -> OpenAIResponsesVisionResult:
+        command = [
+            config.codex_binary,
+            "exec",
+            "--json",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "-C",
+            str(config.project_root),
+            "--add-dir",
+            str(Path(str(metadata.get("run_dir") or image_path.parent)).resolve()),
+            "--image",
+            str(image_path.resolve()),
+            prompt,
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=config.project_root,
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=config.timeout_seconds,
+        )
+        if completed.returncode != 0:
+            diagnostic = (
+                f"codex exec exited {completed.returncode}; "
+                f"stderr={_preview_text(completed.stderr)}; "
+                f"stdout={_preview_text(completed.stdout)}"
+            )
+            raise VisionAdapterError(_redact_provider_text(diagnostic, config=None))
+        return _codex_result_from_stdout(
+            completed.stdout,
+            fallback_model=config.model,
+            mime_type=mime_type,
+            metadata=metadata,
+        )
+
+
 def _openai_result_from_response_payload(
     payload: Mapping[str, Any],
     *,
@@ -557,6 +664,99 @@ def _openai_result_from_response_payload(
         raw_provider_metadata=raw_metadata,
         actual_cost_usd=None,
     )
+
+
+def _codex_result_from_stdout(
+    stdout: str,
+    *,
+    fallback_model: str,
+    mime_type: str,
+    metadata: Mapping[str, Any],
+) -> OpenAIResponsesVisionResult:
+    candidates = _codex_stdout_candidate_texts(stdout)
+    for candidate in candidates:
+        if not _looks_like_json_object_text(candidate):
+            continue
+        parsed = _parse_openai_response_text(candidate)
+        if parsed["observations"] or parsed["inferences"] or parsed["ocr_text"]:
+            return OpenAIResponsesVisionResult(
+                observations=tuple(parsed["observations"]),
+                inferences=tuple(parsed["inferences"]),
+                caveats=tuple(parsed["caveats"]),
+                ocr_text=parsed["ocr_text"],
+                confidence=parsed["confidence"],
+                response_id=None,
+                model=fallback_model,
+                usage={},
+                raw_provider_metadata={
+                    "mime_type": mime_type,
+                    "lineage": {
+                        key: metadata.get(key)
+                        for key in (
+                            "candidate_id",
+                            "fetch_id",
+                            "task_id",
+                            "angle_id",
+                            "evidence_image_id",
+                            "local_artifact_path",
+                        )
+                        if metadata.get(key) is not None
+                    },
+                    "output_format": "codex-exec-json",
+                },
+                actual_cost_usd=0.0,
+            )
+    raise VisionAdapterError("codex exec did not return schema-valid visual JSON")
+
+
+def _looks_like_json_object_text(text: str) -> bool:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+        stripped = stripped.strip()
+    return stripped.startswith("{") and stripped.endswith("}")
+
+
+def _codex_stdout_candidate_texts(stdout: str) -> list[str]:
+    candidates: list[str] = []
+    if _looks_like_json_object_text(stdout):
+        candidates.append(stdout.strip())
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        candidates.extend(_codex_payload_texts(payload))
+    return _dedupe(candidates)
+
+
+def _codex_payload_texts(payload: Any) -> list[str]:
+    texts: list[str] = []
+    if isinstance(payload, str):
+        texts.append(payload)
+        return texts
+    if isinstance(payload, list):
+        for item in payload:
+            texts.extend(_codex_payload_texts(item))
+        return texts
+    if not isinstance(payload, Mapping):
+        return texts
+    if "observations" in payload or "inferences" in payload or "ocr_text" in payload:
+        texts.append(json.dumps(payload, sort_keys=True))
+    for key in ("output_text", "text", "message", "content", "delta"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+        elif isinstance(value, (Mapping, list)):
+            texts.extend(_codex_payload_texts(value))
+    output = payload.get("output")
+    if isinstance(output, (Mapping, list)):
+        texts.extend(_codex_payload_texts(output))
+    return texts
 
 
 def _parse_openai_response_text(text: str | None) -> dict[str, Any]:
@@ -774,6 +974,166 @@ def _run_openai_responses_vision_analysis(
         actual_cost_usd=round(total_actual, 8),
         model=config.model,
         provider_mode=config.provider_mode,
+        provider=OPENAI_RESPONSES_VISION_PROVIDER,
+        external_vlm_call=True,
+    )
+
+
+def _run_codex_interactive_vision_analysis(
+    *,
+    run_dir: Path,
+    evidence: dict[str, Any],
+    now: str,
+    provider_mode: str | None,
+    codex_config: Mapping[str, Any] | None,
+    codex_client: CodexInteractiveVisionClient | None,
+) -> _AutomatedVisionAnalysis | dict[str, Any]:
+    config = _codex_interactive_vision_config(
+        overrides=codex_config,
+        provider_mode=provider_mode,
+        evidence=evidence,
+    )
+    tasks = _codex_interactive_vision_tasks(
+        run_dir=run_dir,
+        evidence=evidence,
+        max_images=config.max_images,
+    )
+    if not tasks:
+        return _write_blocked_missing_codex_vlm_provider(
+            run_dir=run_dir,
+            evidence=evidence,
+            status_reason="no_fetched_visual_artifacts",
+            configured=True,
+            available=False,
+            provider_mode=config.provider_mode,
+            model=config.model,
+            created_at=now,
+            task_count=0,
+        )
+    if config.provider_mode != "real":
+        return _write_blocked_missing_codex_vlm_provider(
+            run_dir=run_dir,
+            evidence=evidence,
+            status_reason="codex_interactive_mode_not_real",
+            configured=True,
+            available=False,
+            provider_mode=config.provider_mode,
+            model=config.model,
+            created_at=now,
+            task_count=len(tasks),
+        )
+    if codex_client is None and shutil.which(config.codex_binary) is None:
+        return _write_blocked_missing_codex_vlm_provider(
+            run_dir=run_dir,
+            evidence=evidence,
+            status_reason="codex_exec_unavailable",
+            configured=True,
+            available=False,
+            provider_mode=config.provider_mode,
+            model=config.model,
+            created_at=now,
+            task_count=len(tasks),
+        )
+
+    client = codex_client or _SubprocessCodexInteractiveVisionClient()
+    records: list[dict[str, Any]] = []
+    provider_run_id = f"codex-interactive:{run_dir.name}:{_sanitize_identifier(now)}"
+    for index, task in enumerate(tasks, start=1):
+        image_path = _codex_image_path(run_dir, task)
+        prompt = _codex_interactive_vision_prompt(task)
+        metadata = {
+            "candidate_id": task["candidate_id"],
+            "fetch_id": task["fetch_id"],
+            "task_id": task["task_id"],
+            "angle_id": task["angle_id"],
+            "evidence_image_id": task["evidence_image_id"],
+            "local_artifact_path": task.get("local_artifact_path"),
+            "run_dir": str(run_dir),
+        }
+        try:
+            result = client.analyze_image(
+                image_path=image_path,
+                mime_type=str(task["mime_type"]),
+                prompt=prompt,
+                config=config,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            partial_observations_path = None
+            if records:
+                partial_observations_path = run_dir / CODEX_INTERACTIVE_RESPONSE_FILENAME
+                _write_jsonl(partial_observations_path, records)
+            return _write_blocked_missing_codex_vlm_provider(
+                run_dir=run_dir,
+                evidence=evidence,
+                status_reason="provider_request_failed",
+                configured=True,
+                available=False,
+                provider_mode=config.provider_mode,
+                model=config.model,
+                created_at=now,
+                task_count=len(tasks),
+                last_error=_redact_provider_text(str(exc) or exc.__class__.__name__, config=None),
+                provider_run_id=provider_run_id,
+                invocations=index,
+                vlm_images_analyzed=len(records),
+                partial_observations_path=partial_observations_path,
+            )
+        records.append(
+            _codex_interactive_observation_record(
+                task,
+                result=result,
+                provider_run_id=provider_run_id,
+                provider_mode=config.provider_mode,
+                model=config.model,
+                created_at=now,
+                sequence=index,
+            )
+        )
+
+    observations_path = run_dir / CODEX_INTERACTIVE_RESPONSE_FILENAME
+    _write_jsonl(observations_path, records)
+    provider_status = {
+        "provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": config.provider_mode,
+        "provider_run_id": provider_run_id,
+        "configured": True,
+        "available": True,
+        "blocked_reason": None,
+        "invoked": True,
+        "invocations": len(records),
+        "candidates_discovered": 0,
+        "artifacts_fetched": len(tasks),
+        "vlm_images_analyzed": len(records),
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "last_error": None,
+        "external_network_call": False,
+        "external_vlm_call": False,
+        "codex_native_handoff": True,
+        "codex_interactive_handoff": True,
+        "handoff_recorded": True,
+        "handoff_artifact": "visual_observations.jsonl",
+        "explicit_artifact_handoff": True,
+        "hidden_codex_api_call": False,
+        "diagnostics": {
+            "model": config.model,
+            "worker_command": "codex exec --json --image <artifact>",
+            "records_written": len(records),
+            "fetched_artifacts_preserved": True,
+        },
+    }
+    return _AutomatedVisionAnalysis(
+        records=tuple(records),
+        observations_path=observations_path,
+        provider_status=provider_status,
+        estimated_cost_usd=0.0,
+        actual_cost_usd=0.0,
+        model=config.model,
+        provider_mode=config.provider_mode,
+        provider=CODEX_INTERACTIVE_PROVIDER,
+        external_vlm_call=False,
     )
 
 
@@ -869,6 +1229,61 @@ def _openai_responses_vision_config(
     )
 
 
+def _codex_interactive_vision_config(
+    *,
+    overrides: Mapping[str, Any] | None,
+    provider_mode: str | None,
+    evidence: Mapping[str, Any],
+) -> CodexInteractiveVisionConfig:
+    mode = (
+        provider_mode
+        or _config_string(overrides, "provider_mode")
+        or "real"
+    )
+    normalized_mode = mode.strip().lower().replace("_", "-")
+    if normalized_mode not in {"real", "fixture", "manual", "user-provided"}:
+        raise VisionAdapterError(
+            "provider_mode must be one of: real, fixture, manual, user_provided"
+        )
+    if normalized_mode == "user-provided":
+        normalized_mode = "user_provided"
+    max_images = _config_int(
+        overrides,
+        "max_images",
+        env_names=(CODEX_INTERACTIVE_MAX_IMAGES_ENV,),
+        default=None,
+    )
+    if max_images is None:
+        budget = evidence.get("budget")
+        if isinstance(budget, Mapping):
+            value = budget.get("max_images")
+            if isinstance(value, int) and value > 0:
+                max_images = value
+    project_root_text = _config_string(overrides, "project_root")
+    return CodexInteractiveVisionConfig(
+        codex_binary=_config_string(
+            overrides,
+            "codex_binary",
+            env_names=(CODEX_INTERACTIVE_BINARY_ENV,),
+            default="codex",
+        )
+        or "codex",
+        timeout_seconds=_config_float(
+            overrides,
+            "timeout_seconds",
+            env_names=(CODEX_INTERACTIVE_TIMEOUT_ENV,),
+            default=120.0,
+        ),
+        provider_mode=normalized_mode,
+        max_images=max_images,
+        model=_config_string(overrides, "model", default=CODEX_INTERACTIVE_MODEL)
+        or CODEX_INTERACTIVE_MODEL,
+        project_root=Path(project_root_text).resolve()
+        if project_root_text
+        else Path(__file__).resolve().parents[4],
+    )
+
+
 def _openai_vlm_block_reason(config: OpenAIResponsesVisionConfig) -> str | None:
     if config.provider_mode != "real":
         return "openai_responses_vision_mode_not_real"
@@ -930,6 +1345,23 @@ def _openai_vision_tasks(
             continue
         task = _task_from_url_candidate(run_dir, candidate, evidence=evidence)
         if task is not None:
+            tasks.append(task)
+    return tasks[:max_images] if max_images is not None and max_images > 0 else tasks
+
+
+def _codex_interactive_vision_tasks(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    max_images: int | None,
+) -> list[dict[str, Any]]:
+    tasks = []
+    for task in _openai_vision_tasks(run_dir=run_dir, evidence=evidence, max_images=None):
+        local_path = _first_optional_string(task, "local_artifact_path")
+        if not local_path:
+            continue
+        artifact = _resolve_run_relative_path(run_dir, local_path)
+        if artifact.is_file():
             tasks.append(task)
     return tasks[:max_images] if max_images is not None and max_images > 0 else tasks
 
@@ -1120,6 +1552,18 @@ def _openai_image_input(run_dir: Path, task: Mapping[str, Any]) -> str:
     raise VisionAdapterError("openai-responses-vision task requires local_artifact_path or image_url")
 
 
+def _codex_image_path(run_dir: Path, task: Mapping[str, Any]) -> Path:
+    local_path = _first_optional_string(task, "local_artifact_path")
+    if not local_path:
+        raise VisionAdapterError("codex-interactive task requires local_artifact_path")
+    artifact = _resolve_run_relative_path(run_dir, local_path)
+    if not artifact.is_file():
+        raise VisionAdapterError(
+            f"codex-interactive local_artifact_path does not exist: {local_path}"
+        )
+    return artifact
+
+
 def _openai_vision_prompt(task: Mapping[str, Any]) -> str:
     visual_tasks = ", ".join(_string_list(task, "visual_tasks")) or "visual observation"
     return (
@@ -1129,6 +1573,25 @@ def _openai_vision_prompt(task: Mapping[str, Any]) -> str:
         "in observations[]. Put interpretations, likely implications, and claim alignment in "
         "inferences[]. Caveat uncertainty, approximate counts, unreadable text, and any limits. "
         f"Visual task focus: {visual_tasks}."
+    )
+
+
+def _codex_interactive_vision_prompt(task: Mapping[str, Any]) -> str:
+    visual_tasks = ", ".join(_string_list(task, "visual_tasks")) or "visual observation"
+    return (
+        "Inspect the attached image artifact for a DeepResearch visual evidence record. "
+        "The worker was invoked with codex exec --json --image. "
+        "Return only one JSON object with this exact shape: "
+        "{\"observations\":[\"directly visible facts or OCR text\"],"
+        "\"inferences\":[\"interpretations or claim alignment\"],"
+        "\"ocr_text\":\"visible text or null\","
+        "\"caveats\":[\"uncertainty or limits\"],"
+        "\"confidence\":0.0}. "
+        "Do not include markdown, citations, or prose outside the JSON object. "
+        "Use observations only for facts visible in the image. "
+        f"Visual task focus: {visual_tasks}. "
+        f"Evidence image id: {task['evidence_image_id']}; "
+        f"candidate id: {task['candidate_id']}; fetch id: {task['fetch_id']}."
     )
 
 
@@ -1327,6 +1790,140 @@ def _openai_observation_record(
     }
 
 
+def _codex_interactive_observation_record(
+    task: Mapping[str, Any],
+    *,
+    result: OpenAIResponsesVisionResult,
+    provider_run_id: str,
+    provider_mode: str,
+    model: str,
+    created_at: str,
+    sequence: int,
+) -> dict[str, Any]:
+    observations = _dedupe(
+        [
+            _redact_provider_text(str(item).strip(), config=None)
+            for item in result.observations
+            if str(item).strip()
+        ]
+    )
+    inferences = _dedupe(
+        [
+            _redact_provider_text(str(item).strip(), config=None)
+            for item in result.inferences
+            if str(item).strip()
+        ]
+    )
+    caveats = _dedupe(
+        [
+            "Codex interactive image worker output is model-generated; use observations as extracted visual evidence and treat inferences as interpretation.",
+            *[
+                _redact_provider_text(str(item).strip(), config=None)
+                for item in result.caveats
+                if str(item).strip()
+            ],
+        ]
+    )
+    ocr_text = (
+        _redact_provider_text(result.ocr_text, config=None)
+        if isinstance(result.ocr_text, str)
+        else None
+    )
+    image_record = {
+        "id": task["evidence_image_id"],
+        "source_id": task.get("source_id"),
+        "origin": task.get("origin") or "image_search",
+        "image_url": task.get("image_url"),
+        "page_url": task.get("page_url"),
+        "local_artifact_path": task.get("local_artifact_path"),
+        "mime_type": task.get("mime_type") or "image/unknown",
+        "width": task.get("width", 0),
+        "height": task.get("height", 0),
+        "artifact_size_bytes": task.get("artifact_size_bytes"),
+        "hash": task.get("hash"),
+        "phash": task.get("phash"),
+        "source_url": task.get("source_url"),
+    }
+    provider_provenance = {
+        "provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": provider_mode,
+        "provider_run_id": provider_run_id,
+        "external_network_call": False,
+        "external_vlm_call": False,
+        "codex_native_handoff": True,
+        "codex_interactive_handoff": True,
+        "handoff_recorded": True,
+        "handoff_artifact": "visual_observations.jsonl",
+        "explicit_artifact_handoff": True,
+        "hidden_codex_api_call": False,
+    }
+    return {
+        "id": str(task["evidence_image_id"]),
+        "image_id": str(task["evidence_image_id"]),
+        "observation_id": f"obs_{_sanitize_identifier(str(task['evidence_image_id']))}_{sequence:03d}",
+        "evidence_image_id": str(task["evidence_image_id"]),
+        "source_id": task.get("source_id"),
+        "origin": task.get("origin") or "image_search",
+        "image": image_record,
+        "observations": observations,
+        "inferences": inferences,
+        "ocr_text": ocr_text,
+        "ocr_outputs": [{"text": ocr_text, "provider": CODEX_INTERACTIVE_PROVIDER}]
+        if ocr_text
+        else [],
+        "visual_tasks": _string_list(task, "visual_tasks"),
+        "analysis_status": "analyzed" if observations or inferences else "needs_manual_review",
+        "policy_flags": _string_list(task, "policy_flags"),
+        "caveats": caveats,
+        "candidate_id": task["candidate_id"],
+        "fetch_id": task["fetch_id"],
+        "task_id": task["task_id"],
+        "candidate_class": task.get("candidate_class"),
+        "angle_id": task["angle_id"],
+        "route": task.get("route"),
+        "visual_provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": provider_mode,
+        "provider_run_id": provider_run_id,
+        "provider_provenance": provider_provenance,
+        "model_or_tool": result.model or model,
+        "observation_status": "analyzed" if observations or inferences else "needs_manual_review",
+        "confidence": result.confidence,
+        "policy_decision": task.get("policy_decision") or "allowed",
+        "verifier_links": [],
+        "report_links": [],
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "created_at": created_at,
+        "visual_validation": dict(task.get("visual_validation", {}))
+        if isinstance(task.get("visual_validation"), Mapping)
+        else {},
+        "source_url": task.get("source_url"),
+        "raw_provider_metadata": _redact_provider_value(
+            result.raw_provider_metadata
+            if isinstance(result.raw_provider_metadata, Mapping)
+            else {},
+            config=None,
+        ),
+        "cost_counters": {
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "usage": _redact_provider_value(
+                dict(result.usage) if isinstance(result.usage, Mapping) else {},
+                config=None,
+            ),
+        },
+        "codex_native_handoff": True,
+        "codex_interactive_handoff": True,
+        "handoff_recorded": True,
+        "handoff_artifact": "visual_observations.jsonl",
+        "explicit_artifact_handoff": True,
+        "hidden_codex_api_call": False,
+    }
+
+
 def _reconcile_openai_fetch_lineage(
     run_dir: Path,
     observations: Sequence[Mapping[str, Any]],
@@ -1503,7 +2100,7 @@ def _write_blocked_missing_vlm_provider(
             "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
         },
     }
-    _write_openai_visual_provider_status(
+    _write_visual_provider_status(
         run_dir=run_dir,
         provider_status=provider_status,
         status="blocked_missing_vlm_provider",
@@ -1589,7 +2186,147 @@ def _write_blocked_missing_vlm_provider(
     return status
 
 
-def _write_openai_visual_provider_status(
+def _write_blocked_missing_codex_vlm_provider(
+    *,
+    run_dir: Path,
+    evidence: dict[str, Any],
+    status_reason: str,
+    configured: bool,
+    available: bool,
+    provider_mode: str,
+    model: str,
+    created_at: str,
+    task_count: int,
+    last_error: str | None = None,
+    provider_run_id: str | None = None,
+    invocations: int = 0,
+    vlm_images_analyzed: int = 0,
+    partial_observations_path: Path | None = None,
+) -> dict[str, Any]:
+    visual_observations_path = run_dir / "visual_observations.jsonl"
+    _write_jsonl(visual_observations_path, [])
+    stale_counts = _remove_provider_visual_evidence(evidence, CODEX_INTERACTIVE_PROVIDER)
+    provider_status = {
+        "provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": provider_mode,
+        "provider_run_id": provider_run_id,
+        "configured": configured,
+        "available": available,
+        "blocked_reason": status_reason,
+        "invoked": invocations > 0,
+        "invocations": invocations,
+        "candidates_discovered": 0,
+        "artifacts_fetched": task_count,
+        "vlm_images_analyzed": vlm_images_analyzed,
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "last_error": last_error or status_reason,
+        "external_network_call": False,
+        "external_vlm_call": False,
+        "codex_native_handoff": True,
+        "codex_interactive_handoff": True,
+        "handoff_recorded": True,
+        "handoff_artifact": "visual_observations.jsonl",
+        "explicit_artifact_handoff": True,
+        "hidden_codex_api_call": False,
+        "diagnostics": {
+            "model": model,
+            "worker_command": "codex exec --json --image <artifact>",
+            "blocked_reason": status_reason,
+            "fetched_artifacts_preserved": True,
+            "stale_visual_observations_cleared": True,
+            "stale_codex_images_cleared": stale_counts["images"],
+            "stale_codex_visual_supports_cleared": stale_counts["visual_supports"],
+        },
+    }
+    _write_visual_provider_status(
+        run_dir=run_dir,
+        provider_status=provider_status,
+        status="blocked_missing_vlm_provider",
+        ok=False,
+        terminal=True,
+        metric_classification="excluded_blocked",
+        actionable_cause=f"codex-interactive visual worker is unavailable: {status_reason}",
+        created_at=created_at,
+    )
+    evidence["vision_adapter"] = {
+        "schema_version": VISION_ADAPTER_SCHEMA_VERSION,
+        "status": "blocked_missing_vlm_provider",
+        "provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider_mode": provider_mode,
+        "model_or_tool": model,
+        "ingested_at": created_at,
+        "visual_observations_path": "visual_observations.jsonl",
+        "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
+        "images_ingested": 0,
+        "vlm_images_analyzed": vlm_images_analyzed,
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "blocked_reason": status_reason,
+        "external_vlm_call": False,
+        "stale_codex_images_cleared": stale_counts["images"],
+        "stale_codex_visual_supports_cleared": stale_counts["visual_supports"],
+    }
+    handoff = evidence.get("handoff")
+    if isinstance(handoff, dict):
+        handoff["visual_observations_path"] = "visual_observations.jsonl"
+        handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
+        handoff["visual_status"] = "blocked_missing_vlm_provider"
+    _write_json(run_dir / "evidence.json", evidence)
+    validation = validate_artifacts(
+        evidence_path=run_dir / "evidence.json",
+        visual_observations_path=visual_observations_path,
+    )
+    visual_artifact_validation = validate_visual_artifacts(run_dir=run_dir, evidence_path=None)
+    status = _base_status(run_dir, evidence, "blocked_missing_vlm_provider")
+    status.update(
+        {
+            "ok": False,
+            "terminal": True,
+            "provider": CODEX_INTERACTIVE_PROVIDER,
+            "provider_mode": provider_mode,
+            "model_or_tool": model,
+            "blocked_reason": status_reason,
+            "images_ingested": 0,
+            "vlm_images_analyzed": vlm_images_analyzed,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "validation": validation.to_dict(),
+            "visual_artifact_validation": visual_artifact_validation.to_dict(),
+            "external_vlm_call": False,
+            "stale_codex_images_cleared": stale_counts["images"],
+            "stale_codex_visual_supports_cleared": stale_counts["visual_supports"],
+            "artifacts": {
+                "evidence": str(run_dir / "evidence.json"),
+                "visual_observations": str(visual_observations_path),
+                "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
+                "vision_ingest_status": str(run_dir / "vision_ingest_status.json"),
+            },
+        }
+    )
+    if partial_observations_path is not None:
+        status["artifacts"]["partial_codex_interactive_observations"] = str(
+            partial_observations_path
+        )
+        evidence["vision_adapter"]["partial_observations_path"] = _relative_or_string(
+            run_dir,
+            partial_observations_path,
+        )
+        _write_json(run_dir / "evidence.json", evidence)
+    record_stage_trace(
+        run_dir,
+        stage="ingest_vision",
+        agent_role="vision_adapter",
+        status_payload=status,
+        prompt_summary="Analyze fetched visual artifacts with codex-interactive.",
+        tool_call_summary="Blocked before Codex image worker completion; fetched visual artifacts and lineage files were preserved.",
+    )
+    _write_json(run_dir / "vision_ingest_status.json", status)
+    return status
+
+
+def _write_visual_provider_status(
     *,
     run_dir: Path,
     provider_status: Mapping[str, Any],
@@ -1605,11 +2342,12 @@ def _write_openai_visual_provider_status(
         if status in {"blocked_missing_vlm_provider"}
         else {"ok": ok, "terminal": terminal, "metric_classification": metric_classification}
     )
+    provider_name = _first_optional_string(provider_status, "provider")
     providers = _existing_visual_provider_records(run_dir)
     providers = [
         provider
         for provider in providers
-        if provider.get("provider") != OPENAI_RESPONSES_VISION_PROVIDER
+        if provider.get("provider") != provider_name
     ]
     providers.append(dict(provider_status))
     payload = {
@@ -1874,6 +2612,13 @@ def _redact_provider_text(
     return "".join(parts)
 
 
+def _preview_text(value: str | None, *, limit: int = 500) -> str:
+    text = (value or "").strip()
+    if not text:
+        return "<empty>"
+    return _redact_provider_text(text[:limit], config=None)
+
+
 def _redact_secret_fields(value: str) -> str:
     redacted = BEARER_VALUE_PATTERN.sub(r"\1 [REDACTED]", value)
     redacted = PRIVATE_ABSOLUTE_PATH_PATTERN.sub("[REDACTED_PATH]", redacted)
@@ -1954,6 +2699,13 @@ def _redact_provider_value(
 
 
 def _remove_openai_visual_evidence(evidence: dict[str, Any]) -> dict[str, int]:
+    return _remove_provider_visual_evidence(evidence, OPENAI_RESPONSES_VISION_PROVIDER)
+
+
+def _remove_provider_visual_evidence(
+    evidence: dict[str, Any],
+    provider: str,
+) -> dict[str, int]:
     images = evidence.get("images", [])
     if not isinstance(images, list):
         return {"images": 0, "visual_supports": 0, "supporting_images": 0}
@@ -1962,7 +2714,7 @@ def _remove_openai_visual_evidence(evidence: dict[str, Any]) -> dict[str, int]:
     removed_image_ids: set[str] = set()
     removed_images = 0
     for image in images:
-        if isinstance(image, Mapping) and _is_openai_visual_image(image):
+        if isinstance(image, Mapping) and _is_provider_visual_image(image, provider):
             removed_images += 1
             image_id = image.get("id")
             if isinstance(image_id, str) and image_id:
@@ -2012,12 +2764,16 @@ def _remove_openai_visual_evidence(evidence: dict[str, Any]) -> dict[str, int]:
 
 
 def _is_openai_visual_image(image: Mapping[str, Any]) -> bool:
+    return _is_provider_visual_image(image, OPENAI_RESPONSES_VISION_PROVIDER)
+
+
+def _is_provider_visual_image(image: Mapping[str, Any], provider: str) -> bool:
     for key in ("analysis_provider", "provider", "visual_provider"):
-        if _first_optional_string(image, key) == OPENAI_RESPONSES_VISION_PROVIDER:
+        if _first_optional_string(image, key) == provider:
             return True
     provenance = image.get("provider_provenance")
     if isinstance(provenance, Mapping):
-        return _first_optional_string(provenance, "provider") == OPENAI_RESPONSES_VISION_PROVIDER
+        return _first_optional_string(provenance, "provider") == provider
     return False
 
 
@@ -3029,6 +3785,49 @@ def _number(record: Mapping[str, Any], image: Mapping[str, Any], key: str) -> in
                 continue
             return int(numeric) if numeric.is_integer() else numeric
     return 0
+
+
+def _automated_analysis_provider_status(analysis: _AutomatedVisionAnalysis) -> str:
+    if analysis.provider == OPENAI_RESPONSES_VISION_PROVIDER:
+        return "openai_responses_vision_analyzed"
+    if analysis.provider == CODEX_INTERACTIVE_PROVIDER:
+        return "codex_interactive_visual_worker_analyzed"
+    return "visual_worker_analyzed"
+
+
+def _automated_analysis_actionable_cause(analysis: _AutomatedVisionAnalysis) -> str:
+    if analysis.provider == OPENAI_RESPONSES_VISION_PROVIDER:
+        return "openai-responses-vision analyzed fetched visual artifacts"
+    if analysis.provider == CODEX_INTERACTIVE_PROVIDER:
+        return (
+            "codex-interactive visual worker analyzed fetched visual artifacts "
+            "via explicit --image handoff"
+        )
+    return "visual worker analyzed fetched visual artifacts"
+
+
+def _vision_trace_tool_call_summary(
+    automated_analysis: _AutomatedVisionAnalysis | None,
+) -> str:
+    if automated_analysis is None:
+        return (
+            "Read visual observations, reused unchanged image cache hits, normalized "
+            "changed image evidence, and updated evidence.json without VLM calls."
+        )
+    if automated_analysis.provider == CODEX_INTERACTIVE_PROVIDER:
+        return (
+            "Invoked codex exec --json --image for fetched local image artifacts, "
+            "wrote visual observations, and normalized image evidence."
+        )
+    if automated_analysis.provider == OPENAI_RESPONSES_VISION_PROVIDER:
+        return (
+            "Invoked openai-responses-vision for fetched visual artifacts, wrote "
+            "visual observations, and normalized image evidence."
+        )
+    return (
+        "Invoked automated visual worker, wrote visual observations, and normalized "
+        "image evidence."
+    )
 
 
 def _first_string(container: Mapping[str, Any], *keys: str) -> str | None:
