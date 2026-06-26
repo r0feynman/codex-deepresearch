@@ -48,7 +48,7 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
                 item.update(updates)
                 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
                 return
-        raise AssertionError(f"missing fixture issue #{number}")
+        raise AssertionError(f"missing fixture project item #{number}")
 
     def remove_project_item(self, fixture_dir: Path, number: int) -> None:
         path = fixture_dir / "project_items.json"
@@ -135,6 +135,207 @@ class GitHubProjectSyncFixtureTests(unittest.TestCase):
             self.assertEqual(2, len(changes))
             common.apply_changes(changes, state, fixture_mode=True)
             self.assertEqual([], common.verify_project_state(state, policy))
+
+    def test_merged_pull_request_workflow_not_done_is_detected_and_safe_to_sync(self) -> None:
+        with self.copy_fixture() as tmp:
+            fixture_dir = Path(tmp)
+            self.mutate_project_item(fixture_dir, 86, **{"workflow Status": "In Progress"})
+            policy, state = self.load_state(fixture_dir)
+            findings = common.verify_project_state(state, policy)
+            pull_request_findings = [
+                finding for finding in findings
+                if finding.content_type == "PullRequest" and finding.issue_number == 86
+            ]
+            self.assertEqual(1, len(pull_request_findings))
+            self.assertEqual("pull_request_workflow_status", pull_request_findings[0].check)
+            self.assertEqual("Workflow Status", pull_request_findings[0].field_name)
+            self.assertEqual("Done", pull_request_findings[0].expected)
+            self.assertTrue(pull_request_findings[0].safe_fix)
+
+            changes = common.planned_changes(findings, state, policy)
+            pull_request_changes = [
+                change for change in changes
+                if change.content_type == "PullRequest" and change.issue_number == 86
+            ]
+            self.assertEqual(1, len(pull_request_changes))
+            common.apply_changes(pull_request_changes, state, fixture_mode=True)
+            self.assertEqual([], common.verify_project_state(state, policy))
+
+    def test_merged_pull_request_status_not_done_is_detected_and_safe_to_sync(self) -> None:
+        with self.copy_fixture() as tmp:
+            fixture_dir = Path(tmp)
+            self.mutate_project_item(fixture_dir, 86, status="In Progress")
+            policy, state = self.load_state(fixture_dir)
+            findings = common.verify_project_state(state, policy)
+            pull_request_findings = [
+                finding for finding in findings
+                if finding.content_type == "PullRequest" and finding.issue_number == 86
+            ]
+            self.assertEqual(1, len(pull_request_findings))
+            self.assertEqual("pull_request_status", pull_request_findings[0].check)
+            self.assertEqual("Status", pull_request_findings[0].field_name)
+            self.assertEqual("Done", pull_request_findings[0].expected)
+            self.assertTrue(pull_request_findings[0].safe_fix)
+
+    def test_sync_apply_safely_completes_merged_pull_request_fields(self) -> None:
+        with self.copy_fixture() as tmp:
+            fixture_dir = Path(tmp)
+            self.mutate_project_item(
+                fixture_dir,
+                86,
+                status="In Progress",
+                **{"workflow Status": "In Progress"},
+            )
+            sync = subprocess.run(
+                [
+                    sys.executable,
+                    str(SYNC_SCRIPT),
+                    "--project-owner",
+                    "r0feynman",
+                    "--project-number",
+                    "1",
+                    "--fixture-dir",
+                    str(fixture_dir),
+                    "--apply",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(0, sync.returncode, sync.stdout + sync.stderr)
+            self.assertIn("PR #86 Status: 'In Progress' -> 'Done'", sync.stdout)
+            self.assertIn("PR #86 Workflow Status: 'In Progress' -> 'Done'", sync.stdout)
+            self.assertIn("After: 0 mismatch(es) remain.", sync.stdout)
+
+    def test_live_loader_fetches_pull_request_merge_state_when_item_omits_it(self) -> None:
+        calls = []
+        original_gh_json = common.gh_json
+
+        def fake_gh_json(args):
+            calls.append(args)
+            if args[:2] == ["project", "view"]:
+                return {"id": "PVT_live_fixture"}
+            if args[:2] == ["project", "field-list"]:
+                return {
+                    "fields": [
+                        {
+                            "id": "field_status",
+                            "name": "Status",
+                            "options": [
+                                {"id": "status_done", "name": "Done"},
+                                {"id": "status_progress", "name": "In Progress"},
+                            ],
+                        },
+                        {
+                            "id": "field_workflow_status",
+                            "name": "Workflow Status",
+                            "options": [
+                                {"id": "workflow_done", "name": "Done"},
+                                {"id": "workflow_progress", "name": "In Progress"},
+                            ],
+                        },
+                    ]
+                }
+            if args[:2] == ["project", "item-list"]:
+                return {
+                    "items": [
+                        {
+                            "id": "item_pr_86",
+                            "content": {
+                                "number": 86,
+                                "repository": "r0feynman/codex-deepresearch",
+                                "title": "[P3-AV6] Implement automated VLM adapter",
+                                "type": "PullRequest",
+                                "url": (
+                                    "https://github.com/r0feynman/"
+                                    "codex-deepresearch/pull/86"
+                                ),
+                            },
+                            "status": "In Progress",
+                            "workflow Status": "In Progress",
+                        }
+                    ]
+                }
+            if args[:2] == ["issue", "list"]:
+                return []
+            if args[:3] == ["pr", "view", "86"]:
+                return {
+                    "mergedAt": "2026-06-25T09:59:23Z",
+                    "number": 86,
+                    "state": "MERGED",
+                    "title": "[P3-AV6] Implement automated VLM adapter",
+                    "url": "https://github.com/r0feynman/codex-deepresearch/pull/86",
+                }
+            raise AssertionError(f"unexpected gh_json args: {args}")
+
+        try:
+            common.gh_json = fake_gh_json
+            state = common.load_live_state(
+                project_owner="r0feynman",
+                project_number=1,
+                repository="r0feynman/codex-deepresearch",
+                limit=50,
+            )
+        finally:
+            common.gh_json = original_gh_json
+
+        pull_request = state.pull_requests[86]
+        self.assertTrue(pull_request.pull_request.merged)
+        self.assertEqual("MERGED", pull_request.pull_request.state)
+        findings = common.verify_pull_request_lifecycle_fields(pull_request, state)
+        self.assertEqual(
+            {
+                ("pull_request_status", "Status"),
+                ("pull_request_workflow_status", "Workflow Status"),
+            },
+            {(finding.check, finding.field_name) for finding in findings},
+        )
+        self.assertTrue(all(finding.safe_fix for finding in findings))
+        self.assertIn(
+            [
+                "pr",
+                "view",
+                "86",
+                "--json",
+                "number,title,state,mergedAt,url",
+                "--repo",
+                "r0feynman/codex-deepresearch",
+            ],
+            calls,
+        )
+
+    def test_open_pull_request_is_not_auto_completed(self) -> None:
+        policy, state = self.load_state()
+        findings = common.verify_project_state(state, policy)
+        self.assertFalse(
+            any(
+                finding.content_type == "PullRequest" and finding.issue_number == 101
+                for finding in findings
+            )
+        )
+        self.assertFalse(
+            any(
+                change.content_type == "PullRequest" and change.issue_number == 101
+                for change in common.planned_changes(findings, state, policy)
+            )
+        )
+
+    def test_closed_unmerged_pull_request_is_not_treated_as_merged(self) -> None:
+        policy, state = self.load_state()
+        findings = common.verify_project_state(state, policy)
+        self.assertFalse(
+            any(
+                finding.content_type == "PullRequest" and finding.issue_number == 102
+                for finding in findings
+            )
+        )
+        self.assertFalse(
+            any(
+                change.content_type == "PullRequest" and change.issue_number == 102
+                for change in common.planned_changes(findings, state, policy)
+            )
+        )
 
     def test_apply_mode_manual_only_mismatch_exits_nonzero(self) -> None:
         with self.copy_fixture() as tmp:
