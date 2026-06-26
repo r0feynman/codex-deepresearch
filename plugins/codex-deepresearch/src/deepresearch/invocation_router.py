@@ -23,16 +23,38 @@ from .report_generation import ReportGenerationError, synthesize_report
 from .search_handoff import SearchHandoffError, prepare_run
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
+from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
 from .visual_artifacts import (
+    IMAGE_FETCH_STATUS_FILENAME,
+    VISUAL_CANDIDATES_FILENAME,
     VISUAL_PROVIDER_STATUS_FILENAME,
     VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
+    VISUAL_SEARCH_PLAN_FILENAME,
+    automatic_visual_status_envelope,
     build_visual_provider_status,
+    real_automatic_visual_release_counts,
+    validate_visual_artifacts,
 )
+from .vision_adapter import VisionAdapterError, ingest_vision_observations
 
 
 RUN_STATUS_SCHEMA_VERSION = "codex-deepresearch.run-status.v0"
 RUN_STATUS_FILENAME = "run_status.json"
 INVOCATION_MODES = ("full-runner", "quick-chat", "manual-handoff", "blocked")
+CODEX_INTERACTIVE_PROVIDER = "codex-interactive"
+BRAVE_IMAGE_PROVIDER = "brave-image-search"
+CHILD_DISCOVERED_IMAGE_PROVIDER = "child-discovered-image-url"
+PAGE_IMAGE_EXTRACTOR_PROVIDER = "page-image-extractor"
+BROWSER_SCREENSHOT_PROVIDER = "browser-screenshot"
+PDF_RASTERIZER_PROVIDER = "local-pdf-rasterizer"
+DEFAULT_AUTOMATIC_VISUAL_PROVIDERS = (
+    CHILD_DISCOVERED_IMAGE_PROVIDER,
+    BRAVE_IMAGE_PROVIDER,
+    PAGE_IMAGE_EXTRACTOR_PROVIDER,
+    BROWSER_SCREENSHOT_PROVIDER,
+)
+MIN_COMPLETED_AUTO_VISUAL_CANDIDATES = 10
+MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES = 3
 
 _QUICK_CHAT_MARKERS = (
     "quick answer",
@@ -106,10 +128,23 @@ _STAGE_OK_STATUSES = {
     "completed_parallel",
     "completed_partial_parallel",
     "manual_sources_ingested",
+    "real_image_search_candidates_collected",
     "skipped",
     "visual_candidates_collected",
     "visual_evidence_ingested",
 }
+_AUTOMATIC_VISUAL_TERMINAL_STATUSES = {
+    "blocked_missing_visual_provider",
+    "blocked_missing_vlm_provider",
+    "budget_pruned_visual",
+    "partial_auto_visual",
+    "policy_blocked_visual",
+}
+_AUTOMATIC_VISUAL_ACQUISITION_OK = {
+    "real_image_search_candidates_collected",
+    "visual_candidates_collected",
+}
+_AUTOMATIC_VISUAL_INGEST_OK = {"visual_evidence_ingested"}
 
 
 def run_skill_invocation(
@@ -241,16 +276,19 @@ def run_skill_invocation(
             visual_provider_status=visual_provider_status,
         )
         if visual_provider_status.get("ok") is not True:
+            terminal_status = str(
+                visual_provider_status.get("status") or "blocked_missing_visual_provider"
+            )
             status = _base_run_status(
                 invocation=normalized_invocation,
                 question=question,
                 selected_mode="full-runner",
                 run_dir=run_dir,
-                status="blocked_missing_visual_provider",
+                status=terminal_status,
                 ok=False,
                 terminal=True,
                 provenance={
-                    "type": "blocked_missing_visual_provider",
+                    "type": terminal_status,
                     "adapter": adapter_name,
                     "fixture_only": False,
                     "manual_handoff": False,
@@ -301,9 +339,49 @@ def run_skill_invocation(
         )
         return _write_run_status(run_dir, status)
 
+    visual_stage_status: Mapping[str, Any] | None = None
     guardrails_status: Mapping[str, Any] | None = None
     verify_status: Mapping[str, Any] | None = None
     report_status: Mapping[str, Any] | None = None
+    if _should_run_automatic_visual_pipeline(run_dir, adapter_name=adapter_name):
+        visual_stage_status = _run_automatic_visual_pipeline(
+            run_dir=run_dir,
+            adapter_name=adapter_name,
+        )
+        if _is_terminal_visual_pipeline_status(visual_stage_status):
+            status = _base_run_status(
+                invocation=normalized_invocation,
+                question=question,
+                selected_mode="full-runner",
+                run_dir=run_dir,
+                status=str(visual_stage_status.get("status") or "partial_auto_visual"),
+                ok=visual_stage_status.get("ok") is True,
+                terminal=True,
+                provenance=_provenance_from_parallel(parallel_status),
+                diagnostics={
+                    "actionable_cause": _visual_actionable_cause(visual_stage_status)
+                },
+                artifacts=_artifact_paths(run_dir),
+            )
+            status["parallel"] = _parallel_summary(parallel_status)
+            status["stages"] = {
+                "visual_acquisition": _stage_summary(
+                    visual_stage_status.get("visual_acquisition")
+                    if isinstance(visual_stage_status.get("visual_acquisition"), Mapping)
+                    else None
+                ),
+                "ingest_vision": _stage_summary(
+                    visual_stage_status.get("ingest_vision")
+                    if isinstance(visual_stage_status.get("ingest_vision"), Mapping)
+                    else None
+                ),
+            }
+            status["visual_provider"] = _stage_summary(
+                _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+            )
+            status["visual_summary"] = _visual_summary(run_dir)
+            return _write_run_status(run_dir, status)
+
     try:
         guardrails_status = enforce_guardrails(run=run_dir)
         verify_status = verify_claims(run=run_dir)
@@ -331,20 +409,32 @@ def run_skill_invocation(
         return _write_run_status(run_dir, status)
 
     report_completed = isinstance(report_status, Mapping) and report_status.get("status") == "completed"
+    automatic_visual_completion: Mapping[str, Any] | None = None
+    final_ok = report_completed
+    if visual_stage_status is not None and report_completed:
+        automatic_visual_completion = _finalize_automatic_visual_completion(
+            run_dir=run_dir,
+            visual_stage_status=visual_stage_status,
+        )
     final_status = str(parallel_status.get("status") or "completed_parallel")
+    if isinstance(automatic_visual_completion, Mapping):
+        final_status = str(automatic_visual_completion.get("status") or final_status)
+        final_ok = automatic_visual_completion.get("ok") is True
     status = _base_run_status(
         invocation=normalized_invocation,
         question=question,
         selected_mode="full-runner",
         run_dir=run_dir,
-        status=final_status if report_completed else "failed_synthesis",
-        ok=report_completed,
+        status=final_status if final_ok or automatic_visual_completion is not None else "failed_synthesis",
+        ok=final_ok,
         terminal=True,
         provenance=_provenance_from_parallel(parallel_status),
         diagnostics={
             "actionable_cause": (
                 "full-runner completed through synthesis"
-                if report_completed
+                if final_ok
+                else _visual_actionable_cause(automatic_visual_completion)
+                if automatic_visual_completion is not None
                 else "report synthesis did not complete"
             )
         },
@@ -356,6 +446,34 @@ def run_skill_invocation(
         "verify_claims": _stage_summary(verify_status),
         "synthesize": _stage_summary(report_status),
     }
+    if isinstance(automatic_visual_completion, Mapping):
+        if isinstance(automatic_visual_completion.get("visual_release_gate"), Mapping):
+            status["visual_release_gate"] = dict(
+                automatic_visual_completion["visual_release_gate"]
+            )
+        if isinstance(automatic_visual_completion.get("visual_artifact_validation"), Mapping):
+            status["visual_artifact_validation"] = dict(
+                automatic_visual_completion["visual_artifact_validation"]
+            )
+    if visual_stage_status is not None:
+        status["stages"].update(
+            {
+                "visual_acquisition": _stage_summary(
+                    visual_stage_status.get("visual_acquisition")
+                    if isinstance(visual_stage_status.get("visual_acquisition"), Mapping)
+                    else None
+                ),
+                "ingest_vision": _stage_summary(
+                    visual_stage_status.get("ingest_vision")
+                    if isinstance(visual_stage_status.get("ingest_vision"), Mapping)
+                    else None
+                ),
+            }
+        )
+        status["visual_provider"] = _stage_summary(
+            _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        )
+        status["visual_summary"] = _visual_summary(run_dir)
     return _write_run_status(run_dir, status)
 
 
@@ -577,7 +695,7 @@ def _visual_provider_preflight_status(
         if shutil.which("codex") is None:
             status = _visual_provider_status(
                 run_dir=run_dir,
-                status="blocked_missing_visual_provider",
+                status="blocked_missing_vlm_provider",
                 ok=False,
                 terminal=True,
                 metric_classification="excluded_blocked",
@@ -791,11 +909,562 @@ def _run_requires_visual_provider(run_dir: Path) -> bool:
     )
 
 
+def _should_run_automatic_visual_pipeline(run_dir: Path, *, adapter_name: str) -> bool:
+    normalized_adapter = adapter_name.strip().lower().replace("_", "-")
+    return normalized_adapter == "codex-exec" and _run_has_visual_routes(run_dir)
+
+
+def _run_has_visual_routes(run_dir: Path) -> bool:
+    try:
+        evidence = _read_json(run_dir / "evidence.json")
+    except (OSError, json.JSONDecodeError):
+        return False
+    routing = evidence.get("routing")
+    if not isinstance(routing, list):
+        return False
+    for route in routing:
+        if not isinstance(route, Mapping):
+            continue
+        if route.get("modality") == "text_only":
+            continue
+        try:
+            max_images = int(route.get("max_images") or 0)
+        except (TypeError, ValueError):
+            max_images = 0
+        if max_images > 0:
+            return True
+    return False
+
+
+def _run_automatic_visual_pipeline(
+    *,
+    run_dir: Path,
+    adapter_name: str,
+) -> dict[str, Any]:
+    acquisition_status: Mapping[str, Any] | None = None
+    ingest_status: Mapping[str, Any] | None = None
+    providers = _automatic_visual_providers(run_dir)
+    try:
+        acquisition_status = acquire_visual_candidates(
+            run=run_dir,
+            providers=providers,
+        )
+    except (VisualAcquisitionError, OSError) as exc:
+        return _visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status="blocked_missing_visual_provider",
+            actionable_cause=str(exc) or exc.__class__.__name__,
+            acquisition_status=acquisition_status,
+            ingest_status=ingest_status,
+        )
+
+    visual_provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    acquisition_status_name = str(
+        acquisition_status.get("status")
+        or visual_provider_status.get("status")
+        or "partial_auto_visual"
+    )
+    if _visual_provider_status_is_terminal(visual_provider_status):
+        return _visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status=_terminal_visual_status_from_artifacts(
+                run_dir,
+                default=acquisition_status_name,
+            ),
+            actionable_cause=_provider_actionable_cause(
+                visual_provider_status,
+                fallback="automatic visual acquisition did not produce usable artifacts",
+            ),
+            acquisition_status=acquisition_status,
+            ingest_status=ingest_status,
+        )
+    if acquisition_status_name not in _AUTOMATIC_VISUAL_ACQUISITION_OK:
+        return _visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status=_terminal_visual_status_from_artifacts(
+                run_dir,
+                default=acquisition_status_name,
+            ),
+            actionable_cause=_provider_actionable_cause(
+                visual_provider_status,
+                fallback="automatic visual acquisition did not produce usable artifacts",
+            ),
+            acquisition_status=acquisition_status,
+            ingest_status=ingest_status,
+        )
+
+    try:
+        ingest_status = ingest_vision_observations(
+            run=run_dir,
+            provider=CODEX_INTERACTIVE_PROVIDER,
+            provider_mode="real",
+        )
+    except (VisionAdapterError, OSError) as exc:
+        return _visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status="blocked_missing_vlm_provider",
+            actionable_cause=str(exc) or exc.__class__.__name__,
+            acquisition_status=acquisition_status,
+            ingest_status=ingest_status,
+        )
+
+    ingest_status_name = str(ingest_status.get("status") or "")
+    if ingest_status_name not in _AUTOMATIC_VISUAL_INGEST_OK:
+        terminal_status = (
+            "blocked_missing_vlm_provider"
+            if ingest_status_name == "blocked_missing_vlm_provider"
+            else _terminal_visual_status_from_artifacts(
+                run_dir,
+                default=ingest_status_name or "partial_auto_visual",
+            )
+        )
+        return _visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status=terminal_status,
+            actionable_cause=_visual_stage_actionable_cause(
+                ingest_status,
+                fallback="Codex-native visual worker did not ingest visual evidence",
+            ),
+            acquisition_status=acquisition_status,
+            ingest_status=ingest_status,
+        )
+
+    return {
+        "status": "visual_pipeline_ready",
+        "ok": True,
+        "terminal": False,
+        "adapter": adapter_name,
+        "providers": list(providers),
+        "visual_acquisition": dict(acquisition_status),
+        "ingest_vision": dict(ingest_status),
+        "diagnostics": {
+            "actionable_cause": (
+                "automatic visual acquisition produced local artifacts and "
+                "codex-interactive ingested them through explicit --image handoff"
+            )
+        },
+    }
+
+
+def _automatic_visual_providers(run_dir: Path) -> tuple[str, ...]:
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    sources = evidence.get("sources") if isinstance(evidence, Mapping) else None
+    providers: list[str] = []
+    if isinstance(sources, list):
+        if any(
+            isinstance(source, Mapping) and source.get("type") in {"web", "screenshot"}
+            for source in sources
+        ):
+            providers.extend(
+                [
+                    CHILD_DISCOVERED_IMAGE_PROVIDER,
+                    BRAVE_IMAGE_PROVIDER,
+                    PAGE_IMAGE_EXTRACTOR_PROVIDER,
+                    BROWSER_SCREENSHOT_PROVIDER,
+                ]
+            )
+        if any(isinstance(source, Mapping) and source.get("type") == "pdf" for source in sources):
+            providers.append(PDF_RASTERIZER_PROVIDER)
+    if not providers:
+        providers.extend(DEFAULT_AUTOMATIC_VISUAL_PROVIDERS)
+    return tuple(dict.fromkeys(providers))
+
+
+def _is_terminal_visual_pipeline_status(status: Mapping[str, Any]) -> bool:
+    return (
+        status.get("terminal") is True
+        and str(status.get("status") or "") in _AUTOMATIC_VISUAL_TERMINAL_STATUSES
+    )
+
+
+def _visual_pipeline_terminal_status(
+    *,
+    run_dir: Path,
+    status: str,
+    actionable_cause: str,
+    acquisition_status: Mapping[str, Any] | None,
+    ingest_status: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    normalized = status if status in _AUTOMATIC_VISUAL_TERMINAL_STATUSES else "partial_auto_visual"
+    envelope = automatic_visual_status_envelope(
+        normalized,
+        visual_required=_run_requires_visual_provider(run_dir),
+    )
+    return {
+        "status": normalized,
+        "ok": envelope["ok"],
+        "terminal": envelope["terminal"],
+        "metric_classification": envelope["metric_classification"],
+        "visual_acquisition": dict(acquisition_status or {}),
+        "ingest_vision": dict(ingest_status or {}),
+        "diagnostics": {"actionable_cause": actionable_cause},
+    }
+
+
+def _visual_provider_status_is_terminal(status: Mapping[str, Any]) -> bool:
+    return status.get("terminal") is True and status.get("ok") is not True
+
+
+def _terminal_visual_status_from_artifacts(run_dir: Path, *, default: str) -> str:
+    provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    provider_status_name = str(provider_status.get("status") or "")
+    if provider_status_name in {
+        "blocked_missing_visual_provider",
+        "blocked_missing_vlm_provider",
+        "policy_blocked_visual",
+        "budget_pruned_visual",
+    }:
+        return provider_status_name
+    fetches = _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+    fetch_statuses = {
+        str(fetch.get("fetch_status") or "")
+        for fetch in fetches
+        if isinstance(fetch, Mapping)
+    }
+    fetched = "fetched" in fetch_statuses
+    if not fetched and "policy_blocked" in fetch_statuses:
+        return "policy_blocked_visual"
+    if not fetched and "budget_pruned" in fetch_statuses:
+        return "budget_pruned_visual"
+    if default in _AUTOMATIC_VISUAL_TERMINAL_STATUSES:
+        return default
+    return "partial_auto_visual"
+
+
+def _finalize_automatic_visual_completion(
+    *,
+    run_dir: Path,
+    visual_stage_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    if not provider_status:
+        return _visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status="partial_auto_visual",
+            actionable_cause="visual_provider_status.json was not produced",
+            acquisition_status=visual_stage_status.get("visual_acquisition")
+            if isinstance(visual_stage_status.get("visual_acquisition"), Mapping)
+            else None,
+            ingest_status=visual_stage_status.get("ingest_vision")
+            if isinstance(visual_stage_status.get("ingest_vision"), Mapping)
+            else None,
+        )
+
+    _write_visual_completion_status(
+        run_dir=run_dir,
+        provider_status=provider_status,
+        status="completed_auto_visual",
+        actionable_cause=(
+            "automatic web visual acquisition, Codex-native visual analysis, "
+            "verification, and report citation completed"
+        ),
+        validation=None,
+    )
+    validation = validate_visual_artifacts(run_dir=run_dir)
+    release_gate = _completed_auto_visual_release_gate(run_dir)
+    if validation.valid and release_gate["valid"]:
+        return {
+            "status": "completed_auto_visual",
+            "ok": True,
+            "terminal": True,
+            "metric_classification": "success",
+            "visual_artifact_validation": validation.to_dict(),
+            "visual_release_gate": release_gate,
+            "diagnostics": {
+                "actionable_cause": (
+                    "automatic visual release gate passed with real acquisition, "
+                    "Codex-native VLM observations, and report-cited image evidence"
+                )
+            },
+        }
+
+    diagnostics = validation.to_dict()
+    diagnostics["visual_release_gate"] = release_gate
+    _write_visual_completion_status(
+        run_dir=run_dir,
+        provider_status=_read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
+        status="partial_auto_visual",
+        actionable_cause=(
+            "automatic visual artifacts were produced but did not satisfy "
+            "completed_auto_visual release prerequisites"
+        ),
+        validation=diagnostics,
+    )
+    return {
+        "status": "partial_auto_visual",
+        "ok": automatic_visual_status_envelope(
+            "partial_auto_visual",
+            visual_required=_run_requires_visual_provider(run_dir),
+        )["ok"],
+        "terminal": True,
+        "metric_classification": "included_failure",
+        "visual_artifact_validation": diagnostics,
+        "visual_release_gate": release_gate,
+        "diagnostics": {
+            "actionable_cause": (
+                "automatic visual artifacts were produced but did not satisfy "
+                "completed_auto_visual release prerequisites"
+            )
+        },
+    }
+
+
+def _write_visual_completion_status(
+    *,
+    run_dir: Path,
+    provider_status: Mapping[str, Any],
+    status: str,
+    actionable_cause: str,
+    validation: Mapping[str, Any] | None,
+) -> None:
+    envelope = automatic_visual_status_envelope(
+        status,
+        visual_required=_run_requires_visual_provider(run_dir),
+    )
+    payload = dict(provider_status)
+    payload.update(
+        {
+            "status": status,
+            "ok": envelope["ok"],
+            "terminal": envelope["terminal"],
+            "metric_classification": envelope["metric_classification"],
+            "updated_at": _utc_now(),
+        }
+    )
+    diagnostics = (
+        dict(payload.get("diagnostics", {}))
+        if isinstance(payload.get("diagnostics"), Mapping)
+        else {}
+    )
+    diagnostics["actionable_cause"] = actionable_cause
+    if validation is not None:
+        diagnostics["visual_artifact_validation"] = dict(validation)
+    payload["diagnostics"] = diagnostics
+    artifacts = (
+        dict(payload.get("artifacts", {}))
+        if isinstance(payload.get("artifacts"), Mapping)
+        else {}
+    )
+    artifacts.update(
+        {
+            "visual_search_plan": VISUAL_SEARCH_PLAN_FILENAME,
+            "visual_candidates": VISUAL_CANDIDATES_FILENAME,
+            "image_fetch_status": IMAGE_FETCH_STATUS_FILENAME,
+            "visual_observations": "visual_observations.jsonl",
+            "visual_provider_status": VISUAL_PROVIDER_STATUS_FILENAME,
+            "evidence": "evidence.json",
+            "report": "report.md",
+            "report_status": "report_status.json",
+        }
+    )
+    payload["artifacts"] = artifacts
+    _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, payload)
+
+
+def _completed_auto_visual_release_gate(run_dir: Path) -> dict[str, Any]:
+    candidates = [
+        item
+        for item in _read_optional_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        if isinstance(item, Mapping)
+    ]
+    fetches = [
+        item
+        for item in _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        if isinstance(item, Mapping)
+    ]
+    observations = [
+        item
+        for item in _read_optional_jsonl(run_dir / "visual_observations.jsonl")
+        if isinstance(item, Mapping)
+    ]
+    provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    report_status = _read_optional_json(run_dir / "report_status.json")
+    counts = real_automatic_visual_release_counts(
+        candidates=candidates,
+        fetches=fetches,
+        observations=observations,
+        visual_provider_status=provider_status,
+    )
+    codex_observations = [
+        observation
+        for observation in observations
+        if observation.get("provider") == CODEX_INTERACTIVE_PROVIDER
+        and observation.get("provider_kind") == "vlm"
+        and observation.get("provider_mode") == "real"
+        and observation.get("observation_status") == "analyzed"
+    ]
+    report_cited_claim = _has_report_cited_real_visual_claim(
+        evidence=evidence,
+        report_status=report_status,
+    )
+    failures: list[str] = []
+    if counts["real_candidates"] < MIN_COMPLETED_AUTO_VISUAL_CANDIDATES:
+        failures.append(
+            "at_least_10_real_image_centric_candidates"
+        )
+    if len(codex_observations) < MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES:
+        failures.append("at_least_3_codex_interactive_real_analyzed_images")
+    if not report_cited_claim:
+        failures.append("report_cited_supported_real_visual_or_mixed_claim")
+    return {
+        "valid": not failures,
+        "failures": failures,
+        "counts": {
+            **counts,
+            "codex_interactive_real_analyzed_images": len(codex_observations),
+        },
+        "minimums": {
+            "real_candidates": MIN_COMPLETED_AUTO_VISUAL_CANDIDATES,
+            "codex_interactive_real_analyzed_images": MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES,
+            "report_cited_supported_real_visual_or_mixed_claim": 1,
+        },
+        "report_cited_supported_real_visual_or_mixed_claim": report_cited_claim,
+    }
+
+
+def _has_report_cited_real_visual_claim(
+    *,
+    evidence: Mapping[str, Any],
+    report_status: Mapping[str, Any],
+) -> bool:
+    used_images = report_status.get("used_images")
+    if not isinstance(used_images, list):
+        return False
+    used_image_ids = {image_id for image_id in used_images if isinstance(image_id, str)}
+    images = evidence.get("images")
+    if not isinstance(images, list):
+        return False
+    real_image_ids = {
+        image.get("id")
+        for image in images
+        if isinstance(image, Mapping)
+        and image.get("provider_mode") == "real"
+        and image.get("provider_kind")
+        in {"web_image_search", "page_extractor", "screenshot", "pdf_rasterizer", "vlm"}
+    }
+    claims = evidence.get("claims")
+    if not isinstance(claims, list):
+        return False
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        if claim.get("verification_status") != "supported":
+            continue
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+        supporting_images = claim.get("supporting_images")
+        if not isinstance(supporting_images, list):
+            continue
+        if any(
+            isinstance(image_id, str)
+            and image_id in used_image_ids
+            and image_id in real_image_ids
+            for image_id in supporting_images
+        ):
+            return True
+    return False
+
+
+def _visual_summary(run_dir: Path) -> dict[str, Any]:
+    provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    report_status = _read_optional_json(run_dir / "report_status.json")
+    candidates = _read_optional_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+    fetches = _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+    observations = _read_optional_jsonl(run_dir / "visual_observations.jsonl")
+    release_gate = _completed_auto_visual_release_gate(run_dir)
+    providers = (
+        provider_status.get("providers")
+        if isinstance(provider_status.get("providers"), list)
+        else []
+    )
+    return {
+        "status": provider_status.get("status"),
+        "ok": provider_status.get("ok"),
+        "terminal": provider_status.get("terminal"),
+        "candidate_count": len(candidates),
+        "fetched_artifact_count": sum(
+            1
+            for fetch in fetches
+            if isinstance(fetch, Mapping) and fetch.get("fetch_status") == "fetched"
+        ),
+        "vlm_analyzed_image_count": sum(
+            _int_or_zero(provider.get("vlm_images_analyzed"))
+            for provider in providers
+            if isinstance(provider, Mapping)
+            and provider.get("provider_kind") == "vlm"
+        ),
+        "observation_count": len(observations),
+        "used_images": list(report_status.get("used_images", []))
+        if isinstance(report_status.get("used_images"), list)
+        else [],
+        "release_gate": release_gate,
+        "providers": [
+            {
+                "provider": provider.get("provider"),
+                "provider_kind": provider.get("provider_kind"),
+                "provider_mode": provider.get("provider_mode"),
+                "blocked_reason": provider.get("blocked_reason"),
+            }
+            for provider in providers
+            if isinstance(provider, Mapping)
+        ],
+    }
+
+
+def _provider_actionable_cause(status: Mapping[str, Any], *, fallback: str) -> str:
+    diagnostics = status.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        cause = diagnostics.get("actionable_cause")
+        if isinstance(cause, str) and cause:
+            return cause
+    return fallback
+
+
+def _visual_stage_actionable_cause(status: Mapping[str, Any], *, fallback: str) -> str:
+    diagnostics = status.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        cause = diagnostics.get("actionable_cause")
+        if isinstance(cause, str) and cause:
+            return cause
+    blocked_reason = status.get("blocked_reason")
+    if isinstance(blocked_reason, str) and blocked_reason:
+        return blocked_reason
+    return fallback
+
+
+def _visual_actionable_cause(status: Mapping[str, Any] | None) -> str:
+    if not isinstance(status, Mapping):
+        return "automatic visual pipeline did not complete"
+    diagnostics = status.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        cause = diagnostics.get("actionable_cause")
+        if isinstance(cause, str) and cause:
+            return cause
+    return str(status.get("status") or "automatic visual pipeline did not complete")
+
+
 def _read_optional_json(path: Path) -> dict[str, Any]:
     try:
         return _read_json(path)
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _read_optional_jsonl(path: Path) -> list[Any]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records: list[Any] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
 
 
 def _quick_chat_status(invocation: str, question: str) -> dict[str, Any]:
@@ -905,7 +1574,11 @@ def _artifact_paths(run_dir: Path, extra_artifacts: Mapping[str, Any] | None = N
         "run_trace": "run_trace.jsonl",
         "run_steps": "run_steps.json",
         "budget_estimate": "budget_estimate.json",
+        "visual_search_plan": VISUAL_SEARCH_PLAN_FILENAME,
+        "visual_candidates": VISUAL_CANDIDATES_FILENAME,
+        "image_fetch_status": IMAGE_FETCH_STATUS_FILENAME,
         "visual_acquisition_status": "visual_acquisition_status.json",
+        "vision_ingest_status": "vision_ingest_status.json",
         "visual_provider_status": "visual_provider_status.json",
     }
     for key, filename in known_files.items():
@@ -962,6 +1635,8 @@ def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict
         if isinstance(output.get("diagnostics"), Mapping)
         else {},
     }
+    if isinstance(output.get("visual_summary"), Mapping):
+        output["artifact_handoff"]["visual_summary"] = dict(output["visual_summary"])
     return output
 
 

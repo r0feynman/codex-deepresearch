@@ -448,17 +448,24 @@ def run_acquire_visual(args: argparse.Namespace) -> int:
     try:
         providers = normalize_acquire_visual_providers(args.provider)
         if PAGE_IMAGE_EXTRACTOR_PROVIDER in providers:
-            if providers != (PAGE_IMAGE_EXTRACTOR_PROVIDER,):
-                raise VisualAcquisitionError(
-                    f"{PAGE_IMAGE_EXTRACTOR_PROVIDER} cannot be combined with fixture providers"
+            if providers == (PAGE_IMAGE_EXTRACTOR_PROVIDER,):
+                result = extract_and_fetch_page_images(
+                    run=args.run,
+                    runs_dir=resolve_repo_path(args.runs_dir),
+                    max_image_bytes=args.max_image_bytes,
+                    max_fetches=args.max_fetches,
+                    provider_mode="real",
                 )
-            result = extract_and_fetch_page_images(
-                run=args.run,
-                runs_dir=resolve_repo_path(args.runs_dir),
-                max_image_bytes=args.max_image_bytes,
-                max_fetches=args.max_fetches,
-                provider_mode="real",
-            )
+            else:
+                result = acquire_visual_candidates(
+                    run=args.run,
+                    runs_dir=resolve_repo_path(args.runs_dir),
+                    providers=args.provider,
+                    screenshot_modes=args.screenshot_mode,
+                    max_image_bytes=args.max_image_bytes,
+                    max_pdf_bytes=args.max_pdf_bytes,
+                    max_fetches=args.max_fetches,
+                )
         else:
             result = acquire_visual_candidates(
                 run=args.run,
@@ -1843,6 +1850,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Visual provider. Repeatable or comma-separated. Defaults to "
             "local-page, local-image-fixture, local-screenshot-fixture, "
             "local-pdf-rasterizer. Use "
+            "child-discovered-image-url to fetch/cache HTTP(S) image URLs already "
+            "discovered by accepted real Codex child evidence, "
             "brave-image-search for the credential- and storage-confirmation-gated "
             "real web image search adapter. Use page-image-extractor alone to "
             "run the page image fetch/cache provider, or browser-screenshot for "
@@ -1867,7 +1876,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-fetches",
         type=int,
         default=None,
-        help="Maximum image fetch attempts for --provider page-image-extractor.",
+        help=(
+            "Maximum image fetch attempts for --provider page-image-extractor or "
+            "child-discovered-image-url."
+        ),
     )
     acquire_visual.add_argument(
         "--max-pdf-bytes",

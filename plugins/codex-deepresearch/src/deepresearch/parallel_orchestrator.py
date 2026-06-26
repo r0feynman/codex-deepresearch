@@ -491,7 +491,7 @@ def plan_research_tasks(
             continue
         task_id = f"task_research_{index:03d}"
         route = str(base.get("route") or "text_only")
-        max_images = int(base.get("max_images") or 0)
+        max_images = _planner_max_images(base, evidence=evidence, route=route)
         query = _bounded_task_query(str(base.get("query") or evidence.get("question") or ""), index)
         tasks.append(
             ResearchTask(
@@ -525,6 +525,43 @@ def plan_research_tasks(
     }
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, payload)
     return _tasks_payload(run_dir, tasks, evidence=evidence, status="planned")
+
+
+def _planner_max_images(
+    task: Mapping[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+    route: str,
+) -> int:
+    if route == "text_only":
+        return 0
+    direct = _nonnegative_int(task.get("max_images"))
+    if direct > 0:
+        return direct
+    angle_id = str(task.get("angle_id") or "")
+    routing = evidence.get("routing")
+    if isinstance(routing, list):
+        for record in routing:
+            if not isinstance(record, Mapping):
+                continue
+            same_angle = bool(angle_id and str(record.get("id") or "") == angle_id)
+            same_route = str(record.get("modality") or record.get("route") or "") == route
+            if same_angle or same_route:
+                routed = _nonnegative_int(record.get("max_images"))
+                if routed > 0:
+                    return routed
+    budget = evidence.get("budget")
+    if isinstance(budget, Mapping):
+        return _nonnegative_int(budget.get("max_images"))
+    return 0
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
 
 
 def run_parallel_orchestration(
@@ -1249,7 +1286,11 @@ def _skip_serial_handoff_after_parallel(
     run_dir: Path,
     status_payload: Mapping[str, Any],
 ) -> None:
-    for stage in ("ingest", "fetch_claims", "ingest_vision"):
+    stages = ["ingest", "fetch_claims"]
+    adapter = str(status_payload.get("adapter") or "").strip().lower().replace("_", "-")
+    if adapter != "codex-exec" or not _run_has_visual_routes(run_dir):
+        stages.append("ingest_vision")
+    for stage in stages:
         try:
             skip_stage(
                 run_dir,
@@ -1258,6 +1299,23 @@ def _skip_serial_handoff_after_parallel(
             )
         except Exception:
             continue
+
+
+def _run_has_visual_routes(run_dir: Path) -> bool:
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    routing = evidence.get("routing") if isinstance(evidence, Mapping) else None
+    if not isinstance(routing, list):
+        return False
+    for route in routing:
+        if not isinstance(route, Mapping) or route.get("modality") == "text_only":
+            continue
+        try:
+            max_images = int(route.get("max_images") or 0)
+        except (TypeError, ValueError):
+            max_images = 0
+        if max_images > 0:
+            return True
+    return False
 
 
 def _enforce_parallel_budget_gate(
@@ -1666,6 +1724,23 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
     verifier_votes_path = shard_dir / "verifier_votes.jsonl"
     query = str(task.get("query") or "")
     response_language = "Korean" if _contains_korean(query) else "English"
+    try:
+        max_images = max(0, int(task.get("max_images") or 0))
+    except (TypeError, ValueError):
+        max_images = 0
+    visual_instruction = ""
+    if max_images > 0:
+        visual_instruction = (
+            f"Because this visual task requests up to {max_images} images, discover and write as many "
+            f"public HTTP(S) image_url records as the task supports, targeting {max_images} when available. "
+            "Prefer direct NASA, Wikimedia Commons, or other source-hosted image URLs over pages that only "
+            "describe images. Each image record must reference a source_id present in the same shard, use "
+            "origin `image_search` or `page_image`, set local_artifact_path to a placeholder under "
+            f"`{EVIDENCE_SHARDS_DIRNAME}/<task_id>/` when the child has not downloaded the binary, set "
+            "analysis_provider `codex-interactive`, analysis_status `skipped`, and leave observations and "
+            "inferences empty for later runner VLM analysis. Do not use user-uploaded, manual, login-walled, "
+            "paywalled, CAPTCHA-gated, DRM-restricted, or robots-disallowed images. "
+        )
     return (
         "Run this bounded research shard task and write only schema-valid "
         f"evidence to {shard_path}. "
@@ -1674,6 +1749,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         "Only direct quote_spans.quote values should remain verbatim in the source language. "
         "Prioritize a compact shard with decision-ready claims and do not read repository docs or skills unless the schema is otherwise impossible to satisfy. "
         "Use `vlm_provider` exactly `codex-interactive` unless the input evidence specifies another allowed value. "
+        f"{visual_instruction}"
         "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
         "Verifier vote `method` must be one of `codex-subagent`, `runner-agent`, `model-call`, or `manual-review`; "
         "`vote` must be one of `support`, `refute`, `uncertain`, or `blocked`; "
