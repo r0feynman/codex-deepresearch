@@ -393,6 +393,46 @@
       "work Type": "Task",
       "priority": "P1",
       "workflow Status": "In Progress"
+    },
+    {
+      "id": "item_pr_86",
+      "content": {
+        "mergedAt": "2026-06-25T09:59:23Z",
+        "number": 86,
+        "repository": "r0feynman/codex-deepresearch",
+        "state": "MERGED",
+        "title": "[P3-AV6] Implement automated VLM adapter",
+        "type": "PullRequest",
+        "url": "https://github.com/r0feynman/codex-deepresearch/pull/86"
+      },
+      "status": "Done",
+      "workflow Status": "Done"
+    },
+    {
+      "id": "item_pr_101",
+      "content": {
+        "number": 101,
+        "repository": "r0feynman/codex-deepresearch",
+        "state": "OPEN",
+        "title": "Open fixture pull request",
+        "type": "PullRequest",
+        "url": "https://github.com/r0feynman/codex-deepresearch/pull/101"
+      },
+      "status": "In Progress",
+      "workflow Status": "In Progress"
+    },
+    {
+      "id": "item_pr_102",
+      "content": {
+        "number": 102,
+        "repository": "r0feynman/codex-deepresearch",
+        "state": "CLOSED",
+        "title": "Closed unmerged fixture pull request",
+        "type": "PullRequest",
+        "url": "https://github.com/r0feynman/codex-deepresearch/pull/102"
+      },
+      "status": "In Progress",
+      "workflow Status": "In Progress"
     }
   ]
 }

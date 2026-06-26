@@ -71,10 +71,31 @@ class IssueRecord:
     repository: str | None = None
 
 
+@dataclass(frozen=True)
+class PullRequestRecord:
+    number: int
+    title: str
+    state: str
+    merged_at: str | None
+    url: str
+    repository: str | None = None
+
+    @property
+    def merged(self) -> bool:
+        return self.state == "MERGED" or self.merged_at is not None
+
+
 @dataclass
 class ProjectItem:
     item_id: str
     issue: IssueRecord
+    fields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ProjectPullRequestItem:
+    item_id: str
+    pull_request: PullRequestRecord
     fields: dict[str, str] = field(default_factory=dict)
 
 
@@ -98,6 +119,7 @@ class ProjectState:
     fields: dict[str, ProjectField]
     dependencies: DependencyState
     issues: dict[int, IssueRecord] = field(default_factory=dict)
+    pull_requests: dict[int, ProjectPullRequestItem] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -110,6 +132,7 @@ class Finding:
     expected: str | None
     message: str
     safe_fix: bool = False
+    content_type: str = "Issue"
 
 
 @dataclass(frozen=True)
@@ -121,6 +144,7 @@ class PlannedChange:
     before: str | None
     after: str | None
     reason: str
+    content_type: str = "Issue"
 
 
 class GitHubError(RuntimeError):
@@ -225,6 +249,20 @@ def issue_from_raw(raw: dict[str, Any], fallback_repo: str | None = None) -> Iss
     )
 
 
+def pull_request_from_raw(
+    raw: dict[str, Any],
+    fallback_repo: str | None = None,
+) -> PullRequestRecord:
+    return PullRequestRecord(
+        number=int(raw["number"]),
+        title=str(raw.get("title") or ""),
+        state=str(raw.get("state") or "OPEN").upper(),
+        merged_at=str(raw["mergedAt"]) if raw.get("mergedAt") else None,
+        url=str(raw.get("url") or ""),
+        repository=str(raw.get("repository") or fallback_repo or ""),
+    )
+
+
 def item_fields_from_raw(raw: dict[str, Any]) -> dict[str, str]:
     ignored = {
         "content",
@@ -298,21 +336,31 @@ def load_fixture_state(fixture_dir: Path, policy: Policy) -> ProjectState:
             issue_overrides[issue.number] = issue
 
     items: dict[int, ProjectItem] = {}
+    pull_requests: dict[int, ProjectPullRequestItem] = {}
     for raw_item in list_items(items_payload, "items"):
         content = raw_item.get("content") or {}
-        if not isinstance(content, dict) or content.get("type") not in (None, "Issue"):
+        if not isinstance(content, dict):
             continue
         if "number" not in content:
             continue
-        issue = issue_overrides.get(
-            int(content["number"]),
-            issue_from_raw(content, fallback_repo=policy.repository),
-        )
-        items[issue.number] = ProjectItem(
-            item_id=str(raw_item.get("id") or ""),
-            issue=issue,
-            fields=item_fields_from_raw(raw_item),
-        )
+        content_type = content.get("type")
+        if content_type in (None, "Issue"):
+            issue = issue_overrides.get(
+                int(content["number"]),
+                issue_from_raw(content, fallback_repo=policy.repository),
+            )
+            items[issue.number] = ProjectItem(
+                item_id=str(raw_item.get("id") or ""),
+                issue=issue,
+                fields=item_fields_from_raw(raw_item),
+            )
+        elif content_type == "PullRequest":
+            pull_request = pull_request_from_raw(content, fallback_repo=policy.repository)
+            pull_requests[pull_request.number] = ProjectPullRequestItem(
+                item_id=str(raw_item.get("id") or ""),
+                pull_request=pull_request,
+                fields=item_fields_from_raw(raw_item),
+            )
 
     issues = dict(issue_overrides)
     issues.update({number: item.issue for number, item in items.items()})
@@ -322,6 +370,7 @@ def load_fixture_state(fixture_dir: Path, policy: Policy) -> ProjectState:
         fields=fields_from_raw(fields_payload),
         dependencies=dependencies_from_raw(dependencies_payload),
         issues=issues,
+        pull_requests=pull_requests,
     )
 
 
@@ -390,35 +439,60 @@ def load_live_state(
     }
 
     items: dict[int, ProjectItem] = {}
+    pull_requests: dict[int, ProjectPullRequestItem] = {}
     for raw_item in list_items(items_payload, "items"):
         content = raw_item.get("content") or {}
-        if not isinstance(content, dict) or content.get("type") != "Issue":
+        if not isinstance(content, dict):
             continue
         if "number" not in content:
             continue
-        issue_number = int(content["number"])
-        issue = issues.get(issue_number)
-        if issue is None:
-            issue = issue_from_raw(
+        content_type = content.get("type")
+        if content_type == "Issue":
+            issue_number = int(content["number"])
+            issue = issues.get(issue_number)
+            if issue is None:
+                issue = issue_from_raw(
+                    gh_json(
+                        [
+                            "issue",
+                            "view",
+                            str(issue_number),
+                            "--repo",
+                            repository,
+                            "--json",
+                            "number,title,body,state,labels,milestone,url",
+                        ]
+                    ),
+                    fallback_repo=repository,
+                )
+            issues[issue.number] = issue
+            items[issue.number] = ProjectItem(
+                item_id=str(raw_item.get("id") or ""),
+                issue=issue,
+                fields=item_fields_from_raw(raw_item),
+            )
+        elif content_type == "PullRequest":
+            pull_request_number = int(content["number"])
+            pull_request_repo = str(content.get("repository") or repository)
+            pull_request = pull_request_from_raw(
                 gh_json(
                     [
-                        "issue",
+                        "pr",
                         "view",
-                        str(issue_number),
-                        "--repo",
-                        repository,
+                        str(pull_request_number),
                         "--json",
-                        "number,title,body,state,labels,milestone,url",
+                        "number,title,state,mergedAt,url",
+                        "--repo",
+                        pull_request_repo,
                     ]
                 ),
-                fallback_repo=repository,
+                fallback_repo=pull_request_repo,
             )
-        issues[issue.number] = issue
-        items[issue.number] = ProjectItem(
-            item_id=str(raw_item.get("id") or ""),
-            issue=issue,
-            fields=item_fields_from_raw(raw_item),
-        )
+            pull_requests[pull_request.number] = ProjectPullRequestItem(
+                item_id=str(raw_item.get("id") or ""),
+                pull_request=pull_request,
+                fields=item_fields_from_raw(raw_item),
+            )
 
     dependencies = load_live_dependencies(repository, items.keys())
     return ProjectState(
@@ -427,6 +501,7 @@ def load_live_state(
         fields=fields_from_raw(fields_payload),
         dependencies=dependencies,
         issues=issues,
+        pull_requests=pull_requests,
     )
 
 
@@ -631,6 +706,11 @@ def verify_project_state(state: ProjectState, policy: Policy) -> list[Finding]:
         findings.extend(verify_dependencies(item, state))
         findings.extend(verify_workflow_fields(item, state, policy))
         findings.extend(verify_metadata_fields(item, state, policy))
+    for item in sorted(
+        state.pull_requests.values(),
+        key=lambda project_item: project_item.pull_request.number,
+    ):
+        findings.extend(verify_pull_request_lifecycle_fields(item, state))
     return findings
 
 
@@ -868,6 +948,64 @@ def verify_metadata_fields(item: ProjectItem, state: ProjectState, policy: Polic
     return findings
 
 
+def verify_pull_request_lifecycle_fields(
+    item: ProjectPullRequestItem,
+    state: ProjectState,
+) -> list[Finding]:
+    if not item.pull_request.merged:
+        return []
+
+    findings: list[Finding] = []
+    findings.extend(
+        pull_request_field_findings(
+            item=item,
+            state=state,
+            field_key="workflow_status",
+            expected="Done",
+            check="pull_request_workflow_status",
+            reason="Merged pull requests must have Workflow Status=Done.",
+        )
+    )
+    findings.extend(
+        pull_request_field_findings(
+            item=item,
+            state=state,
+            field_key="status",
+            expected="Done",
+            check="pull_request_status",
+            reason="Merged pull requests must have Status=Done.",
+        )
+    )
+    return findings
+
+
+def pull_request_field_findings(
+    *,
+    item: ProjectPullRequestItem,
+    state: ProjectState,
+    field_key: str,
+    expected: str,
+    check: str,
+    reason: str,
+) -> list[Finding]:
+    current = item.fields.get(field_key)
+    if current == expected:
+        return []
+    return [
+        Finding(
+            check=check,
+            issue_number=item.pull_request.number,
+            title=item.pull_request.title,
+            field_name=CANONICAL_FIELD_TITLES[field_key],
+            current=current,
+            expected=expected,
+            message=reason,
+            safe_fix=field_supports(state, field_key, expected),
+            content_type="PullRequest",
+        )
+    ]
+
+
 def field_findings(
     *,
     item: ProjectItem,
@@ -968,7 +1106,7 @@ def planned_changes(findings: list[Finding], state: ProjectState, policy: Policy
         field_key = canonical_field_name(finding.field_name)
         if field_key not in policy.safe_apply_fields:
             continue
-        item = state.items[finding.issue_number]
+        item = project_item_for_finding(state, finding)
         changes.append(
             PlannedChange(
                 issue_number=finding.issue_number,
@@ -978,15 +1116,34 @@ def planned_changes(findings: list[Finding], state: ProjectState, policy: Policy
                 before=finding.current,
                 after=finding.expected,
                 reason=finding.message,
+                content_type=finding.content_type,
             )
         )
     return changes
 
 
+def project_item_for_finding(
+    state: ProjectState,
+    finding: Finding,
+) -> ProjectItem | ProjectPullRequestItem:
+    if finding.content_type == "PullRequest":
+        return state.pull_requests[finding.issue_number]
+    return state.items[finding.issue_number]
+
+
+def project_item_for_change(
+    state: ProjectState,
+    change: PlannedChange,
+) -> ProjectItem | ProjectPullRequestItem:
+    if change.content_type == "PullRequest":
+        return state.pull_requests[change.issue_number]
+    return state.items[change.issue_number]
+
+
 def apply_changes(changes: list[PlannedChange], state: ProjectState, fixture_mode: bool) -> None:
     if fixture_mode:
         for change in changes:
-            item = state.items[change.issue_number]
+            item = project_item_for_change(state, change)
             if change.after is None:
                 item.fields.pop(change.field_key, None)
             else:
@@ -1023,19 +1180,29 @@ def apply_changes(changes: list[PlannedChange], state: ProjectState, fixture_mod
 
 
 def print_verification_report(findings: list[Finding], state: ProjectState) -> None:
-    print(f"Checked {len(state.items)} GitHub Project issue item(s).")
+    print(
+        "Checked "
+        f"{len(state.items) + len(state.pull_requests)} GitHub Project item(s) "
+        f"({len(state.items)} issue, {len(state.pull_requests)} pull request)."
+    )
     if not findings:
         print("No Project policy mismatches found.")
         return
     print(f"Found {len(findings)} Project policy mismatch(es):")
     for finding in findings:
-        location = f"#{finding.issue_number}"
+        location = format_project_location(finding.content_type, finding.issue_number)
         field_part = f" {finding.field_name}" if finding.field_name else ""
         before_after = ""
         if finding.current != finding.expected:
             before_after = f" current={format_value(finding.current)} expected={format_value(finding.expected)}"
         fix_part = " safe-fix" if finding.safe_fix else " manual"
         print(f"- {finding.check}{field_part} {location}:{before_after} [{fix_part}] {finding.message}")
+
+
+def format_project_location(content_type: str, number: int) -> str:
+    if content_type == "PullRequest":
+        return f"PR #{number}"
+    return f"#{number}"
 
 
 def print_sync_report(
@@ -1052,7 +1219,8 @@ def print_sync_report(
         print("Safe field fixes:")
         for change in changes:
             print(
-                f"- #{change.issue_number} {change.field_name}: "
+                f"- {format_project_location(change.content_type, change.issue_number)} "
+                f"{change.field_name}: "
                 f"{format_value(change.before)} -> {format_value(change.after)}"
             )
     else:
@@ -1061,7 +1229,10 @@ def print_sync_report(
     if manual:
         print(f"Manual-only mismatch(es): {len(manual)}")
         for finding in manual:
-            print(f"- #{finding.issue_number} {finding.check}: {finding.message}")
+            print(
+                f"- {format_project_location(finding.content_type, finding.issue_number)} "
+                f"{finding.check}: {finding.message}"
+            )
     if after is not None:
         print(f"After: {len(after)} mismatch(es) remain.")
 
