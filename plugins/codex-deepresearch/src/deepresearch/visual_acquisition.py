@@ -31,6 +31,11 @@ from .pdf_rasterizer import (
     pdf_renderer_available,
     render_pdf_candidate_artifact,
 )
+from .page_image_extraction import (
+    PROVIDER_NAME as PAGE_IMAGE_EXTRACTOR_PROVIDER,
+    ImageTransport,
+    extract_and_fetch_page_images,
+)
 from .search_handoff import resolve_run_dir
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
@@ -152,6 +157,8 @@ def acquire_visual_candidates(
     real_image_search_config: Mapping[str, Any] | None = None,
     browser_transport: BrowserScreenshotTransport | None = None,
     max_pdf_bytes: int = DEFAULT_MAX_PDF_BYTES,
+    page_image_transport: ImageTransport | None = None,
+    max_fetches: int | None = None,
 ) -> dict[str, Any]:
     """Collect visual candidates for visual routes.
 
@@ -190,6 +197,24 @@ def acquire_visual_candidates(
             created_at=now,
         )
         return status
+
+    if PAGE_IMAGE_EXTRACTOR_PROVIDER in provider_names:
+        return _acquire_with_page_image_extractor(
+            run_dir=run_dir,
+            evidence=evidence,
+            evidence_path=evidence_path,
+            routes=routes,
+            provider_names=provider_names,
+            screenshot_modes=normalized_modes,
+            max_image_bytes=max_image_bytes,
+            max_pdf_bytes=max_pdf_bytes,
+            real_image_search_transport=real_image_search_transport,
+            real_image_search_config=real_image_search_config,
+            browser_transport=browser_transport,
+            page_image_transport=page_image_transport,
+            max_fetches=max_fetches,
+            created_at=now,
+        )
 
     provider_instances = _providers(
         provider_names,
@@ -496,6 +521,306 @@ def acquire_visual_candidates(
     )
     _write_json(run_dir / "visual_acquisition_status.json", status)
     return status
+
+
+def _acquire_with_page_image_extractor(
+    *,
+    run_dir: Path,
+    evidence: dict[str, Any],
+    evidence_path: Path,
+    routes: Sequence[Mapping[str, Any]],
+    provider_names: Sequence[str],
+    screenshot_modes: Sequence[str],
+    max_image_bytes: int,
+    max_pdf_bytes: int,
+    real_image_search_transport: _BraveImageSearchTransport | None,
+    real_image_search_config: Mapping[str, Any] | None,
+    browser_transport: BrowserScreenshotTransport | None,
+    page_image_transport: ImageTransport | None,
+    max_fetches: int | None,
+    created_at: str,
+) -> dict[str, Any]:
+    core_provider_names = tuple(
+        provider for provider in provider_names if provider != PAGE_IMAGE_EXTRACTOR_PROVIDER
+    )
+    core_candidates: list[Mapping[str, Any]] = []
+    core_fetches: list[Mapping[str, Any]] = []
+    core_observations: list[Mapping[str, Any]] = []
+    core_provider_records: list[Mapping[str, Any]] = []
+    core_status: Mapping[str, Any] | None = None
+
+    if core_provider_names:
+        core_status = acquire_visual_candidates(
+            run=run_dir,
+            providers=core_provider_names,
+            screenshot_modes=screenshot_modes,
+            max_image_bytes=max_image_bytes,
+            real_image_search_transport=real_image_search_transport,
+            real_image_search_config=real_image_search_config,
+            browser_transport=browser_transport,
+            max_pdf_bytes=max_pdf_bytes,
+        )
+        core_candidates = _read_jsonl(run_dir / "visual_candidates.jsonl")
+        core_fetches = _read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        core_observations = _read_jsonl(run_dir / "visual_observations.jsonl")
+        core_provider_status = _read_json_object(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        raw_providers = core_provider_status.get("providers")
+        if isinstance(raw_providers, list):
+            core_provider_records = [
+                item for item in raw_providers if isinstance(item, Mapping)
+            ]
+
+    page_status = extract_and_fetch_page_images(
+        run=run_dir,
+        transport=page_image_transport,
+        max_image_bytes=max_image_bytes,
+        max_fetches=max_fetches,
+        provider_mode="real",
+    )
+    page_candidates = _read_jsonl(run_dir / "visual_candidates.jsonl")
+    page_fetches = _read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+    page_provider_status = _read_json_object(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+    raw_page_providers = page_provider_status.get("providers")
+    page_provider_records = (
+        [item for item in raw_page_providers if isinstance(item, Mapping)]
+        if isinstance(raw_page_providers, list)
+        else []
+    )
+
+    candidate_records = [*core_candidates, *page_candidates]
+    image_fetch_records = [*core_fetches, *page_fetches]
+    observations = [item for item in core_observations if isinstance(item, Mapping)]
+    provider_statuses = _dedupe_provider_statuses(
+        [*core_provider_records, *page_provider_records],
+        provider_names=provider_names,
+    )
+    real_provider_succeeded = _real_provider_succeeded(
+        provider_statuses=provider_statuses,
+        image_fetch_records=image_fetch_records,
+    )
+    visual_status = (
+        "real_image_search_candidates_collected"
+        if real_provider_succeeded
+        else _combined_terminal_status_from_fetches(
+            provider_statuses=provider_statuses,
+            image_fetch_records=image_fetch_records,
+        )
+    )
+    visual_ok = real_provider_succeeded
+    visual_terminal = not real_provider_succeeded
+    metric_classification = (
+        "real_provider_candidate_discovery"
+        if real_provider_succeeded
+        else "included_failure"
+    )
+    actionable_cause = (
+        "configured real visual providers returned successful candidates or fetched artifacts"
+        if real_provider_succeeded
+        else _blocked_actionable_cause(provider_statuses)
+    )
+
+    visual_candidates_path = run_dir / "visual_candidates.jsonl"
+    visual_search_plan_path = run_dir / VISUAL_SEARCH_PLAN_FILENAME
+    image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
+    visual_observations_path = run_dir / "visual_observations.jsonl"
+    visual_search_plan = _combined_visual_search_plan(
+        run_dir=run_dir,
+        evidence=evidence,
+        routes=routes,
+        provider_names=provider_names,
+        candidate_records=candidate_records,
+        created_at=created_at,
+        selected_observations=len(observations),
+        state="completed" if real_provider_succeeded else "blocked",
+    )
+    visual_provider_status = _visual_provider_status(
+        run_dir=run_dir,
+        status=visual_status,
+        ok=visual_ok,
+        terminal=visual_terminal,
+        metric_classification=metric_classification,
+        provider_names=provider_names,
+        provider_statuses=provider_statuses,
+        candidate_records=candidate_records,
+        image_fetch_records=image_fetch_records,
+        observations=observations,
+        created_at=created_at,
+        actionable_cause=actionable_cause,
+    )
+    _write_json(visual_search_plan_path, visual_search_plan)
+    _write_jsonl(visual_candidates_path, candidate_records)
+    _write_jsonl(image_fetch_status_path, image_fetch_records)
+    _write_jsonl(visual_observations_path, observations)
+    _write_json(visual_provider_status_path, visual_provider_status)
+
+    evidence = _read_json(evidence_path)
+    candidate_counts = _candidate_counts(candidate_records)
+    removal_counts = _removal_counts(candidate_records)
+    screenshot_capture = _screenshot_capture_summary(candidate_records, provider_statuses)
+    pdf_rasterization = _pdf_rasterization_summary(candidate_records, provider_statuses)
+    route_summary = _route_summary(routes)
+    evidence["visual_acquisition"] = {
+        "schema_version": VISUAL_ACQUISITION_SCHEMA_VERSION,
+        "status": visual_status,
+        "created_at": created_at,
+        "providers": [dict(item) for item in provider_statuses],
+        "routes": route_summary,
+        "candidate_records_path": "visual_candidates.jsonl",
+        "visual_search_plan_path": VISUAL_SEARCH_PLAN_FILENAME,
+        "image_fetch_status_path": IMAGE_FETCH_STATUS_FILENAME,
+        "visual_observations_path": "visual_observations.jsonl",
+        "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
+        "candidate_counts": candidate_counts,
+        "removal_counts": removal_counts,
+        "near_duplicate_groups": [],
+        "screenshot_capture": screenshot_capture,
+        "pdf_rasterization": pdf_rasterization,
+        "validation": {
+            "max_image_bytes": max_image_bytes,
+            "max_pdf_bytes": max_pdf_bytes,
+            "mime_types": list(SUPPORTED_MIME_TYPES),
+            "url_duplicate_check": True,
+            "content_hash_check": True,
+            "near_duplicate_check": True,
+        },
+        "image_search_invocations": _image_search_invocations(provider_statuses),
+        "screenshot_capture_requests": len(screenshot_capture["requests"]),
+        "ocr_records": 0,
+        "external_network_call": any(
+            bool(status.get("external_network_call")) for status in provider_statuses
+        ),
+        "external_ocr_call": False,
+        "external_vlm_call": False,
+        "composed_page_image_extraction": {
+            "status": page_status.get("status"),
+            "candidate_records": page_status.get("candidate_records"),
+            "fetch_records": page_status.get("fetch_records"),
+            "images_linked": page_status.get("images_linked"),
+        },
+    }
+    if core_status is not None:
+        evidence["visual_acquisition"]["composed_core_acquisition"] = {
+            "status": core_status.get("status"),
+            "candidate_records": core_status.get("candidate_records"),
+            "selected_observations": core_status.get("selected_observations"),
+        }
+    handoff = evidence.get("handoff")
+    if isinstance(handoff, dict):
+        handoff["visual_observations_path"] = "visual_observations.jsonl"
+        handoff["visual_candidates_path"] = "visual_candidates.jsonl"
+        handoff["visual_search_plan_path"] = VISUAL_SEARCH_PLAN_FILENAME
+        handoff["image_fetch_status_path"] = IMAGE_FETCH_STATUS_FILENAME
+        handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
+        handoff["visual_status"] = visual_status
+    budget = evidence.get("budget")
+    if isinstance(budget, dict):
+        budget["images_selected"] = sum(
+            1
+            for fetch in image_fetch_records
+            if isinstance(fetch, Mapping) and fetch.get("fetch_status") == "fetched"
+        )
+    _write_json(evidence_path, evidence)
+
+    validation = validate_artifacts(
+        evidence_path=evidence_path,
+        visual_observations_path=visual_observations_path,
+    )
+    visual_artifact_validation = validate_visual_artifacts(
+        run_dir=run_dir,
+        visual_search_plan_path=visual_search_plan_path,
+        visual_candidates_path=visual_candidates_path,
+        image_fetch_status_path=image_fetch_status_path,
+        visual_observations_path=visual_observations_path,
+        visual_provider_status_path=visual_provider_status_path,
+        evidence_path=evidence_path,
+    )
+    status = _base_status(run_dir, evidence, visual_status, created_at)
+    status.update(
+        {
+            "ok": visual_ok,
+            "terminal": visual_terminal,
+            "providers": [dict(item) for item in provider_statuses],
+            "candidate_records": len(candidate_records),
+            "selected_observations": len(observations),
+            "candidate_counts": candidate_counts,
+            "removal_counts": removal_counts,
+            "near_duplicate_groups": [],
+            "screenshot_capture": screenshot_capture,
+            "pdf_rasterization": pdf_rasterization,
+            "validation": validation.to_dict(),
+            "visual_artifact_validation": visual_artifact_validation.to_dict(),
+            "image_search_invocations": evidence["visual_acquisition"][
+                "image_search_invocations"
+            ],
+            "screenshot_capture_requests": evidence["visual_acquisition"][
+                "screenshot_capture_requests"
+            ],
+            "ocr_records": evidence["visual_acquisition"]["ocr_records"],
+            "external_network_call": evidence["visual_acquisition"][
+                "external_network_call"
+            ],
+            "external_ocr_call": False,
+            "external_vlm_call": False,
+            "diagnostics": {"actionable_cause": actionable_cause},
+            "artifacts": {
+                "evidence": str(evidence_path),
+                "visual_search_plan": str(visual_search_plan_path),
+                "visual_candidates": str(visual_candidates_path),
+                "image_fetch_status": str(image_fetch_status_path),
+                "visual_observations": str(visual_observations_path),
+                "visual_provider_status": str(visual_provider_status_path),
+                "visual_acquisition_status": str(run_dir / "visual_acquisition_status.json"),
+                "page_image_extraction_status": str(
+                    run_dir / "page_image_extraction_status.json"
+                ),
+            },
+        }
+    )
+    _write_json(run_dir / "visual_acquisition_status.json", status)
+    return status
+
+
+def _dedupe_provider_statuses(
+    provider_statuses: Sequence[Mapping[str, Any]],
+    *,
+    provider_names: Sequence[str],
+) -> list[dict[str, Any]]:
+    by_provider: dict[str, dict[str, Any]] = {}
+    for status in provider_statuses:
+        provider = _string(status.get("provider"))
+        if provider:
+            by_provider[provider] = dict(status)
+    ordered = []
+    for provider in provider_names:
+        if provider in by_provider:
+            ordered.append(by_provider.pop(provider))
+    ordered.extend(by_provider.values())
+    return ordered
+
+
+def _combined_terminal_status_from_fetches(
+    *,
+    provider_statuses: Sequence[Mapping[str, Any]],
+    image_fetch_records: Sequence[Mapping[str, Any]],
+) -> str:
+    provider_status_names = {
+        str(status.get("status") or "")
+        for status in provider_statuses
+        if isinstance(status, Mapping)
+    }
+    if "blocked_missing_visual_provider" in provider_status_names:
+        return "blocked_missing_visual_provider"
+    fetch_statuses = {
+        str(fetch.get("fetch_status") or "")
+        for fetch in image_fetch_records
+        if isinstance(fetch, Mapping)
+    }
+    if fetch_statuses and fetch_statuses <= {"policy_blocked"}:
+        return "policy_blocked_visual"
+    if "budget_pruned" in fetch_statuses:
+        return "budget_pruned_visual"
+    return "partial_auto_visual"
 
 
 class _LocalPageProvider:
@@ -1926,7 +2251,7 @@ def _real_provider_succeeded(
         ) > 0:
             return True
     return any(
-        record.get("provider_kind") in {"screenshot", "pdf_rasterizer"}
+        record.get("provider_kind") in {"page_extractor", "screenshot", "pdf_rasterizer"}
         and record.get("fetch_status") == "fetched"
         and isinstance(record.get("local_artifact_path"), str)
         and bool(record.get("local_artifact_path"))
@@ -2033,6 +2358,92 @@ def _visual_search_plan(
                 "estimated_cost_usd": 0.0,
                 "state": state,
             }
+        )
+    return {
+        "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
+        "run_id": str(evidence.get("run_id") or run_dir.name),
+        "created_at": created_at,
+        "tasks": tasks,
+    }
+
+
+def _combined_visual_search_plan(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    routes: Sequence[Mapping[str, Any]],
+    provider_names: Sequence[str],
+    candidate_records: Sequence[Mapping[str, Any]],
+    created_at: str,
+    selected_observations: int,
+    state: str,
+) -> dict[str, Any]:
+    if not candidate_records:
+        return _visual_search_plan(
+            run_dir=run_dir,
+            evidence=evidence,
+            routes=routes,
+            provider_names=provider_names,
+            created_at=created_at,
+            selected_observations=selected_observations,
+            state=state,
+        )
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for candidate in candidate_records:
+        plan_id = _string(candidate.get("plan_id"))
+        task_id = _string(candidate.get("task_id"))
+        angle_id = _string(candidate.get("angle_id"))
+        if not plan_id or not task_id or not angle_id:
+            continue
+        key = (plan_id, task_id, angle_id)
+        task = grouped.setdefault(
+            key,
+            {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "angle_id": angle_id,
+                "route": _string(candidate.get("route")) or "visual_required",
+                "target_evidence_type": _target_evidence_type(
+                    [_string(candidate.get("provider")) or ""]
+                ),
+                "query": str(evidence.get("question") or ""),
+                "providers": [],
+                "source_search_result_ids": [],
+                "caps": {
+                    "max_candidates": 0,
+                    "max_fetches": 0,
+                    "max_vlm_images": 0,
+                    "max_cost_usd": _budget_cost_cap(evidence),
+                },
+                "policy_constraints": {
+                    "license_policy": "allowed",
+                    "robots_policy": "allowed",
+                    "policy_decision": "allowed",
+                },
+                "estimated_cost_usd": 0.0,
+                "state": state,
+            },
+        )
+        provider = _string(candidate.get("provider"))
+        if provider and provider not in task["providers"]:
+            task["providers"].append(provider)
+        result_id = _string(candidate.get("source_search_result_id"))
+        if result_id and result_id not in task["source_search_result_ids"]:
+            task["source_search_result_ids"].append(result_id)
+        task["caps"]["max_candidates"] += 1
+        if candidate.get("candidate_status") in {"fetched", "analyzed"}:
+            task["caps"]["max_fetches"] += 1
+            task["caps"]["max_vlm_images"] += 1
+        task["estimated_cost_usd"] += float(candidate.get("estimated_cost_usd") or 0.0)
+    tasks = list(grouped.values())
+    for task in tasks:
+        if not task["providers"]:
+            task["providers"] = list(provider_names)
+        task["target_evidence_type"] = _target_evidence_type(task["providers"])
+        task["caps"]["max_fetches"] = max(task["caps"]["max_fetches"], selected_observations)
+        task["caps"]["max_vlm_images"] = max(
+            task["caps"]["max_vlm_images"],
+            selected_observations,
         )
     return {
         "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
@@ -2163,7 +2574,7 @@ def _visual_provider_status(
 def _provider_kind(provider: str) -> str:
     if provider == BRAVE_IMAGE_PROVIDER:
         return "web_image_search"
-    if provider == "local-page":
+    if provider in {"local-page", PAGE_IMAGE_EXTRACTOR_PROVIDER}:
         return "page_extractor"
     if provider == "local-image-fixture":
         return "web_image_search"
@@ -3169,6 +3580,7 @@ def _sanitized_result_metadata(
 def _is_real_provider_name(provider: str) -> bool:
     return provider in {
         BRAVE_IMAGE_PROVIDER,
+        PAGE_IMAGE_EXTRACTOR_PROVIDER,
         BROWSER_SCREENSHOT_PROVIDER,
         DEFAULT_PDF_RASTERIZER_PROVIDER,
     }
@@ -3254,7 +3666,7 @@ def _blocked_actionable_cause(provider_statuses: Sequence[Mapping[str, Any]]) ->
             reasons.append(f"{provider}: {reason}")
     suffix = "; ".join(reasons) if reasons else "no configured or available real visual provider"
     return (
-        "visual_required route needs a configured and available real image search provider; "
+        "visual_required route needs a configured and available real visual acquisition provider; "
         + suffix
     )
 
@@ -3550,6 +3962,38 @@ def _read_json(path: Path) -> dict[str, Any]:
     if payload.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
         raise VisualAcquisitionError(f"evidence schema_version must be {EVIDENCE_SCHEMA_VERSION}")
     return payload
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise VisualAcquisitionError(f"missing JSON file: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise VisualAcquisitionError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise VisualAcquisitionError(f"expected JSON object in {path}")
+    return payload
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise VisualAcquisitionError(
+                f"invalid JSONL record in {path} line {line_number}: {exc}"
+            ) from exc
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

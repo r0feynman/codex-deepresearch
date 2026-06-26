@@ -12,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
+import deepresearch.invocation_router as invocation_router  # noqa: E402
 from deepresearch.invocation_router import run_skill_invocation  # noqa: E402
+from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
+from deepresearch.vision_adapter import OpenAIResponsesVisionResult  # noqa: E402
 
 
 class InvocationRouterTests(unittest.TestCase):
@@ -197,7 +200,7 @@ class InvocationRouterTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["terminal"])
-        self.assertEqual(result["status"], "blocked_missing_visual_provider")
+        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
         self.assertIn("actionable_cause", result["diagnostics"])
         self.assertIn("codex exec is not available on PATH", result["diagnostics"]["actionable_cause"])
         self.assertIn("run_status", result["artifacts"])
@@ -207,7 +210,7 @@ class InvocationRouterTests(unittest.TestCase):
         run_status = self.read_json(Path(result["artifacts"]["run_status"]))
         self.assertFalse(run_status["ok"])
         self.assertTrue(run_status["terminal"])
-        self.assertEqual(run_status["status"], "blocked_missing_visual_provider")
+        self.assertEqual(run_status["status"], "blocked_missing_vlm_provider")
         self.assertEqual(
             run_status["diagnostics"]["actionable_cause"],
             result["diagnostics"]["actionable_cause"],
@@ -216,7 +219,7 @@ class InvocationRouterTests(unittest.TestCase):
         visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
         self.assertFalse(visual_provider_status["ok"])
         self.assertTrue(visual_provider_status["terminal"])
-        self.assertEqual(visual_provider_status["status"], "blocked_missing_visual_provider")
+        self.assertEqual(visual_provider_status["status"], "blocked_missing_vlm_provider")
         self.assertEqual(
             visual_provider_status["diagnostics"]["actionable_cause"],
             result["diagnostics"]["actionable_cause"],
@@ -227,7 +230,7 @@ class InvocationRouterTests(unittest.TestCase):
 
         trace = self.read_jsonl(Path(result["artifacts"]["run_trace"]))
         self.assertEqual(trace[-1]["event_type"], "visual_provider_preflight")
-        self.assertEqual(trace[-1]["status"], "blocked_missing_visual_provider")
+        self.assertEqual(trace[-1]["status"], "blocked_missing_vlm_provider")
         self.assertEqual(trace[-1]["provider"], "codex-interactive")
         self.assertEqual(trace[-1]["adapter"], "codex-exec")
 
@@ -379,7 +382,10 @@ class InvocationRouterTests(unittest.TestCase):
 
         def fake_acquire(*, run, providers, **_kwargs):
             call_order.append("acquire")
-            self.assertEqual(tuple(providers), ("browser-screenshot",))
+            self.assertEqual(
+                tuple(providers),
+                ("brave-image-search", "page-image-extractor", "browser-screenshot"),
+            )
             run_dir = Path(run)
             self.write_json(
                 run_dir / "visual_search_plan.json",
@@ -683,6 +689,354 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertTrue(visual_provider_status["ok"])
         self.assertTrue(visual_provider_status["terminal"])
         self.assertEqual(visual_provider_status["metric_classification"], "success")
+
+    def test_completed_auto_visual_finalization_requires_ten_real_candidates(self) -> None:
+        class PassingVisualValidation:
+            valid = True
+
+            def to_dict(self) -> dict:
+                return {"valid": True, "errors": []}
+
+        run_dir = self.temp_runs_dir() / "run_quant_gate"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "run_id": run_dir.name,
+                "routing": [
+                    {"id": "angle_001", "modality": "visual_required", "max_images": 12}
+                ],
+                "images": [
+                    {
+                        "id": f"img_auto_visual_{index:03d}",
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "observations": ["The image supports the visual claim."],
+                        "policy_decision": "allowed",
+                    }
+                    for index in range(1, 4)
+                ],
+                "claims": [
+                    {
+                        "id": "claim_visual_gate",
+                        "text": "The automatically acquired image supports the report.",
+                        "claim_type": "mixed",
+                        "supporting_images": ["img_auto_visual_001"],
+                        "verification_status": "supported",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_auto_visual_{index:03d}",
+                    "provider": "page-image-extractor",
+                    "provider_kind": "page_extractor",
+                    "provider_mode": "real",
+                }
+                for index in range(1, 10)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": f"fetch_auto_visual_{index:03d}",
+                    "candidate_id": f"cand_auto_visual_{index:03d}",
+                    "provider": "page-image-extractor",
+                    "provider_kind": "page_extractor",
+                    "provider_mode": "real",
+                    "fetch_status": "fetched",
+                    "evidence_image_id": f"img_auto_visual_{index:03d}",
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "evidence_image_id": f"img_auto_visual_{index:03d}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "observation_status": "analyzed",
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.write_json(
+            run_dir / "report_status.json",
+            {"status": "completed", "used_images": ["img_auto_visual_001"]},
+        )
+        self.write_json(
+            run_dir / "visual_provider_status.json",
+            {
+                "status": "codex_interactive_visual_worker_analyzed",
+                "providers": [
+                    {
+                        "provider": "page-image-extractor",
+                        "provider_kind": "page_extractor",
+                        "provider_mode": "real",
+                        "invocations": 1,
+                        "candidates_discovered": 9,
+                        "artifacts_fetched": 3,
+                        "vlm_images_analyzed": 0,
+                    },
+                    {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "invocations": 1,
+                        "candidates_discovered": 0,
+                        "artifacts_fetched": 3,
+                        "vlm_images_analyzed": 3,
+                    },
+                ],
+            },
+        )
+
+        with mock.patch(
+            "deepresearch.invocation_router.validate_visual_artifacts",
+            return_value=PassingVisualValidation(),
+        ):
+            result = invocation_router._finalize_automatic_visual_completion(
+                run_dir=run_dir,
+                visual_stage_status={},
+            )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["visual_release_gate"]["valid"])
+        self.assertIn(
+            "at_least_10_real_image_centric_candidates",
+            result["visual_release_gate"]["failures"],
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+
+    def test_visual_required_full_runner_uses_real_acquire_ingest_verify_synthesize_stack(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        class FakeCodexClient:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def analyze_image(self, *, image_path, mime_type, prompt, config, metadata):
+                self.calls.append(
+                    {
+                        "image_path": image_path,
+                        "mime_type": mime_type,
+                        "prompt": prompt,
+                        "metadata": dict(metadata),
+                    }
+                )
+                ordinal = len(self.calls)
+                return OpenAIResponsesVisionResult(
+                    observations=(
+                        f"Automatic product visual {ordinal} shows a public chart or UI state.",
+                        f"OCR text for automatic visual {ordinal} is visible.",
+                    ),
+                    inferences=("The image can support a visual research claim.",),
+                    caveats=(),
+                    ocr_text=f"Automatic visual {ordinal}",
+                    confidence=0.86,
+                    response_id=f"codex_auto_visual_{ordinal:03d}",
+                    model=config.model,
+                    usage={"events": 2},
+                    raw_provider_metadata={"response_id": f"codex_auto_visual_{ordinal:03d}"},
+                    actual_cost_usd=0.0,
+                )
+
+        def png_bytes(index: int) -> bytes:
+            return (
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02"
+                b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00\xef\xbf\xa7\xdb"
+                b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                + f"auto-visual-{index}".encode("ascii")
+            )
+
+        def image_url(index: int) -> str:
+            return f"https://images.example.com/auto-visual-{index}.png"
+
+        def fake_default_fetch_image(url: str, *, timeout_seconds: float, max_image_bytes: int):
+            index = int(url.rsplit("-", 1)[1].split(".", 1)[0])
+            return FetchResponse(
+                content=png_bytes(index),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            sources_dir = run_dir / "sources"
+            sources_dir.mkdir(exist_ok=True)
+            page_path = sources_dir / "auto-visual-page.html"
+            image_tags = "\n".join(
+                (
+                    f'<figure><img src="{image_url(index)}" '
+                    f'alt="Automatic visual chart {index}" '
+                    f'data-phash="auto-visual-{index}" width="640" height="360">'
+                    f"<figcaption>Automatic visual chart {index}</figcaption></figure>"
+                )
+                for index in range(1, 11)
+            )
+            page_path.write_text(
+                f"<html><body><main>{image_tags}</main></body></html>",
+                encoding="utf-8",
+            )
+            evidence = self.read_json(run_dir / "evidence.json")
+            evidence["sources"] = [
+                {
+                    "id": "src_auto_visual_page",
+                    "type": "web",
+                    "url": "https://example.com/auto-visual-page",
+                    "title": "Public-safe automatic visual fixture page",
+                    "published_at": None,
+                    "accessed_at": "2026-06-26T00:00:00Z",
+                    "quality": "primary",
+                    "retrieval_status": "fetched",
+                    "local_artifact_path": "sources/auto-visual-page.html",
+                    "license_policy": "allowed",
+                    "robots_policy": "allowed",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "route": "visual_required",
+                    "angle_id": "angle_001",
+                    "task_id": "task_search_001",
+                    "search_result_id": "search_auto_visual_page",
+                }
+            ]
+            evidence.setdefault("budget", {})["max_images"] = 12
+            self.write_json(run_dir / "evidence.json", evidence)
+            payload = {
+                "status": "completed_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 1,
+                "failure_counts": {},
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 1,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "attempted_real_child_execution": True,
+                    "real_child_execution": True,
+                    "real_use_e2e_eligible": True,
+                },
+                "merge": {"accepted_shards": [{"task_id": "task_research_001"}]},
+                "artifacts": {
+                    "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json")
+                },
+            }
+            self.write_json(run_dir / "parallel_orchestration_status.json", payload)
+            return payload
+
+        codex_client = FakeCodexClient()
+        with (
+            mock.patch("deepresearch.invocation_router.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.vision_adapter.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.page_image_extraction._default_fetch_image",
+                side_effect=fake_default_fetch_image,
+            ),
+            mock.patch(
+                "deepresearch.page_image_extraction._is_private_or_reserved_http_url",
+                return_value=False,
+            ),
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch(
+                "deepresearch.vision_adapter._SubprocessCodexInteractiveVisionClient",
+                return_value=codex_client,
+            ),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: inspect public product screenshots and chart images for visual evidence",
+                runs_dir=runs_dir,
+                route="visual_required",
+                budget_preset="quick",
+                max_images=12,
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "completed_auto_visual")
+        self.assertTrue(result["visual_release_gate"]["valid"], result["visual_release_gate"])
+        self.assertGreaterEqual(result["visual_release_gate"]["counts"]["real_candidates"], 10)
+        self.assertGreaterEqual(
+            result["visual_release_gate"]["counts"]["codex_interactive_real_analyzed_images"],
+            3,
+        )
+        self.assertGreaterEqual(len(codex_client.calls), 3)
+
+        run_dir = Path(result["run_dir"])
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        evidence = self.read_json(run_dir / "evidence.json")
+        report_status = self.read_json(run_dir / "report_status.json")
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+
+        self.assertIn("page-image-extractor", {candidate["provider"] for candidate in candidates})
+        self.assertGreaterEqual(
+            len(
+                [
+                    candidate
+                    for candidate in candidates
+                    if candidate["provider"] == "page-image-extractor"
+                    and candidate["provider_mode"] == "real"
+                ]
+            ),
+            10,
+        )
+        self.assertGreaterEqual(
+            len([fetch for fetch in fetches if fetch["fetch_status"] == "fetched"]),
+            3,
+        )
+        self.assertGreaterEqual(
+            len(
+                [
+                    observation
+                    for observation in observations
+                    if observation["provider"] == "codex-interactive"
+                    and observation["provider_mode"] == "real"
+                    and observation["observation_status"] == "analyzed"
+                ]
+            ),
+            3,
+        )
+        self.assertTrue(report_status["used_images"])
+        self.assertTrue(
+            any(
+                claim.get("claim_type") in {"visual", "mixed"}
+                and claim.get("verification_status") == "supported"
+                and set(claim.get("supporting_images", [])) & set(report_status["used_images"])
+                for claim in evidence["claims"]
+                if isinstance(claim, dict)
+            )
+        )
+        self.assertEqual(provider_status["status"], "completed_auto_visual")
+        provider_names = {provider["provider"] for provider in provider_status["providers"]}
+        self.assertIn("brave-image-search", provider_names)
+        self.assertIn("page-image-extractor", provider_names)
+        self.assertIn("browser-screenshot", provider_names)
+        self.assertIn("codex-interactive", provider_names)
+        codex_provider = next(
+            provider
+            for provider in provider_status["providers"]
+            if provider["provider"] == "codex-interactive"
+        )
+        self.assertEqual(codex_provider["vlm_images_analyzed"], len(codex_client.calls))
+        self.assertTrue(codex_provider["codex_native_handoff"])
+        self.assertFalse(codex_provider["hidden_codex_api_call"])
 
     def test_visual_required_blocks_before_synthesis_when_codex_vlm_provider_is_missing(self) -> None:
         runs_dir = self.temp_runs_dir()

@@ -448,17 +448,24 @@ def run_acquire_visual(args: argparse.Namespace) -> int:
     try:
         providers = normalize_acquire_visual_providers(args.provider)
         if PAGE_IMAGE_EXTRACTOR_PROVIDER in providers:
-            if providers != (PAGE_IMAGE_EXTRACTOR_PROVIDER,):
-                raise VisualAcquisitionError(
-                    f"{PAGE_IMAGE_EXTRACTOR_PROVIDER} cannot be combined with fixture providers"
+            if providers == (PAGE_IMAGE_EXTRACTOR_PROVIDER,):
+                result = extract_and_fetch_page_images(
+                    run=args.run,
+                    runs_dir=resolve_repo_path(args.runs_dir),
+                    max_image_bytes=args.max_image_bytes,
+                    max_fetches=args.max_fetches,
+                    provider_mode="real",
                 )
-            result = extract_and_fetch_page_images(
-                run=args.run,
-                runs_dir=resolve_repo_path(args.runs_dir),
-                max_image_bytes=args.max_image_bytes,
-                max_fetches=args.max_fetches,
-                provider_mode="real",
-            )
+            else:
+                result = acquire_visual_candidates(
+                    run=args.run,
+                    runs_dir=resolve_repo_path(args.runs_dir),
+                    providers=args.provider,
+                    screenshot_modes=args.screenshot_mode,
+                    max_image_bytes=args.max_image_bytes,
+                    max_pdf_bytes=args.max_pdf_bytes,
+                    max_fetches=args.max_fetches,
+                )
         else:
             result = acquire_visual_candidates(
                 run=args.run,
