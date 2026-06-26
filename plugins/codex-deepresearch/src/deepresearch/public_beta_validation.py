@@ -307,7 +307,14 @@ def run_public_beta_validation(
         gate_results,
         validation_time=generated_at,
     )
-    required_gate_ids = _required_completion_gate_ids(completion_mode)
+    required_gate_ids = _required_completion_gate_ids(
+        completion_mode,
+        prompt_metrics=prompt_metrics,
+    )
+    prompt_metrics = _prompt_metrics_with_completion_roles(
+        prompt_metrics,
+        required_gate_ids=required_gate_ids,
+    )
     acceptance = _acceptance(
         manifest=manifest,
         evaluated_runs=evaluated_runs,
@@ -369,9 +376,13 @@ def run_public_beta_validation(
         ),
         "release_gate_components": {
             "completion_mode": completion_mode,
+            "required_prompt_metric_gate_ids": sorted(required_gate_ids),
             "required_codex_native_gate_ids": sorted(required_gate_ids),
             "prompt_metrics_ready": prompt_release_gate_ready,
             "external_gates_required": external_gates_required,
+            "required_external_gate_ids": sorted(external_gate_results)
+            if external_gates_required
+            else [],
             "external_gates_ready": external_release_gate_ready,
             "supplied_real_runs_ready": acceptance.get(
                 "all_prompt_runs_are_supplied_sanitized_real_runs",
@@ -380,12 +391,17 @@ def run_public_beta_validation(
             "optional_diagnostic_gate_ids": sorted(
                 set(GATE_THRESHOLDS)
                 if not external_gates_required
-                else OPTIONAL_DIAGNOSTIC_GATE_IDS
+                else set()
             ),
             "optional_diagnostic_gates_failed": [
                 gate_id
                 for gate_id, result in sorted(external_gate_results.items())
-                if result.get("status") == "failed"
+                if not external_gates_required and result.get("status") == "failed"
+            ],
+            "failed_external_gate_ids": [
+                gate_id
+                for gate_id, result in sorted(external_gate_results.items())
+                if external_gates_required and result.get("status") == "failed"
             ],
         },
         "prompt_coverage": {
@@ -815,10 +831,32 @@ def _metric_summary(
     }
 
 
-def _required_completion_gate_ids(completion_mode: str) -> set[str]:
+def _required_completion_gate_ids(
+    completion_mode: str,
+    *,
+    prompt_metrics: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
     if completion_mode == "codex-native":
         return set(CODEX_NATIVE_COMPLETION_GATE_IDS)
-    return set(GATE_THRESHOLDS)
+    return {
+        metric_id
+        for metric_id, metric in prompt_metrics.items()
+        if int(metric.get("prompt_count") or 0) > 0
+    }
+
+
+def _prompt_metrics_with_completion_roles(
+    prompt_metrics: Mapping[str, Mapping[str, Any]],
+    *,
+    required_gate_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    metrics: dict[str, dict[str, Any]] = {}
+    for metric_id, metric in prompt_metrics.items():
+        updated = dict(metric)
+        updated["completion_required"] = metric_id in required_gate_ids
+        updated["diagnostic_only"] = metric_id not in required_gate_ids
+        metrics[metric_id] = updated
+    return metrics
 
 
 def _external_gate_results(

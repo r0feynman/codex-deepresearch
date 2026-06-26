@@ -1159,7 +1159,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Release completion path. codex-native requires supplied Codex-plugin "
             "handoff runs and treats external/provider gates as diagnostics; "
-            "external-gated also requires every supplied gate result to pass."
+            "external-gated also requires every supported external gate result "
+            "to be supplied and pass."
         ),
     )
     public_beta.add_argument(

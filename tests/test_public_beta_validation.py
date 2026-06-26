@@ -20,6 +20,11 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
     EXTERNAL_GATE_REQUIREMENTS,
     PublicBetaValidationError,
+    _AUTOMATED_VISUAL_REQUIRED_ACCEPTANCE,
+    _AUTOMATED_VISUAL_REQUIRED_ARTIFACTS,
+    _AUTOMATED_VISUAL_REQUIRED_SCENARIOS,
+    _FRESH_SESSION_REQUIRED_ACCEPTANCE,
+    _FRESH_SESSION_VISUAL_REQUIRED_ACCEPTANCE,
     evaluate_public_beta_prompt_run,
     load_public_beta_prompt_manifest,
     run_public_beta_validation,
@@ -391,6 +396,65 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "automated_cli_real_provider_visual_e2e"
             ]["status"],
             "not_supplied",
+        )
+        self.assertEqual(
+            payload["remaining_gaps"],
+            ["No remaining release-gate gaps were detected."],
+        )
+
+    def test_external_gated_completion_accepts_automated_cli_as_external_json_only(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        runs_dir = self.temp_dir()
+        suite_id = "external-gated-real-use"
+        prompt_runs = self.write_all_passing_prompt_runs(
+            manifest,
+            runs_dir=runs_dir / "prompt-runs",
+            suite_id=suite_id,
+        )
+        gate_results = {}
+        for gate_id in EXTERNAL_GATE_REQUIREMENTS:
+            gate_path = runs_dir / f"{gate_id}.json"
+            self.write_json(gate_path, self.passing_external_gate_payload(gate_id))
+            gate_results[gate_id] = gate_path
+
+        payload = run_public_beta_validation(
+            runs_dir=self.temp_dir(),
+            suite_id=suite_id,
+            clean=True,
+            prompt_runs=prompt_runs,
+            gate_results=gate_results,
+            completion_mode="external-gated",
+        )
+
+        automated_cli_gate = "automated_cli_real_provider_visual_e2e"
+        components = payload["release_gate_components"]
+        self.assertEqual(payload["status"], "passed")
+        self.assertTrue(payload["release_gate_ready"])
+        self.assertTrue(payload["issue_75_completion_ready"])
+        self.assertTrue(components["prompt_metrics_ready"])
+        self.assertTrue(components["external_gates_required"])
+        self.assertTrue(components["external_gates_ready"])
+        self.assertNotIn(automated_cli_gate, components["required_prompt_metric_gate_ids"])
+        self.assertNotIn(automated_cli_gate, components["required_codex_native_gate_ids"])
+        self.assertIn(automated_cli_gate, components["required_external_gate_ids"])
+        self.assertEqual(components["optional_diagnostic_gate_ids"], [])
+        self.assertEqual(components["failed_external_gate_ids"], [])
+        self.assertEqual(
+            payload["prompt_metrics"][automated_cli_gate]["prompt_count"],
+            0,
+        )
+        self.assertFalse(
+            payload["prompt_metrics"][automated_cli_gate]["completion_required"]
+        )
+        self.assertTrue(
+            all(
+                result["status"] == "passed"
+                for result in payload["external_gate_results"].values()
+            )
+        )
+        self.assertEqual(
+            payload["external_gate_results"][automated_cli_gate]["status"],
+            "passed",
         )
         self.assertEqual(
             payload["remaining_gaps"],
@@ -789,6 +853,109 @@ class PublicBetaValidationTests(unittest.TestCase):
                     status="completed_parallel",
                 )
         return prompt_runs
+
+    def passing_external_gate_payload(self, gate_id: str) -> dict[str, Any]:
+        payload = self.minimal_spoofed_gate_payload(gate_id)
+        payload["release_gate_ready"] = True
+        if gate_id == "fresh_session_full_runner_artifact_handoff":
+            payload["acceptance"] = {
+                key: True for key in _FRESH_SESSION_REQUIRED_ACCEPTANCE
+            }
+            payload["skill_transcript_gate"] = {
+                "status": "passed",
+                "route_command": "$deep-research: public beta text fixture",
+            }
+            payload["runner_artifact_gate"] = {"status": "passed"}
+            payload["scenarios"] = [
+                {
+                    "id": "completed-real-parallel",
+                    "status": "passed",
+                    "terminal_outcome": "completed_real_parallel",
+                    "provenance_class": "real_parallel",
+                    "validation": {
+                        "status": "passed",
+                        "required_artifacts": ["run_status"],
+                    },
+                    "artifacts": {"run_status": "run_status.json"},
+                }
+            ]
+        elif gate_id == "codex_plugin_interactive_visual_e2e":
+            payload["release_gate_status"] = "passed"
+            payload["acceptance"] = {
+                key: True for key in _FRESH_SESSION_VISUAL_REQUIRED_ACCEPTANCE
+            }
+            payload["skill_transcript_gate"] = {"status": "passed"}
+            payload["scenarios"] = [
+                {
+                    "id": "visual-release",
+                    "visual_release_gate": {
+                        "schema_version": "codex-deepresearch.fresh-session-visual-e2e.v0",
+                        "release_gate_passed": True,
+                        "status": "completed_auto_visual",
+                        "codex_interactive_analyzed_images": 3,
+                        "report_cited_visual_or_mixed_claims": 1,
+                        "visual_artifact_validation": {"valid": True},
+                        "checks": {
+                            "codex_native_visual_acquisition_evidence": True,
+                            "codex_interactive_vlm_handoff_observations": True,
+                            "report_cited_visual_or_mixed_claim": True,
+                        },
+                        "required_response_artifacts": [
+                            "run_status",
+                            "evidence",
+                            "visual_tasks",
+                            "visual_observations",
+                            "visual_provider_status",
+                            "report",
+                            "report_status",
+                            "visual_candidates",
+                            "image_fetch_status",
+                        ],
+                    },
+                }
+            ]
+        elif gate_id in {
+            "automated_cli_real_provider_visual_e2e",
+            "automatic_web_visual_e2e",
+        }:
+            payload["acceptance"] = {
+                key: True for key in _AUTOMATED_VISUAL_REQUIRED_ACCEPTANCE
+            }
+            payload["external_network_call"] = True
+            payload["external_vlm_call"] = True
+            payload["blockers"] = []
+            payload["scenario_prompts"] = [
+                {"id": scenario_id}
+                for scenario_id in sorted(_AUTOMATED_VISUAL_REQUIRED_SCENARIOS)
+            ]
+            payload["scenarios"] = [
+                {
+                    "id": scenario_id,
+                    "status": "passed",
+                    "run_status": "completed_auto_visual",
+                    "visual_provider_status": "completed_auto_visual",
+                    "ok": True,
+                    "terminal": True,
+                    "external_network_call": True,
+                    "external_vlm_call": True,
+                    "visual_artifact_validation": {"valid": True},
+                    "artifacts": {
+                        name: f"{name}.json"
+                        for name in sorted(_AUTOMATED_VISUAL_REQUIRED_ARTIFACTS)
+                    },
+                    "counts": {
+                        "scenario_real_candidates": 10,
+                        "real_openai_responses_vision_observations": 3,
+                        "report_cited_visual_or_mixed_claims": 1,
+                    },
+                    "release_numerator_counts": {
+                        "real_vlm_images_analyzed": 3,
+                        "report_cited_visual_or_mixed_claims": 1,
+                    },
+                }
+                for scenario_id in sorted(_AUTOMATED_VISUAL_REQUIRED_SCENARIOS)
+            ]
+        return payload
 
     def minimal_spoofed_gate_payload(self, gate_id: str) -> dict[str, Any]:
         requirements = EXTERNAL_GATE_REQUIREMENTS[gate_id]
