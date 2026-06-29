@@ -61,6 +61,7 @@ python3 /home/user/.codex/skills/.system/plugin-creator/scripts/validate_plugin.
 plugins/codex-deepresearch/scripts/codex-deepresearch mvp-smoke --runs-dir /tmp/codex-deepresearch-mvp-smoke --suite-id mvp-smoke --clean --invoke '$deep-research: MVP smoke text-only fixture'
 plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-e2e --runs-dir /tmp/codex-deepresearch-fresh-session-e2e --suite-id fresh-session-e2e --clean --real-codex-exec skip
 tmpdir=/tmp/codex-deepresearch-fresh-session-visual-e2e; rm -rf "$tmpdir"; plugins/codex-deepresearch/scripts/codex-deepresearch fresh-session-visual-e2e --runs-dir "$tmpdir" --suite-id fresh-session-visual-e2e --clean --real-codex-interactive skip
+tmpdir=/tmp/codex-deepresearch-sanitized-real-visual-e2e; rm -rf "$tmpdir"; plugins/codex-deepresearch/scripts/codex-deepresearch sanitized-real-visual-e2e --runs-dir "$tmpdir" --suite-id sanitized-real-visual-e2e --clean
 plugins/codex-deepresearch/scripts/codex-deepresearch public-beta-validation --runs-dir /tmp/codex-deepresearch-public-beta-validation --suite-id public-beta-validation --clean --allow-blocked
 tmpdir=/tmp/codex-deepresearch-parallel-validation; rm -rf "$tmpdir"; run_dir=$(plugins/codex-deepresearch/scripts/codex-deepresearch prepare "Parallel orchestration validation" --runs-dir "$tmpdir" --route text_only | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_dir"])'); plugins/codex-deepresearch/scripts/codex-deepresearch orchestrate-parallel --run "$run_dir" --adapter fixture --min-tasks 3
 plugins/codex-deepresearch/scripts/codex-deepresearch validate-evidence --evidence tests/fixtures/evidence_schema/valid_evidence.json --search-results tests/fixtures/evidence_schema/search_results.jsonl --visual-observations tests/fixtures/evidence_schema/visual_observations.jsonl --verifier-votes tests/fixtures/evidence_schema/verifier_votes.jsonl
@@ -149,7 +150,7 @@ plugins/codex-deepresearch/scripts/codex-deepresearch verify-claims --run "$run_
 plugins/codex-deepresearch/scripts/codex-deepresearch synthesize --run "$run_dir"
 ```
 
-`python3 scripts/validate_repo.py` also runs no-network `fetch-claims`, `enforce-guardrails`, `synthesize`, CI-safe visual E2E, and public beta validation smokes against temporary local artifacts.
+`python3 scripts/validate_repo.py` also runs no-network `fetch-claims`, `enforce-guardrails`, `synthesize`, CI-safe visual E2E, sanitized-real visual E2E, and public beta validation smokes against temporary local artifacts.
 
 Keep this section current when new implementation test commands are added.
 

@@ -38,6 +38,7 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/public_beta_validation.py",
     "plugins/codex-deepresearch/src/deepresearch/report_generation.py",
     "plugins/codex-deepresearch/src/deepresearch/run_state.py",
+    "plugins/codex-deepresearch/src/deepresearch/sanitized_real_visual_e2e.py",
     "plugins/codex-deepresearch/src/deepresearch/search_handoff.py",
     "plugins/codex-deepresearch/src/deepresearch/verification_matrix.py",
     "plugins/codex-deepresearch/src/deepresearch/vision_adapter.py",
@@ -61,6 +62,7 @@ REQUIRED_FILES = [
     "tests/test_public_beta_validation.py",
     "tests/test_report_generation.py",
     "tests/test_run_state.py",
+    "tests/test_sanitized_real_visual_e2e.py",
     "tests/test_search_handoff.py",
     "tests/test_validate_repo.py",
     "tests/test_verification_matrix.py",
@@ -372,6 +374,68 @@ def run_fresh_session_visual_e2e_validation(runner: Path) -> None:
         fail("fresh-session visual blocked scenario did not expose provider status artifact")
 
 
+def run_sanitized_real_visual_e2e_validation(runner: Path) -> None:
+    """Validate the #105 sanitized-real no-user-image visual release gate."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="codex-deepresearch-sanitized-real-visual-e2e-",
+        dir="/tmp",
+    ) as runs_dir:
+        suite_id = "validate-sanitized-real-visual-suite"
+        result = subprocess.run(
+            [
+                str(runner),
+                "sanitized-real-visual-e2e",
+                "--runs-dir",
+                runs_dir,
+                "--suite-id",
+                suite_id,
+                "--clean",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        results_path = (
+            Path(runs_dir)
+            / suite_id
+            / "sanitized_real_visual_e2e_results.json"
+        )
+        if result.returncode != 0:
+            fail("runner sanitized-real-visual-e2e must exit 0")
+        raw_payload = result.stdout.strip() or results_path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        fail(f"runner sanitized-real-visual-e2e must output valid JSON: {exc}")
+    if payload.get("status") != "passed":
+        fail("runner sanitized-real-visual-e2e did not report passed")
+    if payload.get("release_gate_passed") is not True:
+        fail("sanitized-real visual gate did not pass release gate")
+    counts = payload.get("counts", {})
+    if counts.get("candidate_count", 0) < 10:
+        fail("sanitized-real visual gate must record at least 10 candidates")
+    if counts.get("fetched_artifacts", 0) < 3:
+        fail("sanitized-real visual gate must record at least 3 fetched artifacts")
+    if counts.get("codex_interactive_observations", 0) < 3:
+        fail("sanitized-real visual gate must record at least 3 codex-interactive observations")
+    if counts.get("report_cited_visual_or_mixed_claims", 0) < 1:
+        fail("sanitized-real visual gate must record at least 1 report-cited visual claim")
+    minimums = payload.get("visual_minimums", {})
+    if minimums.get("satisfied") is not True:
+        fail("sanitized-real visual gate minimums must be satisfied")
+    lineage = payload.get("lineage", {})
+    if lineage.get("non_fixture_non_manual_non_user_provided") is not True:
+        fail("sanitized-real visual gate lineage must exclude fixture/manual/user evidence")
+    if payload.get("live_web_fetch") is not False:
+        fail("sanitized-real visual gate must not claim live web fetch")
+    if payload.get("live_codex_vlm_session") is not False:
+        fail("sanitized-real visual gate must not claim live Codex VLM")
+    if payload.get("deterministic_codex_interactive_test_double") is not True:
+        fail("sanitized-real visual gate must disclose deterministic codex-interactive test double")
+
+
 def run_public_beta_validation(runner: Path) -> None:
     """Validate the CI-safe P3-E2E1 public beta classification gate."""
 
@@ -536,6 +600,7 @@ def main() -> None:
     run_parallel_orchestration_validation(runner)
     run_fresh_session_e2e_validation(runner)
     run_fresh_session_visual_e2e_validation(runner)
+    run_sanitized_real_visual_e2e_validation(runner)
     run_public_beta_validation(runner)
 
     with tempfile.TemporaryDirectory() as manual_runs_dir:

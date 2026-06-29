@@ -22,6 +22,9 @@ from deepresearch.fresh_session_e2e import (  # noqa: E402
     run_fresh_session_visual_e2e,
     validate_final_response,
 )
+from deepresearch.sanitized_real_visual_e2e import (  # noqa: E402
+    run_sanitized_real_visual_e2e,
+)
 
 
 class FreshSessionE2ETests(unittest.TestCase):
@@ -170,17 +173,77 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertTrue(gate_checks["final_transcript_exposes_status_summary"])
 
     def test_completed_auto_visual_requires_three_real_codex_images_and_report_citation(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         gate = self._visual_release_gate_with_response(run_status)
 
         self.assertTrue(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["real_candidate_count"], 10)
+        self.assertEqual(gate["real_fetched_artifacts"], 3)
         self.assertEqual(gate["codex_interactive_analyzed_images"], 3)
         self.assertEqual(gate["report_cited_visual_or_mixed_claims"], 1)
-        self.assertTrue(gate["visual_artifact_validation"]["valid"], gate["visual_artifact_validation"])
+        self.assertTrue(gate["visual_minimums"]["satisfied"])
+        self.assertTrue(gate["checks"]["visual_provider_minimums_satisfied"])
+        self.assertTrue(
+            gate["visual_artifact_validation"]["valid"],
+            gate["visual_artifact_validation"],
+        )
+
+    def test_completed_auto_visual_requires_ten_real_visual_candidates(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(
+            image_count=3,
+            candidate_count=3,
+        )
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["real_candidate_count"], 3)
+        self.assertEqual(gate["real_fetched_artifacts"], 3)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 3)
+        self.assertFalse(gate["checks"]["real_automatic_visual_candidates_at_least_10"])
+        self.assertFalse(gate["checks"]["visual_provider_minimums_satisfied"])
+
+    def test_sanitized_real_no_user_image_completed_run_satisfies_visual_gate(self) -> None:
+        result = run_sanitized_real_visual_e2e(
+            runs_dir=self.temp_runs_dir(),
+            suite_id="fresh-session-sanitized-real",
+            clean=True,
+        )
+
+        self.assertEqual(result["status"], "passed", result.get("failures"))
+        self.assertTrue(result["release_gate_passed"])
+        self.assertTrue(result["no_user_image"])
+        self.assertTrue(result["sanitized_real_artifact"])
+        self.assertFalse(result["live_web_fetch"])
+        self.assertFalse(result["live_codex_vlm_session"])
+        self.assertTrue(result["deterministic_codex_interactive_test_double"])
+        self.assertEqual(result["counts"]["candidate_count"], 10)
+        self.assertGreaterEqual(result["counts"]["fetched_artifacts"], 3)
+        self.assertGreaterEqual(result["counts"]["codex_interactive_observations"], 3)
+        self.assertGreaterEqual(
+            result["counts"]["report_cited_visual_or_mixed_claims"],
+            1,
+        )
+        self.assertTrue(result["visual_minimums"]["satisfied"])
+        self.assertTrue(
+            result["lineage"]["non_fixture_non_manual_non_user_provided"],
+            result["lineage"],
+        )
+
+        provider_status = self.read_json(
+            Path(result["artifacts"]["visual_provider_status"])
+        )
+        self.assertEqual(provider_status["status"], "completed_auto_visual")
+        self.assertTrue(provider_status["minimums"]["satisfied"])
+        self.assertEqual(provider_status["minimums"]["candidate_count"], 10)
+        self.assertGreaterEqual(provider_status["minimums"]["fetched_artifacts"], 3)
+        self.assertGreaterEqual(provider_status["minimums"]["vlm_images_analyzed"], 3)
+        self.assertGreaterEqual(provider_status["minimums"]["report_cited_images"], 1)
 
     def test_completed_auto_visual_rejects_mixed_fixture_image_evidence(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         evidence = self.read_json(run_dir / "evidence.json")
         evidence["images"].append(
@@ -199,9 +262,94 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["release_gate_passed"], gate)
         self.assertEqual(gate["non_release_visual_images"], 1)
         self.assertFalse(gate["checks"]["fixture_manual_user_evidence_excluded"])
+        self.assertFalse(gate["checks"]["forbidden_visual_lineage_excluded"])
+        self.assertIn(
+            "evidence_images_has_fixture_manual_or_user_lineage",
+            gate["forbidden_visual_lineage"]["failures"],
+        )
+
+    def test_supplied_completed_visual_run_rejects_fixture_candidate_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        self._visual_run_status(run_dir, status="completed_auto_visual")
+        candidates = self._read_jsonl(run_dir / "visual_candidates.jsonl")
+        fixture_candidate = dict(candidates[0])
+        fixture_candidate.update(
+            {
+                "candidate_id": "cand_fixture_999",
+                "provider": "fixture-image-search",
+                "provider_kind": "fixture",
+                "provider_mode": "fixture",
+                "provider_provenance": {
+                    "provider": "fixture-image-search",
+                    "provider_kind": "fixture",
+                    "provider_mode": "fixture",
+                },
+                "rank": 999,
+            }
+        )
+        candidates.append(fixture_candidate)
+        self._write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        gate = self._failed_supplied_visual_release_gate(
+            run_dir,
+            suite_id="fresh-session-visual-fixture-candidate",
+        )
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "visual_candidates_has_fixture_manual_or_user_lineage",
+        )
+
+    def test_supplied_completed_visual_run_rejects_manual_fetch_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        self._visual_run_status(run_dir, status="completed_auto_visual")
+        fetches = self._read_jsonl(run_dir / "image_fetch_status.jsonl")
+        fetches[0]["manual"] = True
+        self._write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        gate = self._failed_supplied_visual_release_gate(
+            run_dir,
+            suite_id="fresh-session-visual-manual-fetch",
+        )
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "image_fetch_status_has_fixture_manual_or_user_lineage",
+        )
+
+    def test_supplied_completed_visual_run_rejects_user_observation_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        self._visual_run_status(run_dir, status="completed_auto_visual")
+        observations = self._read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["user_provided"] = True
+        self._write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        gate = self._failed_supplied_visual_release_gate(
+            run_dir,
+            suite_id="fresh-session-visual-user-observation",
+        )
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "visual_observations_has_fixture_manual_or_user_lineage",
+        )
+
+    def test_completed_auto_visual_rejects_fixture_report_citation_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        report_status = self.read_json(run_dir / "report_status.json")
+        report_status["included_claims"][0]["provider_mode"] = "fixture"
+        self._write_json(run_dir / "report_status.json", report_status)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "report_status_included_claims_has_fixture_manual_or_user_lineage",
+        )
 
     def test_completed_auto_visual_counts_only_real_vlm_observation_records(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=1)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=1)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         evidence = self.read_json(run_dir / "evidence.json")
         for index in (2, 3):
@@ -223,7 +371,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         )
 
     def test_completed_auto_visual_requires_linked_evidence_image_records(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         evidence = self.read_json(run_dir / "evidence.json")
         evidence["images"] = []
@@ -238,7 +386,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         )
 
     def test_completed_auto_visual_rejects_failed_observation_statuses(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         observations = [
             json.loads(line)
@@ -259,7 +407,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         )
 
     def test_completed_auto_visual_report_citation_must_use_codex_observed_image(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         evidence = self.read_json(run_dir / "evidence.json")
         evidence["images"].append(
@@ -311,7 +459,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["checks"]["report_cited_visual_or_mixed_claim_at_least_1"])
 
     def test_completed_auto_visual_requires_report_markdown_visual_claim_citation(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         (run_dir / "report.md").write_text("# Report\n\n## Visual Findings\n", encoding="utf-8")
 
@@ -322,7 +470,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["checks"]["report_cited_visual_or_mixed_claim_at_least_1"])
 
     def test_completed_auto_visual_requires_completed_report_status(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         report_status = self.read_json(run_dir / "report_status.json")
         report_status["status"] = "failed_visual_evidence_unused"
@@ -334,7 +482,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["checks"]["report_status_completed"])
 
     def test_completed_auto_visual_requires_matching_visual_provider_status(self) -> None:
-        run_dir = self._complete_visual_run_dir(image_count=3)
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
         run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         provider_status["status"] = "partial_auto_visual"
@@ -348,7 +496,9 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["checks"]["visual_provider_status_completed_auto_visual"])
 
     def test_visual_gate_accepts_supplied_completed_auto_visual_run_for_release_pass(self) -> None:
-        completed_run_dir = self._complete_visual_run_dir(image_count=3)
+        completed_run_dir = self._deterministic_sanitized_real_visual_run_dir(
+            image_count=3
+        )
         self._visual_run_status(completed_run_dir, status="completed_auto_visual")
 
         result = run_fresh_session_visual_e2e(
@@ -362,7 +512,10 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertTrue(result["release_gate_passed"])
         self.assertEqual(result["release_gate_status"], "passed")
-        self.assertEqual(result["completed_auto_visual_run"], str(completed_run_dir.resolve()))
+        self.assertEqual(
+            result["completed_auto_visual_run"],
+            str(completed_run_dir.resolve()),
+        )
         completed = {
             scenario["id"]: scenario for scenario in result["scenarios"]
         }["visual_completed_auto_release_candidate"]
@@ -371,6 +524,60 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertEqual(
             completed["visual_release_gate"]["codex_interactive_analyzed_images"],
             3,
+        )
+        self.assertGreaterEqual(
+            completed["visual_release_gate"]["real_candidate_count"],
+            10,
+        )
+        self.assertGreaterEqual(
+            completed["visual_release_gate"]["real_fetched_artifacts"],
+            3,
+        )
+        self.assertGreaterEqual(
+            completed["visual_release_gate"]["report_cited_visual_or_mixed_claims"],
+            1,
+        )
+        self.assertTrue(
+            completed["visual_release_gate"]["visual_minimums"]["satisfied"]
+        )
+        self.assertTrue(
+            completed["visual_release_gate"]["checks"]["visual_provider_minimums_satisfied"]
+        )
+
+    def test_visual_gate_rejects_supplied_completed_run_below_candidate_floor(self) -> None:
+        completed_run_dir = self._deterministic_sanitized_real_visual_run_dir(
+            image_count=3,
+            candidate_count=3,
+        )
+        self._visual_run_status(completed_run_dir, status="completed_auto_visual")
+
+        with self.assertRaises(FreshSessionE2EError) as raised:
+            run_fresh_session_visual_e2e(
+                runs_dir=self.temp_runs_dir(),
+                suite_id="fresh-session-visual-low-candidates",
+                clean=True,
+                real_codex_interactive="require",
+                completed_auto_visual_run=completed_run_dir,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(payload["release_gate_passed"])
+        completed = {
+            scenario["id"]: scenario for scenario in payload["scenarios"]
+        }["visual_completed_auto_release_candidate"]
+        gate = completed["visual_release_gate"]
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["real_candidate_count"], 3)
+        self.assertEqual(gate["real_fetched_artifacts"], 3)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 3)
+        self.assertFalse(
+            gate["checks"]["real_automatic_visual_candidates_at_least_10"]
+        )
+        self.assertFalse(gate["checks"]["visual_provider_minimums_satisfied"])
+        self.assertIn(
+            "real_automatic_visual_candidates_at_least_10",
+            {failure["check"] for failure in completed["failures"]},
         )
 
     def test_broken_skill_instructions_fail_user_facing_gate(self) -> None:
@@ -627,7 +834,14 @@ class FreshSessionE2ETests(unittest.TestCase):
         )
         return payload
 
-    def _complete_visual_run_dir(self, *, image_count: int) -> Path:
+    def _deterministic_sanitized_real_visual_run_dir(
+        self,
+        *,
+        image_count: int,
+        candidate_count: int = 10,
+    ) -> Path:
+        """Create a public-safe replay with real-mode provenance and no live fetch."""
+
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         run_dir = Path(temp_dir.name)
@@ -641,38 +855,40 @@ class FreshSessionE2ETests(unittest.TestCase):
         fetches = []
         observations = []
         images = []
-        for index in range(1, image_count + 1):
-            image_id = f"img_real_{index:03d}"
+        for index in range(1, candidate_count + 1):
             candidate = self._visual_candidate(
                 candidate_id=f"cand_real_{index:03d}",
                 task_id=task_id,
                 angle_id=angle_id,
                 rank=index,
-            )
-            fetch = self._visual_fetch(
-                candidate=candidate,
-                fetch_id=f"fetch_real_{index:03d}",
-                evidence_image_id=image_id,
+                candidate_status="analyzed" if index <= image_count else "ranked",
             )
             candidates.append(candidate)
-            fetches.append(fetch)
-            observations.append(
-                self._visual_observation(
+            if index <= image_count:
+                image_id = f"img_real_{index:03d}"
+                fetch = self._visual_fetch(
                     candidate=candidate,
-                    fetch=fetch,
-                    evidence_image_id=image_id,
-                    claim_id=claim_id if index == 1 else None,
-                    vote_id=vote_id if index == 1 else None,
-                    created_at=created_at,
-                )
-            )
-            images.append(
-                self._visual_evidence_image(
-                    candidate=candidate,
-                    fetch=fetch,
+                    fetch_id=f"fetch_real_{index:03d}",
                     evidence_image_id=image_id,
                 )
-            )
+                fetches.append(fetch)
+                observations.append(
+                    self._visual_observation(
+                        candidate=candidate,
+                        fetch=fetch,
+                        evidence_image_id=image_id,
+                        claim_id=claim_id if index == 1 else None,
+                        vote_id=vote_id if index == 1 else None,
+                        created_at=created_at,
+                    )
+                )
+                images.append(
+                    self._visual_evidence_image(
+                        candidate=candidate,
+                        fetch=fetch,
+                        evidence_image_id=image_id,
+                    )
+                )
 
         self._write_json(
             run_dir / "visual_tasks.json",
@@ -691,11 +907,11 @@ class FreshSessionE2ETests(unittest.TestCase):
                         "angle_id": angle_id,
                         "route": "visual_required",
                         "target_evidence_type": "web_image",
-                        "query": "codex interactive visual release fixture",
+                        "query": "codex interactive sanitized-real visual release replay",
                         "providers": ["page-image-extractor", "codex-interactive"],
                         "source_search_result_ids": [],
                         "caps": {
-                            "max_candidates": image_count,
+                            "max_candidates": candidate_count,
                             "max_fetches": image_count,
                             "max_vlm_images": image_count,
                             "max_cost_usd": 1.0,
@@ -721,7 +937,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                 "metric_classification": "success",
                 "minimums": {
                     "required_vlm_images": 3,
-                    "candidate_count": image_count,
+                    "candidate_count": candidate_count,
                     "selected_candidates": image_count,
                     "fetched_artifacts": image_count,
                     "vlm_images_analyzed": image_count,
@@ -736,7 +952,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                         provider="page-image-extractor",
                         provider_kind="page_extractor",
                         invocations=1,
-                        candidates_discovered=image_count,
+                        candidates_discovered=candidate_count,
                         artifacts_fetched=image_count,
                         vlm_images_analyzed=0,
                     ),
@@ -757,7 +973,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                 "schema_version": "0.1.0",
                 "run_id": run_dir.name,
                 "created_at": created_at,
-                "question": "Visual release fixture",
+                "question": "Visual release sanitized-real replay",
                 "mode": "codex-plugin",
                 "search_provider": "codex-native",
                 "vlm_provider": "codex-interactive",
@@ -766,7 +982,10 @@ class FreshSessionE2ETests(unittest.TestCase):
                 "claims": [
                     {
                         "id": claim_id,
-                        "text": "The first real visual fixture contains report-cited UI evidence.",
+                        "text": (
+                            "The first sanitized-real replay image contains "
+                            "report-cited UI evidence."
+                        ),
                         "claim_type": "visual",
                         "supporting_sources": [],
                         "supporting_images": ["img_real_001"],
@@ -815,7 +1034,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         (run_dir / "report.md").write_text(
             "# Report\n\n"
             "## Visual Findings\n"
-            f"- Claim `{claim_id}`: The first real visual fixture contains "
+            f"- Claim `{claim_id}`: The first sanitized-real replay image contains "
             "report-cited UI evidence.\n"
             "- Image `img_real_001` (visual_match; provider `codex-interactive`): "
             f"{images[0]['observations'][0]}\n",
@@ -840,7 +1059,12 @@ class FreshSessionE2ETests(unittest.TestCase):
                 "real_child_execution": True,
                 "accepted_shards": 1,
             },
-            "diagnostics": {"actionable_cause": "completed visual fixture"},
+            "diagnostics": {
+                "actionable_cause": (
+                    "completed sanitized-real visual replay; no live web fetch "
+                    "or live Codex VLM call"
+                )
+            },
             "artifacts": {
                 "run_status": str(run_dir / "run_status.json"),
                 "evidence": str(run_dir / "evidence.json"),
@@ -885,6 +1109,55 @@ class FreshSessionE2ETests(unittest.TestCase):
             check_final_response=True,
         )
 
+    def _failed_supplied_visual_release_gate(
+        self,
+        run_dir: Path,
+        *,
+        suite_id: str,
+    ) -> dict:
+        with self.assertRaises(FreshSessionE2EError) as raised:
+            run_fresh_session_visual_e2e(
+                runs_dir=self.temp_runs_dir(),
+                suite_id=suite_id,
+                clean=True,
+                real_codex_interactive="require",
+                completed_auto_visual_run=run_dir,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(payload["release_gate_passed"])
+        completed = {
+            scenario["id"]: scenario for scenario in payload["scenarios"]
+        }["visual_completed_auto_release_candidate"]
+        return completed["visual_release_gate"]
+
+    def _assert_forbidden_visual_lineage_failure(
+        self,
+        gate: dict,
+        expected_detail: str,
+    ) -> None:
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertFalse(gate["checks"]["forbidden_visual_lineage_excluded"])
+        self.assertFalse(gate["checks"]["fixture_manual_user_evidence_excluded"])
+        self.assertIn(expected_detail, gate["forbidden_visual_lineage"]["failures"])
+        details = [
+            failure["detail"]
+            for failure in gate["failures"]
+            if failure["check"] == "forbidden_visual_lineage_excluded"
+        ]
+        self.assertTrue(
+            any(expected_detail in detail for detail in details),
+            gate["failures"],
+        )
+
+    def _read_jsonl(self, path: Path) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def _visual_candidate(
         self,
         *,
@@ -892,6 +1165,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         task_id: str,
         angle_id: str,
         rank: int,
+        candidate_status: str = "analyzed",
     ) -> dict:
         return {
             "candidate_id": candidate_id,
@@ -914,7 +1188,7 @@ class FreshSessionE2ETests(unittest.TestCase):
             "score": 1.0,
             "policy_decision": "allowed",
             "policy_flags": [],
-            "candidate_status": "analyzed",
+            "candidate_status": candidate_status,
             "rejection_reason": None,
             "estimated_cost_usd": 0.01,
             "actual_cost_usd": 0.01,
