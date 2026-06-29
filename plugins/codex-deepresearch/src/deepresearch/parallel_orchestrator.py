@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import random
 import re
@@ -21,6 +22,10 @@ from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .execution_mode import BUDGET_PRESETS
 from .run_state import add_run_steps_artifact, begin_stage, skip_stage, transition_stage
 from .search_handoff import SearchHandoffError, resolve_run_dir
+from .semantic_planner import (
+    SEMANTIC_PLANNER_VALIDATION_FILENAME,
+    write_semantic_planner_validation,
+)
 from .trace import TRACE_FAILURE_CATEGORIES, TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 
 
@@ -92,6 +97,9 @@ class ResearchTask:
     angle_id: str
     route: str
     query: str
+    expected_evidence: list[str]
+    success_criteria: list[str]
+    report_section: str
     state: str
     assigned_subagent_id: str | None
     attempt: int
@@ -548,19 +556,27 @@ def plan_research_tasks(
         confirm_exhaustive=confirm_exhaustive,
         max_cost_usd=max_cost_usd,
     )
-    hard_task_cap = min(preset.max_codex_handoff_tasks, 100)
-    requested_cap = max_tasks if max_tasks is not None else hard_task_cap
-    task_count = min(max(min_tasks, 1), requested_cap, hard_task_cap)
     existing = _read_research_tasks(run_dir)
     if existing:
+        write_semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=existing,
+            report_status=_read_optional_json(run_dir / "report_status.json"),
+        )
         return _tasks_payload(run_dir, existing, evidence=evidence, status="already_planned")
 
     planner_tasks = evidence.get("search_tasks")
     if not isinstance(planner_tasks, list) or not planner_tasks:
         raise ParallelOrchestrationError("evidence.json must include search_tasks before planning")
 
+    semantic_floor = _semantic_task_floor(evidence, planner_tasks)
+    hard_task_cap = min(preset.max_codex_handoff_tasks, 100)
+    requested_cap = max_tasks if max_tasks is not None else hard_task_cap
+    task_count = min(max(min_tasks, semantic_floor, 1), requested_cap, hard_task_cap)
     now = _utc_now()
     tasks: list[dict[str, Any]] = []
+    angle_occurrences: dict[str, int] = {}
     for index in range(1, task_count + 1):
         base = planner_tasks[(index - 1) % len(planner_tasks)]
         if not isinstance(base, Mapping):
@@ -568,13 +584,22 @@ def plan_research_tasks(
         task_id = f"task_research_{index:03d}"
         route = str(base.get("route") or "text_only")
         max_images = _planner_max_images(base, evidence=evidence, route=route)
-        query = _bounded_task_query(str(base.get("query") or evidence.get("question") or ""), index)
+        angle_id = str(base.get("angle_id") or f"angle_{index:03d}")
+        angle_occurrences[angle_id] = int(angle_occurrences.get(angle_id, 0)) + 1
+        query = _semantic_task_query(
+            base,
+            question=str(evidence.get("question") or ""),
+            occurrence=angle_occurrences[angle_id],
+        )
         tasks.append(
             ResearchTask(
                 id=task_id,
-                angle_id=str(base.get("angle_id") or f"angle_{index:03d}"),
+                angle_id=angle_id,
                 route=route,
                 query=query,
+                expected_evidence=_expected_evidence_for_task(base, route=route),
+                success_criteria=_success_criteria_for_task(base),
+                report_section=str(base.get("report_section") or base.get("angle") or "Findings"),
                 state="queued",
                 assigned_subagent_id=None,
                 attempt=0,
@@ -600,6 +625,12 @@ def plan_research_tasks(
         "tasks": tasks,
     }
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, payload)
+    write_semantic_planner_validation(
+        run_dir=run_dir,
+        evidence=evidence,
+        tasks=tasks,
+        report_status=_read_optional_json(run_dir / "report_status.json"),
+    )
     return _tasks_payload(run_dir, tasks, evidence=evidence, status="planned")
 
 
@@ -630,6 +661,77 @@ def _planner_max_images(
     if isinstance(budget, Mapping):
         return _nonnegative_int(budget.get("max_images"))
     return 0
+
+
+def _semantic_task_floor(
+    evidence: Mapping[str, Any],
+    planner_tasks: Sequence[Any],
+) -> int:
+    semantic_angles = evidence.get("semantic_angles")
+    if isinstance(semantic_angles, list) and semantic_angles:
+        return len([angle for angle in semantic_angles if isinstance(angle, Mapping)])
+    return len([task for task in planner_tasks if isinstance(task, Mapping)])
+
+
+_TASK_QUERY_VARIANTS = (
+    "evidence map",
+    "verification and caveats",
+    "decision implications",
+    "counterexamples and gaps",
+)
+
+
+def _semantic_task_query(
+    task: Mapping[str, Any],
+    *,
+    question: str,
+    occurrence: int,
+) -> str:
+    research_question = str(
+        task.get("research_question")
+        or task.get("query")
+        or question
+        or "research question"
+    )
+    title = str(task.get("title") or task.get("angle") or task.get("angle_id") or "angle")
+    evidence_need = str(task.get("evidence_need") or "primary_source")
+    report_section = str(task.get("report_section") or title)
+    expected_artifacts = _string_list(task.get("expected_artifacts"))
+    artifact_hint = expected_artifacts[(occurrence - 1) % len(expected_artifacts)] if expected_artifacts else "evidence notes"
+    normalized = " ".join(research_question.split()) or "research question"
+    if occurrence <= 1:
+        return f"{title}: {normalized} Evidence need={evidence_need}; artifact={artifact_hint}."
+    variant = _TASK_QUERY_VARIANTS[(occurrence - 2) % len(_TASK_QUERY_VARIANTS)]
+    return (
+        f"{title} / {variant}: investigate {artifact_hint} for report section "
+        f"{report_section}. Evidence need={evidence_need}; avoid repeating the root question."
+    )
+
+
+def _expected_evidence_for_task(task: Mapping[str, Any], *, route: str) -> list[str]:
+    expected = _string_list(task.get("expected_evidence"))
+    evidence_need = str(task.get("evidence_need") or "")
+    if evidence_need and evidence_need not in expected:
+        expected.insert(0, evidence_need)
+    if route != "text_only" and "visual_observation" not in expected:
+        expected.append("visual_observation")
+    return list(dict.fromkeys(expected or ["primary_source"]))
+
+
+def _success_criteria_for_task(task: Mapping[str, Any]) -> list[str]:
+    criteria = _string_list(task.get("success_criteria"))
+    if criteria:
+        return criteria
+    return [
+        "Produce source-backed claims scoped to the parent semantic angle.",
+        "Record caveats, counter-evidence, and artifact paths when available.",
+    ]
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str) and item]
 
 
 def _nonnegative_int(value: Any) -> int:
@@ -882,6 +984,12 @@ def _run_parallel_orchestration_started(
         codex_exec_retry_policy=capacity_retry_policy,
     )
     _write_json(run_dir / "parallel_orchestration_status.json", status)
+    write_semantic_planner_validation(
+        run_dir=run_dir,
+        evidence=_read_json(run_dir / "evidence.json"),
+        tasks=tasks,
+        report_status=_read_optional_json(run_dir / "report_status.json"),
+    )
     if _parallel_status_ok(status_value):
         transition_stage(
             run_dir,
@@ -1169,6 +1277,9 @@ def _tasks_payload(
             "research_tasks": str(run_dir / RESEARCH_TASKS_FILENAME),
             "subagent_assignments": str(run_dir / ASSIGNMENTS_FILENAME),
             "evidence_shards": str(run_dir / EVIDENCE_SHARDS_DIRNAME),
+            "semantic_planner_validation": str(
+                run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+            ),
         },
     }
 
@@ -1733,15 +1844,37 @@ def _assign_task(
         "assignment_id": f"assign-{uuid.uuid4().hex[:12]}",
         "timestamp": _utc_now(),
         "task_id": task["id"],
+        "angle_id": task.get("angle_id"),
         "state": "assigned",
         "assigned_subagent_id": task["assigned_subagent_id"],
         "attempt": task["attempt"],
         "adapter": adapter_name,
         "max_concurrent_codex_subagents": max_concurrent,
         "parallel_degraded": parallel_degraded,
+        "task_scope_hash": _task_scope_hash(task),
+        "task_scope": {
+            "query": task.get("query"),
+            "route": task.get("route"),
+            "expected_evidence": list(task.get("expected_evidence") or []),
+            "report_section": task.get("report_section"),
+        },
     }
     _append_jsonl(run_dir / ASSIGNMENTS_FILENAME, record)
     task["state"] = "running"
+
+
+def _task_scope_hash(task: Mapping[str, Any]) -> str:
+    scope = {
+        "angle_id": task.get("angle_id"),
+        "query": task.get("query"),
+        "route": task.get("route"),
+        "expected_evidence": list(task.get("expected_evidence") or []),
+        "success_criteria": list(task.get("success_criteria") or []),
+        "report_section": task.get("report_section"),
+        "output_shard_path": task.get("output_shard_path"),
+    }
+    serialized = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerResult) -> None:
@@ -2240,6 +2373,9 @@ def _write_fixture_shard(run_dir: Path, task: Mapping[str, Any], shard_path: Pat
                 "id": f"claim_{task['id']}_001",
                 "text": claim_text,
                 "claim_type": claim_type,
+                "angle_id": task.get("angle_id"),
+                "report_section": task.get("report_section"),
+                "expected_evidence": list(task.get("expected_evidence") or []),
                 "supporting_sources": [source_id],
                 "supporting_images": supporting_images,
                 "visual_supports": visual_supports,
@@ -2253,7 +2389,7 @@ def _write_fixture_shard(run_dir: Path, task: Mapping[str, Any], shard_path: Pat
                 "votes": [],
                 "verification_status": "supported",
                 "review_status": "human_accepted",
-                "promotion_status": "not_eligible",
+                "promotion_status": "eligible",
                 "confidence": "medium",
                 "caveats": [],
                 "source_task_id": task["id"],
