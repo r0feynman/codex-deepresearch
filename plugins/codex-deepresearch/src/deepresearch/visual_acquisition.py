@@ -46,6 +46,7 @@ from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
     VISUAL_SEARCH_PLAN_FILENAME,
+    visual_minimum_diagnostics,
     visual_release_minimums,
     validate_visual_artifacts,
 )
@@ -3100,6 +3101,16 @@ def _visual_provider_status(
         ):
             if counter in provider_status:
                 providers[-1][counter] = _int_or_zero(provider_status.get(counter))
+    minimums = visual_release_minimums(
+        candidates=candidate_records,
+        fetches=image_fetch_records,
+        observations=observations,
+        evidence=_read_json_object(run_dir / "evidence.json"),
+        report_status=_read_optional_json_object(run_dir / "report_status.json"),
+    )
+    diagnostics = {"actionable_cause": actionable_cause}
+    if status == "partial_auto_visual":
+        diagnostics.update(visual_minimum_diagnostics(minimums))
     return {
         "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
         "run_id": run_dir.name,
@@ -3109,15 +3120,9 @@ def _visual_provider_status(
         "terminal": terminal,
         "created_at": created_at,
         "metric_classification": metric_classification,
-        "minimums": visual_release_minimums(
-            candidates=candidate_records,
-            fetches=image_fetch_records,
-            observations=observations,
-            evidence=_read_json_object(run_dir / "evidence.json"),
-            report_status=_read_optional_json_object(run_dir / "report_status.json"),
-        ),
+        "minimums": minimums,
         "providers": providers,
-        "diagnostics": {"actionable_cause": actionable_cause},
+        "diagnostics": diagnostics,
         "artifacts": {
             "visual_search_plan": str(run_dir / VISUAL_SEARCH_PLAN_FILENAME),
             "visual_candidates": str(run_dir / "visual_candidates.jsonl"),

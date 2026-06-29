@@ -26,6 +26,7 @@ from deepresearch.visual_artifacts import (  # noqa: E402
     real_automatic_visual_release_counts,
     validate_visual_artifacts,
     visual_failure_code_for_minimums,
+    visual_minimum_diagnostics,
     visual_release_minimums,
 )
 
@@ -357,6 +358,34 @@ class VisualArtifactTests(unittest.TestCase):
             visual_failure_code_for_minimums(minimums),
             "visual_minimum_shortfall",
         )
+
+    def test_visual_minimum_diagnostics_preserve_specific_shortfall_category(self) -> None:
+        expected_codes = {
+            "insufficient_candidates": "visual_minimum_shortfall",
+            "fetch_failures": "visual_minimum_shortfall",
+            "vlm_failures": "visual_minimum_shortfall",
+            "report_linkage_missing": "visual_report_linkage_missing",
+            "policy_blocked": "visual_minimum_shortfall",
+            "budget_pruned": "visual_minimum_shortfall",
+        }
+        for reason, failure_code in expected_codes.items():
+            with self.subTest(reason=reason):
+                diagnostics = visual_minimum_diagnostics(
+                    {
+                        "required_vlm_images": 3,
+                        "candidate_count": 3,
+                        "selected_candidates": 3,
+                        "fetched_artifacts": 2,
+                        "vlm_images_analyzed": 2,
+                        "report_cited_images": 0,
+                        "satisfied": False,
+                        "shortfall_reason": reason,
+                    }
+                )
+
+                self.assertEqual(diagnostics["shortfall_reason"], reason)
+                self.assertEqual(diagnostics["failure_category"], reason)
+                self.assertEqual(diagnostics["failure_code"], failure_code)
 
     def test_visual_release_minimums_flag_missing_report_linkage_after_three_real_images(self) -> None:
         candidates: list[dict] = []

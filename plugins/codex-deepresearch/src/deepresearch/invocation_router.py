@@ -33,7 +33,8 @@ from .visual_artifacts import (
     automatic_visual_status_envelope,
     build_visual_provider_status,
     real_automatic_visual_release_counts,
-    visual_failure_code_for_minimums,
+    visual_failure_code_for_shortfall_reason,
+    visual_minimum_diagnostics,
     visual_minimums_for_run,
     validate_visual_artifacts,
 )
@@ -1108,10 +1109,7 @@ def _visual_pipeline_terminal_status(
     minimums = visual_minimums_for_run(run_dir)
     diagnostics = {"actionable_cause": actionable_cause}
     if normalized == "partial_auto_visual":
-        diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
-        failure_code = visual_failure_code_for_minimums(minimums)
-        if failure_code:
-            diagnostics["failure_code"] = failure_code
+        diagnostics.update(visual_minimum_diagnostics(minimums))
     return {
         "status": normalized,
         "ok": envelope["ok"],
@@ -1203,9 +1201,8 @@ def _finalize_automatic_visual_completion(
 
     diagnostics = validation.to_dict()
     diagnostics["visual_release_gate"] = release_gate
-    minimums = release_gate.get("minimums") if isinstance(release_gate, Mapping) else {}
-    failure_code = visual_failure_code_for_minimums(
-        minimums if isinstance(minimums, Mapping) else None
+    release_gate_diagnostics = _visual_release_gate_diagnostics(
+        release_gate if isinstance(release_gate, Mapping) else None
     )
     _write_visual_completion_status(
         run_dir=run_dir,
@@ -1232,10 +1229,7 @@ def _finalize_automatic_visual_completion(
                 "automatic visual artifacts were produced but did not satisfy "
                 "completed_auto_visual release prerequisites"
             ),
-            "shortfall_reason": minimums.get("shortfall_reason")
-            if isinstance(minimums, Mapping)
-            else None,
-            **({"failure_code": failure_code} if failure_code else {}),
+            **release_gate_diagnostics,
         },
     }
 
@@ -1269,10 +1263,15 @@ def _write_visual_completion_status(
         else {}
     )
     diagnostics["actionable_cause"] = actionable_cause
-    failure_code = visual_failure_code_for_minimums(payload.get("minimums"))
-    if failure_code and status == "partial_auto_visual":
-        diagnostics["failure_code"] = failure_code
-        diagnostics["shortfall_reason"] = payload["minimums"].get("shortfall_reason")
+    if status == "partial_auto_visual":
+        diagnostics.update(
+            _visual_release_gate_diagnostics(
+                _release_gate_from_validation(validation),
+                fallback_minimums=payload.get("minimums")
+                if isinstance(payload.get("minimums"), Mapping)
+                else None,
+            )
+        )
     if validation is not None:
         diagnostics["visual_artifact_validation"] = dict(validation)
     payload["diagnostics"] = diagnostics
@@ -1332,9 +1331,24 @@ def _completed_auto_visual_release_gate(run_dir: Path) -> dict[str, Any]:
         failures.append("at_least_3_codex_interactive_real_analyzed_images")
     if minimums["report_cited_images"] < 1:
         failures.append("report_cited_supported_real_visual_or_mixed_claim")
+    diagnostics = _visual_release_gate_diagnostics(
+        {
+            "valid": not failures,
+            "failures": failures,
+            "minimums": minimums,
+        }
+    )
     return {
         "valid": not failures,
         "failures": failures,
+        "required_vlm_images": minimums["required_vlm_images"],
+        "candidate_count": minimums["candidate_count"],
+        "selected_candidates": minimums["selected_candidates"],
+        "fetched_artifacts": minimums["fetched_artifacts"],
+        "vlm_images_analyzed": minimums["vlm_images_analyzed"],
+        "report_cited_images": minimums["report_cited_images"],
+        "shortfall_reason": diagnostics["shortfall_reason"],
+        "diagnostics": diagnostics,
         "counts": {
             **counts,
             "codex_interactive_real_analyzed_images": minimums["vlm_images_analyzed"],
@@ -1349,6 +1363,67 @@ def _completed_auto_visual_release_gate(run_dir: Path) -> dict[str, Any]:
             minimums["report_cited_images"]
         ),
     }
+
+
+def _release_gate_from_validation(
+    validation: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if not isinstance(validation, Mapping):
+        return None
+    release_gate = validation.get("visual_release_gate")
+    return release_gate if isinstance(release_gate, Mapping) else None
+
+
+def _visual_release_gate_diagnostics(
+    release_gate: Mapping[str, Any] | None,
+    *,
+    fallback_minimums: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    minimums = None
+    failures: list[str] = []
+    valid = False
+    if isinstance(release_gate, Mapping):
+        if isinstance(release_gate.get("minimums"), Mapping):
+            minimums = release_gate["minimums"]
+        raw_failures = release_gate.get("failures")
+        if isinstance(raw_failures, list):
+            failures = [str(item) for item in raw_failures if isinstance(item, str)]
+        valid = release_gate.get("valid") is True
+    if minimums is None:
+        minimums = fallback_minimums
+    reason = _visual_release_gate_shortfall_reason(
+        failures=failures,
+        minimums=minimums,
+        valid=valid,
+    )
+    diagnostics: dict[str, Any] = {"shortfall_reason": reason}
+    if reason != "none":
+        diagnostics["failure_category"] = reason
+        failure_code = visual_failure_code_for_shortfall_reason(reason)
+        if failure_code:
+            diagnostics["failure_code"] = failure_code
+    return diagnostics
+
+
+def _visual_release_gate_shortfall_reason(
+    *,
+    failures: Sequence[str],
+    minimums: Mapping[str, Any] | None,
+    valid: bool,
+) -> str:
+    if isinstance(minimums, Mapping):
+        minimum_reason = str(minimums.get("shortfall_reason") or "none")
+        if minimum_reason != "none":
+            return minimum_reason
+    if valid:
+        return "none"
+    if "report_cited_supported_real_visual_or_mixed_claim" in failures:
+        return "report_linkage_missing"
+    if "at_least_3_codex_interactive_real_analyzed_images" in failures:
+        return "vlm_failures"
+    if "at_least_10_real_image_centric_candidates" in failures:
+        return "insufficient_candidates"
+    return "none"
 
 
 def _has_report_cited_real_visual_claim(
@@ -1485,20 +1560,20 @@ def _visual_completion_diagnostics(
     if isinstance(raw_diagnostics, Mapping):
         diagnostics.update(dict(raw_diagnostics))
     minimums = status.get("minimums")
+    release_gate = status.get("visual_release_gate")
     if not isinstance(minimums, Mapping):
-        release_gate = status.get("visual_release_gate")
         if isinstance(release_gate, Mapping) and isinstance(
             release_gate.get("minimums"),
             Mapping,
         ):
             minimums = release_gate["minimums"]
     if status_name == "partial_auto_visual":
-        failure_code = visual_failure_code_for_minimums(minimums)
-        if failure_code:
-            diagnostics["failure_code"] = failure_code
-            diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
-        elif isinstance(minimums, Mapping):
-            diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+        diagnostics.update(
+            _visual_release_gate_diagnostics(
+                release_gate if isinstance(release_gate, Mapping) else None,
+                fallback_minimums=minimums if isinstance(minimums, Mapping) else None,
+            )
+        )
     return diagnostics
 
 
