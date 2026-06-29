@@ -29,6 +29,7 @@ from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
     VISUAL_SEARCH_PLAN_FILENAME,
+    visual_release_minimums,
     validate_visual_artifacts,
 )
 
@@ -1250,6 +1251,13 @@ def _visual_provider_status(
         "terminal": terminal,
         "created_at": created_at,
         "metric_classification": metric,
+        "minimums": visual_release_minimums(
+            candidates=candidates,
+            fetches=fetch_records,
+            observations=[],
+            evidence=_read_json(run_dir / "evidence.json"),
+            report_status={},
+        ),
         "providers": [
             {
                 "provider": PROVIDER_NAME,

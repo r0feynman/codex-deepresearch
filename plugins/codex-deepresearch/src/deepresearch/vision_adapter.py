@@ -28,6 +28,7 @@ from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
     automatic_visual_status_envelope,
+    visual_minimums_for_run,
     validate_visual_artifacts,
 )
 
@@ -2369,6 +2370,7 @@ def _write_visual_provider_status(
         "terminal": envelope["terminal"],
         "created_at": created_at,
         "metric_classification": envelope["metric_classification"],
+        "minimums": visual_minimums_for_run(run_dir),
         "providers": providers,
         "diagnostics": {"actionable_cause": actionable_cause},
         "artifacts": {

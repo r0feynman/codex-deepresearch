@@ -15,6 +15,7 @@ sys.path.insert(0, str(PLUGIN_SRC))
 import deepresearch.invocation_router as invocation_router  # noqa: E402
 from deepresearch.invocation_router import run_skill_invocation  # noqa: E402
 from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
+from deepresearch.visual_artifacts import VISUAL_PROVIDER_STATUS_FILENAME  # noqa: E402
 from deepresearch.vision_adapter import OpenAIResponsesVisionResult  # noqa: E402
 
 
@@ -1454,6 +1455,181 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed_fixture")
         acquire_mock.assert_not_called()
         ingest_mock.assert_not_called()
+
+    def test_visual_terminal_status_reports_minimum_shortfall_for_two_real_images(self) -> None:
+        run_dir = self.temp_runs_dir() / "visual_minimum_shortfall"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "run_id": run_dir.name,
+                "routing": [
+                    {"id": "angle_001", "modality": "visual_required", "max_images": 12}
+                ],
+                "claims": [],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_real_{index:03d}",
+                    "provider": "page-image-extractor",
+                    "provider_kind": "page_extractor",
+                    "provider_mode": "real",
+                    "candidate_status": "fetched",
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_real_{index:03d}",
+                    "fetch_id": f"fetch_real_{index:03d}",
+                    "provider": "page-image-extractor",
+                    "provider_kind": "page_extractor",
+                    "provider_mode": "real",
+                    "fetch_status": "fetched",
+                    "local_artifact_path": f"images/img_real_{index:03d}.png",
+                    "evidence_image_id": f"img_real_{index:03d}",
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_real_{index:03d}",
+                    "fetch_id": f"fetch_real_{index:03d}",
+                    "evidence_image_id": f"img_real_{index:03d}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "observation_status": "analyzed",
+                }
+                for index in range(1, 3)
+            ],
+        )
+
+        status = invocation_router._visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status="partial_auto_visual",
+            actionable_cause="visual minimum shortfall",
+            acquisition_status=None,
+            ingest_status=None,
+        )
+
+        self.assertEqual(status["status"], "partial_auto_visual")
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["diagnostics"]["failure_code"], "visual_minimum_shortfall")
+        self.assertNotEqual(status["minimums"]["shortfall_reason"], "none")
+
+        invocation_router._write_visual_completion_status(
+            run_dir=run_dir,
+            provider_status={
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "providers": [],
+                "diagnostics": {},
+                "artifacts": {},
+            },
+            status="partial_auto_visual",
+            actionable_cause="visual minimum shortfall",
+            validation=None,
+        )
+        provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        self.assertEqual(provider_status["diagnostics"]["failure_code"], "visual_minimum_shortfall")
+        self.assertNotEqual(provider_status["minimums"]["shortfall_reason"], "none")
+
+    def test_visual_terminal_status_reports_missing_report_linkage_after_three_real_images(self) -> None:
+        run_dir = self.temp_runs_dir() / "visual_report_linkage_missing"
+        run_dir.mkdir()
+        image_ids = [f"img_real_{index:03d}" for index in range(1, 4)]
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "run_id": run_dir.name,
+                "routing": [
+                    {"id": "angle_001", "modality": "visual_required", "max_images": 12}
+                ],
+                "claims": [
+                    {
+                        "id": "claim_visual_real",
+                        "claim_type": "visual",
+                        "supporting_images": image_ids,
+                        "verification_status": "supported",
+                    }
+                ],
+            },
+        )
+        self.write_json(run_dir / "report_status.json", {"used_images": []})
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_real_{index:03d}",
+                    "provider": "child-discovered-image-url",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "candidate_status": "analyzed",
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_real_{index:03d}",
+                    "fetch_id": f"fetch_real_{index:03d}",
+                    "provider": "child-discovered-image-url",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "fetch_status": "fetched",
+                    "local_artifact_path": f"images/{image_ids[index - 1]}.png",
+                    "evidence_image_id": image_ids[index - 1],
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_real_{index:03d}",
+                    "fetch_id": f"fetch_real_{index:03d}",
+                    "evidence_image_id": image_ids[index - 1],
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "observation_status": "analyzed",
+                }
+                for index in range(1, 4)
+            ],
+        )
+
+        status = invocation_router._visual_pipeline_terminal_status(
+            run_dir=run_dir,
+            status="partial_auto_visual",
+            actionable_cause="report linkage missing",
+            acquisition_status=None,
+            ingest_status=None,
+        )
+
+        self.assertEqual(status["status"], "partial_auto_visual")
+        self.assertFalse(status["ok"])
+        self.assertEqual(
+            status["diagnostics"]["failure_code"],
+            "visual_report_linkage_missing",
+        )
+        self.assertEqual(
+            status["minimums"]["shortfall_reason"],
+            "report_linkage_missing",
+        )
 
     def test_serial_fallback_provenance_is_distinguishable_when_no_shards_are_accepted(self) -> None:
         result = run_skill_invocation(
