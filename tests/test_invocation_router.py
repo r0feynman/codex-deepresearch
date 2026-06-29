@@ -255,6 +255,7 @@ class InvocationRouterTests(unittest.TestCase):
             run_status["diagnostics"]["actionable_cause"],
             result["diagnostics"]["actionable_cause"],
         )
+        self.assertNotIn("failure_code", run_status["diagnostics"])
 
         visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
         self.assertFalse(visual_provider_status["ok"])
@@ -264,6 +265,7 @@ class InvocationRouterTests(unittest.TestCase):
             visual_provider_status["diagnostics"]["actionable_cause"],
             result["diagnostics"]["actionable_cause"],
         )
+        self.assertNotIn("failure_code", visual_provider_status["diagnostics"])
         self.assertTrue(visual_provider_status["providers"][0]["configured"])
         self.assertFalse(visual_provider_status["providers"][0]["available"])
         self.assertEqual(visual_provider_status["providers"][0]["blocked_reason"], "codex_exec_unavailable")
@@ -1433,6 +1435,8 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["terminal"])
         self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertNotIn("failure_code", result["diagnostics"])
+        self.assertNotIn("shortfall_reason", result["diagnostics"])
         synthesize_mock.assert_not_called()
         self.assertIn("visual_provider_status", result["artifacts"])
 
@@ -1630,6 +1634,34 @@ class InvocationRouterTests(unittest.TestCase):
             status["minimums"]["shortfall_reason"],
             "report_linkage_missing",
         )
+
+    def test_visual_completion_diagnostics_do_not_add_minimum_failure_codes_to_blocked_vlm_status(self) -> None:
+        diagnostics = invocation_router._visual_completion_diagnostics(
+            {
+                "status": "blocked_missing_vlm_provider",
+                "diagnostics": {
+                    "actionable_cause": "codex-interactive visual worker is unavailable"
+                },
+                "minimums": {
+                    "required_vlm_images": 3,
+                    "candidate_count": 3,
+                    "selected_candidates": 3,
+                    "fetched_artifacts": 3,
+                    "vlm_images_analyzed": 0,
+                    "report_cited_images": 0,
+                    "satisfied": False,
+                    "shortfall_reason": "vlm_failures",
+                },
+            },
+            fallback_actionable_cause="fallback blocked cause",
+        )
+
+        self.assertEqual(
+            diagnostics["actionable_cause"],
+            "codex-interactive visual worker is unavailable",
+        )
+        self.assertNotIn("failure_code", diagnostics)
+        self.assertNotIn("shortfall_reason", diagnostics)
 
     def test_serial_fallback_provenance_is_distinguishable_when_no_shards_are_accepted(self) -> None:
         result = run_skill_invocation(

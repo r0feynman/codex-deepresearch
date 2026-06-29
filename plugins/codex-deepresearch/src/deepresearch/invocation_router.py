@@ -1106,13 +1106,12 @@ def _visual_pipeline_terminal_status(
         visual_required=_run_requires_visual_provider(run_dir),
     )
     minimums = visual_minimums_for_run(run_dir)
-    diagnostics = {
-        "actionable_cause": actionable_cause,
-        "shortfall_reason": minimums.get("shortfall_reason"),
-    }
-    failure_code = visual_failure_code_for_minimums(minimums)
-    if failure_code:
-        diagnostics["failure_code"] = failure_code
+    diagnostics = {"actionable_cause": actionable_cause}
+    if normalized == "partial_auto_visual":
+        diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+        failure_code = visual_failure_code_for_minimums(minimums)
+        if failure_code:
+            diagnostics["failure_code"] = failure_code
     return {
         "status": normalized,
         "ok": envelope["ok"],
@@ -1481,6 +1480,7 @@ def _visual_completion_diagnostics(
     diagnostics: dict[str, Any] = {"actionable_cause": fallback_actionable_cause}
     if not isinstance(status, Mapping):
         return diagnostics
+    status_name = str(status.get("status") or "")
     raw_diagnostics = status.get("diagnostics")
     if isinstance(raw_diagnostics, Mapping):
         diagnostics.update(dict(raw_diagnostics))
@@ -1492,10 +1492,13 @@ def _visual_completion_diagnostics(
             Mapping,
         ):
             minimums = release_gate["minimums"]
-    failure_code = visual_failure_code_for_minimums(minimums)
-    if failure_code:
-        diagnostics["failure_code"] = failure_code
-        diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+    if status_name == "partial_auto_visual":
+        failure_code = visual_failure_code_for_minimums(minimums)
+        if failure_code:
+            diagnostics["failure_code"] = failure_code
+            diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+        elif isinstance(minimums, Mapping):
+            diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
     return diagnostics
 
 

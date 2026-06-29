@@ -338,6 +338,16 @@ def visual_release_minimums(
         for item in eligible_observations
         if _has_nonempty_string(item.get("evidence_image_id"))
     }
+    unique_fetched_artifact_ids = {
+        identity
+        for item in real_fetched_artifacts
+        if (identity := _artifact_identity(item)) is not None
+    }
+    unique_analyzed_image_ids = {
+        identity
+        for item in eligible_observations
+        if (identity := _observation_identity(item)) is not None
+    }
     report_cited_image_ids = _report_cited_visual_image_ids(
         evidence=evidence,
         report_status=report_status,
@@ -346,8 +356,8 @@ def visual_release_minimums(
     satisfied = (
         required == 0
         or (
-            len(real_fetched_artifacts) >= required
-            and len(eligible_observations) >= required
+            len(unique_fetched_artifact_ids) >= required
+            and len(unique_analyzed_image_ids) >= required
             and len(report_cited_image_ids) >= 1
         )
     )
@@ -355,8 +365,8 @@ def visual_release_minimums(
         required_vlm_images=required,
         candidate_count=len(real_candidates),
         selected_candidates=len(selected_candidates),
-        fetched_artifacts=len(real_fetched_artifacts),
-        vlm_images_analyzed=len(eligible_observations),
+        fetched_artifacts=len(unique_fetched_artifact_ids),
+        vlm_images_analyzed=len(unique_analyzed_image_ids),
         report_cited_images=len(report_cited_image_ids),
         fetch_records=real_fetch_records,
         evidence=evidence,
@@ -366,8 +376,8 @@ def visual_release_minimums(
         "required_vlm_images": required,
         "candidate_count": len(real_candidates),
         "selected_candidates": len(selected_candidates),
-        "fetched_artifacts": len(real_fetched_artifacts),
-        "vlm_images_analyzed": len(eligible_observations),
+        "fetched_artifacts": len(unique_fetched_artifact_ids),
+        "vlm_images_analyzed": len(unique_analyzed_image_ids),
         "report_cited_images": len(report_cited_image_ids),
         "satisfied": satisfied,
         "shortfall_reason": shortfall_reason,
@@ -464,6 +474,22 @@ def _report_cited_visual_image_ids(
             ):
                 cited.add(image_id)
     return cited
+
+
+def _artifact_identity(record: Mapping[str, Any]) -> str | None:
+    for field in ("evidence_image_id", "fetch_id", "local_artifact_path", "candidate_id"):
+        value = record.get(field)
+        if _has_nonempty_string(value):
+            return f"{field}:{value}"
+    return None
+
+
+def _observation_identity(record: Mapping[str, Any]) -> str | None:
+    for field in ("evidence_image_id", "fetch_id", "candidate_id", "observation_id"):
+        value = record.get(field)
+        if _has_nonempty_string(value):
+            return f"{field}:{value}"
+    return None
 
 
 def _visual_shortfall_reason(
@@ -1141,6 +1167,12 @@ def _validate_visual_provider_status(
                     f"{field} must be {envelope[field]!r} for status '{state}'",
                 )
     minimums = status.get("minimums")
+    if state == "completed_auto_visual" and minimums is None:
+        collector.add(
+            f"{path}.minimums",
+            "missing_required_field",
+            "completed_auto_visual requires a minimums object",
+        )
     if minimums is not None:
         _validate_visual_minimums(minimums, path, collector)
         if isinstance(minimums, Mapping):

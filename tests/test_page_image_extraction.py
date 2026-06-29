@@ -284,7 +284,7 @@ class PageImageExtractionTests(unittest.TestCase):
             run=run_dir,
             transport=transport,
             max_image_bytes=140,
-            max_fetches=9,
+            max_fetches=4,
             provider_mode="fixture",
         )
 
@@ -941,9 +941,9 @@ class PageImageExtractionTests(unittest.TestCase):
                 "http://169.254.169.254/latest/meta-data/",
             )
 
-    def test_max_fetches_caps_attempts_even_when_fetches_do_not_select_images(self) -> None:
+    def test_max_fetches_caps_successful_fetches_and_tops_up_after_initial_failures(self) -> None:
         prepared = prepare_run(
-            question="Fetch attempts should be capped",
+            question="Successful fetches should be capped after top-up",
             runs_dir=self.temp_runs_dir(),
             route="visual_required",
         )
@@ -953,8 +953,15 @@ class PageImageExtractionTests(unittest.TestCase):
         page.write_text(
             "<html><body>"
             + "".join(
-                f'<img src="https://img.example.test/fail-{index}.txt" alt="{index}">'
-                for index in range(4)
+                f'<img src="https://img.example.test/candidate-{index}{suffix}" alt="{index}">'
+                for index, suffix in (
+                    (1, ".txt"),
+                    (2, ".txt"),
+                    (3, ".png"),
+                    (4, ".png"),
+                    (5, ".png"),
+                    (6, ".png"),
+                )
             )
             + "</body></html>",
             encoding="utf-8",
@@ -984,6 +991,72 @@ class PageImageExtractionTests(unittest.TestCase):
 
         def transport(url: str) -> FetchResponse:
             calls.append(url)
+            if url.endswith(".txt"):
+                return FetchResponse(
+                    content=b"not an image",
+                    mime_type="text/plain",
+                    status_code=200,
+                    final_url=url,
+                )
+            return FetchResponse(
+                content=PNG_1X1 + url.encode("utf-8"),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        extract_and_fetch_page_images(run=run_dir, transport=transport, max_fetches=3)
+
+        self.assertEqual(len(calls), 5)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        statuses = [record["fetch_status"] for record in fetches]
+        self.assertEqual(statuses.count("unsupported_mime"), 2)
+        self.assertEqual(statuses.count("fetched"), 3)
+        self.assertEqual(statuses.count("budget_pruned"), 1)
+
+    def test_max_fetches_exhausts_eligible_candidates_when_success_cap_is_not_met(self) -> None:
+        prepared = prepare_run(
+            question="Failed fetches should not consume the success cap",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "exhaust-page.html"
+        page.write_text(
+            "<html><body>"
+            + "".join(
+                f'<img src="https://img.example.test/fail-{index}.txt" alt="{index}">'
+                for index in range(4)
+            )
+            + "</body></html>",
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_exhaust_page",
+                "type": "web",
+                "url": "https://example.test/exhaust/",
+                "title": "Exhaust page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/exhaust-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
             return FetchResponse(
                 content=b"not an image",
                 mime_type="text/plain",
@@ -991,13 +1064,14 @@ class PageImageExtractionTests(unittest.TestCase):
                 final_url=url,
             )
 
-        extract_and_fetch_page_images(run=run_dir, transport=transport, max_fetches=2)
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport, max_fetches=2)
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(result["images_linked"], 0)
         fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
         statuses = [record["fetch_status"] for record in fetches]
-        self.assertEqual(statuses.count("unsupported_mime"), 2)
-        self.assertEqual(statuses.count("budget_pruned"), 2)
+        self.assertEqual(statuses.count("unsupported_mime"), 4)
+        self.assertEqual(statuses.count("budget_pruned"), 0)
 
     def test_duplicate_failed_url_is_attempted_once_and_deduped(self) -> None:
         prepared = prepare_run(

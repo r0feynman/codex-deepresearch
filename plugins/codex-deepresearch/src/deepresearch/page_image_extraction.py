@@ -604,7 +604,6 @@ def _fetch_candidates(
     seen_urls: dict[str, dict[str, Any]] = {}
     seen_hashes: dict[str, dict[str, Any]] = {}
     seen_phashes: dict[str, dict[str, Any]] = {}
-    fetch_attempt_count = 0
     for candidate in candidates:
         candidate_id = str(candidate["candidate_id"])
         fetch_id = _fetch_id(candidate_id)
@@ -696,7 +695,7 @@ def _fetch_candidates(
                 )
             )
             continue
-        if fetch_attempt_count >= max_fetches:
+        if len(evidence_images) >= max_fetches:
             candidate["candidate_status"] = "budget_pruned"
             candidate["policy_decision"] = "budget_pruned"
             candidate["rejection_reason"] = "budget_pruned"
@@ -710,7 +709,6 @@ def _fetch_candidates(
                 )
             )
             continue
-        fetch_attempt_count += 1
         seen_urls[normalized_url] = {
             "candidate_id": candidate.get("candidate_id"),
             "fetch_id": fetch_id,
