@@ -30,6 +30,11 @@ CHILD_EVENTS_DIRNAME = "child_events"
 CODEX_EXEC_STDOUT_FILENAME = "codex_exec_stdout.jsonl"
 CODEX_EXEC_STDERR_FILENAME = "codex_exec_stderr.txt"
 LAST_CHILD_EVENT_FILENAME = "last_child_event.json"
+EXPECTED_CHILD_SIDECARS = {
+    "search_results": "search_results.jsonl",
+    "visual_observations": "visual_observations.jsonl",
+    "verifier_votes": "verifier_votes.jsonl",
+}
 RETRY_SAFE_FAILURES = {
     "adapter_unavailable",
     "codex_exec_failed",
@@ -216,7 +221,13 @@ class CodexExecAdapter:
             )
             if shard_path.exists() and validate_artifacts(evidence_path=shard_path).valid:
                 valid_shard_context = dict(command_context)
-                valid_shard_context["timeout_after_valid_shard"] = True
+                valid_shard_context.update(
+                    _timeout_after_valid_shard_context(shard_path=shard_path)
+                )
+                diagnostic = _append_timeout_after_valid_shard_context(
+                    diagnostic,
+                    valid_shard_context,
+                )
                 events.append(
                     _codex_event(
                         "wait",
@@ -605,6 +616,7 @@ def run_parallel_orchestration(
     run: str | Path,
     runs_dir: str | Path | None = None,
     adapter_name: str = "codex-exec",
+    codex_exec_timeout_seconds: float | None = None,
     min_tasks: int = 1,
     max_tasks: int | None = None,
     retry_failed: bool = False,
@@ -637,6 +649,7 @@ def run_parallel_orchestration(
         result = _run_parallel_orchestration_started(
             run_dir=run_dir,
             adapter_name=adapter_name,
+            codex_exec_timeout_seconds=codex_exec_timeout_seconds,
             min_tasks=min_tasks,
             max_tasks=max_tasks,
             retry_failed=retry_failed,
@@ -674,6 +687,7 @@ def _run_parallel_orchestration_started(
     *,
     run_dir: Path,
     adapter_name: str,
+    codex_exec_timeout_seconds: float | None,
     min_tasks: int,
     max_tasks: int | None,
     retry_failed: bool,
@@ -693,7 +707,7 @@ def _run_parallel_orchestration_started(
     tasks = _task_list(tasks_artifact)
     max_concurrent = int(tasks_artifact.get("max_concurrent_codex_subagents") or 1)
     requested_adapter_name = _normalize_adapter_name(adapter_name)
-    adapter = _adapter(adapter_name)
+    adapter = _adapter(adapter_name, codex_exec_timeout_seconds=codex_exec_timeout_seconds)
     parallel_degraded = False
     degraded_reason = None
     if isinstance(adapter, CodexExecAdapter) and not adapter.available():
@@ -1075,10 +1089,18 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     return merge_status
 
 
-def _adapter(name: str) -> CodexExecAdapter | FixtureAdapter | SerialFallbackAdapter:
+def _adapter(
+    name: str,
+    *,
+    codex_exec_timeout_seconds: float | None = None,
+) -> CodexExecAdapter | FixtureAdapter | SerialFallbackAdapter:
     normalized = _normalize_adapter_name(name)
     if normalized == "codex-exec":
-        return CodexExecAdapter()
+        if codex_exec_timeout_seconds is not None and codex_exec_timeout_seconds <= 0:
+            raise ParallelOrchestrationError("codex_exec_timeout_seconds must be positive")
+        if codex_exec_timeout_seconds is None:
+            return CodexExecAdapter()
+        return CodexExecAdapter(timeout_seconds=codex_exec_timeout_seconds)
     if normalized in {"fixture", "fake", "deterministic"}:
         return FixtureAdapter()
     if normalized in {"serial-degraded", "serial-fallback"}:
@@ -1780,6 +1802,9 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
     return (
         "Run this bounded research shard task and write only schema-valid "
         f"evidence to {shard_path}. "
+        "First create the shard directory if needed and write a minimal valid `evidence_shard.json` "
+        f"to {shard_path} before any optional sidecars; keep replacing it with richer valid evidence as you proceed. "
+        "If you use inline scripts for local JSON or file manipulation, invoke them with `python3`, not `python`. "
         f"Write claim text, caveats, rationales, and synthesized source snippets in {response_language}; "
         "for Korean queries, translate/summarize English source findings into Korean user-facing prose. "
         "Only direct quote_spans.quote values should remain verbatim in the source language. "
@@ -1796,6 +1821,38 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         f"Do not write sidecars outside {shard_dir}. "
         f"Task JSON: {json.dumps(dict(task), sort_keys=True)}"
     )
+
+
+def _timeout_after_valid_shard_context(*, shard_path: Path) -> dict[str, Any]:
+    sidecars = _expected_sidecar_status(shard_path.parent)
+    missing = [
+        record["filename"]
+        for record in sidecars.values()
+        if record.get("exists") is not True
+    ]
+    return {
+        "timeout_after_valid_shard": True,
+        "valid_evidence_shard_exists": True,
+        "valid_evidence_shard_path": str(shard_path),
+        "expected_sidecars": sidecars,
+        "missing_expected_sidecars": missing,
+        "missing_expected_sidecar_paths": [
+            record["path"]
+            for record in sidecars.values()
+            if record.get("exists") is not True
+        ],
+    }
+
+
+def _expected_sidecar_status(shard_dir: Path) -> dict[str, dict[str, Any]]:
+    return {
+        key: {
+            "filename": filename,
+            "path": str(shard_dir / filename),
+            "exists": (shard_dir / filename).exists(),
+        }
+        for key, filename in EXPECTED_CHILD_SIDECARS.items()
+    }
 
 
 def _contains_korean(value: str) -> bool:
@@ -2128,6 +2185,20 @@ def _append_shard_validation_context(message: str, shard_path: Path) -> str:
     return (
         f"{message}; shard_status=invalid; shard_path={shard_path}; "
         f"shard_validation={json.dumps(validation.to_dict(), sort_keys=True)}"
+    )
+
+
+def _append_timeout_after_valid_shard_context(
+    message: str,
+    context: Mapping[str, Any],
+) -> str:
+    return (
+        f"{message}; timeout_after_valid_shard=True; "
+        f"valid_evidence_shard_exists=True; "
+        "missing_expected_sidecars="
+        f"{json.dumps(context.get('missing_expected_sidecars') or [], sort_keys=True)}; "
+        "missing_expected_sidecar_paths="
+        f"{json.dumps(context.get('missing_expected_sidecar_paths') or [], sort_keys=True)}"
     )
 
 
