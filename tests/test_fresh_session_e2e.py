@@ -22,6 +22,9 @@ from deepresearch.fresh_session_e2e import (  # noqa: E402
     run_fresh_session_visual_e2e,
     validate_final_response,
 )
+from deepresearch.sanitized_real_visual_e2e import (  # noqa: E402
+    run_sanitized_real_visual_e2e,
+)
 
 
 class FreshSessionE2ETests(unittest.TestCase):
@@ -175,9 +178,59 @@ class FreshSessionE2ETests(unittest.TestCase):
         gate = self._visual_release_gate_with_response(run_status)
 
         self.assertTrue(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["real_candidate_count"], 10)
+        self.assertEqual(gate["real_fetched_artifacts"], 3)
         self.assertEqual(gate["codex_interactive_analyzed_images"], 3)
         self.assertEqual(gate["report_cited_visual_or_mixed_claims"], 1)
         self.assertTrue(gate["visual_artifact_validation"]["valid"], gate["visual_artifact_validation"])
+
+    def test_completed_auto_visual_requires_ten_real_visual_candidates(self) -> None:
+        run_dir = self._complete_visual_run_dir(image_count=3, candidate_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertEqual(gate["real_candidate_count"], 3)
+        self.assertEqual(gate["real_fetched_artifacts"], 3)
+        self.assertEqual(gate["codex_interactive_analyzed_images"], 3)
+        self.assertFalse(gate["checks"]["real_automatic_visual_candidates_at_least_10"])
+        self.assertFalse(gate["checks"]["visual_provider_minimums_satisfied"])
+
+    def test_sanitized_real_no_user_image_completed_run_satisfies_visual_gate(self) -> None:
+        result = run_sanitized_real_visual_e2e(
+            runs_dir=self.temp_runs_dir(),
+            suite_id="fresh-session-sanitized-real",
+            clean=True,
+        )
+
+        self.assertEqual(result["status"], "passed", result.get("failures"))
+        self.assertTrue(result["release_gate_passed"])
+        self.assertTrue(result["no_user_image"])
+        self.assertTrue(result["sanitized_real_artifact"])
+        self.assertFalse(result["live_web_fetch"])
+        self.assertFalse(result["live_codex_vlm_session"])
+        self.assertTrue(result["deterministic_codex_interactive_test_double"])
+        self.assertEqual(result["counts"]["candidate_count"], 10)
+        self.assertGreaterEqual(result["counts"]["fetched_artifacts"], 3)
+        self.assertGreaterEqual(result["counts"]["codex_interactive_observations"], 3)
+        self.assertGreaterEqual(
+            result["counts"]["report_cited_visual_or_mixed_claims"],
+            1,
+        )
+        self.assertTrue(result["visual_minimums"]["satisfied"])
+        self.assertTrue(
+            result["lineage"]["non_fixture_non_manual_non_user_provided"],
+            result["lineage"],
+        )
+
+        provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
+        self.assertEqual(provider_status["status"], "completed_auto_visual")
+        self.assertTrue(provider_status["minimums"]["satisfied"])
+        self.assertEqual(provider_status["minimums"]["candidate_count"], 10)
+        self.assertGreaterEqual(provider_status["minimums"]["fetched_artifacts"], 3)
+        self.assertGreaterEqual(provider_status["minimums"]["vlm_images_analyzed"], 3)
+        self.assertGreaterEqual(provider_status["minimums"]["report_cited_images"], 1)
 
     def test_completed_auto_visual_rejects_mixed_fixture_image_evidence(self) -> None:
         run_dir = self._complete_visual_run_dir(image_count=3)
@@ -372,6 +425,7 @@ class FreshSessionE2ETests(unittest.TestCase):
             completed["visual_release_gate"]["codex_interactive_analyzed_images"],
             3,
         )
+        self.assertEqual(completed["visual_release_gate"]["real_candidate_count"], 10)
 
     def test_broken_skill_instructions_fail_user_facing_gate(self) -> None:
         skill_dir = self.temp_runs_dir()
@@ -627,7 +681,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         )
         return payload
 
-    def _complete_visual_run_dir(self, *, image_count: int) -> Path:
+    def _complete_visual_run_dir(self, *, image_count: int, candidate_count: int = 10) -> Path:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         run_dir = Path(temp_dir.name)
@@ -641,38 +695,40 @@ class FreshSessionE2ETests(unittest.TestCase):
         fetches = []
         observations = []
         images = []
-        for index in range(1, image_count + 1):
-            image_id = f"img_real_{index:03d}"
+        for index in range(1, candidate_count + 1):
             candidate = self._visual_candidate(
                 candidate_id=f"cand_real_{index:03d}",
                 task_id=task_id,
                 angle_id=angle_id,
                 rank=index,
-            )
-            fetch = self._visual_fetch(
-                candidate=candidate,
-                fetch_id=f"fetch_real_{index:03d}",
-                evidence_image_id=image_id,
+                candidate_status="analyzed" if index <= image_count else "ranked",
             )
             candidates.append(candidate)
-            fetches.append(fetch)
-            observations.append(
-                self._visual_observation(
+            if index <= image_count:
+                image_id = f"img_real_{index:03d}"
+                fetch = self._visual_fetch(
                     candidate=candidate,
-                    fetch=fetch,
-                    evidence_image_id=image_id,
-                    claim_id=claim_id if index == 1 else None,
-                    vote_id=vote_id if index == 1 else None,
-                    created_at=created_at,
-                )
-            )
-            images.append(
-                self._visual_evidence_image(
-                    candidate=candidate,
-                    fetch=fetch,
+                    fetch_id=f"fetch_real_{index:03d}",
                     evidence_image_id=image_id,
                 )
-            )
+                fetches.append(fetch)
+                observations.append(
+                    self._visual_observation(
+                        candidate=candidate,
+                        fetch=fetch,
+                        evidence_image_id=image_id,
+                        claim_id=claim_id if index == 1 else None,
+                        vote_id=vote_id if index == 1 else None,
+                        created_at=created_at,
+                    )
+                )
+                images.append(
+                    self._visual_evidence_image(
+                        candidate=candidate,
+                        fetch=fetch,
+                        evidence_image_id=image_id,
+                    )
+                )
 
         self._write_json(
             run_dir / "visual_tasks.json",
@@ -695,7 +751,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                         "providers": ["page-image-extractor", "codex-interactive"],
                         "source_search_result_ids": [],
                         "caps": {
-                            "max_candidates": image_count,
+                            "max_candidates": candidate_count,
                             "max_fetches": image_count,
                             "max_vlm_images": image_count,
                             "max_cost_usd": 1.0,
@@ -721,7 +777,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                 "metric_classification": "success",
                 "minimums": {
                     "required_vlm_images": 3,
-                    "candidate_count": image_count,
+                    "candidate_count": candidate_count,
                     "selected_candidates": image_count,
                     "fetched_artifacts": image_count,
                     "vlm_images_analyzed": image_count,
@@ -736,7 +792,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                         provider="page-image-extractor",
                         provider_kind="page_extractor",
                         invocations=1,
-                        candidates_discovered=image_count,
+                        candidates_discovered=candidate_count,
                         artifacts_fetched=image_count,
                         vlm_images_analyzed=0,
                     ),
@@ -892,6 +948,7 @@ class FreshSessionE2ETests(unittest.TestCase):
         task_id: str,
         angle_id: str,
         rank: int,
+        candidate_status: str = "analyzed",
     ) -> dict:
         return {
             "candidate_id": candidate_id,
@@ -914,7 +971,7 @@ class FreshSessionE2ETests(unittest.TestCase):
             "score": 1.0,
             "policy_decision": "allowed",
             "policy_flags": [],
-            "candidate_status": "analyzed",
+            "candidate_status": candidate_status,
             "rejection_reason": None,
             "estimated_cost_usd": 0.01,
             "actual_cost_usd": 0.01,

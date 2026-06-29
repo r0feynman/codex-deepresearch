@@ -73,6 +73,13 @@ from .public_beta_validation import (
     run_public_beta_validation,
 )
 from .report_generation import ReportGenerationError, synthesize_report
+from .sanitized_real_visual_e2e import (
+    DEFAULT_SANITIZED_REAL_VISUAL_INVOKE,
+    SANITIZED_REAL_VISUAL_E2E_RESULTS_FILENAME,
+    SANITIZED_REAL_VISUAL_E2E_SCHEMA_VERSION,
+    SanitizedRealVisualE2EError,
+    run_sanitized_real_visual_e2e,
+)
 from .report_exports import (
     REPORT_EXPORT_SCHEMA_VERSION,
     ReportExportError,
@@ -143,6 +150,7 @@ __all__ = [
     "PublicBetaValidationError",
     "ReportGenerationError",
     "ReportExportError",
+    "SanitizedRealVisualE2EError",
     "RUN_CONTROL_FILENAME",
     "RUN_CONTROL_SCHEMA_VERSION",
     "RunConfig",
@@ -164,8 +172,11 @@ __all__ = [
     "PUBLIC_BETA_VALIDATION_RESULTS_FILENAME",
     "PUBLIC_BETA_VALIDATION_SCHEMA_VERSION",
     "PUBLIC_BETA_VALIDATION_SUMMARY_FILENAME",
+    "SANITIZED_REAL_VISUAL_E2E_RESULTS_FILENAME",
+    "SANITIZED_REAL_VISUAL_E2E_SCHEMA_VERSION",
     "DEFAULT_FRESH_SESSION_INVOKE",
     "DEFAULT_FRESH_SESSION_VISUAL_INVOKE",
+    "DEFAULT_SANITIZED_REAL_VISUAL_INVOKE",
     "DEFAULT_SCENARIO_TIMEOUT_SECONDS",
     "TraceError",
     "TraceValidationError",
@@ -223,6 +234,7 @@ __all__ = [
     "run_public_beta_validation",
     "run_mvp_smoke",
     "run_parallel_orchestration",
+    "run_sanitized_real_visual_e2e",
     "run_skill_invocation",
     "export_report",
     "review_claim",

@@ -16,6 +16,7 @@ from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     real_automatic_visual_release_counts,
     validate_visual_artifacts,
+    visual_minimums_for_run,
 )
 
 FRESH_SESSION_E2E_SCHEMA_VERSION = "codex-deepresearch.fresh-session-e2e.v0"
@@ -29,6 +30,7 @@ DEFAULT_FRESH_SESSION_VISUAL_INVOKE = (
     "applications and cite the visual evidence differences."
 )
 DEFAULT_SCENARIO_TIMEOUT_SECONDS = 120.0
+DEFAULT_MIN_REAL_VISUAL_CANDIDATES = 10
 REAL_CODEX_EXEC_MODES = ("auto", "require", "skip")
 REAL_CODEX_INTERACTIVE_MODES = ("auto", "require", "skip")
 
@@ -383,6 +385,8 @@ def render_final_response(
             "Visual summary: "
             f"release_gate_passed={visual_release_gate.get('release_gate_passed')}, "
             f"status={visual_release_gate.get('status')}, "
+            f"real_candidates={visual_release_gate.get('real_candidate_count', 0)}, "
+            f"fetched_artifacts={visual_release_gate.get('real_fetched_artifacts', 0)}, "
             f"codex_interactive_analyzed_images="
             f"{visual_release_gate.get('codex_interactive_analyzed_images', 0)}, "
             f"report_cited_visual_claims="
@@ -1018,6 +1022,13 @@ def _visual_release_gate(
         "visual_provider_status_completed_auto_visual": (
             counts["visual_provider_status_completed_auto_visual"]
         ),
+        "visual_provider_minimums_satisfied": counts[
+            "visual_provider_minimums_satisfied"
+        ],
+        "real_automatic_visual_candidates_at_least_10": (
+            counts["real_candidate_count"] >= DEFAULT_MIN_REAL_VISUAL_CANDIDATES
+        ),
+        "real_fetched_artifacts_at_least_3": counts["real_fetched_artifacts"] >= 3,
         "report_status_completed": counts["report_status_completed"],
         "codex_interactive_analyzed_non_fixture_images_at_least_3": (
             counts["codex_interactive_analyzed_images"] >= 3
@@ -1044,11 +1055,14 @@ def _visual_release_gate(
         "release_gate_passed": release_gate_passed,
         "blocked_capability": _blocked_capability(run_status),
         "blocked_detail": _blocked_detail(run_status),
+        "real_candidate_count": counts["real_candidate_count"],
+        "real_fetched_artifacts": counts["real_fetched_artifacts"],
         "codex_interactive_analyzed_images": counts["codex_interactive_analyzed_images"],
         "report_cited_visual_or_mixed_claims": counts[
             "report_cited_visual_or_mixed_claims"
         ],
         "non_release_visual_images": counts["non_release_visual_images"],
+        "visual_minimums": counts["visual_minimums"],
         "real_automatic_visual_counts": counts["real_automatic_visual_counts"],
         "visual_artifact_validation": visual_artifact_validation,
         "required_response_artifacts": artifact_exposure["required_artifacts"],
@@ -1062,6 +1076,8 @@ def _visual_release_summary(visual_release_gate: Mapping[str, Any]) -> dict[str,
         "status": visual_release_gate.get("status"),
         "release_gate_passed": visual_release_gate.get("release_gate_passed"),
         "blocked_capability": visual_release_gate.get("blocked_capability"),
+        "real_candidate_count": visual_release_gate.get("real_candidate_count", 0),
+        "real_fetched_artifacts": visual_release_gate.get("real_fetched_artifacts", 0),
         "codex_interactive_analyzed_images": visual_release_gate.get(
             "codex_interactive_analyzed_images", 0
         ),
@@ -1157,6 +1173,13 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
     visual_provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
     report_text = _read_optional_text(run_dir / "report.md")
     images = _mapping_list(evidence.get("images") if isinstance(evidence, Mapping) else [])
+    visual_minimums = visual_minimums_for_run(run_dir)
+    provider_minimums = (
+        visual_provider_status.get("minimums")
+        if isinstance(visual_provider_status, Mapping)
+        and isinstance(visual_provider_status.get("minimums"), Mapping)
+        else {}
+    )
 
     codex_image_ids = _codex_interactive_real_evidence_image_ids(
         images=images,
@@ -1178,6 +1201,18 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
         "report_cited_visual_or_mixed_claims": report_cited_claims,
         "non_release_visual_images": non_release_images,
         "release_evidence_is_non_fixture": non_release_images == 0,
+        "real_candidate_count": int(visual_minimums.get("candidate_count") or 0),
+        "real_fetched_artifacts": int(visual_minimums.get("fetched_artifacts") or 0),
+        "visual_minimums": visual_minimums,
+        "visual_provider_minimums_satisfied": (
+            visual_minimums.get("satisfied") is True
+            and provider_minimums.get("satisfied") is True
+            and int(provider_minimums.get("candidate_count") or 0)
+            >= DEFAULT_MIN_REAL_VISUAL_CANDIDATES
+            and int(provider_minimums.get("fetched_artifacts") or 0) >= 3
+            and int(provider_minimums.get("vlm_images_analyzed") or 0) >= 3
+            and int(provider_minimums.get("report_cited_images") or 0) >= 1
+        ),
         "visual_provider_status_completed_auto_visual": (
             isinstance(visual_provider_status, Mapping)
             and visual_provider_status.get("status") == "completed_auto_visual"
@@ -1202,6 +1237,19 @@ def _empty_visual_counts() -> dict[str, Any]:
         "report_cited_visual_or_mixed_claims": 0,
         "non_release_visual_images": 0,
         "release_evidence_is_non_fixture": True,
+        "real_candidate_count": 0,
+        "real_fetched_artifacts": 0,
+        "visual_minimums": {
+            "required_vlm_images": 3,
+            "candidate_count": 0,
+            "selected_candidates": 0,
+            "fetched_artifacts": 0,
+            "vlm_images_analyzed": 0,
+            "report_cited_images": 0,
+            "satisfied": False,
+            "shortfall_reason": "insufficient_candidates",
+        },
+        "visual_provider_minimums_satisfied": False,
         "visual_provider_status_completed_auto_visual": False,
         "report_status_completed": False,
         "real_automatic_visual_counts": real_automatic_visual_release_counts(),

@@ -25,8 +25,10 @@ from deepresearch import (
     DEFAULT_SCENARIO_TIMEOUT_SECONDS,
     EvidenceReviewError,
     FreshSessionE2EError,
+    DEFAULT_SANITIZED_REAL_VISUAL_INVOKE,
     DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
     PublicBetaValidationError,
+    SanitizedRealVisualE2EError,
     parse_scenario_run,
     parse_public_beta_gate_result,
     parse_public_beta_run,
@@ -39,6 +41,7 @@ from deepresearch import (
     run_fresh_session_e2e,
     run_fresh_session_visual_e2e,
     run_public_beta_validation,
+    run_sanitized_real_visual_e2e,
     run_skill_invocation,
     validate_artifacts,
 )
@@ -875,6 +878,32 @@ def run_fresh_session_visual_e2e_command(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 2
 
 
+def run_sanitized_real_visual_e2e_command(args: argparse.Namespace) -> int:
+    try:
+        result = run_sanitized_real_visual_e2e(
+            runs_dir=resolve_repo_path(args.runs_dir),
+            suite_id=args.suite_id,
+            invocation=args.invoke,
+            clean=args.clean,
+            candidate_count=args.candidate_count,
+            fetched_artifacts=args.fetched_artifacts,
+            scenario_timeout_seconds=args.scenario_timeout_seconds,
+        )
+    except (SanitizedRealVisualE2EError, OSError, json.JSONDecodeError) as exc:
+        results_path = getattr(exc, "results_path", None)
+        if results_path and Path(results_path).is_file():
+            payload = json.loads(Path(results_path).read_text(encoding="utf-8"))
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 2
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if results_path:
+            print(f"Results: {results_path}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["status"] == "passed" else 2
+
+
 def run_public_beta_validation_command(args: argparse.Namespace) -> int:
     prompt_runs = {}
     gate_results = {}
@@ -1117,6 +1146,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-scenario subprocess timeout for fixture and blocked visual paths.",
     )
     fresh_session_visual.set_defaults(func=run_fresh_session_visual_e2e_command)
+
+    sanitized_real_visual = subparsers.add_parser(
+        "sanitized-real-visual-e2e",
+        help=(
+            "Run the public-safe sanitized-real-artifact no-user-image visual "
+            "release gate."
+        ),
+    )
+    sanitized_real_visual.add_argument(
+        "--invoke",
+        default=DEFAULT_SANITIZED_REAL_VISUAL_INVOKE,
+        help=(
+            "Visual-required $deep-research invocation used for the sanitized-real "
+            "completed_auto_visual run and fresh-session transcript."
+        ),
+    )
+    sanitized_real_visual.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for sanitized-real visual gate artifacts, relative to the repo root by default.",
+    )
+    sanitized_real_visual.add_argument(
+        "--suite-id",
+        default="sanitized-real-visual-e2e",
+        help="Subdirectory name under --runs-dir for this gate.",
+    )
+    sanitized_real_visual.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove an existing suite directory before writing new artifacts.",
+    )
+    sanitized_real_visual.add_argument(
+        "--candidate-count",
+        type=int,
+        default=10,
+        help="Real-mode sanitized replay visual candidates to create; must be at least 10.",
+    )
+    sanitized_real_visual.add_argument(
+        "--fetched-artifacts",
+        type=int,
+        default=3,
+        help="Real-mode sanitized replay image artifacts to fetch and analyze; must be at least 3.",
+    )
+    sanitized_real_visual.add_argument(
+        "--scenario-timeout-seconds",
+        type=float,
+        default=DEFAULT_SCENARIO_TIMEOUT_SECONDS,
+        help="Per-scenario subprocess timeout for the nested fresh-session visual gate.",
+    )
+    sanitized_real_visual.set_defaults(func=run_sanitized_real_visual_e2e_command)
 
     public_beta = subparsers.add_parser(
         "public-beta-validation",
