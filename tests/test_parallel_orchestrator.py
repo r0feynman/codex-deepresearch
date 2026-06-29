@@ -641,6 +641,262 @@ class ParallelOrchestratorTests(unittest.TestCase):
             expected_missing,
         )
 
+    def test_codex_exec_capacity_failure_retries_and_recovers_with_attempt_diagnostics(self) -> None:
+        run_dir = self.prepare()
+        capacity_message = "Selected model is at capacity. Please try a different model."
+        call_count = 0
+
+        def fake_codex_exec(command, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
+            task = tasks[0]
+            if call_count == 1:
+                return subprocess.CompletedProcess(
+                    args=command,
+                    returncode=1,
+                    stdout=json.dumps(
+                        {
+                            "type": "message",
+                            "status": "error",
+                            "message": capacity_message,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    stderr="",
+                )
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.random.uniform", return_value=0.0),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        self.assertEqual(run_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(5.0)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        self.assertEqual(task["state"], "merged")
+        self.assertEqual(task["attempt"], 2)
+        self.assertEqual(task["max_attempts"], 3)
+        attempts = task["attempt_diagnostics"]
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0]["attempt"], 1)
+        self.assertEqual(attempts[0]["child_failure_code"], "codex_child_model_capacity")
+        self.assertFalse(attempts[0]["timeout"])
+        self.assertEqual(attempts[0]["returncode"], 1)
+        self.assertEqual(attempts[0]["last_message_text_preview"], capacity_message)
+        self.assertIn("attempt_001", attempts[0]["raw_child_event_artifacts"]["stdout_jsonl_path"])
+        self.assertEqual(attempts[0]["computed_backoff_seconds"], 5.0)
+        self.assertEqual(attempts[0]["actual_sleep_seconds"], 0.0)
+        self.assertEqual(attempts[0]["retry_decision"], "retry")
+        self.assertEqual(attempts[1]["attempt"], 2)
+        self.assertIsNone(attempts[1]["child_failure_code"])
+        self.assertEqual(attempts[1]["returncode"], 0)
+        self.assertIn("attempt_002", attempts[1]["raw_child_event_artifacts"]["stdout_jsonl_path"])
+        self.assertEqual(attempts[1]["retry_decision"], "do_not_retry")
+        self.assertEqual(tasks_artifact["retry_summary"]["retry_count"], 1)
+        self.assertEqual(tasks_artifact["retry_summary"]["recovered_after_capacity_count"], 1)
+
+        accepted = result["merge"]["accepted_shards"][0]
+        self.assertEqual(
+            accepted["diagnostics"]["attempt_diagnostics"][0]["child_failure_code"],
+            "codex_child_model_capacity",
+        )
+        self.assertTrue(accepted["diagnostics"]["retry_summary"]["recovered_after_capacity"])
+        self.assertEqual(result["retry_summary"]["retry_count"], 1)
+        self.assertEqual(result["diagnostics"]["recovered_after_capacity_count"], 1)
+        status = self.load_json(run_dir / "parallel_orchestration_status.json")
+        self.assertEqual(status["retry_summary"]["recovered_after_capacity_count"], 1)
+        self.assertEqual(status["codex_exec_retry_policy"]["max_attempts"], 3)
+        self.assertEqual(status["codex_exec_retry_policy"]["max_retry_elapsed_seconds"], 60.0)
+
+    def test_codex_exec_non_capacity_child_failures_do_not_capacity_retry(self) -> None:
+        cases = (
+            ("auth", "Invalid auth credential; please login.", "codex_child_auth_blocked"),
+            ("sandbox", "Sandbox approval blocked before child could write shard.", "codex_child_sandbox_blocked"),
+            ("quota", "Quota exhausted for this account.", "codex_child_quota_exhausted"),
+            ("billing", "Billing disabled for this workspace.", "codex_child_billing_disabled"),
+            ("policy", "Policy blocked this request.", "codex_child_policy_blocked"),
+        )
+        for _name, message, expected_code in cases:
+            with self.subTest(message=message):
+                run_dir = self.prepare()
+
+                def fake_codex_exec(command, **_kwargs):
+                    return subprocess.CompletedProcess(
+                        args=command,
+                        returncode=1,
+                        stdout=json.dumps(
+                            {"type": "message", "status": "error", "message": message},
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        stderr=message,
+                    )
+
+                with (
+                    mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+                    mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+                    mock.patch(
+                        "deepresearch.parallel_orchestrator.subprocess.run",
+                        side_effect=fake_codex_exec,
+                    ) as run_mock,
+                ):
+                    result = run_parallel_orchestration(
+                        run=run_dir,
+                        adapter_name="codex-exec",
+                        codex_exec_timeout_seconds=120,
+                        min_tasks=1,
+                        max_tasks=1,
+                        allow_degraded=False,
+                    )
+
+                self.assertFalse(result["ok"])
+                self.assertIn(
+                    result["status"],
+                    {"blocked_parallel_execution", "failed_parallel_no_accepted_shards"},
+                )
+                run_mock.assert_called_once()
+                sleep_mock.assert_not_called()
+                task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+                attempt = task["attempt_diagnostics"][0]
+                self.assertEqual(attempt["child_failure_code"], expected_code)
+                self.assertEqual(attempt["retry_decision"], "do_not_retry")
+                self.assertNotEqual(attempt["child_failure_code"], "codex_child_model_capacity")
+
+    def test_codex_exec_invalid_schema_child_failure_does_not_capacity_retry(self) -> None:
+        run_dir = self.prepare()
+
+        def fake_codex_exec(command, **_kwargs):
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, {"schema_version": "0.1.0", "sources": []})
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote invalid shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        run_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        attempt = task["attempt_diagnostics"][0]
+        self.assertEqual(attempt["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(attempt["retry_decision"], "do_not_retry")
+
+    def test_codex_exec_capacity_retry_exhaustion_fails_without_timeout(self) -> None:
+        run_dir = self.prepare()
+        capacity_message = "Selected model is at capacity. Please try a different model."
+
+        def fake_codex_exec(command, **_kwargs):
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout=json.dumps(
+                    {"type": "message", "status": "error", "message": capacity_message},
+                    sort_keys=True,
+                )
+                + "\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.random.uniform", return_value=0.0),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=300,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        self.assertFalse(result["parallel_degraded"])
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_args_list, [mock.call(5.0), mock.call(10.0)])
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "failed")
+        self.assertTrue(task["retry_exhausted"])
+        self.assertEqual(task["retry_exhausted_reason"], "max_attempts_reached")
+        self.assertEqual(task["failure_category"], "codex_child_model_capacity")
+        self.assertEqual(task["child_failure_code"], "codex_child_model_capacity")
+        attempts = task["attempt_diagnostics"]
+        self.assertEqual([attempt["attempt"] for attempt in attempts], [1, 2, 3])
+        self.assertEqual(
+            [attempt["retry_decision"] for attempt in attempts],
+            ["retry", "retry", "retry_exhausted"],
+        )
+        self.assertTrue(all(attempt["timeout"] is False for attempt in attempts))
+        self.assertEqual(attempts[0]["computed_backoff_seconds"], 5.0)
+        self.assertEqual(attempts[1]["computed_backoff_seconds"], 10.0)
+        self.assertEqual(attempts[2]["computed_backoff_seconds"], None)
+
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "codex_child_model_capacity")
+        self.assertEqual(failed_task["child_failure_code"], "codex_child_model_capacity")
+        self.assertFalse(failed_task["timeout"])
+        self.assertEqual(failed_task["returncode"], 1)
+        self.assertEqual(
+            failed_task["attempt_diagnostics"][2]["retry_decision"],
+            "retry_exhausted",
+        )
+        self.assertTrue(result["diagnostics"]["retry_exhausted"])
+        self.assertEqual(result["retry_summary"]["retry_exhausted_count"], 1)
+        self.assertEqual(result["retry_summary"]["capacity_failure_count"], 3)
+
     def test_fixture_runner_records_codex_events_and_schema_valid_shards(self) -> None:
         run_dir = self.prepare(route="visual_optional")
 
