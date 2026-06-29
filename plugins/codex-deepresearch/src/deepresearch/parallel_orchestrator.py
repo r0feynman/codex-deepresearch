@@ -1569,9 +1569,11 @@ def _execute_task_attempts(
                     parallel_degraded = True
                     degraded_reason = result.failure_category or "codex_exec_unavailable"
                     _preserve_parallel_failure(task)
+                    retryable = _task_is_retryable(task)
                     if isinstance(task.get("parallel_failure"), dict):
-                        task["parallel_failure"]["retryable"] = True
-                    task["state"] = "retryable"
+                        task["parallel_failure"]["retryable"] = retryable
+                    if retryable:
+                        task["state"] = "retryable"
         if retry_traces:
             batch_sleep_seconds = max(
                 float(plan.get("computed_backoff_seconds") or 0.0)
@@ -3139,15 +3141,15 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _task_is_retryable(task: Mapping[str, Any]) -> bool:
-    preserved_failure = task.get("parallel_failure")
-    if isinstance(preserved_failure, Mapping) and isinstance(preserved_failure.get("retryable"), bool):
-        return bool(preserved_failure.get("retryable"))
     latest_attempt = _latest_attempt_diagnostic(task) or {}
     retry_decision = str(latest_attempt.get("retry_decision") or "")
     if retry_decision == "retry":
         return True
     if retry_decision in {"do_not_retry", "retry_exhausted"}:
         return False
+    preserved_failure = task.get("parallel_failure")
+    if isinstance(preserved_failure, Mapping) and isinstance(preserved_failure.get("retryable"), bool):
+        return bool(preserved_failure.get("retryable"))
     failure_category = str(task.get("failure_category") or "")
     return str(task.get("state") or "") == "retryable" or failure_category in RETRY_SAFE_FAILURES
 
