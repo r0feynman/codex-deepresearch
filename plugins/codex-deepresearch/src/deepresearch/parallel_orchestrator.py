@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import shlex
@@ -1029,7 +1030,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
 
         if new_claims or state == "merged":
             task["state"] = "merged"
-            accepted_shards.append({"task_id": task["id"], "path": str(shard_path)})
+            accepted_shards.append(_accepted_shard_record(task, shard_path))
         else:
             task["state"] = "discarded"
             task["discard_reason"] = "dedupe_or_no_mergeable_claims"
@@ -2507,6 +2508,33 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _accepted_shard_record(task: Mapping[str, Any], shard_path: Path) -> dict[str, Any]:
+    record = {"task_id": task["id"], "path": str(shard_path)}
+    diagnostics = _accepted_shard_diagnostics(task)
+    if diagnostics:
+        record["diagnostics"] = diagnostics
+    return record
+
+
+def _accepted_shard_diagnostics(task: Mapping[str, Any]) -> dict[str, Any]:
+    command_context = task.get("last_command_context")
+    if not isinstance(command_context, Mapping):
+        return {}
+    if command_context.get("timeout_after_valid_shard") is not True:
+        return {}
+    diagnostics: dict[str, Any] = {"timeout_after_valid_shard": True}
+    for key in (
+        "valid_evidence_shard_exists",
+        "valid_evidence_shard_path",
+        "expected_sidecars",
+        "missing_expected_sidecars",
+        "missing_expected_sidecar_paths",
+    ):
+        if key in command_context:
+            diagnostics[key] = copy.deepcopy(command_context[key])
+    return diagnostics
+
+
 def _preserve_parallel_failure(task: dict[str, Any]) -> None:
     if isinstance(task.get("parallel_failure"), Mapping):
         return
@@ -2577,6 +2605,12 @@ def _merge_diagnostics(
     rejected_shards: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     if accepted_shards:
+        accepted_warnings = _accepted_shard_warnings(accepted_shards)
+        if accepted_warnings:
+            return {
+                "accepted_shard_warning_count": len(accepted_warnings),
+                "accepted_shard_warnings": accepted_warnings,
+            }
         return {}
     if failed_tasks:
         first = failed_tasks[0]
@@ -2608,6 +2642,32 @@ def _merge_diagnostics(
             "first_rejected_reason": first.get("reason"),
         }
     return {"actionable_cause": "no evidence shards were accepted"}
+
+
+def _accepted_shard_warnings(
+    accepted_shards: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    for shard in accepted_shards:
+        diagnostics = shard.get("diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            continue
+        if diagnostics.get("timeout_after_valid_shard") is not True:
+            continue
+        warnings.append(
+            {
+                "task_id": shard.get("task_id"),
+                "path": shard.get("path"),
+                "warning": "timeout_after_valid_shard",
+                "missing_expected_sidecars": list(
+                    diagnostics.get("missing_expected_sidecars") or []
+                ),
+                "missing_expected_sidecar_paths": list(
+                    diagnostics.get("missing_expected_sidecar_paths") or []
+                ),
+            }
+        )
+    return warnings
 
 
 def _read_json(path: Path) -> dict[str, Any]:
