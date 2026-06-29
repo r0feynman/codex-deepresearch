@@ -320,6 +320,7 @@ def run_invoke(args: argparse.Namespace) -> int:
         max_cost_usd=args.max_cost_usd,
         confirm_budget=args.confirm_budget,
         adapter_name=args.adapter,
+        codex_exec_timeout_seconds=args.codex_exec_timeout_seconds,
         min_tasks=args.min_tasks,
         max_tasks=args.max_tasks,
         allow_degraded=not args.no_degrade,
@@ -760,6 +761,7 @@ def run_orchestrate_parallel(args: argparse.Namespace) -> int:
             allow_degraded=not args.no_degrade,
             confirm_exhaustive=args.confirm_exhaustive,
             max_cost_usd=args.max_cost_usd,
+            codex_exec_timeout_seconds=args.codex_exec_timeout_seconds,
         )
     except (AdapterUnavailable, ParallelOrchestrationError, SearchHandoffError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1449,6 +1451,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit exhaustive max-cost cap when no prepared budget cap exists.",
     )
     orchestrate_parallel.add_argument(
+        "--codex-exec-timeout-seconds",
+        type=float,
+        help="Per-child codex exec timeout in seconds. Defaults to 300.",
+    )
+    orchestrate_parallel.add_argument(
         "--no-degrade",
         action="store_true",
         help="Fail instead of serially degrading when codex-exec is unavailable.",
@@ -1553,6 +1560,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-cost-usd",
         type=float,
         help="Optional deterministic high-water cost cap in USD placeholder units.",
+    )
+    invoke.add_argument(
+        "--codex-exec-timeout-seconds",
+        type=float,
+        help="Per-child codex exec timeout in seconds for full-runner mode. Defaults to 300.",
     )
     invoke.add_argument(
         "--confirm-budget",

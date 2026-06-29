@@ -80,6 +80,45 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(persisted["provenance"]["type"], "fixture")
         self.assertIn("report_status", persisted["artifact_handoff"]["artifact_paths"])
 
+    def test_full_runner_forwards_codex_exec_timeout_override(self) -> None:
+        captured_kwargs: list[dict] = []
+
+        def fake_parallel(*, run, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return {
+                "status": "blocked_parallel_execution",
+                "ok": False,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": True,
+                "planned_task_count": 1,
+                "failure_counts": {},
+                "diagnostics": {"actionable_cause": "fake blocked parallel status"},
+                "evidence_source": {
+                    "type": "blocked_parallel_execution",
+                    "adapter": "codex-exec",
+                },
+                "merge": {"accepted_shards": []},
+                "artifacts": {},
+            }
+
+        with mock.patch(
+            "deepresearch.invocation_router.run_parallel_orchestration",
+            side_effect=fake_parallel,
+        ):
+            result = run_skill_invocation(
+                "$deep-research: investigate codex exec timeout forwarding",
+                runs_dir=self.temp_runs_dir(),
+                adapter_name="codex-exec",
+                route="text_only",
+                codex_exec_timeout_seconds=900,
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        self.assertEqual(result["status"], "blocked_parallel_execution")
+        self.assertEqual(captured_kwargs[0]["codex_exec_timeout_seconds"], 900)
+
     def test_quick_chat_is_explicit_and_declares_no_evidence_bundle(self) -> None:
         result = run_skill_invocation(
             "$deep-research: quick answer about cache eviction policies",

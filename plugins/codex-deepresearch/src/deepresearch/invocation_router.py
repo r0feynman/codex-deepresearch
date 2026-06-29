@@ -169,6 +169,7 @@ def run_skill_invocation(
     max_cost_usd: float | None = None,
     confirm_budget: bool = False,
     adapter_name: str = "codex-exec",
+    codex_exec_timeout_seconds: float | None = None,
     min_tasks: int = 1,
     max_tasks: int | None = None,
     allow_degraded: bool = True,
@@ -309,6 +310,7 @@ def run_skill_invocation(
         parallel_status = run_parallel_orchestration(
             run=run_dir,
             adapter_name=adapter_name,
+            codex_exec_timeout_seconds=codex_exec_timeout_seconds,
             min_tasks=min_tasks,
             max_tasks=max_tasks,
             allow_degraded=allow_degraded,

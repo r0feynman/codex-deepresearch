@@ -187,6 +187,9 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn(str(shard_dir / "search_results.jsonl"), command[-1])
         self.assertIn(str(shard_dir / "visual_observations.jsonl"), command[-1])
         self.assertIn(str(shard_dir / "verifier_votes.jsonl"), command[-1])
+        self.assertIn("write a minimal valid `evidence_shard.json`", command[-1])
+        self.assertIn("before any optional sidecars", command[-1])
+        self.assertIn("invoke them with `python3`, not `python`", command[-1])
         self.assertIn(f"Do not write sidecars outside {shard_dir}", command[-1])
         self.assertIn("Write claim text, caveats, rationales, and synthesized source snippets in English", command[-1])
         self.assertIn("Use `vlm_provider` exactly `codex-interactive`", command[-1])
@@ -218,6 +221,11 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("translate/summarize English source findings into Korean", korean_command[-1])
         self.assertIn("Only direct quote_spans.quote values should remain verbatim", korean_command[-1])
         self.assertIn("Prioritize a compact shard", korean_command[-1])
+
+    def test_codex_exec_adapter_default_timeout_remains_300_seconds(self) -> None:
+        adapter = CodexExecAdapter(project_root=ROOT)
+
+        self.assertEqual(adapter.timeout_seconds, 300.0)
 
     def test_visual_research_tasks_inherit_image_budget(self) -> None:
         run_dir = self.prepare(route="visual_required")
@@ -544,7 +552,94 @@ class ParallelOrchestratorTests(unittest.TestCase):
         wait_events = [event for event in result.events if event["event_type"] == "wait"]
         self.assertEqual(wait_events[-1]["child_status"], "completed")
         self.assertIn("timed out after writing a valid shard", wait_events[-1]["child_message"])
-        self.assertTrue(wait_events[-1]["raw_event"]["timeout_after_valid_shard"])
+        timeout_context = wait_events[-1]["raw_event"]
+        self.assertTrue(timeout_context["timeout_after_valid_shard"])
+        self.assertTrue(timeout_context["valid_evidence_shard_exists"])
+        self.assertEqual(timeout_context["valid_evidence_shard_path"], str(shard_path))
+        self.assertEqual(
+            timeout_context["missing_expected_sidecars"],
+            ["search_results.jsonl", "visual_observations.jsonl", "verifier_votes.jsonl"],
+        )
+        self.assertEqual(
+            sorted(timeout_context["expected_sidecars"].keys()),
+            ["search_results", "verifier_votes", "visual_observations"],
+        )
+        self.assertFalse(timeout_context["expected_sidecars"]["search_results"]["exists"])
+        self.assertIn("missing_expected_sidecars", wait_events[-1]["child_message"])
+        self.assertIn("search_results.jsonl", result.message or "")
+
+    def test_timeout_after_valid_shard_sidecars_surface_in_final_status(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        shard_path = run_dir / task["output_shard_path"]
+        expected_missing = [
+            "search_results.jsonl",
+            "visual_observations.jsonl",
+            "verifier_votes.jsonl",
+        ]
+
+        def timeout_after_writing_valid_shard(*args, **kwargs):
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            raise subprocess.TimeoutExpired(
+                cmd=args[0],
+                timeout=12,
+                output='{"type":"thread.started"}\n',
+                stderr="Auth(AuthorizationRequired)",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=timeout_after_writing_valid_shard,
+            ),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=12,
+                min_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        accepted = result["merge"]["accepted_shards"][0]
+        diagnostics = accepted["diagnostics"]
+        self.assertTrue(diagnostics["timeout_after_valid_shard"])
+        self.assertTrue(diagnostics["valid_evidence_shard_exists"])
+        self.assertEqual(diagnostics["missing_expected_sidecars"], expected_missing)
+        self.assertEqual(
+            sorted(diagnostics["expected_sidecars"].keys()),
+            ["search_results", "verifier_votes", "visual_observations"],
+        )
+
+        merge_diagnostics = result["merge"]["diagnostics"]
+        self.assertEqual(result["diagnostics"], merge_diagnostics)
+        self.assertEqual(merge_diagnostics["accepted_shard_warning_count"], 1)
+        warning = merge_diagnostics["accepted_shard_warnings"][0]
+        self.assertEqual(warning["task_id"], task["id"])
+        self.assertEqual(warning["warning"], "timeout_after_valid_shard")
+        self.assertEqual(warning["missing_expected_sidecars"], expected_missing)
+
+        merge_status = self.load_json(run_dir / "merge_status.json")
+        orchestration_status = self.load_json(run_dir / "parallel_orchestration_status.json")
+        self.assertEqual(
+            merge_status["accepted_shards"][0]["diagnostics"]["missing_expected_sidecars"],
+            expected_missing,
+        )
+        self.assertEqual(
+            orchestration_status["merge"]["accepted_shards"][0]["diagnostics"][
+                "missing_expected_sidecars"
+            ],
+            expected_missing,
+        )
+        self.assertEqual(
+            orchestration_status["diagnostics"]["accepted_shard_warnings"][0][
+                "missing_expected_sidecars"
+            ],
+            expected_missing,
+        )
 
     def test_fixture_runner_records_codex_events_and_schema_valid_shards(self) -> None:
         run_dir = self.prepare(route="visual_optional")
@@ -1047,6 +1142,43 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["parallel_orchestration"]["status"], "failed")
         self.assertEqual(stages["parallel_orchestration"]["stage_status"], "blocked_parallel_execution")
         self.assertEqual(state["next_safe_stage"], "parallel_orchestration")
+
+    def test_run_parallel_orchestration_wires_codex_exec_timeout_override(self) -> None:
+        run_dir = self.prepare()
+
+        def fake_codex_exec(command, **kwargs):
+            self.assertEqual(kwargs["timeout"], 900)
+            tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
+            task = tasks[0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=900,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        run_mock.assert_called_once()
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 900)
 
     def test_cli_codex_exec_no_degrade_fails_when_children_accept_no_shards(self) -> None:
         runs_dir = self.temp_runs_dir()
