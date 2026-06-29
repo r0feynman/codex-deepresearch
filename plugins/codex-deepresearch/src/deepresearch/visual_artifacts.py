@@ -388,11 +388,29 @@ def visual_failure_code_for_minimums(minimums: Mapping[str, Any] | None) -> str 
     if not isinstance(minimums, Mapping):
         return None
     reason = str(minimums.get("shortfall_reason") or "none")
+    return visual_failure_code_for_shortfall_reason(reason)
+
+
+def visual_failure_code_for_shortfall_reason(reason: str | None) -> str | None:
+    reason = str(reason or "none")
     if reason == "none":
         return None
     if reason == "report_linkage_missing":
         return "visual_report_linkage_missing"
     return "visual_minimum_shortfall"
+
+
+def visual_minimum_diagnostics(minimums: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(minimums, Mapping):
+        return {}
+    reason = str(minimums.get("shortfall_reason") or "none")
+    diagnostics: dict[str, Any] = {"shortfall_reason": reason}
+    if reason != "none":
+        diagnostics["failure_category"] = reason
+        failure_code = visual_failure_code_for_shortfall_reason(reason)
+        if failure_code:
+            diagnostics["failure_code"] = failure_code
+    return diagnostics
 
 
 def _candidate_was_selected_or_attempted(record: Mapping[str, Any]) -> bool:

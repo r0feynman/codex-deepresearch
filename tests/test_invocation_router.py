@@ -864,6 +864,215 @@ class InvocationRouterTests(unittest.TestCase):
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         self.assertEqual(provider_status["status"], "partial_auto_visual")
 
+    def test_partial_auto_visual_final_run_status_exposes_visual_shortfall_diagnostics(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        class PassingVisualValidation:
+            valid = True
+
+            def to_dict(self) -> dict:
+                return {"valid": True, "errors": []}
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            evidence = self.read_json(run_dir / "evidence.json")
+            evidence["routing"] = [
+                {"id": "angle_001", "modality": "visual_required", "max_images": 12}
+            ]
+            evidence["claims"] = [
+                {
+                    "id": "claim_visual_shortfall",
+                    "text": "The cited public image supports the visual finding.",
+                    "claim_type": "visual",
+                    "supporting_images": ["img_shortfall_001"],
+                    "verification_status": "supported",
+                }
+            ]
+            self.write_json(run_dir / "evidence.json", evidence)
+            return {
+                "status": "completed_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 1,
+                "failure_counts": {},
+                "evidence_source": {"type": "real_child_execution", "adapter": "codex-exec"},
+                "merge": {"accepted_shards": [{"task_id": "task_research_001"}]},
+                "artifacts": {},
+            }
+
+        def fake_acquire(*, run, **_kwargs):
+            run_dir = Path(run)
+            self.write_json(run_dir / "visual_search_plan.json", {"tasks": []})
+            self.write_jsonl(
+                run_dir / "visual_candidates.jsonl",
+                [
+                    {
+                        "candidate_id": f"cand_shortfall_{index:03d}",
+                        "provider": "page-image-extractor",
+                        "provider_kind": "page_extractor",
+                        "provider_mode": "real",
+                        "candidate_status": "fetched",
+                    }
+                    for index in range(1, 4)
+                ],
+            )
+            self.write_jsonl(
+                run_dir / "image_fetch_status.jsonl",
+                [
+                    {
+                        "candidate_id": f"cand_shortfall_{index:03d}",
+                        "fetch_id": f"fetch_shortfall_{index:03d}",
+                        "provider": "page-image-extractor",
+                        "provider_kind": "page_extractor",
+                        "provider_mode": "real",
+                        "fetch_status": "fetched",
+                        "local_artifact_path": f"images/img_shortfall_{index:03d}.png",
+                        "evidence_image_id": f"img_shortfall_{index:03d}",
+                    }
+                    for index in range(1, 4)
+                ],
+            )
+            self.write_jsonl(run_dir / "visual_observations.jsonl", [])
+            self.write_json(
+                run_dir / "visual_provider_status.json",
+                {
+                    "status": "real_image_search_candidates_collected",
+                    "ok": True,
+                    "terminal": False,
+                    "providers": [
+                        {
+                            "provider": "page-image-extractor",
+                            "provider_kind": "page_extractor",
+                            "provider_mode": "real",
+                            "invocations": 1,
+                            "candidates_discovered": 3,
+                            "artifacts_fetched": 3,
+                            "vlm_images_analyzed": 0,
+                        }
+                    ],
+                    "diagnostics": {"actionable_cause": "acquisition ready"},
+                },
+            )
+            return {"status": "real_image_search_candidates_collected", "ok": True}
+
+        def fake_ingest(*, run, **_kwargs):
+            run_dir = Path(run)
+            observations = [
+                {
+                    "candidate_id": f"cand_shortfall_{index:03d}",
+                    "fetch_id": f"fetch_shortfall_{index:03d}",
+                    "evidence_image_id": f"img_shortfall_{index:03d}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "observation_status": "analyzed",
+                }
+                for index in range(1, 3)
+            ]
+            self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+            self.write_json(
+                run_dir / "visual_provider_status.json",
+                {
+                    "status": "visual_evidence_ingested",
+                    "ok": True,
+                    "terminal": False,
+                    "providers": [
+                        {
+                            "provider": "page-image-extractor",
+                            "provider_kind": "page_extractor",
+                            "provider_mode": "real",
+                            "invocations": 1,
+                            "candidates_discovered": 3,
+                            "artifacts_fetched": 3,
+                            "vlm_images_analyzed": 0,
+                        },
+                        {
+                            "provider": "codex-interactive",
+                            "provider_kind": "vlm",
+                            "provider_mode": "real",
+                            "invocations": 1,
+                            "candidates_discovered": 0,
+                            "artifacts_fetched": 3,
+                            "vlm_images_analyzed": 2,
+                        },
+                    ],
+                    "diagnostics": {"actionable_cause": "two images analyzed"},
+                },
+            )
+            self.write_json(
+                run_dir / "vision_ingest_status.json",
+                {"status": "visual_evidence_ingested", "ok": True},
+            )
+            return {"status": "visual_evidence_ingested", "ok": True}
+
+        def fake_synthesize(*, run):
+            run_dir = Path(run)
+            self.write_json(
+                run_dir / "report_status.json",
+                {"status": "completed", "used_images": ["img_shortfall_001"]},
+            )
+            (run_dir / "report.md").write_text("Report cites img_shortfall_001.\n", encoding="utf-8")
+            return {"status": "completed", "ok": True}
+
+        with (
+            mock.patch("deepresearch.invocation_router.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch("deepresearch.invocation_router.acquire_visual_candidates", side_effect=fake_acquire),
+            mock.patch("deepresearch.invocation_router.ingest_vision_observations", side_effect=fake_ingest),
+            mock.patch("deepresearch.invocation_router.enforce_guardrails", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.verify_claims", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.synthesize_report", side_effect=fake_synthesize),
+            mock.patch(
+                "deepresearch.invocation_router.validate_visual_artifacts",
+                return_value=PassingVisualValidation(),
+            ),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: inspect public product screenshots for visual evidence",
+                runs_dir=runs_dir,
+                route="visual_required",
+                budget_preset="quick",
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["ok"])
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        release_gate = run_status["visual_summary"]["release_gate"]
+        self.assertFalse(release_gate["valid"])
+        self.assertEqual(release_gate["required_vlm_images"], 3)
+        self.assertEqual(release_gate["candidate_count"], 3)
+        self.assertEqual(release_gate["selected_candidates"], 3)
+        self.assertEqual(release_gate["fetched_artifacts"], 3)
+        self.assertEqual(release_gate["vlm_images_analyzed"], 2)
+        self.assertEqual(release_gate["report_cited_images"], 1)
+        self.assertFalse(release_gate["minimums"]["satisfied"])
+        self.assertEqual(release_gate["shortfall_reason"], "vlm_failures")
+        self.assertEqual(
+            release_gate["diagnostics"]["failure_code"],
+            "visual_minimum_shortfall",
+        )
+        self.assertEqual(release_gate["diagnostics"]["failure_category"], "vlm_failures")
+
+        provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertEqual(provider_status["minimums"]["required_vlm_images"], 3)
+        self.assertEqual(provider_status["minimums"]["candidate_count"], 3)
+        self.assertEqual(provider_status["minimums"]["selected_candidates"], 3)
+        self.assertEqual(provider_status["minimums"]["fetched_artifacts"], 3)
+        self.assertEqual(provider_status["minimums"]["vlm_images_analyzed"], 2)
+        self.assertEqual(provider_status["minimums"]["report_cited_images"], 1)
+        self.assertFalse(provider_status["minimums"]["satisfied"])
+        self.assertEqual(provider_status["diagnostics"]["shortfall_reason"], "vlm_failures")
+        self.assertEqual(provider_status["diagnostics"]["failure_category"], "vlm_failures")
+        self.assertEqual(
+            provider_status["diagnostics"]["failure_code"],
+            "visual_minimum_shortfall",
+        )
+
     def test_visual_required_full_runner_uses_real_acquire_ingest_verify_synthesize_stack(self) -> None:
         runs_dir = self.temp_runs_dir()
 
@@ -1439,6 +1648,18 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertNotIn("shortfall_reason", result["diagnostics"])
         synthesize_mock.assert_not_called()
         self.assertIn("visual_provider_status", result["artifacts"])
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        release_gate = run_status["visual_summary"]["release_gate"]
+        release_gate_diagnostics = release_gate["diagnostics"]
+        self.assertFalse(release_gate["valid"])
+        self.assertEqual(release_gate["shortfall_reason"], "none")
+        self.assertEqual(release_gate_diagnostics["shortfall_reason"], "none")
+        self.assertEqual(
+            release_gate_diagnostics["blocked_status"],
+            "blocked_missing_vlm_provider",
+        )
+        self.assertNotIn("failure_code", release_gate_diagnostics)
+        self.assertNotIn("failure_category", release_gate_diagnostics)
 
     def test_text_only_codex_full_runner_does_not_run_visual_acquisition_or_ingest(self) -> None:
         with (
