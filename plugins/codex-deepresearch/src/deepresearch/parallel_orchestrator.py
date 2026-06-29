@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import re
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -19,7 +21,7 @@ from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .execution_mode import BUDGET_PRESETS
 from .run_state import add_run_steps_artifact, begin_stage, skip_stage, transition_stage
 from .search_handoff import SearchHandoffError, resolve_run_dir
-from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
+from .trace import TRACE_FAILURE_CATEGORIES, TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 
 
 PARALLEL_SCHEMA_VERSION = "codex-deepresearch.parallel-orchestration.v0"
@@ -31,6 +33,26 @@ CHILD_EVENTS_DIRNAME = "child_events"
 CODEX_EXEC_STDOUT_FILENAME = "codex_exec_stdout.jsonl"
 CODEX_EXEC_STDERR_FILENAME = "codex_exec_stderr.txt"
 LAST_CHILD_EVENT_FILENAME = "last_child_event.json"
+CODEX_CHILD_MODEL_CAPACITY = "codex_child_model_capacity"
+CODEX_CHILD_TIMEOUT = "codex_child_timeout"
+CODEX_CHILD_SCHEMA_INVALID = "codex_child_schema_invalid"
+CODEX_CHILD_QUOTA_EXHAUSTED = "codex_child_quota_exhausted"
+CODEX_CHILD_BILLING_DISABLED = "codex_child_billing_disabled"
+CODEX_CHILD_AUTH_BLOCKED = "codex_child_auth_blocked"
+CODEX_CHILD_SANDBOX_BLOCKED = "codex_child_sandbox_blocked"
+CODEX_CHILD_POLICY_BLOCKED = "codex_child_policy_blocked"
+CODEX_CHILD_PERMISSION_DENIED = "codex_child_permission_denied"
+CODEX_CHILD_MISSING_SHARD = "codex_child_missing_shard"
+CODEX_CHILD_EXEC_FAILED = "codex_child_exec_failed"
+CAPACITY_RETRY_MAX_ATTEMPTS = 3
+DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300.0
+CAPACITY_RETRY_POLICY_DEFAULTS = {
+    "max_attempts": CAPACITY_RETRY_MAX_ATTEMPTS,
+    "initial_delay_seconds": 5.0,
+    "backoff_multiplier": 2.0,
+    "max_delay_seconds": 30.0,
+    "jitter_ratio": 0.2,
+}
 EXPECTED_CHILD_SIDECARS = {
     "search_results": "search_results.jsonl",
     "visual_observations": "visual_observations.jsonl",
@@ -39,6 +61,7 @@ EXPECTED_CHILD_SIDECARS = {
 RETRY_SAFE_FAILURES = {
     "adapter_unavailable",
     "codex_exec_failed",
+    CODEX_CHILD_MODEL_CAPACITY,
     "invalid_shard",
     "missing_shard",
 }
@@ -180,8 +203,13 @@ class CodexExecAdapter:
         child_artifacts = _codex_exec_child_artifact_paths(
             run_dir=run_dir,
             task_id=str(task.get("id") or "unknown"),
+            attempt=int(task.get("attempt") or 1),
         )
-        command_context["child_event_artifacts"] = _stringify_paths(child_artifacts)
+        legacy_child_artifacts = _codex_exec_legacy_child_artifact_paths(
+            run_dir=run_dir,
+            task_id=str(task.get("id") or "unknown"),
+        )
+        command_context["child_event_artifacts"] = _stringify_paths(legacy_child_artifacts)
         events = [
             _codex_event(
                 "spawn_agent",
@@ -342,7 +370,7 @@ class CodexExecAdapter:
                 child_thread_id=str(event.get("thread_id") or child_thread_id),
                 child_status=str(event.get("status") or "running"),
                 child_message=_event_message(event),
-                raw_event=_with_child_event_artifacts(event, child_artifacts),
+                raw_event=_with_child_event_artifacts(event, legacy_child_artifacts),
                 failure_category=_event_failure(event),
             )
             for event in parsed_events
@@ -365,7 +393,7 @@ class CodexExecAdapter:
                 child_status=status,
                 failure_category=failure,
                 child_message=diagnostic or f"codex exec exited {completed.returncode}",
-                raw_event=command_context if diagnostic else None,
+                raw_event=command_context,
             )
         )
         events.append(
@@ -550,7 +578,7 @@ def plan_research_tasks(
                 state="queued",
                 assigned_subagent_id=None,
                 attempt=0,
-                max_attempts=2,
+                max_attempts=CAPACITY_RETRY_MAX_ATTEMPTS,
                 max_sources=max(1, int(base.get("max_results") or 3)),
                 max_images=max_images if route != "text_only" else 0,
                 source_policy={"decision": "allowed", "flags": []},
@@ -709,6 +737,24 @@ def _run_parallel_orchestration_started(
     max_concurrent = int(tasks_artifact.get("max_concurrent_codex_subagents") or 1)
     requested_adapter_name = _normalize_adapter_name(adapter_name)
     adapter = _adapter(adapter_name, codex_exec_timeout_seconds=codex_exec_timeout_seconds)
+    effective_codex_exec_timeout_seconds = (
+        float(adapter.timeout_seconds)
+        if isinstance(adapter, CodexExecAdapter)
+        else (
+            float(codex_exec_timeout_seconds)
+            if codex_exec_timeout_seconds is not None
+            else None
+        )
+    )
+    capacity_retry_policy = (
+        _capacity_retry_policy(effective_codex_exec_timeout_seconds)
+        if isinstance(adapter, CodexExecAdapter)
+        else None
+    )
+    if capacity_retry_policy is not None:
+        _apply_capacity_retry_policy(tasks, capacity_retry_policy)
+        tasks_artifact["codex_exec_retry_policy"] = capacity_retry_policy
+        tasks_artifact["codex_exec_timeout_seconds"] = effective_codex_exec_timeout_seconds
     parallel_degraded = False
     degraded_reason = None
     if isinstance(adapter, CodexExecAdapter) and not adapter.available():
@@ -738,6 +784,8 @@ def _run_parallel_orchestration_started(
                 max_scheduled_concurrency=0,
                 merge_status=merge_status,
                 needs_serial_handoff=True,
+                codex_exec_timeout_seconds=effective_codex_exec_timeout_seconds,
+                codex_exec_retry_policy=capacity_retry_policy,
             )
             _write_json(run_dir / "parallel_orchestration_status.json", status)
             transition_stage(
@@ -755,47 +803,25 @@ def _run_parallel_orchestration_started(
 
     runnable = _runnable_tasks(tasks, retry_failed=retry_failed)
     worker_count = max(1, min(max_concurrent, len(runnable) or 1))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_task: dict[Any, dict[str, Any]] = {}
-        for task in runnable:
-            if isinstance(adapter, SerialFallbackAdapter):
-                max_concurrent = 1
-                worker_count = 1
-            _assign_task(
-                run_dir,
-                task,
-                adapter_name=adapter.name,
-                max_concurrent=max_concurrent,
-                parallel_degraded=parallel_degraded,
-            )
-            future = executor.submit(
-                adapter.run_task,
-                dict(task),
-                run_dir=run_dir,
-                max_threads=max_concurrent,
-            )
-            future_to_task[future] = task
-
-        for future in as_completed(future_to_task):
-            task = future_to_task[future]
-            result = future.result()
-            _record_runner_result(run_dir, task, result)
-            if (
-                isinstance(adapter, CodexExecAdapter)
-                and allow_degraded
-                and result.status == "failed"
-                and _is_missing_capability_failure(result)
-            ):
-                parallel_degraded = True
-                degraded_reason = result.failure_category or "codex_exec_unavailable"
-                _preserve_parallel_failure(task)
-                task["state"] = "retryable"
+    parallel_degraded, degraded_reason = _execute_task_attempts(
+        run_dir=run_dir,
+        runnable=runnable,
+        adapter=adapter,
+        max_concurrent=max_concurrent,
+        worker_count=worker_count,
+        parallel_degraded=parallel_degraded,
+        degraded_reason=degraded_reason,
+        allow_degraded=allow_degraded,
+        capacity_retry_policy=capacity_retry_policy,
+    )
 
     if parallel_degraded and isinstance(adapter, CodexExecAdapter):
         adapter = SerialFallbackAdapter()
         max_concurrent = 1
         for task in _runnable_tasks(tasks, retry_failed=True):
-            if task.get("failure_category") not in RETRY_SAFE_FAILURES:
+            if task.get("child_failure_code") == CODEX_CHILD_MODEL_CAPACITY:
+                continue
+            if not _task_is_retryable(task):
                 continue
             if task.get("state") in {"completed", "merged", "blocked", "discarded"}:
                 continue
@@ -818,6 +844,10 @@ def _run_parallel_orchestration_started(
     tasks_artifact["parallel_degraded"] = parallel_degraded
     tasks_artifact["last_adapter"] = adapter.name
     tasks_artifact["attempted_real_child_execution"] = attempted_real_child_execution
+    tasks_artifact["retry_summary"] = _retry_summary(
+        tasks,
+        retry_policy=tasks_artifact.get("codex_exec_retry_policy"),
+    )
     if degraded_reason:
         tasks_artifact["degraded_reason"] = degraded_reason
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
@@ -848,6 +878,8 @@ def _run_parallel_orchestration_started(
         max_scheduled_concurrency=max_concurrent,
         merge_status=merge_status,
         needs_serial_handoff=needs_serial_handoff,
+        codex_exec_timeout_seconds=effective_codex_exec_timeout_seconds,
+        codex_exec_retry_policy=capacity_retry_policy,
     )
     _write_json(run_dir / "parallel_orchestration_status.json", status)
     if _parallel_status_ok(status_value):
@@ -1054,6 +1086,10 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         rejected_shards=rejected_shards,
         discarded_tasks=discarded_tasks,
     )
+    retry_summary = _retry_summary(
+        tasks,
+        retry_policy=tasks_artifact.get("codex_exec_retry_policy"),
+    )
     merge_status = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
@@ -1067,11 +1103,13 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         "discarded_tasks": discarded_tasks,
         "failed_tasks": failed_tasks,
         "failure_counts": failure_counts,
+        "retry_summary": retry_summary,
         "diagnostics": _merge_diagnostics(
             accepted_shards=accepted_shards,
             failed_tasks=failed_tasks,
             blocked_tasks=blocked_tasks,
             rejected_shards=rejected_shards,
+            retry_summary=retry_summary,
         ),
         "source_dedupe": source_dedupe,
         "image_dedupe": image_dedupe,
@@ -1085,6 +1123,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         "validation": validation.to_dict(),
     }
     tasks_artifact["tasks"] = tasks
+    tasks_artifact["retry_summary"] = retry_summary
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     _write_json(run_dir / MERGE_STATUS_FILENAME, merge_status)
     return merge_status
@@ -1149,6 +1188,8 @@ def _parallel_status(
     needs_serial_handoff: bool = False,
     skip_reason: str | None = None,
     errors: Sequence[Mapping[str, Any]] | None = None,
+    codex_exec_timeout_seconds: float | None = None,
+    codex_exec_retry_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     accepted_shards = _list(merge_status.get("accepted_shards")) if merge_status else []
     existing_source = merge_status.get("evidence_source") if merge_status else None
@@ -1177,6 +1218,7 @@ def _parallel_status(
         "evidence_source": evidence_source,
         "failure_counts": dict(merge_status.get("failure_counts", {})) if merge_status else {},
         "diagnostics": dict(merge_status.get("diagnostics", {})) if merge_status else {},
+        "retry_summary": dict(merge_status.get("retry_summary", {})) if merge_status else {},
         "planned_task_count": planned_task_count,
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
@@ -1194,6 +1236,10 @@ def _parallel_status(
         merge = dict(merge_status)
         merge.setdefault("evidence_source", evidence_source)
         payload["merge"] = merge
+    if codex_exec_timeout_seconds is not None:
+        payload["codex_exec_timeout_seconds"] = codex_exec_timeout_seconds
+    if codex_exec_retry_policy is not None:
+        payload["codex_exec_retry_policy"] = dict(codex_exec_retry_policy)
     if skip_reason:
         payload["skip_reason"] = skip_reason
     if errors:
@@ -1447,16 +1493,227 @@ def _runnable_tasks(tasks: list[dict[str, Any]], *, retry_failed: bool) -> list[
         state = str(task.get("state"))
         if state in {"completed", "merged", "blocked", "discarded"}:
             continue
+        if state == "retryable" and not _task_is_retryable(task):
+            task["state"] = "failed"
+            continue
         if state == "failed":
             if not retry_failed:
                 continue
-            if task.get("failure_category") not in RETRY_SAFE_FAILURES:
+            if not _task_is_retryable(task):
                 continue
             if int(task.get("attempt") or 0) >= int(task.get("max_attempts") or 1):
                 continue
             task["state"] = "retryable"
         runnable.append(task)
     return runnable
+
+
+def _execute_task_attempts(
+    *,
+    run_dir: Path,
+    runnable: Sequence[dict[str, Any]],
+    adapter: CodexExecAdapter | FixtureAdapter | SerialFallbackAdapter,
+    max_concurrent: int,
+    worker_count: int,
+    parallel_degraded: bool,
+    degraded_reason: str | None,
+    allow_degraded: bool,
+    capacity_retry_policy: Mapping[str, Any] | None,
+) -> tuple[bool, str | None]:
+    pending = list(runnable)
+    while pending:
+        if isinstance(adapter, SerialFallbackAdapter):
+            max_concurrent = 1
+            worker_count = 1
+        retry_pending: list[dict[str, Any]] = []
+        retry_traces: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_task: dict[Any, dict[str, Any]] = {}
+            for task in pending:
+                _assign_task(
+                    run_dir,
+                    task,
+                    adapter_name=adapter.name,
+                    max_concurrent=max_concurrent,
+                    parallel_degraded=parallel_degraded,
+                )
+                future = executor.submit(
+                    adapter.run_task,
+                    dict(task),
+                    run_dir=run_dir,
+                    max_threads=max_concurrent,
+                )
+                future_to_task[future] = task
+
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                result = future.result()
+                _record_runner_result(run_dir, task, result)
+                if isinstance(adapter, CodexExecAdapter):
+                    retry_plan = _maybe_retry_capacity_failure(
+                        task,
+                        capacity_retry_policy=capacity_retry_policy,
+                    )
+                    if retry_plan is not None:
+                        if retry_plan.get("should_retry") is True:
+                            retry_pending.append(task)
+                            retry_traces.append((task, retry_plan))
+                            continue
+                        _append_retry_trace_event(run_dir, task, retry_plan)
+                if (
+                    isinstance(adapter, CodexExecAdapter)
+                    and allow_degraded
+                    and result.status == "failed"
+                    and _is_missing_capability_failure(result)
+                ):
+                    parallel_degraded = True
+                    degraded_reason = result.failure_category or "codex_exec_unavailable"
+                    _preserve_parallel_failure(task)
+                    retryable = _task_is_retryable(task)
+                    if isinstance(task.get("parallel_failure"), dict):
+                        task["parallel_failure"]["retryable"] = retryable
+                    if retryable:
+                        task["state"] = "retryable"
+        if retry_traces:
+            batch_sleep_seconds = max(
+                float(plan.get("computed_backoff_seconds") or 0.0)
+                for _task, plan in retry_traces
+            )
+            actual_sleep_seconds = _sleep_for_retry(batch_sleep_seconds)
+            for task, retry_plan in retry_traces:
+                task["capacity_retry_actual_elapsed_seconds"] = (
+                    float(task.get("capacity_retry_actual_elapsed_seconds") or 0.0)
+                    + actual_sleep_seconds
+                )
+                _set_latest_attempt_retry_decision(
+                    task,
+                    str(retry_plan.get("retry_decision") or "retry"),
+                    computed_backoff_seconds=retry_plan.get("computed_backoff_seconds"),
+                    actual_sleep_seconds=actual_sleep_seconds,
+                )
+                retry_plan = dict(retry_plan)
+                retry_plan["actual_sleep_seconds"] = actual_sleep_seconds
+                retry_plan["batch_sleep_seconds"] = batch_sleep_seconds
+                _append_retry_trace_event(run_dir, task, retry_plan)
+        pending = retry_pending
+    return parallel_degraded, degraded_reason
+
+
+def _capacity_retry_policy(timeout_seconds: float | None) -> dict[str, Any]:
+    effective_timeout = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS
+    )
+    policy = dict(CAPACITY_RETRY_POLICY_DEFAULTS)
+    policy["max_retry_elapsed_seconds"] = min(120.0, effective_timeout / 2.0)
+    policy["codex_exec_timeout_seconds"] = effective_timeout
+    return policy
+
+
+def _apply_capacity_retry_policy(
+    tasks: Sequence[dict[str, Any]],
+    policy: Mapping[str, Any],
+) -> None:
+    max_attempts = int(policy.get("max_attempts") or CAPACITY_RETRY_MAX_ATTEMPTS)
+    for task in tasks:
+        task["max_attempts"] = max(max_attempts, int(task.get("max_attempts") or 1))
+
+
+def _maybe_retry_capacity_failure(
+    task: dict[str, Any],
+    *,
+    capacity_retry_policy: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    attempt_record = _latest_attempt_diagnostic(task)
+    if not attempt_record:
+        return None
+    if attempt_record.get("status") == "completed":
+        _set_latest_attempt_retry_decision(task, "do_not_retry")
+        return {"retry_decision": "do_not_retry", "should_retry": False}
+    if capacity_retry_policy is None:
+        task["state"] = "failed"
+        _set_latest_attempt_retry_decision(task, "do_not_retry")
+        return {"retry_decision": "do_not_retry", "should_retry": False}
+    if attempt_record.get("child_failure_code") != CODEX_CHILD_MODEL_CAPACITY:
+        task["state"] = "failed"
+        _set_latest_attempt_retry_decision(task, "do_not_retry")
+        return {"retry_decision": "do_not_retry", "should_retry": False}
+    if attempt_record.get("timeout") is True:
+        task["state"] = "failed"
+        _set_latest_attempt_retry_decision(task, "do_not_retry")
+        return {"retry_decision": "do_not_retry", "should_retry": False}
+    attempt = int(attempt_record.get("attempt") or task.get("attempt") or 0)
+    max_attempts = int(
+        attempt_record.get("max_attempts")
+        or task.get("max_attempts")
+        or capacity_retry_policy.get("max_attempts")
+        or CAPACITY_RETRY_MAX_ATTEMPTS
+    )
+    if attempt >= max_attempts:
+        task["state"] = "failed"
+        task["retry_exhausted"] = True
+        task["retry_exhausted_reason"] = "max_attempts_reached"
+        _set_latest_attempt_retry_decision(task, "retry_exhausted")
+        return {
+            "retry_decision": "retry_exhausted",
+            "should_retry": False,
+            "retry_exhausted_reason": "max_attempts_reached",
+        }
+    computed_backoff = _capacity_retry_backoff_seconds(attempt, capacity_retry_policy)
+    max_elapsed = float(capacity_retry_policy.get("max_retry_elapsed_seconds") or 0.0)
+    previous_elapsed = float(task.get("capacity_retry_computed_elapsed_seconds") or 0.0)
+    if previous_elapsed + computed_backoff > max_elapsed:
+        task["state"] = "failed"
+        task["retry_exhausted"] = True
+        task["retry_exhausted_reason"] = "max_retry_elapsed_seconds_reached"
+        _set_latest_attempt_retry_decision(
+            task,
+            "retry_exhausted",
+            computed_backoff_seconds=computed_backoff,
+            actual_sleep_seconds=0.0,
+        )
+        return {
+            "retry_decision": "retry_exhausted",
+            "should_retry": False,
+            "computed_backoff_seconds": computed_backoff,
+            "actual_sleep_seconds": 0.0,
+            "retry_exhausted_reason": "max_retry_elapsed_seconds_reached",
+        }
+    _set_latest_attempt_retry_decision(
+        task,
+        "retry",
+        computed_backoff_seconds=computed_backoff,
+    )
+    task["capacity_retry_computed_elapsed_seconds"] = previous_elapsed + computed_backoff
+    task["state"] = "retryable"
+    return {
+        "retry_decision": "retry",
+        "should_retry": True,
+        "computed_backoff_seconds": computed_backoff,
+    }
+
+
+def _capacity_retry_backoff_seconds(
+    attempt: int,
+    policy: Mapping[str, Any],
+) -> float:
+    initial = float(policy.get("initial_delay_seconds") or 0.0)
+    multiplier = float(policy.get("backoff_multiplier") or 1.0)
+    max_delay = float(policy.get("max_delay_seconds") or initial)
+    jitter_ratio = max(0.0, float(policy.get("jitter_ratio") or 0.0))
+    base_delay = min(max_delay, initial * (multiplier ** max(0, attempt - 1)))
+    if jitter_ratio:
+        base_delay *= 1.0 + random.uniform(-jitter_ratio, jitter_ratio)
+    return max(0.0, base_delay)
+
+
+def _sleep_for_retry(seconds: float) -> float:
+    if seconds <= 0:
+        return 0.0
+    started = time.monotonic()
+    time.sleep(seconds)
+    return max(0.0, time.monotonic() - started)
 
 
 def _assign_task(
@@ -1493,6 +1750,7 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
     command_context = _last_command_context(result.events)
     if command_context:
         task["last_command_context"] = command_context
+    attempt_record = _append_attempt_diagnostic(task, result, command_context)
     for event in result.events:
         trace_record = _trace_record(run_dir, event)
         append_trace_record(run_dir, trace_record)
@@ -1502,29 +1760,261 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
         validation = validate_artifacts(evidence_path=result.shard_path)
         if not validation.valid:
             task["failure_category"] = "invalid_shard"
+            task["child_failure_code"] = CODEX_CHILD_SCHEMA_INVALID
             task["validation"] = validation.to_dict()
-            if int(task.get("attempt") or 0) < int(task.get("max_attempts") or 1):
-                task["state"] = "retryable"
-            else:
-                task["state"] = "failed"
+            _update_attempt_diagnostic(
+                attempt_record,
+                child_failure_code=CODEX_CHILD_SCHEMA_INVALID,
+                retry_decision="do_not_retry",
+            )
+            task["state"] = "failed"
             return
         task["state"] = "completed"
         task["failure_category"] = None
+        task["child_failure_code"] = None
+        _update_attempt_diagnostic(attempt_record, retry_decision="do_not_retry")
         task.pop("validation", None)
         return
     if result.status == "blocked":
         task["state"] = "blocked"
         task["failure_category"] = result.failure_category or "adapter_unavailable"
+        task["child_failure_code"] = attempt_record.get("child_failure_code")
         task["blocked_reason"] = result.message or "parallel execution unavailable"
+        _update_attempt_diagnostic(attempt_record, retry_decision="do_not_retry")
         return
     failure = result.failure_category or "missing_shard"
+    child_failure_code = str(attempt_record.get("child_failure_code") or "")
+    if not child_failure_code and failure == "missing_shard":
+        child_failure_code = CODEX_CHILD_MISSING_SHARD
+        _update_attempt_diagnostic(
+            attempt_record,
+            child_failure_code=child_failure_code,
+        )
+    if child_failure_code == CODEX_CHILD_MODEL_CAPACITY:
+        failure = CODEX_CHILD_MODEL_CAPACITY
     task["failure_category"] = failure
+    task["child_failure_code"] = child_failure_code or None
     if result.message:
         task["last_error"] = result.message
-    if failure in RETRY_SAFE_FAILURES and int(task.get("attempt") or 0) < int(task.get("max_attempts") or 1):
-        task["state"] = "retryable"
-    else:
-        task["state"] = "failed"
+    task["state"] = "failed"
+
+
+def _append_attempt_diagnostic(
+    task: dict[str, Any],
+    result: RunnerResult,
+    command_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    context = command_context if isinstance(command_context, Mapping) else {}
+    summary = context.get("last_child_event_summary")
+    if not isinstance(summary, Mapping):
+        summary = {}
+    attempt = int(task.get("attempt") or 0)
+    record = {
+        "attempt": attempt,
+        "max_attempts": int(task.get("max_attempts") or 0),
+        "child_thread_id": result.child_thread_id,
+        "child_failure_code": _classify_child_failure_code(
+            result=result,
+            command_context=context,
+            child_summary=summary,
+        ),
+        "timeout": bool(summary.get("timeout")),
+        "returncode": summary.get("returncode"),
+        "last_message_text_preview": _attempt_last_message_preview(
+            result=result,
+            child_summary=summary,
+        ),
+        "raw_child_event_artifacts": _raw_child_artifacts(context, summary),
+        "computed_backoff_seconds": None,
+        "actual_sleep_seconds": 0.0,
+        "retry_decision": "do_not_retry",
+        "status": result.status,
+        "failure_category": result.failure_category,
+    }
+    diagnostics = task.setdefault("attempt_diagnostics", [])
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+        task["attempt_diagnostics"] = diagnostics
+    diagnostics.append(record)
+    return record
+
+
+def _latest_attempt_diagnostic(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    diagnostics = task.get("attempt_diagnostics")
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return None
+    latest = diagnostics[-1]
+    return latest if isinstance(latest, dict) else None
+
+
+def _set_latest_attempt_retry_decision(
+    task: dict[str, Any],
+    retry_decision: str,
+    *,
+    computed_backoff_seconds: float | None = None,
+    actual_sleep_seconds: float | None = None,
+) -> None:
+    attempt_record = _latest_attempt_diagnostic(task)
+    if attempt_record is None:
+        return
+    _update_attempt_diagnostic(
+        attempt_record,
+        retry_decision=retry_decision,
+        computed_backoff_seconds=computed_backoff_seconds,
+        actual_sleep_seconds=actual_sleep_seconds,
+    )
+
+
+def _update_attempt_diagnostic(
+    attempt_record: dict[str, Any],
+    *,
+    child_failure_code: str | None = None,
+    retry_decision: str | None = None,
+    computed_backoff_seconds: float | None = None,
+    actual_sleep_seconds: float | None = None,
+) -> None:
+    if child_failure_code is not None:
+        attempt_record["child_failure_code"] = child_failure_code
+    if retry_decision is not None:
+        attempt_record["retry_decision"] = retry_decision
+    if computed_backoff_seconds is not None:
+        attempt_record["computed_backoff_seconds"] = computed_backoff_seconds
+    if actual_sleep_seconds is not None:
+        attempt_record["actual_sleep_seconds"] = actual_sleep_seconds
+
+
+def _classify_child_failure_code(
+    *,
+    result: RunnerResult,
+    command_context: Mapping[str, Any],
+    child_summary: Mapping[str, Any],
+) -> str | None:
+    if result.status == "completed":
+        return None
+    if child_summary.get("timeout") is True:
+        return CODEX_CHILD_TIMEOUT
+    if result.failure_category == "missing_shard":
+        return CODEX_CHILD_MISSING_SHARD
+    observed = _child_diagnostic_text(
+        result=result,
+        command_context=command_context,
+        child_summary=child_summary,
+    )
+    lower = observed.lower()
+    non_retry_code = _non_capacity_child_failure_code(lower)
+    if non_retry_code:
+        return non_retry_code
+    if _looks_like_capacity_failure(lower):
+        return CODEX_CHILD_MODEL_CAPACITY
+    if result.failure_category == "invalid_shard":
+        return CODEX_CHILD_SCHEMA_INVALID
+    if result.failure_category == "codex_exec_failed":
+        return CODEX_CHILD_EXEC_FAILED
+    return result.failure_category
+
+
+def _non_capacity_child_failure_code(observed_lower: str) -> str | None:
+    marker_groups = (
+        (CODEX_CHILD_BILLING_DISABLED, ("billing", "payment required", "past due")),
+        (
+            CODEX_CHILD_QUOTA_EXHAUSTED,
+            ("quota", "insufficient_quota", "usage limit", "rate limit", "too many requests"),
+        ),
+        (
+            CODEX_CHILD_AUTH_BLOCKED,
+            ("auth", "authorization", "unauthorized", "unauthenticated", "credential", "login", "api key"),
+        ),
+        (
+            CODEX_CHILD_POLICY_BLOCKED,
+            (
+                "policy blocked",
+                "content policy",
+                "policy violation",
+                "request blocked by policy",
+                "request denied by policy",
+                "safety policy",
+                "disallowed",
+            ),
+        ),
+        (
+            CODEX_CHILD_SANDBOX_BLOCKED,
+            (
+                "sandbox",
+                "sandbox approval",
+                "approval blocked",
+                "approval required",
+                "trusted directory",
+                "not inside a trusted directory",
+            ),
+        ),
+        (CODEX_CHILD_PERMISSION_DENIED, ("permission denied", "access denied", "eacces")),
+    )
+    for code, markers in marker_groups:
+        if any(marker in observed_lower for marker in markers):
+            return code
+    return None
+
+
+def _looks_like_capacity_failure(observed_lower: str) -> bool:
+    markers = (
+        "selected model is at capacity",
+        "model is at capacity",
+        "model capacity",
+        "at capacity. please try a different model",
+        "temporarily unavailable",
+        "service unavailable",
+        "server overloaded",
+        "overloaded",
+        "try again later",
+    )
+    return any(marker in observed_lower for marker in markers)
+
+
+def _child_diagnostic_text(
+    *,
+    result: RunnerResult,
+    command_context: Mapping[str, Any],
+    child_summary: Mapping[str, Any],
+) -> str:
+    stdout_stderr_summary = _stdout_stderr_summary(result.message or "")
+    parts: list[str] = [
+        result.failure_category or "",
+        str(stdout_stderr_summary.get("stderr") or ""),
+        str(stdout_stderr_summary.get("stdout") or ""),
+        json.dumps(dict(child_summary), sort_keys=True),
+        str(child_summary.get("last_message_text_preview") or ""),
+        str(child_summary.get("last_command") or ""),
+        str(child_summary.get("last_tool_name") or ""),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _attempt_last_message_preview(
+    *,
+    result: RunnerResult,
+    child_summary: Mapping[str, Any],
+) -> str | None:
+    preview = child_summary.get("last_message_text_preview")
+    if isinstance(preview, str) and preview:
+        return preview
+    for event in reversed(result.events):
+        message = event.get("child_message")
+        if isinstance(message, str) and message:
+            return _bounded_preview(message)
+    return None
+
+
+def _raw_child_artifacts(
+    command_context: Mapping[str, Any],
+    child_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    summary_artifacts = child_summary.get("artifacts")
+    if isinstance(summary_artifacts, Mapping):
+        return dict(summary_artifacts)
+    artifacts = command_context.get("child_event_artifacts")
+    if isinstance(artifacts, Mapping):
+        return dict(artifacts)
+    return {}
 
 
 def _trace_record(run_dir: Path, event: Mapping[str, Any]) -> dict[str, Any]:
@@ -1552,6 +2042,98 @@ def _trace_record(run_dir: Path, event: Mapping[str, Any]) -> dict[str, Any]:
         "child_message": child_message,
         "raw_event": event.get("raw_event", {}),
     }
+
+
+def _append_task_trace_event(
+    run_dir: Path,
+    task: dict[str, Any],
+    event: Mapping[str, Any],
+) -> None:
+    trace_record = _trace_record(run_dir, event)
+    append_trace_record(run_dir, trace_record)
+    trace_ids: list[str] = list(task.get("trace_event_ids") or [])
+    trace_ids.append(trace_record["event_id"])
+    task["trace_event_ids"] = trace_ids
+
+
+def _append_retry_trace_event(
+    run_dir: Path,
+    task: dict[str, Any],
+    retry_plan: Mapping[str, Any],
+) -> None:
+    attempt_record = _latest_attempt_diagnostic(task) or {}
+    retry_decision = str(retry_plan.get("retry_decision") or attempt_record.get("retry_decision") or "do_not_retry")
+    event = _codex_event(
+        "retry_decision",
+        task,
+        child_thread_id=str(attempt_record.get("child_thread_id") or task.get("last_child_thread_id") or "unknown"),
+        child_status="retrying" if retry_decision == "retry" else "failed",
+        child_message=_retry_trace_message(task, retry_plan, attempt_record),
+        failure_category=_trace_failure_category(task, attempt_record),
+        raw_event=_retry_trace_raw_event(task, retry_plan, attempt_record),
+    )
+    _append_task_trace_event(run_dir, task, event)
+
+
+def _retry_trace_message(
+    task: Mapping[str, Any],
+    retry_plan: Mapping[str, Any],
+    attempt_record: Mapping[str, Any],
+) -> str:
+    decision = str(retry_plan.get("retry_decision") or attempt_record.get("retry_decision") or "do_not_retry")
+    child_failure_code = str(attempt_record.get("child_failure_code") or task.get("child_failure_code") or "unknown")
+    attempt = int(attempt_record.get("attempt") or task.get("attempt") or 0)
+    max_attempts = int(attempt_record.get("max_attempts") or task.get("max_attempts") or 0)
+    details = [
+        f"retry_decision={decision}",
+        f"attempt={attempt}/{max_attempts}",
+        f"child_failure_code={child_failure_code}",
+    ]
+    computed_backoff = retry_plan.get("computed_backoff_seconds")
+    if computed_backoff is not None:
+        details.append(f"computed_backoff_seconds={computed_backoff}")
+    actual_sleep = retry_plan.get("actual_sleep_seconds")
+    if actual_sleep is not None:
+        details.append(f"actual_sleep_seconds={actual_sleep}")
+    exhausted_reason = retry_plan.get("retry_exhausted_reason")
+    if exhausted_reason:
+        details.append(f"retry_exhausted_reason={exhausted_reason}")
+    return "; ".join(details)
+
+
+def _retry_trace_raw_event(
+    task: Mapping[str, Any],
+    retry_plan: Mapping[str, Any],
+    attempt_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "task_id": task.get("id"),
+        "attempt": int(attempt_record.get("attempt") or task.get("attempt") or 0),
+        "max_attempts": int(attempt_record.get("max_attempts") or task.get("max_attempts") or 0),
+        "child_thread_id": attempt_record.get("child_thread_id") or task.get("last_child_thread_id"),
+        "child_failure_code": attempt_record.get("child_failure_code") or task.get("child_failure_code"),
+        "failure_category": task.get("failure_category"),
+        "timeout": bool(attempt_record.get("timeout")),
+        "returncode": attempt_record.get("returncode"),
+        "retry_decision": retry_plan.get("retry_decision") or attempt_record.get("retry_decision"),
+        "computed_backoff_seconds": retry_plan.get("computed_backoff_seconds"),
+        "actual_sleep_seconds": retry_plan.get("actual_sleep_seconds"),
+        "batch_sleep_seconds": retry_plan.get("batch_sleep_seconds"),
+        "retry_exhausted_reason": retry_plan.get("retry_exhausted_reason"),
+    }
+
+
+def _trace_failure_category(
+    task: Mapping[str, Any],
+    attempt_record: Mapping[str, Any],
+) -> str | None:
+    failure_category = str(task.get("failure_category") or "")
+    if failure_category in TRACE_FAILURE_CATEGORIES:
+        return failure_category
+    child_failure_code = str(attempt_record.get("child_failure_code") or task.get("child_failure_code") or "")
+    if child_failure_code == CODEX_CHILD_MODEL_CAPACITY:
+        return "codex_exec_failed"
+    return None
 
 
 def _codex_event(
@@ -1864,7 +2446,27 @@ def _default_project_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
-def _codex_exec_child_artifact_paths(*, run_dir: Path, task_id: str) -> dict[str, Path]:
+def _codex_exec_child_artifact_paths(
+    *,
+    run_dir: Path,
+    task_id: str,
+    attempt: int,
+) -> dict[str, Path]:
+    safe_task_id = _artifact_safe_task_id(task_id)
+    safe_attempt = max(1, attempt)
+    artifact_dir = run_dir / CHILD_EVENTS_DIRNAME / safe_task_id / f"attempt_{safe_attempt:03d}"
+    return {
+        "stdout_jsonl_path": artifact_dir / CODEX_EXEC_STDOUT_FILENAME,
+        "stderr_path": artifact_dir / CODEX_EXEC_STDERR_FILENAME,
+        "last_child_event_path": artifact_dir / LAST_CHILD_EVENT_FILENAME,
+    }
+
+
+def _codex_exec_legacy_child_artifact_paths(
+    *,
+    run_dir: Path,
+    task_id: str,
+) -> dict[str, Path]:
     safe_task_id = _artifact_safe_task_id(task_id)
     artifact_dir = run_dir / CHILD_EVENTS_DIRNAME / safe_task_id
     return {
@@ -1919,7 +2521,26 @@ def _write_codex_exec_child_diagnostics(
         os_error=os_error,
     )
     _write_json(artifacts["last_child_event_path"], summary)
+    legacy_artifacts = _codex_exec_legacy_child_artifact_paths(
+        run_dir=Path(artifacts["stdout_jsonl_path"]).parents[3],
+        task_id=str(task.get("id") or "unknown"),
+    )
+    _mirror_child_diagnostic_artifacts(
+        artifacts=artifacts,
+        legacy_artifacts=legacy_artifacts,
+    )
     return summary
+
+
+def _mirror_child_diagnostic_artifacts(
+    *,
+    artifacts: Mapping[str, Path],
+    legacy_artifacts: Mapping[str, Path],
+) -> None:
+    for key, legacy_path in legacy_artifacts.items():
+        source_path = artifacts[key]
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def _last_child_event_summary(
@@ -2454,7 +3075,8 @@ def _task_status_record(task: Mapping[str, Any], reason: Any) -> dict[str, Any]:
     adapter = preserved_failure.get("adapter") or task.get("last_adapter") or _adapter_from_assignment(task)
     retryable = preserved_failure.get("retryable")
     if not isinstance(retryable, bool):
-        retryable = failure_category in RETRY_SAFE_FAILURES
+        retryable = _task_is_retryable(task)
+    latest_attempt = _latest_attempt_diagnostic(task) or {}
     record = {
         "task_id": task.get("id"),
         "state": state,
@@ -2462,6 +3084,9 @@ def _task_status_record(task: Mapping[str, Any], reason: Any) -> dict[str, Any]:
         "output_shard_path": task.get("output_shard_path"),
         "adapter": adapter,
         "failure_category": failure_category,
+        "child_failure_code": task.get("child_failure_code"),
+        "timeout": bool(latest_attempt.get("timeout")),
+        "returncode": latest_attempt.get("returncode"),
         "retryable": retryable,
         "attempt": int(task.get("attempt") or 0),
         "max_attempts": int(task.get("max_attempts") or 0),
@@ -2474,6 +3099,7 @@ def _task_status_record(task: Mapping[str, Any], reason: Any) -> dict[str, Any]:
         "stdout_stderr_summary": dict(stdout_stderr_summary),
         "command_context": dict(command_context),
     }
+    _add_attempt_diagnostics(record, task)
     if preserved_failure:
         record["serial_fallback"] = {
             "adapter": task.get("last_adapter") or _adapter_from_assignment(task),
@@ -2490,12 +3116,16 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
         command_context = {}
     failure_category = str(task.get("failure_category") or "unknown_failure")
     state = str(task.get("state") or "failed")
-    return {
+    latest_attempt = _latest_attempt_diagnostic(task) or {}
+    record = {
         "task_id": task.get("id"),
         "state": state,
         "adapter": task.get("last_adapter") or _adapter_from_assignment(task),
         "failure_category": failure_category,
-        "retryable": state == "retryable" or failure_category in RETRY_SAFE_FAILURES,
+        "child_failure_code": task.get("child_failure_code"),
+        "timeout": bool(latest_attempt.get("timeout")),
+        "returncode": latest_attempt.get("returncode"),
+        "retryable": _task_is_retryable(task),
         "attempt": int(task.get("attempt") or 0),
         "max_attempts": int(task.get("max_attempts") or 0),
         "child_thread_id": task.get("last_child_thread_id"),
@@ -2506,6 +3136,22 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
         "stdout_stderr_summary": _stdout_stderr_summary(diagnostic),
         "command_context": dict(command_context),
     }
+    _add_attempt_diagnostics(record, task)
+    return record
+
+
+def _task_is_retryable(task: Mapping[str, Any]) -> bool:
+    latest_attempt = _latest_attempt_diagnostic(task) or {}
+    retry_decision = str(latest_attempt.get("retry_decision") or "")
+    if retry_decision == "retry":
+        return True
+    if retry_decision in {"do_not_retry", "retry_exhausted"}:
+        return False
+    preserved_failure = task.get("parallel_failure")
+    if isinstance(preserved_failure, Mapping) and isinstance(preserved_failure.get("retryable"), bool):
+        return bool(preserved_failure.get("retryable"))
+    failure_category = str(task.get("failure_category") or "")
+    return str(task.get("state") or "") == "retryable" or failure_category in RETRY_SAFE_FAILURES
 
 
 def _accepted_shard_record(task: Mapping[str, Any], shard_path: Path) -> dict[str, Any]:
@@ -2518,20 +3164,19 @@ def _accepted_shard_record(task: Mapping[str, Any], shard_path: Path) -> dict[st
 
 def _accepted_shard_diagnostics(task: Mapping[str, Any]) -> dict[str, Any]:
     command_context = task.get("last_command_context")
-    if not isinstance(command_context, Mapping):
-        return {}
-    if command_context.get("timeout_after_valid_shard") is not True:
-        return {}
-    diagnostics: dict[str, Any] = {"timeout_after_valid_shard": True}
-    for key in (
-        "valid_evidence_shard_exists",
-        "valid_evidence_shard_path",
-        "expected_sidecars",
-        "missing_expected_sidecars",
-        "missing_expected_sidecar_paths",
-    ):
-        if key in command_context:
-            diagnostics[key] = copy.deepcopy(command_context[key])
+    diagnostics: dict[str, Any] = {}
+    if isinstance(command_context, Mapping) and command_context.get("timeout_after_valid_shard") is True:
+        diagnostics["timeout_after_valid_shard"] = True
+        for key in (
+            "valid_evidence_shard_exists",
+            "valid_evidence_shard_path",
+            "expected_sidecars",
+            "missing_expected_sidecars",
+            "missing_expected_sidecar_paths",
+        ):
+            if key in command_context:
+                diagnostics[key] = copy.deepcopy(command_context[key])
+    _add_attempt_diagnostics(diagnostics, task)
     return diagnostics
 
 
@@ -2566,6 +3211,116 @@ def _stdout_stderr_summary(diagnostic: str) -> dict[str, str]:
         if match:
             summary[key] = match.group(1).strip()
     return summary
+
+
+def _add_attempt_diagnostics(
+    record: dict[str, Any],
+    task: Mapping[str, Any],
+) -> None:
+    diagnostics = task.get("attempt_diagnostics")
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return
+    copied = [copy.deepcopy(item) for item in diagnostics if isinstance(item, Mapping)]
+    if not copied:
+        return
+    record["attempt_diagnostics"] = copied
+    summary = _task_retry_summary(task)
+    if summary:
+        record["retry_summary"] = summary
+
+
+def _retry_summary(
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    retry_policy: Any,
+) -> dict[str, Any]:
+    task_summaries: list[dict[str, Any]] = []
+    child_failure_counts: dict[str, int] = {}
+    total_attempts = 0
+    retry_count = 0
+    retry_exhausted_count = 0
+    recovered_after_capacity_count = 0
+    capacity_failure_count = 0
+    for task in tasks:
+        diagnostics = [
+            item
+            for item in task.get("attempt_diagnostics", [])
+            if isinstance(item, Mapping)
+        ] if isinstance(task.get("attempt_diagnostics"), list) else []
+        if not diagnostics:
+            continue
+        total_attempts += len(diagnostics)
+        for attempt in diagnostics:
+            child_failure_code = attempt.get("child_failure_code")
+            if child_failure_code:
+                key = str(child_failure_code)
+                child_failure_counts[key] = child_failure_counts.get(key, 0) + 1
+                if key == CODEX_CHILD_MODEL_CAPACITY:
+                    capacity_failure_count += 1
+            if attempt.get("retry_decision") == "retry":
+                retry_count += 1
+            if attempt.get("retry_decision") == "retry_exhausted":
+                retry_exhausted_count += 1
+        task_summary = _task_retry_summary(task)
+        if task_summary:
+            task_summaries.append(task_summary)
+            if task_summary.get("recovered_after_capacity") is True:
+                recovered_after_capacity_count += 1
+    policy = dict(retry_policy) if isinstance(retry_policy, Mapping) else {}
+    return {
+        "policy": policy,
+        "total_attempts": total_attempts,
+        "retry_count": retry_count,
+        "capacity_failure_count": capacity_failure_count,
+        "retry_exhausted_count": retry_exhausted_count,
+        "recovered_after_capacity_count": recovered_after_capacity_count,
+        "child_failure_counts": child_failure_counts,
+        "tasks": task_summaries,
+    }
+
+
+def _task_retry_summary(task: Mapping[str, Any]) -> dict[str, Any]:
+    diagnostics = task.get("attempt_diagnostics")
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return {}
+    attempts = [item for item in diagnostics if isinstance(item, Mapping)]
+    if not attempts:
+        return {}
+    retry_decisions = [str(item.get("retry_decision") or "") for item in attempts]
+    capacity_failures = [
+        item
+        for item in attempts
+        if item.get("child_failure_code") == CODEX_CHILD_MODEL_CAPACITY
+    ]
+    retry_count = sum(1 for decision in retry_decisions if decision == "retry")
+    retry_exhausted = any(decision == "retry_exhausted" for decision in retry_decisions)
+    recovered_after_capacity = bool(
+        capacity_failures
+        and str(task.get("state") or "") in {"completed", "merged"}
+    )
+    return {
+        "task_id": task.get("id"),
+        "attempts": len(attempts),
+        "max_attempts": int(task.get("max_attempts") or 0),
+        "retry_count": retry_count,
+        "capacity_failure_count": len(capacity_failures),
+        "retry_exhausted": retry_exhausted,
+        "retry_exhausted_reason": task.get("retry_exhausted_reason"),
+        "recovered_after_capacity": recovered_after_capacity,
+        "final_state": task.get("state"),
+        "final_child_failure_code": task.get("child_failure_code"),
+        "retry_decisions": retry_decisions,
+        "computed_backoff_seconds": [
+            item.get("computed_backoff_seconds")
+            for item in attempts
+            if item.get("computed_backoff_seconds") is not None
+        ],
+        "actual_sleep_seconds": [
+            item.get("actual_sleep_seconds")
+            for item in attempts
+            if item.get("actual_sleep_seconds") is not None
+        ],
+    }
 
 
 def _failure_counts(
@@ -2603,25 +3358,39 @@ def _merge_diagnostics(
     failed_tasks: Sequence[Mapping[str, Any]],
     blocked_tasks: Sequence[Mapping[str, Any]],
     rejected_shards: Sequence[Mapping[str, Any]],
+    retry_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    retry_summary = retry_summary if isinstance(retry_summary, Mapping) else {}
     if accepted_shards:
         accepted_warnings = _accepted_shard_warnings(accepted_shards)
+        diagnostics: dict[str, Any] = {}
         if accepted_warnings:
-            return {
+            diagnostics.update({
                 "accepted_shard_warning_count": len(accepted_warnings),
                 "accepted_shard_warnings": accepted_warnings,
-            }
-        return {}
+            })
+        if int(retry_summary.get("recovered_after_capacity_count") or 0) > 0:
+            diagnostics["recovered_after_capacity_count"] = retry_summary.get(
+                "recovered_after_capacity_count"
+            )
+            diagnostics["capacity_retry_count"] = retry_summary.get("retry_count")
+        return diagnostics
     if failed_tasks:
         first = failed_tasks[0]
-        return {
+        diagnostics = {
             "actionable_cause": "no evidence shards were accepted because child tasks failed",
             "first_failure_category": first.get("failure_category"),
+            "first_child_failure_code": first.get("child_failure_code"),
             "first_failed_task_id": first.get("task_id"),
             "first_failed_adapter": first.get("adapter"),
             "first_failed_retryable": first.get("retryable"),
             "first_failed_diagnostic": first.get("diagnostic"),
         }
+        if int(retry_summary.get("retry_exhausted_count") or 0) > 0:
+            diagnostics["retry_exhausted"] = True
+            diagnostics["retry_exhausted_count"] = retry_summary.get("retry_exhausted_count")
+            diagnostics["capacity_failure_count"] = retry_summary.get("capacity_failure_count")
+        return diagnostics
     if blocked_tasks:
         first = blocked_tasks[0]
         return {
