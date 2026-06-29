@@ -695,6 +695,7 @@ def _run_scenario(
     if visual_release_gate is not None:
         expected_release = scenario.get("expected_release_gate_pass")
         if expected_release is True and visual_release_gate["release_gate_passed"] is not True:
+            failures.extend(visual_release_gate.get("failures", []))
             failures.append(
                 _failure(
                     scenario_id,
