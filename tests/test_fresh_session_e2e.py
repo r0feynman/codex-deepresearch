@@ -719,6 +719,18 @@ class FreshSessionE2ETests(unittest.TestCase):
                 "ok": True,
                 "terminal": True,
                 "metric_classification": "success",
+                "minimums": {
+                    "required_vlm_images": 3,
+                    "candidate_count": image_count,
+                    "selected_candidates": image_count,
+                    "fetched_artifacts": image_count,
+                    "vlm_images_analyzed": image_count,
+                    "report_cited_images": 1 if image_count >= 3 else 0,
+                    "satisfied": image_count >= 3,
+                    "shortfall_reason": "none"
+                    if image_count >= 3
+                    else "insufficient_candidates",
+                },
                 "providers": [
                     self._visual_provider(
                         provider="page-image-extractor",

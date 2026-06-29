@@ -453,6 +453,24 @@ class AutomatedVisualE2ETests(unittest.TestCase):
                 "ok": True,
                 "terminal": True,
                 "metric_classification": "success",
+                "minimums": {
+                    "required_vlm_images": 3,
+                    "candidate_count": candidate_count,
+                    "selected_candidates": candidate_count,
+                    "fetched_artifacts": observation_count,
+                    "vlm_images_analyzed": observation_count,
+                    "report_cited_images": 1 if observation_count >= 3 else 0,
+                    "satisfied": (
+                        candidate_count >= 3 and observation_count >= 3
+                    ),
+                    "shortfall_reason": (
+                        "none"
+                        if candidate_count >= 3 and observation_count >= 3
+                        else "insufficient_candidates"
+                        if candidate_count < 3
+                        else "vlm_failures"
+                    ),
+                },
                 "providers": [
                     self.provider_status(
                         provider=provider,

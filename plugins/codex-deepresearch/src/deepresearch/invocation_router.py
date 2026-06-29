@@ -33,6 +33,8 @@ from .visual_artifacts import (
     automatic_visual_status_envelope,
     build_visual_provider_status,
     real_automatic_visual_release_counts,
+    visual_failure_code_for_minimums,
+    visual_minimums_for_run,
     validate_visual_artifacts,
 )
 from .vision_adapter import VisionAdapterError, ingest_vision_observations
@@ -360,9 +362,12 @@ def run_skill_invocation(
                 ok=visual_stage_status.get("ok") is True,
                 terminal=True,
                 provenance=_provenance_from_parallel(parallel_status),
-                diagnostics={
-                    "actionable_cause": _visual_actionable_cause(visual_stage_status)
-                },
+                diagnostics=_visual_completion_diagnostics(
+                    visual_stage_status,
+                    fallback_actionable_cause=_visual_actionable_cause(
+                        visual_stage_status
+                    ),
+                ),
                 artifacts=_artifact_paths(run_dir),
             )
             status["parallel"] = _parallel_summary(parallel_status)
@@ -422,6 +427,22 @@ def run_skill_invocation(
     if isinstance(automatic_visual_completion, Mapping):
         final_status = str(automatic_visual_completion.get("status") or final_status)
         final_ok = automatic_visual_completion.get("ok") is True
+    final_diagnostics: dict[str, Any] = {
+        "actionable_cause": (
+            "full-runner completed through synthesis"
+            if final_ok
+            else _visual_actionable_cause(automatic_visual_completion)
+            if automatic_visual_completion is not None
+            else "report synthesis did not complete"
+        )
+    }
+    if automatic_visual_completion is not None:
+        final_diagnostics.update(
+            _visual_completion_diagnostics(
+                automatic_visual_completion,
+                fallback_actionable_cause=final_diagnostics["actionable_cause"],
+            )
+        )
     status = _base_run_status(
         invocation=normalized_invocation,
         question=question,
@@ -431,15 +452,7 @@ def run_skill_invocation(
         ok=final_ok,
         terminal=True,
         provenance=_provenance_from_parallel(parallel_status),
-        diagnostics={
-            "actionable_cause": (
-                "full-runner completed through synthesis"
-                if final_ok
-                else _visual_actionable_cause(automatic_visual_completion)
-                if automatic_visual_completion is not None
-                else "report synthesis did not complete"
-            )
-        },
+        diagnostics=final_diagnostics,
         artifacts=_artifact_paths(run_dir),
     )
     status["parallel"] = _parallel_summary(parallel_status)
@@ -1092,14 +1105,22 @@ def _visual_pipeline_terminal_status(
         normalized,
         visual_required=_run_requires_visual_provider(run_dir),
     )
+    minimums = visual_minimums_for_run(run_dir)
+    diagnostics = {"actionable_cause": actionable_cause}
+    if normalized == "partial_auto_visual":
+        diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+        failure_code = visual_failure_code_for_minimums(minimums)
+        if failure_code:
+            diagnostics["failure_code"] = failure_code
     return {
         "status": normalized,
         "ok": envelope["ok"],
         "terminal": envelope["terminal"],
         "metric_classification": envelope["metric_classification"],
+        "minimums": minimums,
         "visual_acquisition": dict(acquisition_status or {}),
         "ingest_vision": dict(ingest_status or {}),
-        "diagnostics": {"actionable_cause": actionable_cause},
+        "diagnostics": diagnostics,
     }
 
 
@@ -1182,6 +1203,10 @@ def _finalize_automatic_visual_completion(
 
     diagnostics = validation.to_dict()
     diagnostics["visual_release_gate"] = release_gate
+    minimums = release_gate.get("minimums") if isinstance(release_gate, Mapping) else {}
+    failure_code = visual_failure_code_for_minimums(
+        minimums if isinstance(minimums, Mapping) else None
+    )
     _write_visual_completion_status(
         run_dir=run_dir,
         provider_status=_read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
@@ -1206,7 +1231,11 @@ def _finalize_automatic_visual_completion(
             "actionable_cause": (
                 "automatic visual artifacts were produced but did not satisfy "
                 "completed_auto_visual release prerequisites"
-            )
+            ),
+            "shortfall_reason": minimums.get("shortfall_reason")
+            if isinstance(minimums, Mapping)
+            else None,
+            **({"failure_code": failure_code} if failure_code else {}),
         },
     }
 
@@ -1230,6 +1259,7 @@ def _write_visual_completion_status(
             "ok": envelope["ok"],
             "terminal": envelope["terminal"],
             "metric_classification": envelope["metric_classification"],
+            "minimums": visual_minimums_for_run(run_dir),
             "updated_at": _utc_now(),
         }
     )
@@ -1239,6 +1269,10 @@ def _write_visual_completion_status(
         else {}
     )
     diagnostics["actionable_cause"] = actionable_cause
+    failure_code = visual_failure_code_for_minimums(payload.get("minimums"))
+    if failure_code and status == "partial_auto_visual":
+        diagnostics["failure_code"] = failure_code
+        diagnostics["shortfall_reason"] = payload["minimums"].get("shortfall_reason")
     if validation is not None:
         diagnostics["visual_artifact_validation"] = dict(validation)
     payload["diagnostics"] = diagnostics
@@ -1282,46 +1316,38 @@ def _completed_auto_visual_release_gate(run_dir: Path) -> dict[str, Any]:
     provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
     evidence = _read_optional_json(run_dir / "evidence.json")
     report_status = _read_optional_json(run_dir / "report_status.json")
+    minimums = visual_minimums_for_run(run_dir)
     counts = real_automatic_visual_release_counts(
         candidates=candidates,
         fetches=fetches,
         observations=observations,
         visual_provider_status=provider_status,
     )
-    codex_observations = [
-        observation
-        for observation in observations
-        if observation.get("provider") == CODEX_INTERACTIVE_PROVIDER
-        and observation.get("provider_kind") == "vlm"
-        and observation.get("provider_mode") == "real"
-        and observation.get("observation_status") == "analyzed"
-    ]
-    report_cited_claim = _has_report_cited_real_visual_claim(
-        evidence=evidence,
-        report_status=report_status,
-    )
     failures: list[str] = []
     if counts["real_candidates"] < MIN_COMPLETED_AUTO_VISUAL_CANDIDATES:
         failures.append(
             "at_least_10_real_image_centric_candidates"
         )
-    if len(codex_observations) < MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES:
+    if minimums["vlm_images_analyzed"] < MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES:
         failures.append("at_least_3_codex_interactive_real_analyzed_images")
-    if not report_cited_claim:
+    if minimums["report_cited_images"] < 1:
         failures.append("report_cited_supported_real_visual_or_mixed_claim")
     return {
         "valid": not failures,
         "failures": failures,
         "counts": {
             **counts,
-            "codex_interactive_real_analyzed_images": len(codex_observations),
+            "codex_interactive_real_analyzed_images": minimums["vlm_images_analyzed"],
         },
-        "minimums": {
+        "minimums": minimums,
+        "required": {
             "real_candidates": MIN_COMPLETED_AUTO_VISUAL_CANDIDATES,
             "codex_interactive_real_analyzed_images": MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES,
             "report_cited_supported_real_visual_or_mixed_claim": 1,
         },
-        "report_cited_supported_real_visual_or_mixed_claim": report_cited_claim,
+        "report_cited_supported_real_visual_or_mixed_claim": bool(
+            minimums["report_cited_images"]
+        ),
     }
 
 
@@ -1444,6 +1470,36 @@ def _visual_actionable_cause(status: Mapping[str, Any] | None) -> str:
         if isinstance(cause, str) and cause:
             return cause
     return str(status.get("status") or "automatic visual pipeline did not complete")
+
+
+def _visual_completion_diagnostics(
+    status: Mapping[str, Any] | None,
+    *,
+    fallback_actionable_cause: str,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {"actionable_cause": fallback_actionable_cause}
+    if not isinstance(status, Mapping):
+        return diagnostics
+    status_name = str(status.get("status") or "")
+    raw_diagnostics = status.get("diagnostics")
+    if isinstance(raw_diagnostics, Mapping):
+        diagnostics.update(dict(raw_diagnostics))
+    minimums = status.get("minimums")
+    if not isinstance(minimums, Mapping):
+        release_gate = status.get("visual_release_gate")
+        if isinstance(release_gate, Mapping) and isinstance(
+            release_gate.get("minimums"),
+            Mapping,
+        ):
+            minimums = release_gate["minimums"]
+    if status_name == "partial_auto_visual":
+        failure_code = visual_failure_code_for_minimums(minimums)
+        if failure_code:
+            diagnostics["failure_code"] = failure_code
+            diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+        elif isinstance(minimums, Mapping):
+            diagnostics["shortfall_reason"] = minimums.get("shortfall_reason")
+    return diagnostics
 
 
 def _read_optional_json(path: Path) -> dict[str, Any]:

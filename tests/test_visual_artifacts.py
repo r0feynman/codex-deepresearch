@@ -25,6 +25,8 @@ from deepresearch.visual_artifacts import (  # noqa: E402
     automatic_visual_status_envelope,
     real_automatic_visual_release_counts,
     validate_visual_artifacts,
+    visual_failure_code_for_minimums,
+    visual_release_minimums,
 )
 
 
@@ -138,9 +140,9 @@ class VisualArtifactTests(unittest.TestCase):
             observations=self.read_jsonl(run_dir / "visual_observations.jsonl"),
             visual_provider_status=self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
         )
-        self.assertEqual(counts["real_candidates"], 1)
-        self.assertEqual(counts["real_fetches"], 1)
-        self.assertEqual(counts["real_observations"], 1)
+        self.assertEqual(counts["real_candidates"], 3)
+        self.assertEqual(counts["real_fetches"], 3)
+        self.assertEqual(counts["real_observations"], 3)
         self.assertGreaterEqual(counts["excluded_non_real_provider_records"], 3)
 
     def test_run_dir_validation_requires_phase3_visual_artifacts(self) -> None:
@@ -292,6 +294,184 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertIn("real_artifacts_fetched", errors[0].message)
         self.assertIn("real_vlm_images_analyzed", errors[0].message)
 
+    def test_visual_release_minimums_keep_text_only_runs_at_zero_visual_work(self) -> None:
+        minimums = visual_release_minimums(required_vlm_images=0)
+
+        self.assertEqual(minimums["required_vlm_images"], 0)
+        self.assertEqual(minimums["candidate_count"], 0)
+        self.assertEqual(minimums["fetched_artifacts"], 0)
+        self.assertEqual(minimums["vlm_images_analyzed"], 0)
+        self.assertEqual(minimums["report_cited_images"], 0)
+        self.assertTrue(minimums["satisfied"])
+        self.assertEqual(minimums["shortfall_reason"], "none")
+        self.assertIsNone(visual_failure_code_for_minimums(minimums))
+
+    def test_visual_release_minimums_flag_shortfall_for_one_or_two_real_analyzed_images(self) -> None:
+        candidates: list[dict] = []
+        fetches: list[dict] = []
+        observations: list[dict] = []
+        for index in range(1, 4):
+            candidate = self.candidate_record(
+                candidate_id=f"cand_real_{index:03d}",
+                task_id="task_visual_001",
+                angle_id="angle_001",
+                provider="page-image-extractor",
+                provider_kind="page_extractor",
+                provider_mode="real",
+            )
+            candidates.append(candidate)
+            fetch = self.fetch_record(
+                candidate=candidate,
+                fetch_id=f"fetch_real_{index:03d}",
+                evidence_image_id=f"img_real_{index:03d}",
+            )
+            fetches.append(fetch)
+            if index <= 2:
+                observations.append(
+                    self.observation_record(
+                        candidate=candidate,
+                        fetch_id=fetch["fetch_id"],
+                        evidence_image_id=fetch["evidence_image_id"],
+                        claim_id=None,
+                        verifier_vote_id=None,
+                        provider="codex-interactive",
+                        provider_kind="vlm",
+                        provider_mode="real",
+                    )
+                )
+
+        minimums = visual_release_minimums(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            evidence={"routing": [{"id": "angle_001", "modality": "visual_required"}]},
+            report_status={},
+        )
+
+        self.assertEqual(minimums["required_vlm_images"], 3)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertEqual(minimums["vlm_images_analyzed"], 2)
+        self.assertFalse(minimums["satisfied"])
+        self.assertNotEqual(minimums["shortfall_reason"], "none")
+        self.assertEqual(
+            visual_failure_code_for_minimums(minimums),
+            "visual_minimum_shortfall",
+        )
+
+    def test_visual_release_minimums_flag_missing_report_linkage_after_three_real_images(self) -> None:
+        candidates: list[dict] = []
+        fetches: list[dict] = []
+        observations: list[dict] = []
+        image_ids: list[str] = []
+        for index in range(1, 4):
+            candidate = self.candidate_record(
+                candidate_id=f"cand_real_{index:03d}",
+                task_id="task_visual_001",
+                angle_id="angle_001",
+                provider="child-discovered-image-url",
+                provider_kind="web_image_search",
+                provider_mode="real",
+            )
+            candidates.append(candidate)
+            image_id = f"img_real_{index:03d}"
+            image_ids.append(image_id)
+            fetch = self.fetch_record(
+                candidate=candidate,
+                fetch_id=f"fetch_real_{index:03d}",
+                evidence_image_id=image_id,
+            )
+            fetches.append(fetch)
+            observations.append(
+                self.observation_record(
+                    candidate=candidate,
+                    fetch_id=fetch["fetch_id"],
+                    evidence_image_id=image_id,
+                    claim_id=None,
+                    verifier_vote_id=None,
+                    provider="codex-interactive",
+                    provider_kind="vlm",
+                    provider_mode="real",
+                )
+            )
+
+        minimums = visual_release_minimums(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            evidence={
+                "routing": [{"id": "angle_001", "modality": "visual_required"}],
+                "claims": [
+                    {
+                        "id": "claim_visual_real",
+                        "claim_type": "visual",
+                        "supporting_images": image_ids,
+                        "verification_status": "supported",
+                    }
+                ],
+            },
+            report_status={"used_images": []},
+        )
+
+        self.assertEqual(minimums["vlm_images_analyzed"], 3)
+        self.assertEqual(minimums["report_cited_images"], 0)
+        self.assertFalse(minimums["satisfied"])
+        self.assertEqual(minimums["shortfall_reason"], "report_linkage_missing")
+        self.assertEqual(
+            visual_failure_code_for_minimums(minimums),
+            "visual_report_linkage_missing",
+        )
+
+    def test_visual_release_minimums_deduplicate_fetches_and_observations_for_one_image(self) -> None:
+        candidate = self.candidate_record(
+            candidate_id="cand_real_001",
+            task_id="task_visual_001",
+            angle_id="angle_001",
+            provider="page-image-extractor",
+            provider_kind="page_extractor",
+            provider_mode="real",
+        )
+        fetch = self.fetch_record(
+            candidate=candidate,
+            fetch_id="fetch_real_001",
+            evidence_image_id="img_real_001",
+        )
+        fetches = [
+            {**fetch, "fetch_id": f"fetch_real_dup_{index:03d}"}
+            for index in range(1, 4)
+        ]
+        observations = [
+            {
+                **self.observation_record(
+                    candidate=candidate,
+                    fetch_id=fetches[0]["fetch_id"],
+                    evidence_image_id=fetch["evidence_image_id"],
+                    claim_id=None,
+                    verifier_vote_id=None,
+                    provider="codex-interactive",
+                    provider_kind="vlm",
+                    provider_mode="real",
+                ),
+                "observation_id": f"obs_real_dup_{index}",
+            }
+            for index in range(1, 4)
+        ]
+
+        minimums = visual_release_minimums(
+            candidates=[candidate],
+            fetches=fetches,
+            observations=observations,
+            evidence={"routing": [{"id": "angle_001", "modality": "visual_required"}]},
+            report_status={},
+        )
+
+        self.assertEqual(minimums["fetched_artifacts"], 1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
+        self.assertFalse(minimums["satisfied"])
+        self.assertEqual(
+            visual_failure_code_for_minimums(minimums),
+            "visual_minimum_shortfall",
+        )
+
     def test_candidate_provider_kind_rejects_vlm_and_counts_do_not_inflate(self) -> None:
         run_dir = self.write_phase3_fixture()
         candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
@@ -314,6 +494,39 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertEqual(counts["real_candidates"], 0)
         self.assertEqual(counts["real_fetches"], 0)
         self.assertEqual(counts["real_observations"], 1)
+
+    def test_completed_auto_visual_requires_minimums_object(self) -> None:
+        run_dir = self.write_phase3_fixture()
+        provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        provider_status.pop("minimums", None)
+        self.write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, provider_status)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        self.assertIn(
+            ("$.visual_provider_status.minimums", "missing_required_field"),
+            {(error.path, error.code) for error in result.errors},
+        )
+
+    def test_completed_auto_visual_rejects_unsatisfied_minimums(self) -> None:
+        run_dir = self.write_phase3_fixture()
+        provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        provider_status["minimums"] = {
+            **provider_status["minimums"],
+            "vlm_images_analyzed": 2,
+            "satisfied": False,
+            "shortfall_reason": "vlm_failures",
+        }
+        self.write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, provider_status)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "completed_auto_visual_minimum_mismatch",
+            {error.code for error in result.errors},
+        )
 
     def test_validation_rejects_missing_required_automatic_fields(self) -> None:
         cases = (
@@ -447,51 +660,56 @@ class VisualArtifactTests(unittest.TestCase):
                 ],
             },
         )
-        candidates = [
-            self.candidate_record(
-                candidate_id="cand_real_001",
+        candidates = []
+        fetches = []
+        observations = []
+        images = []
+        real_image_ids = []
+        for index in range(1, 4):
+            candidate = self.candidate_record(
+                candidate_id=f"cand_real_{index:03d}",
                 task_id=task_id,
                 angle_id=angle_id,
                 provider="real-image-provider",
                 provider_kind="web_image_search",
                 provider_mode="real",
             )
-        ]
-        fetches = [
-            self.fetch_record(
-                candidate=candidates[0],
-                fetch_id="fetch_real_001",
-                evidence_image_id="img_real_001",
+            fetch = self.fetch_record(
+                candidate=candidate,
+                fetch_id=f"fetch_real_{index:03d}",
+                evidence_image_id=f"img_real_{index:03d}",
             )
-        ]
-        observations = [
-            self.observation_record(
-                candidate=candidates[0],
-                fetch_id="fetch_real_001",
-                evidence_image_id="img_real_001",
-                claim_id="claim_visual_001",
-                verifier_vote_id="vote_visual_001",
-                provider="openai-responses-vision",
-                provider_kind="vlm",
-                provider_mode="real",
+            candidates.append(candidate)
+            fetches.append(fetch)
+            real_image_ids.append(fetch["evidence_image_id"])
+            observations.append(
+                self.observation_record(
+                    candidate=candidate,
+                    fetch_id=fetch["fetch_id"],
+                    evidence_image_id=fetch["evidence_image_id"],
+                    claim_id="claim_visual_001",
+                    verifier_vote_id=f"vote_visual_{index:03d}",
+                    provider="codex-interactive",
+                    provider_kind="vlm",
+                    provider_mode="real",
+                )
             )
-        ]
-        images = [
-            self.evidence_image(
-                candidate=candidates[0],
-                fetch=fetches[0],
-                evidence_image_id="img_real_001",
+            images.append(
+                self.evidence_image(
+                    candidate=candidate,
+                    fetch=fetch,
+                    evidence_image_id=fetch["evidence_image_id"],
+                )
             )
-        ]
         providers = [
             self.provider_status(
                 provider="real-image-provider",
                 provider_kind="web_image_search",
                 provider_mode="real",
                 invocations=1,
-                candidates_discovered=1,
-                artifacts_fetched=1,
-                vlm_images_analyzed=1,
+                candidates_discovered=3,
+                artifacts_fetched=3,
+                vlm_images_analyzed=3,
             )
         ]
         if include_non_real:
@@ -577,6 +795,45 @@ class VisualArtifactTests(unittest.TestCase):
         self.write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, candidates)
         self.write_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME, fetches)
         self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        evidence_payload = {
+            "schema_version": "0.1.0",
+            "run_id": run_id,
+            "created_at": created_at,
+            "question": "Visual artifact fixture",
+            "mode": "automated-cli",
+            "search_provider": "openai",
+            "vlm_provider": "codex-interactive",
+            "routing": [{"id": angle_id, "modality": "visual_required"}],
+            "search_tasks": [],
+            "images": images,
+            "claims": [
+                {
+                    "id": "claim_visual_001",
+                    "claim_type": "visual",
+                    "supporting_images": real_image_ids,
+                    "visual_supports": [
+                        {
+                            "image_id": image_id,
+                            "observation_ref": f"images.{image_id}.observations[0]",
+                        }
+                        for image_id in real_image_ids
+                    ],
+                    "verification_status": "supported",
+                    "votes": [
+                        {"id": f"vote_visual_{index:03d}"}
+                        for index in range(1, 4)
+                    ],
+                }
+            ],
+        }
+        report_status_payload = {"used_images": [real_image_ids[0]]}
+        minimums = visual_release_minimums(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            evidence=evidence_payload,
+            report_status=report_status_payload,
+        )
         self.write_json(
             run_dir / VISUAL_PROVIDER_STATUS_FILENAME,
             {
@@ -586,39 +843,12 @@ class VisualArtifactTests(unittest.TestCase):
                 "ok": True,
                 "terminal": True,
                 "metric_classification": "success",
+                "minimums": minimums,
                 "providers": providers,
             },
         )
-        self.write_json(
-            run_dir / "evidence.json",
-            {
-                "schema_version": "0.1.0",
-                "run_id": run_id,
-                "created_at": created_at,
-                "question": "Visual artifact fixture",
-                "mode": "automated-cli",
-                "search_provider": "openai",
-                "vlm_provider": "openai-responses-vision",
-                "search_tasks": [],
-                "images": images,
-                "claims": [
-                    {
-                        "id": "claim_visual_001",
-                        "claim_type": "visual",
-                        "supporting_images": ["img_real_001"],
-                        "visual_supports": [
-                            {
-                                "image_id": "img_real_001",
-                                "observation_ref": "images.img_real_001.observations[0]",
-                            }
-                        ],
-                        "verification_status": "supported",
-                        "votes": [{"id": "vote_visual_001"}],
-                    }
-                ],
-            },
-        )
-        self.write_json(run_dir / "report_status.json", {"used_images": ["img_real_001"]})
+        self.write_json(run_dir / "evidence.json", evidence_payload)
+        self.write_json(run_dir / "report_status.json", report_status_payload)
         return run_dir
 
     def candidate_record(
@@ -704,7 +934,7 @@ class VisualArtifactTests(unittest.TestCase):
             verifier_links.append(
                 {
                     "claim_id": claim_id,
-                    "visual_support_ref": "images.img_real_001.observations[0]",
+                    "visual_support_ref": f"images.{evidence_image_id}.observations[0]",
                     "verifier_vote_id": verifier_vote_id,
                 }
             )
@@ -712,7 +942,7 @@ class VisualArtifactTests(unittest.TestCase):
                 {
                     "claim_id": claim_id,
                     "report_section_id": "visual-findings",
-                    "citation_id": "img:img_real_001",
+                    "citation_id": f"img:{evidence_image_id}",
                 }
             )
         return {

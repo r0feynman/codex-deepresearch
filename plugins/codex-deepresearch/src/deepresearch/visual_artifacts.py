@@ -15,6 +15,8 @@ VISUAL_SEARCH_PLAN_FILENAME = "visual_search_plan.json"
 VISUAL_CANDIDATES_FILENAME = "visual_candidates.jsonl"
 IMAGE_FETCH_STATUS_FILENAME = "image_fetch_status.jsonl"
 VISUAL_PROVIDER_STATUS_FILENAME = "visual_provider_status.json"
+DEFAULT_REQUIRED_VISUAL_VLM_IMAGES = 3
+CODEX_INTERACTIVE_PROVIDER = "codex-interactive"
 
 AUTOMATIC_VISUAL_TERMINAL_STATUSES = (
     "completed_auto_visual",
@@ -48,6 +50,15 @@ REAL_OBSERVATION_PROVIDER_KINDS = REAL_ACQUISITION_PROVIDER_KINDS + (
     "vlm",
 )
 PROVIDER_MODES = ("real", "fixture", "manual", "user_provided")
+VISUAL_MINIMUM_SHORTFALL_REASONS = (
+    "none",
+    "insufficient_candidates",
+    "fetch_failures",
+    "vlm_failures",
+    "policy_blocked",
+    "budget_pruned",
+    "report_linkage_missing",
+)
 TARGET_EVIDENCE_TYPES = (
     "web_image",
     "page_image",
@@ -222,6 +233,364 @@ def real_automatic_visual_release_counts(
     }
 
 
+def required_vlm_images_for_evidence(evidence: Mapping[str, Any] | None) -> int:
+    """Return the configured visual-required VLM minimum for a run."""
+
+    if not isinstance(evidence, Mapping):
+        return DEFAULT_REQUIRED_VISUAL_VLM_IMAGES
+    routing = evidence.get("routing")
+    if not isinstance(routing, list):
+        return DEFAULT_REQUIRED_VISUAL_VLM_IMAGES
+    visual_required = any(
+        isinstance(route, Mapping) and route.get("modality") == "visual_required"
+        for route in routing
+    )
+    return DEFAULT_REQUIRED_VISUAL_VLM_IMAGES if visual_required else 0
+
+
+def visual_minimums_for_run(
+    run_dir: str | Path,
+    *,
+    required_vlm_images: int | None = None,
+) -> dict[str, Any]:
+    """Read run artifacts and compute PRD visual minimum diagnostics."""
+
+    base = Path(run_dir)
+    evidence = _read_optional_artifact_json(base / "evidence.json")
+    report_status = _read_optional_artifact_json(base / "report_status.json")
+    required = (
+        required_vlm_images
+        if required_vlm_images is not None
+        else required_vlm_images_for_evidence(evidence)
+    )
+    return visual_release_minimums(
+        candidates=_read_optional_artifact_jsonl(base / VISUAL_CANDIDATES_FILENAME),
+        fetches=_read_optional_artifact_jsonl(base / IMAGE_FETCH_STATUS_FILENAME),
+        observations=_read_optional_artifact_jsonl(base / "visual_observations.jsonl"),
+        evidence=evidence,
+        report_status=report_status,
+        required_vlm_images=required,
+    )
+
+
+def visual_release_minimums(
+    *,
+    candidates: Sequence[Mapping[str, Any]] = (),
+    fetches: Sequence[Mapping[str, Any]] = (),
+    observations: Sequence[Mapping[str, Any]] = (),
+    evidence: Mapping[str, Any] | None = None,
+    report_status: Mapping[str, Any] | None = None,
+    required_vlm_images: int | None = None,
+) -> dict[str, Any]:
+    """Count only real automatic lineage eligible for visual release gates."""
+
+    required = (
+        required_vlm_images
+        if required_vlm_images is not None
+        else required_vlm_images_for_evidence(evidence)
+    )
+    required = max(0, int(required))
+    candidate_records = [item for item in candidates if isinstance(item, Mapping)]
+    fetch_records = [item for item in fetches if isinstance(item, Mapping)]
+    observation_records = [item for item in observations if isinstance(item, Mapping)]
+    real_candidates = [item for item in candidate_records if _is_real_acquisition_record(item)]
+    real_candidate_ids = {
+        str(item.get("candidate_id") or item.get("id"))
+        for item in real_candidates
+        if item.get("candidate_id") or item.get("id")
+    }
+    selected_candidates = [
+        item for item in real_candidates if _candidate_was_selected_or_attempted(item)
+    ]
+    real_fetch_records = [item for item in fetch_records if _is_real_acquisition_record(item)]
+    real_fetched_artifacts = [
+        item
+        for item in real_fetch_records
+        if item.get("fetch_status") == "fetched"
+        and _has_nonempty_string(item.get("local_artifact_path"))
+        and (
+            not real_candidate_ids
+            or str(item.get("candidate_id") or "") in real_candidate_ids
+        )
+    ]
+    real_fetch_ids = {
+        str(item.get("fetch_id"))
+        for item in real_fetched_artifacts
+        if _has_nonempty_string(item.get("fetch_id"))
+    }
+    real_fetch_image_ids = {
+        str(item.get("evidence_image_id"))
+        for item in real_fetched_artifacts
+        if _has_nonempty_string(item.get("evidence_image_id"))
+    }
+    eligible_observations = [
+        item
+        for item in observation_records
+        if _is_release_eligible_codex_observation(
+            item,
+            real_candidate_ids=real_candidate_ids,
+            real_fetch_ids=real_fetch_ids,
+            real_fetch_image_ids=real_fetch_image_ids,
+        )
+    ]
+    eligible_observation_image_ids = {
+        str(item.get("evidence_image_id"))
+        for item in eligible_observations
+        if _has_nonempty_string(item.get("evidence_image_id"))
+    }
+    unique_fetched_artifact_ids = {
+        identity
+        for item in real_fetched_artifacts
+        if (identity := _artifact_identity(item)) is not None
+    }
+    unique_analyzed_image_ids = {
+        identity
+        for item in eligible_observations
+        if (identity := _observation_identity(item)) is not None
+    }
+    report_cited_image_ids = _report_cited_visual_image_ids(
+        evidence=evidence,
+        report_status=report_status,
+        eligible_image_ids=eligible_observation_image_ids,
+    )
+    satisfied = (
+        required == 0
+        or (
+            len(unique_fetched_artifact_ids) >= required
+            and len(unique_analyzed_image_ids) >= required
+            and len(report_cited_image_ids) >= 1
+        )
+    )
+    shortfall_reason = _visual_shortfall_reason(
+        required_vlm_images=required,
+        candidate_count=len(real_candidates),
+        selected_candidates=len(selected_candidates),
+        fetched_artifacts=len(unique_fetched_artifact_ids),
+        vlm_images_analyzed=len(unique_analyzed_image_ids),
+        report_cited_images=len(report_cited_image_ids),
+        fetch_records=real_fetch_records,
+        evidence=evidence,
+        satisfied=satisfied,
+    )
+    return {
+        "required_vlm_images": required,
+        "candidate_count": len(real_candidates),
+        "selected_candidates": len(selected_candidates),
+        "fetched_artifacts": len(unique_fetched_artifact_ids),
+        "vlm_images_analyzed": len(unique_analyzed_image_ids),
+        "report_cited_images": len(report_cited_image_ids),
+        "satisfied": satisfied,
+        "shortfall_reason": shortfall_reason,
+    }
+
+
+def visual_failure_code_for_minimums(minimums: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(minimums, Mapping):
+        return None
+    reason = str(minimums.get("shortfall_reason") or "none")
+    if reason == "none":
+        return None
+    if reason == "report_linkage_missing":
+        return "visual_report_linkage_missing"
+    return "visual_minimum_shortfall"
+
+
+def _candidate_was_selected_or_attempted(record: Mapping[str, Any]) -> bool:
+    candidate_status = str(record.get("candidate_status") or "")
+    if candidate_status in {
+        "fetched",
+        "analyzed",
+        "fetch_failed",
+        "policy_blocked",
+        "rejected",
+    }:
+        return True
+    if candidate_status == "budget_pruned":
+        return False
+    status = str(record.get("status") or "")
+    return status in {"accepted", "removed", "fetch_failed"}
+
+
+def _is_release_eligible_codex_observation(
+    observation: Mapping[str, Any],
+    *,
+    real_candidate_ids: set[str],
+    real_fetch_ids: set[str],
+    real_fetch_image_ids: set[str],
+) -> bool:
+    if observation.get("provider") != CODEX_INTERACTIVE_PROVIDER:
+        return False
+    if observation.get("provider_kind") != "vlm":
+        return False
+    if observation.get("provider_mode") != "real":
+        return False
+    if observation.get("observation_status") != "analyzed":
+        return False
+    candidate_id = str(observation.get("candidate_id") or "")
+    fetch_id = str(observation.get("fetch_id") or "")
+    image_id = str(observation.get("evidence_image_id") or "")
+    if real_candidate_ids and candidate_id not in real_candidate_ids:
+        return False
+    if real_fetch_ids and fetch_id not in real_fetch_ids:
+        return False
+    if real_fetch_image_ids and image_id not in real_fetch_image_ids:
+        return False
+    return bool(image_id)
+
+
+def _report_cited_visual_image_ids(
+    *,
+    evidence: Mapping[str, Any] | None,
+    report_status: Mapping[str, Any] | None,
+    eligible_image_ids: set[str],
+) -> set[str]:
+    if not isinstance(evidence, Mapping) or not isinstance(report_status, Mapping):
+        return set()
+    used_images = report_status.get("used_images")
+    if not isinstance(used_images, list):
+        return set()
+    used_image_ids = {
+        image_id for image_id in used_images if isinstance(image_id, str) and image_id
+    }
+    claims = evidence.get("claims")
+    if not isinstance(claims, list):
+        return set()
+    cited: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        if claim.get("verification_status") != "supported":
+            continue
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+        supporting_images = claim.get("supporting_images")
+        if not isinstance(supporting_images, list):
+            continue
+        for image_id in supporting_images:
+            if (
+                isinstance(image_id, str)
+                and image_id in used_image_ids
+                and image_id in eligible_image_ids
+            ):
+                cited.add(image_id)
+    return cited
+
+
+def _artifact_identity(record: Mapping[str, Any]) -> str | None:
+    for field in ("evidence_image_id", "fetch_id", "local_artifact_path", "candidate_id"):
+        value = record.get(field)
+        if _has_nonempty_string(value):
+            return f"{field}:{value}"
+    return None
+
+
+def _observation_identity(record: Mapping[str, Any]) -> str | None:
+    for field in ("evidence_image_id", "fetch_id", "candidate_id", "observation_id"):
+        value = record.get(field)
+        if _has_nonempty_string(value):
+            return f"{field}:{value}"
+    return None
+
+
+def _visual_shortfall_reason(
+    *,
+    required_vlm_images: int,
+    candidate_count: int,
+    selected_candidates: int,
+    fetched_artifacts: int,
+    vlm_images_analyzed: int,
+    report_cited_images: int,
+    fetch_records: Sequence[Mapping[str, Any]],
+    evidence: Mapping[str, Any] | None,
+    satisfied: bool,
+) -> str:
+    if satisfied or required_vlm_images <= 0:
+        return "none"
+    if candidate_count < required_vlm_images:
+        return "insufficient_candidates"
+    if fetched_artifacts < required_vlm_images:
+        statuses = {
+            str(record.get("fetch_status") or "")
+            for record in fetch_records
+            if record.get("fetch_status")
+        }
+        if statuses and statuses <= {"policy_blocked"}:
+            return "policy_blocked"
+        if "budget_pruned" in statuses or _configured_image_cap_below_required(
+            evidence,
+            required_vlm_images,
+        ):
+            return "budget_pruned"
+        if statuses & {"failed", "unsupported_mime", "too_large", "deduped", "skipped"}:
+            return "fetch_failures"
+        if selected_candidates < required_vlm_images:
+            return "insufficient_candidates"
+        return "fetch_failures"
+    if vlm_images_analyzed < required_vlm_images:
+        if _configured_image_cap_below_required(evidence, required_vlm_images):
+            return "budget_pruned"
+        return "vlm_failures"
+    if report_cited_images < 1:
+        return "report_linkage_missing"
+    return "none"
+
+
+def _configured_image_cap_below_required(
+    evidence: Mapping[str, Any] | None,
+    required_vlm_images: int,
+) -> bool:
+    if not isinstance(evidence, Mapping) or required_vlm_images <= 0:
+        return False
+    budget = evidence.get("budget")
+    if isinstance(budget, Mapping):
+        value = budget.get("max_images")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value < required_vlm_images
+    routing = evidence.get("routing")
+    if not isinstance(routing, list):
+        return False
+    route_caps = [
+        int(route.get("max_images"))
+        for route in routing
+        if isinstance(route, Mapping)
+        and route.get("modality") == "visual_required"
+        and isinstance(route.get("max_images"), int)
+        and not isinstance(route.get("max_images"), bool)
+        and int(route.get("max_images")) > 0
+    ]
+    return bool(route_caps) and sum(route_caps) < required_vlm_images
+
+
+def _has_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _read_optional_artifact_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _read_optional_artifact_jsonl(path: Path) -> list[Mapping[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records: list[Mapping[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, Mapping):
+            records.append(payload)
+    return records
+
+
 def build_visual_provider_status(
     *,
     run_dir: Path,
@@ -256,6 +625,11 @@ def build_visual_provider_status(
         "terminal": terminal,
         "created_at": created_at,
         "metric_classification": metric_classification,
+        "minimums": visual_release_minimums(
+            required_vlm_images=0
+            if status == "no_visual_tasks"
+            else DEFAULT_REQUIRED_VISUAL_VLM_IMAGES
+        ),
         "providers": [
             {
                 "provider": provider,
@@ -792,6 +1166,44 @@ def _validate_visual_provider_status(
                     "status_envelope_mismatch",
                     f"{field} must be {envelope[field]!r} for status '{state}'",
                 )
+    minimums = status.get("minimums")
+    if state == "completed_auto_visual" and minimums is None:
+        collector.add(
+            f"{path}.minimums",
+            "missing_required_field",
+            "completed_auto_visual requires a minimums object",
+        )
+    if minimums is not None:
+        _validate_visual_minimums(minimums, path, collector)
+        if isinstance(minimums, Mapping):
+            if state == "completed_auto_visual" and minimums.get("satisfied") is not True:
+                collector.add(
+                    f"{path}.minimums.satisfied",
+                    "completed_auto_visual_minimum_mismatch",
+                    "completed_auto_visual requires minimums.satisfied=true",
+                )
+            if state == "completed_auto_visual" and _int(
+                minimums.get("vlm_images_analyzed")
+            ) < _int(minimums.get("required_vlm_images")):
+                collector.add(
+                    f"{path}.minimums.vlm_images_analyzed",
+                    "completed_auto_visual_minimum_mismatch",
+                    "completed_auto_visual requires vlm_images_analyzed >= required_vlm_images",
+                )
+            if state == "completed_auto_visual" and _int(
+                minimums.get("report_cited_images")
+            ) < 1:
+                collector.add(
+                    f"{path}.minimums.report_cited_images",
+                    "completed_auto_visual_minimum_mismatch",
+                    "completed_auto_visual requires at least one report-cited image",
+                )
+            if state == "partial_auto_visual" and minimums.get("shortfall_reason") == "none":
+                collector.add(
+                    f"{path}.minimums.shortfall_reason",
+                    "partial_auto_visual_shortfall_missing",
+                    "partial_auto_visual requires a non-none shortfall_reason",
+                )
     providers = _check_list(status, "providers", path, collector)
     for index, provider in enumerate(providers):
         provider_path = f"{path}.providers[{index}]"
@@ -837,6 +1249,60 @@ def _validate_visual_provider_status(
         ):
             _check_number(provider, field, provider_path, collector)
         _check_nullable_string(provider, "last_error", provider_path, collector)
+
+
+def _validate_visual_minimums(
+    minimums: Any,
+    path: str,
+    collector: _Collector,
+) -> None:
+    minimums_path = f"{path}.minimums"
+    if not _require_object(minimums, minimums_path, collector):
+        return
+    _require_fields(
+        minimums,
+        minimums_path,
+        (
+            "required_vlm_images",
+            "candidate_count",
+            "selected_candidates",
+            "fetched_artifacts",
+            "vlm_images_analyzed",
+            "report_cited_images",
+            "satisfied",
+            "shortfall_reason",
+        ),
+        collector,
+    )
+    for field in (
+        "required_vlm_images",
+        "candidate_count",
+        "selected_candidates",
+        "fetched_artifacts",
+        "vlm_images_analyzed",
+        "report_cited_images",
+    ):
+        _check_number(minimums, field, minimums_path, collector)
+    _check_bool(minimums, "satisfied", minimums_path, collector)
+    _check_enum(
+        minimums,
+        "shortfall_reason",
+        VISUAL_MINIMUM_SHORTFALL_REASONS,
+        minimums_path,
+        collector,
+    )
+    if minimums.get("satisfied") is True and minimums.get("shortfall_reason") != "none":
+        collector.add(
+            f"{minimums_path}.shortfall_reason",
+            "minimum_satisfaction_mismatch",
+            "satisfied visual minimums must use shortfall_reason='none'",
+        )
+    if minimums.get("satisfied") is False and minimums.get("shortfall_reason") == "none":
+        collector.add(
+            f"{minimums_path}.shortfall_reason",
+            "minimum_satisfaction_mismatch",
+            "unsatisfied visual minimums must provide a non-none shortfall_reason",
+        )
 
 
 def _validate_report_status(

@@ -46,6 +46,7 @@ from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
     VISUAL_SEARCH_PLAN_FILENAME,
+    visual_release_minimums,
     validate_visual_artifacts,
 )
 
@@ -3108,6 +3109,13 @@ def _visual_provider_status(
         "terminal": terminal,
         "created_at": created_at,
         "metric_classification": metric_classification,
+        "minimums": visual_release_minimums(
+            candidates=candidate_records,
+            fetches=image_fetch_records,
+            observations=observations,
+            evidence=_read_json_object(run_dir / "evidence.json"),
+            report_status=_read_optional_json_object(run_dir / "report_status.json"),
+        ),
         "providers": providers,
         "diagnostics": {"actionable_cause": actionable_cause},
         "artifacts": {
@@ -4537,6 +4545,15 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise VisualAcquisitionError(f"expected JSON object in {path}")
     return payload
+
+
+def _read_optional_json_object(path: Path) -> dict[str, Any]:
+    try:
+        return _read_json_object(path)
+    except VisualAcquisitionError as exc:
+        if "missing JSON file:" in str(exc):
+            return {}
+        raise
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
