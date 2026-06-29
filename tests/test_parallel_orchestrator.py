@@ -392,6 +392,55 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.events[1]["raw_event"]["child_event_artifacts"], artifacts)
         self.assertIn("child_event_artifacts=", result.message or "")
 
+    def test_codex_exec_child_summary_extracts_function_call_names(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+        stdout = (
+            json.dumps(
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_function_001",
+                    "arguments": {"cmd": "python3 -m unittest tests.test_parallel_orchestrator"},
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "custom_tool_call",
+                    "name": "view_image",
+                    "call_id": "call_custom_001",
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["codex"],
+                returncode=1,
+                stdout=stdout,
+                stderr="child command failed",
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        artifacts = result.events[0]["raw_event"]["child_event_artifacts"]
+        summary = self.load_json(Path(artifacts["last_child_event_path"]))
+        self.assertEqual(summary["last_tool_name"], "view_image")
+        self.assertEqual(summary["last_tool_call_id"], "call_custom_001")
+        self.assertEqual(summary["last_tool_event_type"], "custom_tool_call")
+        self.assertEqual(
+            summary["last_command"],
+            "python3 -m unittest tests.test_parallel_orchestrator",
+        )
+
     def test_codex_exec_timeout_persists_partial_child_diagnostics(self) -> None:
         run_dir = self.prepare()
         task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]

@@ -1993,7 +1993,7 @@ def _extract_tool_name(event: Mapping[str, Any]) -> str | None:
         return str(value)
     event_type = str(event.get("type") or event.get("event") or "").lower()
     name = event.get("name")
-    if name and "tool" in event_type:
+    if name and _event_type_has_tool_name(event_type):
         return str(name)
     for key in ("item", "tool_call", "call", "function", "msg"):
         nested = event.get(key)
@@ -2002,6 +2002,10 @@ def _extract_tool_name(event: Mapping[str, Any]) -> str | None:
             if value:
                 return value
     return None
+
+
+def _event_type_has_tool_name(event_type: str) -> bool:
+    return "tool" in event_type or "function_call" in event_type
 
 
 def _extract_tool_call_id(event: Mapping[str, Any]) -> str | None:
