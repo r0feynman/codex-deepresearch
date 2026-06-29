@@ -821,7 +821,7 @@ def _run_parallel_orchestration_started(
         for task in _runnable_tasks(tasks, retry_failed=True):
             if task.get("child_failure_code") == CODEX_CHILD_MODEL_CAPACITY:
                 continue
-            if task.get("failure_category") not in RETRY_SAFE_FAILURES:
+            if not _task_is_retryable(task):
                 continue
             if task.get("state") in {"completed", "merged", "blocked", "discarded"}:
                 continue
