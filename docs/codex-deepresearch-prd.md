@@ -351,6 +351,7 @@ Automatic visual completion states:
 Automatic visual terminal status precedence:
 
 - Missing required capability wins first: no configured/available real visual acquisition path is `blocked_missing_visual_provider`; fetched visual artifacts with no allowed VLM path is `blocked_missing_vlm_provider`.
+- Parallel child execution failure wins before visual-minimum classification: if Codex child capacity or another child failure leaves `accepted_shards=0`, the terminal status is `failed_parallel_no_accepted_shards`; `partial_auto_visual` applies only after some evidence/visual path was accepted but the configured visual minimum or report linkage gate was missed.
 - Policy rejection wins over partial completion when every discovered candidate is blocked by robots, copyright, paywall, login, CAPTCHA, PII, sensitive-image, or high-risk policy; the status is `policy_blocked_visual`.
 - `budget_pruned_visual` is reserved for an explicitly low-budget/excluded diagnostic preset, or for a cap that prevents any eligible visual work from starting before candidate/fetch/VLM attempts can run.
 - In the default visual-required Public Beta gate, if providers ran and candidates or artifacts existed but the configured minimum is missed because of fetch failures, VLM failures, capacity, cost, or image/model-call caps, the terminal status is `partial_auto_visual` with `diagnostics.failure_code=visual_minimum_shortfall` and `shortfall_reason=budget_pruned` or the more specific dominant shortfall reason.
