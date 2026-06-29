@@ -15,6 +15,13 @@ The product goal is described in `docs/codex-deepresearch-prd.md`. The developme
 - Prefer small issues and small PRs tied to the documented phase roadmap.
 - For research features, preserve evidence metadata: source URL, retrieval time, modality, extracted claims, verifier results, and confidence.
 
+## Reporting Discipline
+
+- Clearly separate facts, inferences, assumptions, and unknowns when reporting investigation results, test outcomes, root causes, implementation status, or review findings.
+- Do not present a hypothesis as a fact. Label it as a hypothesis, candidate cause, or unverified inference until it is supported by logs, artifacts, code, tests, or external source evidence.
+- When reporting a failure, distinguish the directly observed failure path from the unproven underlying cause. Include the evidence used, such as artifact paths, log lines, command output, code references, or test results.
+- If evidence is incomplete, say what is known, what is not known, and what additional check would narrow the cause.
+
 ## Implementation Coordination
 
 When the user asks to implement work, the main Codex agent must act as a coordinator rather than the primary implementer.

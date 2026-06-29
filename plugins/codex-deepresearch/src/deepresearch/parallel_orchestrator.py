@@ -26,6 +26,10 @@ RESEARCH_TASKS_FILENAME = "research_tasks.json"
 ASSIGNMENTS_FILENAME = "subagent_assignments.jsonl"
 MERGE_STATUS_FILENAME = "merge_status.json"
 EVIDENCE_SHARDS_DIRNAME = "evidence_shards"
+CHILD_EVENTS_DIRNAME = "child_events"
+CODEX_EXEC_STDOUT_FILENAME = "codex_exec_stdout.jsonl"
+CODEX_EXEC_STDERR_FILENAME = "codex_exec_stderr.txt"
+LAST_CHILD_EVENT_FILENAME = "last_child_event.json"
 RETRY_SAFE_FAILURES = {
     "adapter_unavailable",
     "codex_exec_failed",
@@ -167,6 +171,11 @@ class CodexExecAdapter:
             run_dir=run_dir,
             shard_path=shard_path,
         )
+        child_artifacts = _codex_exec_child_artifact_paths(
+            run_dir=run_dir,
+            task_id=str(task.get("id") or "unknown"),
+        )
+        command_context["child_event_artifacts"] = _stringify_paths(child_artifacts)
         events = [
             _codex_event(
                 "spawn_agent",
@@ -188,11 +197,22 @@ class CodexExecAdapter:
                 timeout=self.timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
+            stdout = _timeout_stdout(exc)
+            stderr = getattr(exc, "stderr", None)
+            child_summary = _write_codex_exec_child_diagnostics(
+                task=task,
+                artifacts=child_artifacts,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=True,
+                timeout_seconds=exc.timeout,
+            )
+            command_context["last_child_event_summary"] = child_summary
             diagnostic = _codex_exec_failure_message(
                 command_context=command_context,
                 cause=exc.__class__.__name__,
-                stdout=getattr(exc, "stdout", None),
-                stderr=getattr(exc, "stderr", None),
+                stdout=stdout,
+                stderr=stderr,
             )
             if shard_path.exists() and validate_artifacts(evidence_path=shard_path).valid:
                 valid_shard_context = dict(command_context)
@@ -252,6 +272,14 @@ class CodexExecAdapter:
                 message=diagnostic,
             )
         except OSError as exc:
+            child_summary = _write_codex_exec_child_diagnostics(
+                task=task,
+                artifacts=child_artifacts,
+                stdout=getattr(exc, "stdout", None),
+                stderr=getattr(exc, "stderr", None),
+                os_error=exc.__class__.__name__,
+            )
+            command_context["last_child_event_summary"] = child_summary
             diagnostic = _codex_exec_failure_message(
                 command_context=command_context,
                 cause=exc.__class__.__name__,
@@ -286,6 +314,14 @@ class CodexExecAdapter:
                 message=diagnostic,
             )
 
+        child_summary = _write_codex_exec_child_diagnostics(
+            task=task,
+            artifacts=child_artifacts,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            returncode=completed.returncode,
+        )
+        command_context["last_child_event_summary"] = child_summary
         parsed_events = _parse_json_events(completed.stdout)
         events.extend(
             _codex_event(
@@ -294,7 +330,7 @@ class CodexExecAdapter:
                 child_thread_id=str(event.get("thread_id") or child_thread_id),
                 child_status=str(event.get("status") or "running"),
                 child_message=_event_message(event),
-                raw_event=event,
+                raw_event=_with_child_event_artifacts(event, child_artifacts),
                 failure_category=_event_failure(event),
             )
             for event in parsed_events
@@ -1770,6 +1806,261 @@ def _default_project_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def _codex_exec_child_artifact_paths(*, run_dir: Path, task_id: str) -> dict[str, Path]:
+    safe_task_id = _artifact_safe_task_id(task_id)
+    artifact_dir = run_dir / CHILD_EVENTS_DIRNAME / safe_task_id
+    return {
+        "stdout_jsonl_path": artifact_dir / CODEX_EXEC_STDOUT_FILENAME,
+        "stderr_path": artifact_dir / CODEX_EXEC_STDERR_FILENAME,
+        "last_child_event_path": artifact_dir / LAST_CHILD_EVENT_FILENAME,
+    }
+
+
+def _artifact_safe_task_id(task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id).strip("._")
+    return safe or "unknown"
+
+
+def _stringify_paths(paths: Mapping[str, Path]) -> dict[str, str]:
+    return {key: str(path) for key, path in paths.items()}
+
+
+def _timeout_stdout(exc: subprocess.TimeoutExpired) -> Any:
+    stdout = getattr(exc, "stdout", None)
+    if stdout is not None:
+        return stdout
+    return getattr(exc, "output", None)
+
+
+def _write_codex_exec_child_diagnostics(
+    *,
+    task: Mapping[str, Any],
+    artifacts: Mapping[str, Path],
+    stdout: Any = None,
+    stderr: Any = None,
+    timeout: bool = False,
+    timeout_seconds: float | None = None,
+    returncode: int | None = None,
+    os_error: str | None = None,
+) -> dict[str, Any]:
+    stdout_text = _coerce_output_text(stdout)
+    stderr_text = _coerce_output_text(stderr)
+    for path in artifacts.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    artifacts["stdout_jsonl_path"].write_text(stdout_text, encoding="utf-8")
+    artifacts["stderr_path"].write_text(stderr_text, encoding="utf-8")
+    events, parse_errors = _parse_json_events_with_errors(stdout_text)
+    summary = _last_child_event_summary(
+        task=task,
+        events=events,
+        parse_errors=parse_errors,
+        artifacts=artifacts,
+        timeout=timeout,
+        timeout_seconds=timeout_seconds,
+        returncode=returncode,
+        os_error=os_error,
+    )
+    _write_json(artifacts["last_child_event_path"], summary)
+    return summary
+
+
+def _last_child_event_summary(
+    *,
+    task: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    parse_errors: int,
+    artifacts: Mapping[str, Path],
+    timeout: bool,
+    timeout_seconds: float | None,
+    returncode: int | None,
+    os_error: str | None,
+) -> dict[str, Any]:
+    last_event = events[-1] if events else {}
+    command_event, last_command = _last_extracted_value(events, _extract_command)
+    tool_event, last_tool_name = _last_extracted_value(events, _extract_tool_name)
+    tool_call_event, last_tool_call_id = _last_extracted_value(events, _extract_tool_call_id)
+    message_event, last_message_text = _last_extracted_value(events, _extract_message_text)
+    command_status = _extract_status(command_event or {}) or _extract_status(last_event)
+    return {
+        "schema_version": PARALLEL_SCHEMA_VERSION,
+        "task_id": str(task.get("id") or "unknown"),
+        "artifact_kind": "codex_exec_child_diagnostics",
+        "artifacts": _stringify_paths(artifacts),
+        "total_json_events": len(events),
+        "parse_errors": parse_errors,
+        "last_event_type": _extract_event_type(last_event),
+        "last_item_type": _extract_item_type(last_event),
+        "last_command": _bounded_preview(last_command),
+        "last_command_status": _bounded_preview(command_status),
+        "last_tool_name": _bounded_preview(last_tool_name),
+        "last_tool_call_id": _bounded_preview(last_tool_call_id),
+        "last_message_text_preview": _bounded_preview(last_message_text),
+        "last_message_event_type": _extract_event_type(message_event or {}),
+        "last_tool_event_type": _extract_event_type(tool_event or {}),
+        "last_tool_call_event_type": _extract_event_type(tool_call_event or {}),
+        "timeout": timeout,
+        "timeout_seconds": timeout_seconds,
+        "returncode": returncode,
+        "os_error": os_error,
+    }
+
+
+def _last_extracted_value(
+    events: Sequence[Mapping[str, Any]],
+    extractor: Any,
+) -> tuple[Mapping[str, Any] | None, Any]:
+    for event in reversed(events):
+        value = extractor(event)
+        if value not in (None, ""):
+            return event, value
+    return None, None
+
+
+def _extract_event_type(event: Mapping[str, Any]) -> str | None:
+    value = event.get("event_type") or event.get("event") or event.get("type")
+    if value:
+        return str(value)
+    msg = event.get("msg")
+    if isinstance(msg, Mapping):
+        msg_type = msg.get("type")
+        if msg_type:
+            return str(msg_type)
+    return None
+
+
+def _extract_item_type(event: Mapping[str, Any]) -> str | None:
+    item = event.get("item")
+    if isinstance(item, Mapping) and item.get("type"):
+        return str(item["type"])
+    value = event.get("item_type")
+    if value:
+        return str(value)
+    msg = event.get("msg")
+    if isinstance(msg, Mapping):
+        return _extract_item_type(msg)
+    return None
+
+
+def _extract_command(event: Mapping[str, Any]) -> Any:
+    direct = _first_mapping_value(event, ("command", "cmd"))
+    if direct:
+        return direct
+    arguments = event.get("arguments")
+    command = _command_from_arguments(arguments)
+    if command:
+        return command
+    for key in ("item", "tool_call", "call", "function", "msg"):
+        value = event.get(key)
+        if isinstance(value, Mapping):
+            command = _extract_command(value)
+            if command:
+                return command
+    return None
+
+
+def _command_from_arguments(arguments: Any) -> Any:
+    if isinstance(arguments, Mapping):
+        return _first_mapping_value(arguments, ("command", "cmd"))
+    if isinstance(arguments, str) and arguments.strip():
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, Mapping):
+            return _first_mapping_value(parsed, ("command", "cmd"))
+    return None
+
+
+def _extract_status(event: Mapping[str, Any]) -> str | None:
+    status = _first_mapping_value(event, ("status", "command_status", "result_status", "outcome"))
+    if status:
+        return str(status)
+    for key in ("item", "tool_call", "call", "msg"):
+        value = event.get(key)
+        if isinstance(value, Mapping):
+            nested = _extract_status(value)
+            if nested:
+                return nested
+    return None
+
+
+def _extract_tool_name(event: Mapping[str, Any]) -> str | None:
+    value = _first_mapping_value(event, ("tool_name", "tool"))
+    if isinstance(value, Mapping):
+        name = value.get("name")
+        return str(name) if name else None
+    if value:
+        return str(value)
+    event_type = str(event.get("type") or event.get("event") or "").lower()
+    name = event.get("name")
+    if name and _event_type_has_tool_name(event_type):
+        return str(name)
+    for key in ("item", "tool_call", "call", "function", "msg"):
+        nested = event.get(key)
+        if isinstance(nested, Mapping):
+            value = _extract_tool_name(nested)
+            if value:
+                return value
+    return None
+
+
+def _event_type_has_tool_name(event_type: str) -> bool:
+    return "tool" in event_type or "function_call" in event_type
+
+
+def _extract_tool_call_id(event: Mapping[str, Any]) -> str | None:
+    value = _first_mapping_value(event, ("tool_call_id", "call_id"))
+    if value:
+        return str(value)
+    event_type = str(event.get("type") or event.get("event") or "").lower()
+    identifier = event.get("id")
+    if identifier and "tool" in event_type:
+        return str(identifier)
+    for key in ("item", "tool_call", "call", "function", "msg"):
+        nested = event.get(key)
+        if isinstance(nested, Mapping):
+            value = _extract_tool_call_id(nested)
+            if value:
+                return value
+    return None
+
+
+def _extract_message_text(event: Mapping[str, Any]) -> Any:
+    value = _first_mapping_value(event, ("message", "text", "content", "summary"))
+    if value:
+        return value
+    for key in ("item", "msg", "delta"):
+        nested = event.get(key)
+        if isinstance(nested, Mapping):
+            value = _extract_message_text(nested)
+            if value:
+                return value
+    return None
+
+
+def _first_mapping_value(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _bounded_preview(value: Any, *, limit: int = 300) -> str | None:
+    if value is None:
+        return None
+    return _output_summary(value, limit=limit)
+
+
+def _with_child_event_artifacts(
+    event: Mapping[str, Any],
+    artifacts: Mapping[str, Path],
+) -> dict[str, Any]:
+    raw_event = dict(event)
+    raw_event["child_event_artifacts"] = _stringify_paths(artifacts)
+    return raw_event
+
+
 def _codex_exec_command_context(
     *,
     adapter_name: str,
@@ -1821,6 +2112,7 @@ def _codex_exec_failure_message(
         f"trusted_project_root={command_context.get('trusted_project_root')}; "
         f"run_dir={command_context.get('run_dir')}; "
         f"output_shard_path={command_context.get('output_shard_path')}; "
+        f"child_event_artifacts={json.dumps(command_context.get('child_event_artifacts') or {}, sort_keys=True)}; "
         f"command={command_context.get('command_string')}; "
         f"repo_check_bypass_used={command_context.get('repo_check_bypass_used')}; "
         f"retryable={command_context.get('retryable')}; "
@@ -1840,27 +2132,40 @@ def _append_shard_validation_context(message: str, shard_path: Path) -> str:
 
 
 def _output_summary(value: Any, *, limit: int = 700) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        text = value.decode("utf-8", errors="replace")
-    else:
-        text = str(value)
+    text = _coerce_output_text(value)
     return " ".join(text.split())[:limit]
 
 
+def _coerce_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _parse_json_events(stdout: str) -> list[dict[str, Any]]:
+    events, _parse_errors = _parse_json_events_with_errors(stdout)
+    return events
+
+
+def _parse_json_events_with_errors(stdout: Any) -> tuple[list[dict[str, Any]], int]:
+    text = _coerce_output_text(stdout)
     events: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
+    parse_errors = 0
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            parse_errors += 1
             continue
         if isinstance(event, dict):
             events.append(event)
-    return events
+        else:
+            parse_errors += 1
+    return events, parse_errors
 
 
 def _event_message(event: Mapping[str, Any]) -> str:

@@ -326,6 +326,195 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(spawn_context["run_dir"], str(run_dir.resolve()))
         self.assertFalse(spawn_context["repo_check_bypass_used"])
 
+    def test_codex_exec_nonzero_persists_child_diagnostics(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+        child_events = [
+            {
+                "type": "tool_call",
+                "status": "started",
+                "tool_name": "shell",
+                "call_id": "call_001",
+                "command": "python3 -m unittest tests.test_parallel_orchestrator",
+            },
+            {
+                "type": "item.completed",
+                "status": "failed",
+                "item": {
+                    "type": "tool_call",
+                    "name": "shell",
+                    "call_id": "call_001",
+                    "arguments": {"cmd": "python3 -m unittest tests.test_parallel_orchestrator"},
+                    "status": "failed",
+                },
+            },
+        ]
+        stdout = "\n".join(json.dumps(event, sort_keys=True) for event in child_events) + "\nnot-json\n"
+        stderr = "child command failed"
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["codex"],
+                returncode=17,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.failure_category, "codex_exec_failed")
+        artifacts = result.events[0]["raw_event"]["child_event_artifacts"]
+        stdout_path = Path(artifacts["stdout_jsonl_path"])
+        stderr_path = Path(artifacts["stderr_path"])
+        last_event_path = Path(artifacts["last_child_event_path"])
+        self.assertEqual(
+            stdout_path.relative_to(run_dir),
+            Path("child_events") / task["id"] / "codex_exec_stdout.jsonl",
+        )
+        self.assertEqual(stdout_path.read_text(encoding="utf-8"), stdout)
+        self.assertEqual(stderr_path.read_text(encoding="utf-8"), stderr)
+        summary = self.load_json(last_event_path)
+        self.assertEqual(summary["returncode"], 17)
+        self.assertFalse(summary["timeout"])
+        self.assertEqual(summary["total_json_events"], 2)
+        self.assertEqual(summary["parse_errors"], 1)
+        self.assertEqual(summary["last_event_type"], "item.completed")
+        self.assertEqual(summary["last_item_type"], "tool_call")
+        self.assertEqual(summary["last_command"], "python3 -m unittest tests.test_parallel_orchestrator")
+        self.assertEqual(summary["last_command_status"], "failed")
+        self.assertEqual(summary["last_tool_name"], "shell")
+        self.assertEqual(summary["last_tool_call_id"], "call_001")
+        self.assertEqual(result.events[1]["raw_event"]["child_event_artifacts"], artifacts)
+        self.assertIn("child_event_artifacts=", result.message or "")
+
+    def test_codex_exec_child_summary_extracts_function_call_names(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+        stdout = (
+            json.dumps(
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_function_001",
+                    "arguments": {"cmd": "python3 -m unittest tests.test_parallel_orchestrator"},
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "custom_tool_call",
+                    "name": "view_image",
+                    "call_id": "call_custom_001",
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["codex"],
+                returncode=1,
+                stdout=stdout,
+                stderr="child command failed",
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        artifacts = result.events[0]["raw_event"]["child_event_artifacts"]
+        summary = self.load_json(Path(artifacts["last_child_event_path"]))
+        self.assertEqual(summary["last_tool_name"], "view_image")
+        self.assertEqual(summary["last_tool_call_id"], "call_custom_001")
+        self.assertEqual(summary["last_tool_event_type"], "custom_tool_call")
+        self.assertEqual(
+            summary["last_command"],
+            "python3 -m unittest tests.test_parallel_orchestrator",
+        )
+
+    def test_codex_exec_timeout_persists_partial_child_diagnostics(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+        stdout = json.dumps(
+            {
+                "type": "message",
+                "status": "running",
+                "message": "partial progress before timeout",
+            },
+            sort_keys=True,
+        ) + "\n"
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.side_effect = subprocess.TimeoutExpired(
+                cmd="codex",
+                timeout=12,
+                output=stdout,
+                stderr=b"partial stderr",
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        self.assertEqual(result.status, "failed")
+        artifacts = result.events[0]["raw_event"]["child_event_artifacts"]
+        self.assertEqual(Path(artifacts["stdout_jsonl_path"]).read_text(encoding="utf-8"), stdout)
+        self.assertEqual(Path(artifacts["stderr_path"]).read_text(encoding="utf-8"), "partial stderr")
+        summary = self.load_json(Path(artifacts["last_child_event_path"]))
+        self.assertTrue(summary["timeout"])
+        self.assertEqual(summary["timeout_seconds"], 12)
+        self.assertIsNone(summary["returncode"])
+        self.assertEqual(summary["total_json_events"], 1)
+        self.assertEqual(summary["last_event_type"], "message")
+        self.assertEqual(summary["last_message_text_preview"], "partial progress before timeout")
+        wait_events = [event for event in result.events if event["event_type"] == "wait"]
+        self.assertEqual(wait_events[-1]["raw_event"]["child_event_artifacts"], artifacts)
+
+    def test_codex_exec_context_includes_child_artifacts_without_prompt_leak(self) -> None:
+        run_dir = self.prepare()
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        task["query"] = "private prompt text that must stay redacted"
+        adapter = CodexExecAdapter(project_root=ROOT, timeout_seconds=12)
+        stdout = json.dumps({"type": "message", "message": "child done"}, sort_keys=True) + "\n"
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["codex"],
+                returncode=1,
+                stdout=stdout,
+                stderr="failed",
+            )
+
+            result = adapter.run_task(task, run_dir=run_dir, max_threads=3)
+
+        spawn_context = result.events[0]["raw_event"]
+        wait_context = [event for event in result.events if event["event_type"] == "wait"][-1]["raw_event"]
+        parsed_raw_event = result.events[1]["raw_event"]
+        self.assertEqual(spawn_context["command"][-1], "<prompt>")
+        self.assertIn("<prompt>", spawn_context["command_string"])
+        self.assertNotIn(task["query"], json.dumps(spawn_context, sort_keys=True))
+        self.assertNotIn(task["query"], json.dumps(wait_context, sort_keys=True))
+        self.assertEqual(
+            parsed_raw_event["child_event_artifacts"],
+            spawn_context["child_event_artifacts"],
+        )
+        for artifact_path in spawn_context["child_event_artifacts"].values():
+            self.assertTrue(Path(artifact_path).is_relative_to(run_dir))
+
     def test_codex_exec_timeout_after_valid_shard_keeps_completed_output(self) -> None:
         run_dir = self.prepare()
         task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
