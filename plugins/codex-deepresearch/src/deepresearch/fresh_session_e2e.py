@@ -31,6 +31,7 @@ DEFAULT_FRESH_SESSION_VISUAL_INVOKE = (
 )
 DEFAULT_SCENARIO_TIMEOUT_SECONDS = 120.0
 DEFAULT_MIN_REAL_VISUAL_CANDIDATES = 10
+FORBIDDEN_VISUAL_LINEAGE_MODES = {"fixture", "manual", "user_provided", "user-provided"}
 REAL_CODEX_EXEC_MODES = ("auto", "require", "skip")
 REAL_CODEX_INTERACTIVE_MODES = ("auto", "require", "skip")
 
@@ -1038,6 +1039,7 @@ def _visual_release_gate(
             counts["report_cited_visual_or_mixed_claims"] >= 1
         ),
         "fixture_manual_user_evidence_excluded": counts["release_evidence_is_non_fixture"],
+        "forbidden_visual_lineage_excluded": counts["release_evidence_is_non_fixture"],
         "final_transcript_exposes_required_artifacts": artifact_exposure["ok"],
         "final_transcript_exposes_status_summary": (
             not check_final_response or "Visual summary:" in final_response
@@ -1045,7 +1047,11 @@ def _visual_release_gate(
     }
     release_gate_passed = all(checks.values())
     failures = [
-        _failure(scenario_id, check, "visual release-gate check did not pass")
+        _failure(
+            scenario_id,
+            check,
+            _visual_release_failure_detail(check, counts),
+        )
         for check, passed in checks.items()
         if passed is not True and status == "completed_auto_visual"
     ]
@@ -1063,6 +1069,7 @@ def _visual_release_gate(
             "report_cited_visual_or_mixed_claims"
         ],
         "non_release_visual_images": counts["non_release_visual_images"],
+        "forbidden_visual_lineage": counts["forbidden_visual_lineage"],
         "visual_minimums": counts["visual_minimums"],
         "real_automatic_visual_counts": counts["real_automatic_visual_counts"],
         "visual_artifact_validation": visual_artifact_validation,
@@ -1086,6 +1093,19 @@ def _visual_release_summary(visual_release_gate: Mapping[str, Any]) -> dict[str,
             "report_cited_visual_or_mixed_claims", 0
         ),
     }
+
+
+def _visual_release_failure_detail(check: str, counts: Mapping[str, Any]) -> str:
+    if check in {
+        "fixture_manual_user_evidence_excluded",
+        "forbidden_visual_lineage_excluded",
+    }:
+        lineage = counts.get("forbidden_visual_lineage")
+        if isinstance(lineage, Mapping):
+            failures = _string_items(lineage.get("failures"))
+            if failures:
+                return "forbidden visual lineage: " + ", ".join(failures)
+    return "visual release-gate check did not pass"
 
 
 def _visual_artifact_exposure(
@@ -1171,6 +1191,7 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
     candidates = _read_optional_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
     fetches = _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
     observations = _read_optional_jsonl(run_dir / "visual_observations.jsonl")
+    verifier_votes = _read_optional_jsonl(run_dir / "verifier_votes.jsonl")
     visual_provider_status = _read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
     report_text = _read_optional_text(run_dir / "report.md")
     images = _mapping_list(evidence.get("images") if isinstance(evidence, Mapping) else [])
@@ -1197,11 +1218,31 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
         eligible_image_ids=codex_image_ids,
         report_text=report_text,
     )
+    real_counts = real_automatic_visual_release_counts(
+        candidates=candidates,
+        fetches=fetches,
+        observations=observations,
+        visual_provider_status=visual_provider_status
+        if isinstance(visual_provider_status, Mapping)
+        else None,
+    )
+    forbidden_lineage = _forbidden_visual_lineage(
+        candidates=candidates,
+        fetches=fetches,
+        observations=observations,
+        evidence=evidence if isinstance(evidence, Mapping) else {},
+        report_status=report_status if isinstance(report_status, Mapping) else {},
+        visual_provider_status=visual_provider_status
+        if isinstance(visual_provider_status, Mapping)
+        else {},
+        verifier_votes=verifier_votes,
+    )
     return {
         "codex_interactive_analyzed_images": len(codex_image_ids),
         "report_cited_visual_or_mixed_claims": report_cited_claims,
         "non_release_visual_images": non_release_images,
-        "release_evidence_is_non_fixture": non_release_images == 0,
+        "release_evidence_is_non_fixture": forbidden_lineage["ok"],
+        "forbidden_visual_lineage": forbidden_lineage,
         "real_candidate_count": int(visual_minimums.get("candidate_count") or 0),
         "real_fetched_artifacts": int(visual_minimums.get("fetched_artifacts") or 0),
         "visual_minimums": visual_minimums,
@@ -1221,14 +1262,7 @@ def _visual_evidence_counts(run_dir: Path | None) -> dict[str, Any]:
         "report_status_completed": (
             isinstance(report_status, Mapping) and report_status.get("status") == "completed"
         ),
-        "real_automatic_visual_counts": real_automatic_visual_release_counts(
-            candidates=candidates,
-            fetches=fetches,
-            observations=observations,
-            visual_provider_status=visual_provider_status
-            if isinstance(visual_provider_status, Mapping)
-            else None,
-        ),
+        "real_automatic_visual_counts": real_counts,
     }
 
 
@@ -1238,6 +1272,7 @@ def _empty_visual_counts() -> dict[str, Any]:
         "report_cited_visual_or_mixed_claims": 0,
         "non_release_visual_images": 0,
         "release_evidence_is_non_fixture": True,
+        "forbidden_visual_lineage": {"ok": True, "failures": [], "count": 0},
         "real_candidate_count": 0,
         "real_fetched_artifacts": 0,
         "visual_minimums": {
@@ -1255,6 +1290,135 @@ def _empty_visual_counts() -> dict[str, Any]:
         "report_status_completed": False,
         "real_automatic_visual_counts": real_automatic_visual_release_counts(),
     }
+
+
+def _forbidden_visual_lineage(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    fetches: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    report_status: Mapping[str, Any],
+    visual_provider_status: Mapping[str, Any],
+    verifier_votes: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    failures: list[str] = []
+    _flag_forbidden_visual_records(failures, "visual_candidates", candidates)
+    _flag_forbidden_visual_records(failures, "image_fetch_status", fetches)
+    _flag_forbidden_visual_records(failures, "visual_observations", observations)
+    _flag_forbidden_visual_records(
+        failures,
+        "evidence_images",
+        _mapping_list(evidence.get("images")),
+    )
+    _flag_forbidden_visual_records(
+        failures,
+        "visual_provider_status_providers",
+        _mapping_list(visual_provider_status.get("providers")),
+    )
+    _flag_forbidden_visual_records(failures, "verifier_votes", verifier_votes)
+
+    cited_claims = _report_cited_visual_claim_records(
+        evidence=evidence,
+        report_status=report_status,
+    )
+    _flag_forbidden_visual_records(
+        failures,
+        "report_cited_claims",
+        cited_claims,
+    )
+    _flag_forbidden_visual_records(
+        failures,
+        "report_status_included_claims",
+        _mapping_list(report_status.get("included_claims")),
+    )
+
+    unique_failures = sorted(set(failures))
+    return {
+        "ok": not unique_failures,
+        "count": len(unique_failures),
+        "failures": unique_failures,
+    }
+
+
+def _flag_forbidden_visual_records(
+    failures: list[str],
+    label: str,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    if any(_contains_forbidden_visual_lineage(record) for record in records):
+        failures.append(f"{label}_has_fixture_manual_or_user_lineage")
+
+
+def _contains_forbidden_visual_lineage(value: Any, *, depth: int = 0) -> bool:
+    if depth > 4:
+        return False
+    if isinstance(value, Mapping):
+        if _mapping_declares_forbidden_visual_lineage(value):
+            return True
+        return any(
+            _contains_forbidden_visual_lineage(child, depth=depth + 1)
+            for child in value.values()
+            if isinstance(child, (Mapping, list))
+        )
+    if isinstance(value, list):
+        return any(
+            _contains_forbidden_visual_lineage(child, depth=depth + 1)
+            for child in value
+            if isinstance(child, (Mapping, list))
+        )
+    return False
+
+
+def _mapping_declares_forbidden_visual_lineage(record: Mapping[str, Any]) -> bool:
+    for key in ("provider_mode", "lineage_mode", "source_mode"):
+        if _is_forbidden_visual_lineage_value(record.get(key)):
+            return True
+    if _is_forbidden_visual_lineage_value(record.get("provider_kind")):
+        return True
+    provider = record.get("provider")
+    if isinstance(provider, str) and "fixture" in provider.lower():
+        return True
+    for key in (
+        "fixture",
+        "manual",
+        "user_provided",
+        "user-provided",
+        "user_provided_image",
+        "user_provided_images",
+    ):
+        if record.get(key) is True:
+            return True
+    return False
+
+
+def _is_forbidden_visual_lineage_value(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() in FORBIDDEN_VISUAL_LINEAGE_MODES
+
+
+def _report_cited_visual_claim_records(
+    *,
+    evidence: Mapping[str, Any],
+    report_status: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    used_images = set(_string_items(report_status.get("used_images")))
+    included_claims = _mapping_list(report_status.get("included_claims"))
+    included_ids = {
+        str(claim.get("claim_id"))
+        for claim in included_claims
+        if isinstance(claim.get("claim_id"), str) and claim.get("claim_id")
+    }
+    cited_claims: list[Mapping[str, Any]] = []
+    for claim in _mapping_list(evidence.get("claims")):
+        claim_id = claim.get("id")
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        supporting_images = set(_string_items(claim.get("supporting_images")))
+        if claim_id in included_ids or bool(used_images.intersection(supporting_images)):
+            cited_claims.append(claim)
+    return cited_claims
 
 
 def _is_codex_interactive_real_analyzed(record: Mapping[str, Any]) -> bool:

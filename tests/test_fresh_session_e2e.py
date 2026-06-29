@@ -262,6 +262,91 @@ class FreshSessionE2ETests(unittest.TestCase):
         self.assertFalse(gate["release_gate_passed"], gate)
         self.assertEqual(gate["non_release_visual_images"], 1)
         self.assertFalse(gate["checks"]["fixture_manual_user_evidence_excluded"])
+        self.assertFalse(gate["checks"]["forbidden_visual_lineage_excluded"])
+        self.assertIn(
+            "evidence_images_has_fixture_manual_or_user_lineage",
+            gate["forbidden_visual_lineage"]["failures"],
+        )
+
+    def test_supplied_completed_visual_run_rejects_fixture_candidate_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        self._visual_run_status(run_dir, status="completed_auto_visual")
+        candidates = self._read_jsonl(run_dir / "visual_candidates.jsonl")
+        fixture_candidate = dict(candidates[0])
+        fixture_candidate.update(
+            {
+                "candidate_id": "cand_fixture_999",
+                "provider": "fixture-image-search",
+                "provider_kind": "fixture",
+                "provider_mode": "fixture",
+                "provider_provenance": {
+                    "provider": "fixture-image-search",
+                    "provider_kind": "fixture",
+                    "provider_mode": "fixture",
+                },
+                "rank": 999,
+            }
+        )
+        candidates.append(fixture_candidate)
+        self._write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        gate = self._failed_supplied_visual_release_gate(
+            run_dir,
+            suite_id="fresh-session-visual-fixture-candidate",
+        )
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "visual_candidates_has_fixture_manual_or_user_lineage",
+        )
+
+    def test_supplied_completed_visual_run_rejects_manual_fetch_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        self._visual_run_status(run_dir, status="completed_auto_visual")
+        fetches = self._read_jsonl(run_dir / "image_fetch_status.jsonl")
+        fetches[0]["manual"] = True
+        self._write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        gate = self._failed_supplied_visual_release_gate(
+            run_dir,
+            suite_id="fresh-session-visual-manual-fetch",
+        )
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "image_fetch_status_has_fixture_manual_or_user_lineage",
+        )
+
+    def test_supplied_completed_visual_run_rejects_user_observation_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        self._visual_run_status(run_dir, status="completed_auto_visual")
+        observations = self._read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["user_provided"] = True
+        self._write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        gate = self._failed_supplied_visual_release_gate(
+            run_dir,
+            suite_id="fresh-session-visual-user-observation",
+        )
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "visual_observations_has_fixture_manual_or_user_lineage",
+        )
+
+    def test_completed_auto_visual_rejects_fixture_report_citation_lineage(self) -> None:
+        run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=3)
+        run_status = self._visual_run_status(run_dir, status="completed_auto_visual")
+        report_status = self.read_json(run_dir / "report_status.json")
+        report_status["included_claims"][0]["provider_mode"] = "fixture"
+        self._write_json(run_dir / "report_status.json", report_status)
+
+        gate = self._visual_release_gate_with_response(run_status)
+
+        self._assert_forbidden_visual_lineage_failure(
+            gate,
+            "report_status_included_claims_has_fixture_manual_or_user_lineage",
+        )
 
     def test_completed_auto_visual_counts_only_real_vlm_observation_records(self) -> None:
         run_dir = self._deterministic_sanitized_real_visual_run_dir(image_count=1)
@@ -1023,6 +1108,55 @@ class FreshSessionE2ETests(unittest.TestCase):
             scenario_id="completed_visual",
             check_final_response=True,
         )
+
+    def _failed_supplied_visual_release_gate(
+        self,
+        run_dir: Path,
+        *,
+        suite_id: str,
+    ) -> dict:
+        with self.assertRaises(FreshSessionE2EError) as raised:
+            run_fresh_session_visual_e2e(
+                runs_dir=self.temp_runs_dir(),
+                suite_id=suite_id,
+                clean=True,
+                real_codex_interactive="require",
+                completed_auto_visual_run=run_dir,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(payload["release_gate_passed"])
+        completed = {
+            scenario["id"]: scenario for scenario in payload["scenarios"]
+        }["visual_completed_auto_release_candidate"]
+        return completed["visual_release_gate"]
+
+    def _assert_forbidden_visual_lineage_failure(
+        self,
+        gate: dict,
+        expected_detail: str,
+    ) -> None:
+        self.assertFalse(gate["release_gate_passed"], gate)
+        self.assertFalse(gate["checks"]["forbidden_visual_lineage_excluded"])
+        self.assertFalse(gate["checks"]["fixture_manual_user_evidence_excluded"])
+        self.assertIn(expected_detail, gate["forbidden_visual_lineage"]["failures"])
+        details = [
+            failure["detail"]
+            for failure in gate["failures"]
+            if failure["check"] == "forbidden_visual_lineage_excluded"
+        ]
+        self.assertTrue(
+            any(expected_detail in detail for detail in details),
+            gate["failures"],
+        )
+
+    def _read_jsonl(self, path: Path) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     def _visual_candidate(
         self,
