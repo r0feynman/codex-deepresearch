@@ -1296,7 +1296,12 @@ def _write_visual_completion_status(
     _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, payload)
 
 
-def _completed_auto_visual_release_gate(run_dir: Path) -> dict[str, Any]:
+def _completed_auto_visual_release_gate(
+    run_dir: Path,
+    *,
+    suppress_shortfall_diagnostics: bool = False,
+    blocked_status: str | None = None,
+) -> dict[str, Any]:
     candidates = [
         item
         for item in _read_optional_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
@@ -1336,7 +1341,9 @@ def _completed_auto_visual_release_gate(run_dir: Path) -> dict[str, Any]:
             "valid": not failures,
             "failures": failures,
             "minimums": minimums,
-        }
+        },
+        suppress_shortfall=suppress_shortfall_diagnostics,
+        blocked_status=blocked_status,
     )
     return {
         "valid": not failures,
@@ -1378,7 +1385,14 @@ def _visual_release_gate_diagnostics(
     release_gate: Mapping[str, Any] | None,
     *,
     fallback_minimums: Mapping[str, Any] | None = None,
+    suppress_shortfall: bool = False,
+    blocked_status: str | None = None,
 ) -> dict[str, Any]:
+    if suppress_shortfall:
+        diagnostics = {"shortfall_reason": "none"}
+        if blocked_status:
+            diagnostics["blocked_status"] = blocked_status
+        return diagnostics
     minimums = None
     failures: list[str] = []
     valid = False
@@ -1424,6 +1438,18 @@ def _visual_release_gate_shortfall_reason(
     if "at_least_10_real_image_centric_candidates" in failures:
         return "insufficient_candidates"
     return "none"
+
+
+def _blocked_visual_release_gate_status(provider_status: Mapping[str, Any]) -> str | None:
+    status = str(provider_status.get("status") or "")
+    if status in {
+        "blocked_missing_visual_provider",
+        "blocked_missing_vlm_provider",
+        "policy_blocked_visual",
+        "budget_pruned_visual",
+    }:
+        return status
+    return None
 
 
 def _has_report_cited_real_visual_claim(
@@ -1475,7 +1501,12 @@ def _visual_summary(run_dir: Path) -> dict[str, Any]:
     candidates = _read_optional_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
     fetches = _read_optional_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
     observations = _read_optional_jsonl(run_dir / "visual_observations.jsonl")
-    release_gate = _completed_auto_visual_release_gate(run_dir)
+    blocked_status = _blocked_visual_release_gate_status(provider_status)
+    release_gate = _completed_auto_visual_release_gate(
+        run_dir,
+        suppress_shortfall_diagnostics=blocked_status is not None,
+        blocked_status=blocked_status,
+    )
     providers = (
         provider_status.get("providers")
         if isinstance(provider_status.get("providers"), list)

@@ -1648,6 +1648,18 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertNotIn("shortfall_reason", result["diagnostics"])
         synthesize_mock.assert_not_called()
         self.assertIn("visual_provider_status", result["artifacts"])
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        release_gate = run_status["visual_summary"]["release_gate"]
+        release_gate_diagnostics = release_gate["diagnostics"]
+        self.assertFalse(release_gate["valid"])
+        self.assertEqual(release_gate["shortfall_reason"], "none")
+        self.assertEqual(release_gate_diagnostics["shortfall_reason"], "none")
+        self.assertEqual(
+            release_gate_diagnostics["blocked_status"],
+            "blocked_missing_vlm_provider",
+        )
+        self.assertNotIn("failure_code", release_gate_diagnostics)
+        self.assertNotIn("failure_category", release_gate_diagnostics)
 
     def test_text_only_codex_full_runner_does_not_run_visual_acquisition_or_ingest(self) -> None:
         with (
