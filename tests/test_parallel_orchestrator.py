@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -733,6 +734,20 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(status["retry_summary"]["recovered_after_capacity_count"], 1)
         self.assertEqual(status["codex_exec_retry_policy"]["max_attempts"], 3)
         self.assertEqual(status["codex_exec_retry_policy"]["max_retry_elapsed_seconds"], 60.0)
+        retry_trace_events = [
+            record
+            for record in read_trace_records(run_dir / "run_trace.jsonl")
+            if record.get("event_type") == "retry_decision"
+        ]
+        self.assertEqual(
+            [record["raw_event"]["retry_decision"] for record in retry_trace_events],
+            ["retry", "do_not_retry"],
+        )
+        self.assertEqual(retry_trace_events[0]["raw_event"]["computed_backoff_seconds"], 5.0)
+        self.assertEqual(retry_trace_events[0]["raw_event"]["actual_sleep_seconds"], 0.0)
+        self.assertEqual(retry_trace_events[0]["raw_event"]["child_failure_code"], "codex_child_model_capacity")
+        self.assertEqual(retry_trace_events[1]["raw_event"]["returncode"], 0)
+        self.assertTrue(validate_trace_file(run_dir / "run_trace.jsonl").valid)
 
     def test_codex_exec_non_capacity_child_failures_do_not_capacity_retry(self) -> None:
         cases = (
@@ -741,6 +756,11 @@ class ParallelOrchestratorTests(unittest.TestCase):
             ("quota", "Quota exhausted for this account.", "codex_child_quota_exhausted"),
             ("billing", "Billing disabled for this workspace.", "codex_child_billing_disabled"),
             ("policy", "Policy blocked this request.", "codex_child_policy_blocked"),
+            (
+                "model-mismatch",
+                "Model gpt-4.1-mini is not available for this account. Try a different model.",
+                "codex_child_exec_failed",
+            ),
         )
         for _name, message, expected_code in cases:
             with self.subTest(message=message):
@@ -784,9 +804,20 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 sleep_mock.assert_not_called()
                 task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
                 attempt = task["attempt_diagnostics"][0]
+                self.assertEqual(task["state"], "failed")
                 self.assertEqual(attempt["child_failure_code"], expected_code)
                 self.assertEqual(attempt["retry_decision"], "do_not_retry")
                 self.assertNotEqual(attempt["child_failure_code"], "codex_child_model_capacity")
+                failed_task = result["merge"]["failed_tasks"][0]
+                self.assertFalse(failed_task["retryable"])
+                retry_trace_events = [
+                    record
+                    for record in read_trace_records(run_dir / "run_trace.jsonl")
+                    if record.get("event_type") == "retry_decision"
+                ]
+                self.assertEqual(len(retry_trace_events), 1)
+                self.assertEqual(retry_trace_events[0]["raw_event"]["retry_decision"], "do_not_retry")
+                self.assertEqual(retry_trace_events[0]["raw_event"]["child_failure_code"], expected_code)
 
     def test_codex_exec_invalid_schema_child_failure_does_not_capacity_retry(self) -> None:
         run_dir = self.prepare()
@@ -824,9 +855,11 @@ class ParallelOrchestratorTests(unittest.TestCase):
         run_mock.assert_called_once()
         sleep_mock.assert_not_called()
         task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "failed")
         attempt = task["attempt_diagnostics"][0]
         self.assertEqual(attempt["child_failure_code"], "codex_child_schema_invalid")
         self.assertEqual(attempt["retry_decision"], "do_not_retry")
+        self.assertFalse(result["merge"]["failed_tasks"][0]["retryable"])
 
     def test_codex_exec_capacity_retry_exhaustion_fails_without_timeout(self) -> None:
         run_dir = self.prepare()
@@ -896,6 +929,79 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(result["diagnostics"]["retry_exhausted"])
         self.assertEqual(result["retry_summary"]["retry_exhausted_count"], 1)
         self.assertEqual(result["retry_summary"]["capacity_failure_count"], 3)
+        retry_trace_events = [
+            record
+            for record in read_trace_records(run_dir / "run_trace.jsonl")
+            if record.get("event_type") == "retry_decision"
+        ]
+        self.assertEqual(
+            [record["raw_event"]["retry_decision"] for record in retry_trace_events],
+            ["retry", "retry", "retry_exhausted"],
+        )
+        self.assertEqual(
+            retry_trace_events[2]["raw_event"]["retry_exhausted_reason"],
+            "max_attempts_reached",
+        )
+
+    def test_codex_exec_capacity_retries_sleep_once_per_batch(self) -> None:
+        run_dir = self.prepare()
+        capacity_message = "Selected model is at capacity. Please try a different model."
+        task_attempt_counts: dict[str, int] = {}
+
+        def fake_codex_exec(command, **_kwargs):
+            prompt = command[-1]
+            match = re.search(r'"id": "([^"]+)"', prompt)
+            self.assertIsNotNone(match)
+            assert match is not None
+            task_id = match.group(1)
+            task_attempt_counts[task_id] = task_attempt_counts.get(task_id, 0) + 1
+            tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
+            task = next(item for item in tasks if item["id"] == task_id)
+            if task_attempt_counts[task_id] == 1:
+                return subprocess.CompletedProcess(
+                    args=command,
+                    returncode=1,
+                    stdout=json.dumps(
+                        {"type": "message", "status": "error", "message": capacity_message},
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    stderr="",
+                )
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.random.uniform", return_value=0.0),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=2,
+                max_tasks=2,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        self.assertEqual(run_mock.call_count, 4)
+        sleep_mock.assert_called_once_with(5.0)
+        self.assertEqual(sorted(task_attempt_counts.values()), [2, 2])
+        tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
+        self.assertTrue(all(task["state"] == "merged" for task in tasks))
 
     def test_fixture_runner_records_codex_events_and_schema_valid_shards(self) -> None:
         run_dir = self.prepare(route="visual_optional")
@@ -1148,7 +1254,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
             run_parallel_orchestration(run=run_dir, adapter_name="fixture", min_tasks=1)
 
         task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
-        self.assertEqual(task["state"], "retryable")
+        self.assertEqual(task["state"], "failed")
         self.assertEqual(task["failure_category"], "invalid_shard")
 
     def test_fixture_adapter_uses_bounded_parallel_scheduler(self) -> None:
@@ -1504,7 +1610,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
         failed_task = payload["merge"]["failed_tasks"][0]
         self.assertEqual(failed_task["adapter"], "codex-exec")
         self.assertEqual(failed_task["failure_category"], "codex_exec_failed")
-        self.assertTrue(failed_task["retryable"])
+        self.assertFalse(failed_task["retryable"])
         self.assertIn("fake codex child failed", failed_task["stdout_stderr_summary"]["stderr"])
         self.assertEqual(failed_task["command_context"]["trusted_project_root"], str(ROOT))
         self.assertEqual(failed_task["command_context"]["run_dir"], str(run_dir.resolve()))
