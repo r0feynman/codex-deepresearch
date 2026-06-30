@@ -1758,6 +1758,15 @@ class InvocationRouterTests(unittest.TestCase):
                 side_effect=fake_default_fetch_image,
             ),
             mock.patch(
+                "deepresearch.page_image_extraction._default_fetch_source_html",
+                return_value=FetchResponse(
+                    content=b"<html><body>No page images in deterministic unit fixture.</body></html>",
+                    mime_type="text/html",
+                    status_code=200,
+                    final_url="https://en.wikipedia.org/wiki/Apollo_11",
+                ),
+            ),
+            mock.patch(
                 "deepresearch.page_image_extraction._is_private_or_reserved_http_url",
                 return_value=False,
             ),
@@ -1993,6 +2002,15 @@ class InvocationRouterTests(unittest.TestCase):
             mock.patch(
                 "deepresearch.page_image_extraction._default_fetch_image",
                 side_effect=fake_default_fetch_image,
+            ),
+            mock.patch(
+                "deepresearch.page_image_extraction._default_fetch_source_html",
+                return_value=FetchResponse(
+                    content=b"<html><body>No page images in deterministic unit fixture.</body></html>",
+                    mime_type="text/html",
+                    status_code=200,
+                    final_url="https://en.wikipedia.org/wiki/Apollo_11",
+                ),
             ),
             mock.patch(
                 "deepresearch.page_image_extraction._is_private_or_reserved_http_url",

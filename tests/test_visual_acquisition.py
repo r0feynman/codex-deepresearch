@@ -25,6 +25,7 @@ from deepresearch import (  # noqa: E402
 from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
 from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
 from deepresearch.visual_acquisition import _BraveImageSearchResponse  # noqa: E402
+from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
 
 
 class FakeBraveImageTransport:
@@ -1054,6 +1055,134 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertEqual(len(angle_002_evidence_images), 1)
         self.assertEqual(angle_002_evidence_images[0]["task_id"], "task_visual_002")
         self.assertEqual(angle_002_evidence_images[0]["angle_id"], "angle_002")
+
+    def test_page_extractor_remote_html_fallback_covers_failed_child_image_urls(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Find official JWST first image evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        source = {
+            "id": "src_jwst_first_images",
+            "type": "web",
+            "url": "https://science.example.test/mission/webb/webbs-first-images/",
+            "title": "Webb first images",
+            "published_at": None,
+            "accessed_at": "2026-06-30T00:00:00Z",
+            "quality": "primary",
+            "retrieval_status": "fetched",
+            "local_artifact_path": "evidence_shards/task_research_001/source_001.html",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "angle_id": "angle_001",
+            "route": "visual_required",
+            "search_result_id": "search_jwst_first_images",
+        }
+        evidence["sources"] = [source]
+        evidence["images"] = [
+            {
+                "id": f"img_child_jwst_stale_{index:03d}",
+                "source_id": source["id"],
+                "origin": "image_search",
+                "page_url": source["url"],
+                "image_url": f"https://images-assets.example.test/stale-{index}.jpg",
+                "local_artifact_path": f"evidence_shards/task_research_001/stale_{index:03d}.jpg",
+                "mime_type": "image/jpeg",
+                "width": 0,
+                "height": 0,
+                "observations": [],
+                "inferences": [],
+                "visual_tasks": ["image_claim_alignment"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "skipped",
+                "policy_flags": [],
+                "caveats": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "source_search_result_id": source["search_result_id"],
+            }
+            for index in range(1, 4)
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "merge_status.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "status": "completed",
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "real_child_execution": True,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "accepted_shards": 1,
+                },
+            },
+        )
+
+        def child_transport(url: str) -> FetchResponse:
+            return FetchResponse(
+                content=None,
+                mime_type=None,
+                status_code=404,
+                final_url=url,
+                error_code="fetch_failed:HTTPError",
+            )
+
+        def page_transport(url: str) -> FetchResponse:
+            if url == source["url"]:
+                html = """
+                    <html><body>
+                      <img src="/media/jwst-1.png" alt="JWST image 1">
+                      <img src="/media/jwst-2.png" alt="JWST image 2">
+                      <img src="/media/jwst-3.png" alt="JWST image 3">
+                    </body></html>
+                """
+                return FetchResponse(
+                    content=html.encode("utf-8"),
+                    mime_type="text/html",
+                    status_code=200,
+                    final_url=url,
+                )
+            return FetchResponse(
+                content=b"\x89PNG\r\n\x1a\n" + url.encode("ascii"),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["child-discovered-image-url", "page-image-extractor"],
+            child_image_transport=child_transport,
+            page_image_transport=page_transport,
+            max_fetches=3,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        child_fetches = [
+            fetch for fetch in fetches if fetch["provider"] == "child-discovered-image-url"
+        ]
+        page_fetches = [
+            fetch for fetch in fetches if fetch["provider"] == "page-image-extractor"
+        ]
+        self.assertEqual({fetch["fetch_status"] for fetch in child_fetches}, {"failed"})
+        self.assertEqual(
+            len([fetch for fetch in page_fetches if fetch["fetch_status"] == "fetched"]),
+            3,
+        )
+        minimums = visual_minimums_for_run(run_dir)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertNotEqual(minimums["shortfall_reason"], "fetch_failures")
+        page_status = self.read_json(run_dir / "page_image_extraction_status.json")
+        self.assertEqual(page_status["remote_page_fetches"], 1)
+        self.assertEqual(page_status["remote_page_fetch_status_counts"], {"fetched": 1})
 
     def test_real_brave_missing_config_blocks_without_fixture_candidates(self) -> None:
         prepared = prepare_run(

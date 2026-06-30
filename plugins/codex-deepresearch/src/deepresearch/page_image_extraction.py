@@ -36,6 +36,7 @@ from .visual_artifacts import (
 
 PAGE_IMAGE_EXTRACTION_SCHEMA_VERSION = "codex-deepresearch.page-image-extraction.v0"
 DEFAULT_MAX_IMAGE_BYTES = 5_000_000
+DEFAULT_MAX_PAGE_HTML_BYTES = 2_000_000
 DEFAULT_TIMEOUT_SECONDS = 10.0
 SUPPORTED_IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 PROVIDER_NAME = "page-image-extractor"
@@ -157,11 +158,18 @@ def extract_and_fetch_page_images(
     page_sources = [
         source
         for source in sources
-        if isinstance(source, Mapping) and _source_html_path(run_dir, source) is not None
+        if isinstance(source, Mapping)
+        and _should_scan_page_source(
+            run_dir=run_dir,
+            source=source,
+            provider_mode=provider_mode,
+            routes_by_angle=routes_by_angle,
+        )
     ]
     max_selected = _max_fetches(evidence, max_fetches)
 
     candidates: list[dict[str, Any]] = []
+    page_html_fetches: list[dict[str, Any]] = []
     for source in page_sources:
         candidates.extend(
             _candidate_records_for_source(
@@ -173,6 +181,9 @@ def extract_and_fetch_page_images(
                 provider_mode=provider_mode,
                 provider_run_id=provider_run_id,
                 created_at=created_at,
+                transport=transport,
+                timeout_seconds=timeout_seconds,
+                page_html_fetches=page_html_fetches,
             )
         )
 
@@ -198,6 +209,9 @@ def extract_and_fetch_page_images(
         "candidate_records": len(candidates),
         "fetch_records": len(fetch_records),
         "images_linked": len(evidence_images),
+        "remote_page_fetches": len(page_html_fetches),
+        "remote_page_fetch_status_counts": _count_by(page_html_fetches, "status"),
+        "remote_page_fetch_records": page_html_fetches,
         "image_fetch_status_path": IMAGE_FETCH_STATUS_FILENAME,
         "visual_candidates_path": VISUAL_CANDIDATES_FILENAME,
         "visual_search_plan_path": VISUAL_SEARCH_PLAN_FILENAME,
@@ -228,6 +242,7 @@ def extract_and_fetch_page_images(
         created_at=created_at,
         candidates=candidates,
         fetch_records=fetch_records,
+        page_html_fetches=page_html_fetches,
     )
     _write_json(run_dir / VISUAL_SEARCH_PLAN_FILENAME, visual_search_plan)
     _write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, candidates)
@@ -254,6 +269,8 @@ def extract_and_fetch_page_images(
         "candidate_records": len(candidates),
         "fetch_records": len(fetch_records),
         "images_linked": len(evidence_images),
+        "remote_page_fetches": len(page_html_fetches),
+        "remote_page_fetch_status_counts": _count_by(page_html_fetches, "status"),
         "status_counts": _count_by(fetch_records, "fetch_status"),
         "evidence_validation": evidence_validation.to_dict(),
         "visual_artifact_validation": visual_validation.to_dict(),
@@ -511,13 +528,86 @@ def _candidate_records_for_source(
     provider_mode: str,
     provider_run_id: str,
     created_at: str,
+    transport: ImageTransport | None,
+    timeout_seconds: float,
+    page_html_fetches: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    html_path = _source_html_path(run_dir, source)
-    if html_path is None:
+    html_path, local_status = _source_html_path_status(run_dir, source)
+    local_html = None
+    local_page_url = _string(source.get("url"))
+    if html_path is not None:
+        local_page_url = local_page_url or html_path.resolve().as_uri()
+        local_html = html_path.read_text(encoding="utf-8", errors="replace")
+        raw_candidates = extract_page_image_candidates(
+            html=local_html,
+            page_url=local_page_url,
+        )
+        if raw_candidates:
+            return _candidate_records_from_raw_images(
+                run_dir=run_dir,
+                source=source,
+                evidence=evidence,
+                routes_by_angle=routes_by_angle,
+                visual_task_by_angle=visual_task_by_angle,
+                provider_mode=provider_mode,
+                provider_run_id=provider_run_id,
+                created_at=created_at,
+                raw_candidates=raw_candidates,
+                html_source="local_artifact",
+                html_fetch_record=None,
+            )
+
+    if not _remote_source_html_fetch_allowed(
+        source=source,
+        provider_mode=provider_mode,
+        routes_by_angle=routes_by_angle,
+    ):
         return []
-    page_url = _string(source.get("url")) or html_path.resolve().as_uri()
-    html = html_path.read_text(encoding="utf-8", errors="replace")
-    raw_candidates = extract_page_image_candidates(html=html, page_url=page_url)
+
+    fetch_reason = "local_zero_candidates" if local_html is not None else local_status
+    html_fetch_record, remote_html, remote_page_url = _fetch_remote_source_html(
+        source=source,
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        max_html_bytes=DEFAULT_MAX_PAGE_HTML_BYTES,
+        reason=fetch_reason,
+    )
+    page_html_fetches.append(html_fetch_record)
+    if remote_html is None:
+        return []
+    raw_candidates = extract_page_image_candidates(
+        html=remote_html,
+        page_url=remote_page_url,
+    )
+    return _candidate_records_from_raw_images(
+        run_dir=run_dir,
+        source=source,
+        evidence=evidence,
+        routes_by_angle=routes_by_angle,
+        visual_task_by_angle=visual_task_by_angle,
+        provider_mode=provider_mode,
+        provider_run_id=provider_run_id,
+        created_at=created_at,
+        raw_candidates=raw_candidates,
+        html_source="remote_fetch",
+        html_fetch_record=html_fetch_record,
+    )
+
+
+def _candidate_records_from_raw_images(
+    *,
+    run_dir: Path,
+    source: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    routes_by_angle: Mapping[str, Mapping[str, Any]],
+    visual_task_by_angle: Mapping[str, Mapping[str, Any]],
+    provider_mode: str,
+    provider_run_id: str,
+    created_at: str,
+    raw_candidates: Sequence[Mapping[str, Any]],
+    html_source: str,
+    html_fetch_record: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     route = _source_route(source, routes_by_angle)
     visual_task = visual_task_by_angle.get(str(route.get("id") or source.get("angle_id") or ""))
@@ -534,10 +624,17 @@ def _candidate_records_for_source(
         "source_id": source.get("id"),
         "source_url": source.get("url"),
         "external_vlm_call": False,
+        "external_network_call": html_source == "remote_fetch",
+        "page_html_source": html_source,
     }
+    if html_fetch_record is not None:
+        provider_provenance["page_html_fetch_status"] = html_fetch_record.get("status")
+        provider_provenance["page_html_fetch_reason"] = html_fetch_record.get("reason")
+        provider_provenance["page_html_final_url"] = html_fetch_record.get("final_url")
     policy_decision, policy_flags = _source_policy(source)
     for ordinal, raw in enumerate(raw_candidates, start=1):
         image_url = _string(raw.get("image_url"))
+        raw_metadata = raw.get("raw_provider_metadata", {})
         candidate_id = _candidate_id(
             source_id=str(source.get("id") or "source"),
             origin=str(raw["origin"]),
@@ -581,7 +678,10 @@ def _candidate_records_for_source(
             "width": raw.get("width") or 0,
             "height": raw.get("height") or 0,
             "phash_hint": raw.get("phash_hint"),
-            "raw_provider_metadata": raw.get("raw_provider_metadata", {}),
+            "raw_provider_metadata": {
+                **(dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}),
+                "page_html_source": html_source,
+            },
             "estimated_cost_usd": 0.0,
             "actual_cost_usd": 0.0,
             "created_at": created_at,
@@ -1051,6 +1151,41 @@ def _fetch_image(
         )
 
 
+def _fetch_source_html(
+    url: str,
+    *,
+    transport: ImageTransport | None,
+    timeout_seconds: float,
+    max_html_bytes: int,
+) -> FetchResponse:
+    if transport is not None:
+        try:
+            return transport(url)
+        except Exception as exc:  # pragma: no cover - exercised through public result
+            return FetchResponse(
+                content=None,
+                mime_type=None,
+                status_code=None,
+                final_url=url,
+                error_code=f"fetch_failed:{exc.__class__.__name__}",
+            )
+    try:
+        return _default_fetch_source_html(
+            url,
+            timeout_seconds=timeout_seconds,
+            max_html_bytes=max_html_bytes,
+        )
+    except (OSError, ValueError, HTTPError, URLError) as exc:
+        status = exc.code if isinstance(exc, HTTPError) else None
+        return FetchResponse(
+            content=None,
+            mime_type=None,
+            status_code=status,
+            final_url=url,
+            error_code=f"fetch_failed:{exc.__class__.__name__}",
+        )
+
+
 def _default_fetch_image(
     url: str,
     *,
@@ -1107,6 +1242,48 @@ def _default_fetch_image(
             final_url=path.resolve().as_uri(),
         )
     raise ValueError(f"unsupported image URL: {url}")
+
+
+def _default_fetch_source_html(
+    url: str,
+    *,
+    timeout_seconds: float,
+    max_html_bytes: int,
+) -> FetchResponse:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("unsupported source URL scheme")
+    if _is_private_or_reserved_http_url(url, resolve_host=True):
+        raise ValueError("private_network_source_url")
+    request = Request(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "codex-deepresearch/0",
+        },
+    )
+    opener = build_opener(_PrivateNetworkBlockingRedirectHandler())
+    with opener.open(request, timeout=timeout_seconds) as response:
+        content = response.read(max_html_bytes + 1)
+        mime_type = response.headers.get_content_type()
+        status_code = getattr(response, "status", None)
+        final_url = response.geturl()
+    return FetchResponse(
+        content=content,
+        mime_type=mime_type,
+        status_code=status_code,
+        final_url=final_url,
+    )
+
+
+def _is_html_mime_type(mime_type: str) -> bool:
+    normalized = mime_type.split(";", 1)[0].strip().lower()
+    return normalized in {"text/html", "application/xhtml+xml"}
+
+
+def _looks_like_html(content: bytes) -> bool:
+    sample = content[:1024].lstrip().lower()
+    return sample.startswith((b"<!doctype html", b"<html", b"<head", b"<body"))
 
 
 def _read_capped_file(path: Path, max_image_bytes: int) -> bytes:
@@ -1222,6 +1399,7 @@ def _visual_provider_status(
     created_at: str,
     candidates: Sequence[Mapping[str, Any]],
     fetch_records: Sequence[Mapping[str, Any]],
+    page_html_fetches: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     fetched = [record for record in fetch_records if record.get("fetch_status") == "fetched"]
     statuses = {
@@ -1248,6 +1426,13 @@ def _visual_provider_status(
         ok = False
         terminal = True
         metric = "included_failure"
+    external_network_call = provider_mode == "real" and (
+        any(bool(record.get("external_network_call")) for record in page_html_fetches)
+        or any(
+            str(candidate.get("image_url") or "").startswith(("http://", "https://"))
+            for candidate in candidates
+        )
+    )
     return {
         "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
         "run_id": run_dir.name,
@@ -1279,6 +1464,22 @@ def _visual_provider_status(
                 "estimated_cost_usd": 0.0,
                 "actual_cost_usd": 0.0,
                 "last_error": None,
+                "external_network_call": external_network_call,
+                "external_vlm_call": False,
+                "diagnostics": {
+                    "page_sources_scanned": len(
+                        {
+                            record.get("source_id")
+                            for record in candidates
+                            if record.get("source_id")
+                        }
+                    ),
+                    "remote_page_fetches": len(page_html_fetches),
+                    "remote_page_fetch_status_counts": _count_by(
+                        page_html_fetches,
+                        "status",
+                    ),
+                },
             }
         ],
         "diagnostics": {"actionable_cause": "page image extraction and fetch/cache completed"},
@@ -1292,20 +1493,137 @@ def _visual_provider_status(
 
 
 def _source_html_path(run_dir: Path, source: Mapping[str, Any]) -> Path | None:
+    path, _status = _source_html_path_status(run_dir, source)
+    return path
+
+
+def _source_html_path_status(
+    run_dir: Path,
+    source: Mapping[str, Any],
+) -> tuple[Path | None, str]:
     local_path = source.get("local_artifact_path")
     if not isinstance(local_path, str) or not local_path:
-        return None
+        return None, "missing_local_artifact"
     path = Path(local_path)
     if path.is_absolute() or any(part == ".." for part in path.parts):
-        return None
+        return None, "unsafe_local_artifact_path"
     candidate = (run_dir / path).resolve(strict=False)
     try:
         candidate.relative_to(run_dir.resolve())
     except ValueError:
-        return None
+        return None, "unsafe_local_artifact_path"
+    if not candidate.is_file():
+        return None, "missing_local_artifact"
     if candidate.is_file() and candidate.suffix.lower() in {".html", ".htm"}:
-        return candidate
-    return None
+        return candidate, "local_artifact"
+    return None, "unsupported_local_artifact_type"
+
+
+def _should_scan_page_source(
+    *,
+    run_dir: Path,
+    source: Mapping[str, Any],
+    provider_mode: str,
+    routes_by_angle: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    html_path, local_status = _source_html_path_status(run_dir, source)
+    if html_path is not None:
+        return True
+    if local_status == "unsafe_local_artifact_path":
+        return False
+    return _remote_source_html_fetch_allowed(
+        source=source,
+        provider_mode=provider_mode,
+        routes_by_angle=routes_by_angle,
+    )
+
+
+def _remote_source_html_fetch_allowed(
+    *,
+    source: Mapping[str, Any],
+    provider_mode: str,
+    routes_by_angle: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if provider_mode != "real":
+        return False
+    policy_decision, _policy_flags = _source_policy(source)
+    if policy_decision != "allowed":
+        return False
+    source_url = _string(source.get("url"))
+    if not source_url:
+        return False
+    try:
+        parsed = urlparse(source_url)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    route = _source_route(source, routes_by_angle)
+    route_name = _string(route.get("modality")) or _string(source.get("route"))
+    if route_name == "text_only":
+        return False
+    max_images = _int_or_none(route.get("max_images"))
+    return max_images is None or max_images > 0
+
+
+def _fetch_remote_source_html(
+    *,
+    source: Mapping[str, Any],
+    transport: ImageTransport | None,
+    timeout_seconds: float,
+    max_html_bytes: int,
+    reason: str,
+) -> tuple[dict[str, Any], str | None, str]:
+    source_url = _string(source.get("url")) or ""
+    base_record: dict[str, Any] = {
+        "source_id": source.get("id"),
+        "source_url": source_url,
+        "reason": reason,
+        "status": "failed",
+        "http_status": None,
+        "mime_type": None,
+        "byte_size": None,
+        "final_url": source_url,
+        "failure_code": None,
+        "external_network_call": False,
+    }
+    if _is_private_or_reserved_http_url(source_url, resolve_host=transport is None):
+        base_record.update(
+            {
+                "status": "blocked",
+                "failure_code": "private_network_source_url",
+                "external_network_call": False,
+            }
+        )
+        return base_record, None, source_url
+    response = _fetch_source_html(
+        source_url,
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        max_html_bytes=max_html_bytes,
+    )
+    base_record.update(
+        {
+            "http_status": response.status_code,
+            "mime_type": response.mime_type,
+            "byte_size": len(response.content or b"") if response.content is not None else None,
+            "final_url": response.final_url or source_url,
+            "external_network_call": True,
+        }
+    )
+    if response.error_code:
+        base_record["failure_code"] = response.error_code
+        return base_record, None, str(base_record["final_url"])
+    content = response.content or b""
+    if len(content) > max_html_bytes:
+        base_record["failure_code"] = "source_html_too_large"
+        return base_record, None, str(base_record["final_url"])
+    mime_type = response.mime_type or mimetypes.guess_type(source_url)[0] or "text/html"
+    if not _is_html_mime_type(mime_type) and not _looks_like_html(content):
+        base_record["failure_code"] = "unsupported_source_html_mime"
+        return base_record, None, str(base_record["final_url"])
+    base_record.update({"status": "fetched", "failure_code": None})
+    return base_record, content.decode("utf-8", errors="replace"), str(base_record["final_url"])
 
 
 def _source_route(
