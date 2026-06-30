@@ -405,7 +405,7 @@ class SemanticPlannerTests(unittest.TestCase):
         for route in ("visual_required", "visual_optional"):
             with self.subTest(route=route):
                 result = prepare_run(
-                    question=SEMANTIC_FIXTURES[2]["question"],
+                    question="Find image evidence for a public product interface",
                     runs_dir=self.temp_runs_dir(),
                     route=route,
                     budget_preset="quick",
@@ -417,6 +417,14 @@ class SemanticPlannerTests(unittest.TestCase):
                 self.assertEqual(len(evidence["routing"]), 1)
                 self.assertEqual(evidence["semantic_angles"][0]["route"], route)
                 self.assertEqual(evidence["routing"][0]["modality"], route)
+
+                planned = plan_research_tasks(run=Path(result["run_dir"]), min_tasks=1)
+                validation = self.load_json(
+                    Path(result["run_dir"]) / "semantic_planner_validation.json"
+                )
+                self.assertEqual(len(planned["tasks"]), 1)
+                self.assertFalse(validation["broad_question"])
+                self.assertTrue(validation["ok"], validation["failures"])
 
     def test_visual_evidence_terms_win_over_implementation_wording(self) -> None:
         result = prepare_run(

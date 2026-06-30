@@ -348,7 +348,7 @@ def semantic_planner_validation(
     task_count = len(task_records)
     near_duplicate_ratio = _ratio(len(near_duplicate_records), task_count)
     generic_lens_ratio = _ratio(len(generic_lens_records), task_count)
-    if task_count and near_duplicate_ratio > 0.20:
+    if broad_question and task_count and near_duplicate_ratio > 0.20:
         failures.append(
             {
                 "code": "near_duplicate_task_ratio_exceeded",
@@ -356,7 +356,7 @@ def semantic_planner_validation(
                 "ratio": near_duplicate_ratio,
             }
         )
-    if task_count and generic_lens_ratio > 0.30:
+    if broad_question and task_count and generic_lens_ratio > 0.30:
         failures.append(
             {
                 "code": "generic_lens_task_ratio_exceeded",
@@ -912,7 +912,7 @@ def _validation_failures(
                 "message": "Visual/style questions must include at least one visual route.",
             }
         )
-    if question_class == _CLASS_VISUAL and task_records:
+    if broad_question and question_class == _CLASS_VISUAL and task_records:
         if int(visual_hits.get("visual_example") or 0) < 1:
             failures.append({"code": "visual_example_expected_evidence_missing"})
         observation_hits = int(visual_hits.get("visual_observation") or 0) + int(
