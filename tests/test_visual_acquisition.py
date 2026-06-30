@@ -871,6 +871,190 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertEqual(updated["images"][0]["image_url"], calls[0])
         self.assertEqual(updated["images"][0]["provider_provenance"]["original_child_image_url"], original_url)
 
+    def test_child_discovered_provider_uses_image_angle_task_for_mismatched_source_route(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Find multi-angle child image evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.visual-tasks.v0",
+                "run_id": run_dir.name,
+                "tasks": [
+                    {
+                        "id": "task_visual_001",
+                        "angle_id": "angle_001",
+                        "route": "visual_required",
+                    },
+                    {
+                        "id": "task_visual_002",
+                        "angle_id": "angle_002",
+                        "route": "visual_required",
+                    },
+                ],
+            },
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["routing"] = [
+            {
+                "id": "angle_001",
+                "label": "Primary visual angle",
+                "modality": "visual_required",
+                "visual_tasks": ["image_claim_alignment"],
+                "max_images": 12,
+            },
+            {
+                "id": "angle_002",
+                "label": "Secondary visual angle",
+                "modality": "visual_required",
+                "visual_tasks": ["image_claim_alignment"],
+                "max_images": 12,
+            },
+        ]
+        source = {
+            "id": "src_angle_001",
+            "type": "web",
+            "url": "https://example.com/angle-001",
+            "title": "Angle 001 Source",
+            "published_at": None,
+            "accessed_at": "2026-06-30T00:00:00Z",
+            "quality": "primary",
+            "retrieval_status": "fetched",
+            "local_artifact_path": "sources/src_angle_001.html",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "route": "visual_required",
+            "angle_id": "angle_001",
+            "search_result_id": "search_angle_001",
+        }
+        evidence["sources"] = [source]
+        evidence["images"] = [
+            {
+                "id": "img_child_angle_001",
+                "source_id": source["id"],
+                "origin": "image_search",
+                "page_url": source["url"],
+                "image_url": "https://images.example.com/child-angle-001.png",
+                "local_artifact_path": "evidence_shards/task_research_001/image_001.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 480,
+                "observations": [],
+                "inferences": [],
+                "visual_tasks": ["image_claim_alignment"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "skipped",
+                "policy_flags": [],
+                "caveats": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "source_search_result_id": source["search_result_id"],
+            },
+            {
+                "id": "img_child_angle_002",
+                "source_id": source["id"],
+                "origin": "image_search",
+                "page_url": source["url"],
+                "image_url": "https://images.example.com/child-angle-002.png",
+                "local_artifact_path": "evidence_shards/task_research_002/image_001.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 480,
+                "observations": [],
+                "inferences": [],
+                "visual_tasks": ["image_claim_alignment"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "skipped",
+                "policy_flags": [],
+                "caveats": [],
+                "angle_id": "angle_002",
+                "route": "visual_required",
+                "source_search_result_id": source["search_result_id"],
+            },
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "merge_status.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "status": "completed",
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "real_child_execution": True,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "accepted_shards": 2,
+                },
+            },
+        )
+
+        def fake_child_fetch(url: str) -> FetchResponse:
+            return FetchResponse(
+                content=(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                    b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                    + url.rsplit("-", 1)[-1].encode("ascii")
+                ),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["child-discovered-image-url"],
+            child_image_transport=fake_child_fetch,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        child_candidates = {
+            candidate["provider_provenance"]["source_image_id"]: candidate
+            for candidate in candidates
+            if candidate["provider"] == "child-discovered-image-url"
+        }
+        angle_002_candidate = child_candidates["img_child_angle_002"]
+        self.assertEqual(angle_002_candidate["angle_id"], "angle_002")
+        self.assertEqual(angle_002_candidate["task_id"], "task_visual_002")
+        self.assertEqual(
+            angle_002_candidate["plan_id"],
+            "plan_task_visual_002_angle_002_visual_required",
+        )
+
+        plan = self.read_json(run_dir / "visual_search_plan.json")
+        plan_angles_by_task: dict[str, set[str]] = {}
+        for task in plan["tasks"]:
+            plan_angles_by_task.setdefault(task["task_id"], set()).add(task["angle_id"])
+        self.assertEqual(
+            {task_id: angles for task_id, angles in plan_angles_by_task.items() if len(angles) > 1},
+            {},
+        )
+
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        fetch_by_candidate = {fetch["candidate_id"]: fetch for fetch in fetches}
+        angle_002_fetch = fetch_by_candidate[angle_002_candidate["candidate_id"]]
+        self.assertEqual(angle_002_fetch["task_id"], "task_visual_002")
+        self.assertEqual(angle_002_fetch["angle_id"], "angle_002")
+
+        updated_images = self.read_json(run_dir / "evidence.json")["images"]
+        angle_002_evidence_images = [
+            image
+            for image in updated_images
+            if image.get("candidate_id") == angle_002_candidate["candidate_id"]
+        ]
+        self.assertEqual(len(angle_002_evidence_images), 1)
+        self.assertEqual(angle_002_evidence_images[0]["task_id"], "task_visual_002")
+        self.assertEqual(angle_002_evidence_images[0]["angle_id"], "angle_002")
+
     def test_real_brave_missing_config_blocks_without_fixture_candidates(self) -> None:
         prepared = prepare_run(
             question="Find image evidence but no provider credentials are configured",

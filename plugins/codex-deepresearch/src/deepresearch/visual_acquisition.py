@@ -1256,9 +1256,23 @@ def _child_discovered_image_candidates(
         if url_resolution:
             provider_provenance.update(url_resolution)
         angle_id = _string(image.get("angle_id")) or _string(route.get("id")) or "angle_001"
-        route_name = _string(image.get("route")) or _string(route.get("modality")) or "visual_required"
-        task_id = _string(image.get("task_id")) or _string(route.get("task_id")) or _task_id_for_angle(
-            angle_id
+        angle_route = _route_for_angle(context.routes, angle_id)
+        effective_route = angle_route or route
+        route_name = (
+            _string(image.get("route"))
+            or _string(effective_route.get("modality"))
+            or _string(route.get("modality"))
+            or "visual_required"
+        )
+        task_id = _visual_task_id_for_angle(
+            angle_id=angle_id,
+            routes=context.routes,
+            route=effective_route,
+        )
+        route_visual_tasks = (
+            list(effective_route.get("visual_tasks", []))
+            if isinstance(effective_route.get("visual_tasks"), list)
+            else []
         )
         candidates.append(
             {
@@ -1295,10 +1309,7 @@ def _child_discovered_image_candidates(
                 "surrounding_text": _string(image.get("surrounding_text")),
                 "phash_hint": _string(image.get("phash")),
                 "visual_tasks": _dedupe(
-                    _string_list(image.get("visual_tasks"))
-                    + list(route.get("visual_tasks", []))
-                    if isinstance(route.get("visual_tasks"), list)
-                    else _string_list(image.get("visual_tasks"))
+                    _string_list(image.get("visual_tasks")) + route_visual_tasks
                 ),
                 "analysis_status": "skipped",
                 "observations": [],
@@ -3201,6 +3212,36 @@ def _task_id_for_angle(angle_id: Any) -> str:
     raw = _string(angle_id) or "angle_001"
     suffix = raw.removeprefix("angle_")
     return f"task_visual_{suffix}"
+
+
+def _route_for_angle(
+    routes: Sequence[Mapping[str, Any]],
+    angle_id: Any,
+) -> Mapping[str, Any]:
+    normalized_angle_id = _string(angle_id)
+    if not normalized_angle_id:
+        return {}
+    for route in routes:
+        if _string(route.get("id")) == normalized_angle_id:
+            return route
+    return {}
+
+
+def _visual_task_id_for_angle(
+    *,
+    angle_id: str,
+    routes: Sequence[Mapping[str, Any]],
+    route: Mapping[str, Any],
+) -> str:
+    angle_route = _route_for_angle(routes, angle_id)
+    task_id = _string(angle_route.get("task_id"))
+    if task_id:
+        return task_id
+    if _string(route.get("id")) == angle_id:
+        task_id = _string(route.get("task_id"))
+        if task_id:
+            return task_id
+    return _task_id_for_angle(angle_id)
 
 
 def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
