@@ -633,11 +633,13 @@ def _candidate_records_from_raw_images(
         provider_provenance["page_html_final_url"] = html_fetch_record.get("final_url")
     policy_decision, policy_flags = _source_policy(source)
     for ordinal, raw in enumerate(raw_candidates, start=1):
+        raw_origin = _string(raw.get("origin")) or "page_image"
+        schema_origin = _page_extractor_schema_origin(raw_origin)
         image_url = _string(raw.get("image_url"))
         raw_metadata = raw.get("raw_provider_metadata", {})
         candidate_id = _candidate_id(
             source_id=str(source.get("id") or "source"),
-            origin=str(raw["origin"]),
+            origin=raw_origin,
             image_url=image_url or "",
             ordinal=ordinal,
         )
@@ -659,8 +661,9 @@ def _candidate_records_from_raw_images(
             "provider_mode": provider_mode,
             "provider_run_id": provider_run_id,
             "provider_provenance": dict(provider_provenance),
-            "origin": raw["origin"],
-            "candidate_origin": raw["origin"],
+            "origin": schema_origin,
+            "candidate_origin": raw_origin,
+            "html_origin": raw_origin,
             "page_url": raw.get("page_url"),
             "image_url": image_url,
             "rank": ordinal,
@@ -681,6 +684,7 @@ def _candidate_records_from_raw_images(
             "raw_provider_metadata": {
                 **(dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}),
                 "page_html_source": html_source,
+                "html_origin": raw_origin,
             },
             "estimated_cost_usd": 0.0,
             "actual_cost_usd": 0.0,
@@ -991,6 +995,9 @@ def _base_fetch_record(candidate: Mapping[str, Any], fetch_id: str) -> dict[str,
         "task_id": candidate.get("task_id"),
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
+        "origin": candidate.get("origin"),
+        "candidate_origin": candidate.get("candidate_origin"),
+        "html_origin": candidate.get("html_origin"),
         "source_search_result_id": candidate.get("source_search_result_id"),
         "provider": candidate.get("provider"),
         "provider_kind": candidate.get("provider_kind"),
@@ -1081,6 +1088,7 @@ def _evidence_image(
         "source_id": candidate.get("source_id"),
         "origin": "page_image",
         "candidate_origin": candidate.get("candidate_origin") or candidate.get("origin"),
+        "html_origin": candidate.get("html_origin") or candidate.get("candidate_origin"),
         "image_url": candidate.get("image_url"),
         "page_url": candidate.get("page_url"),
         "local_artifact_path": artifact_path,
@@ -1495,6 +1503,12 @@ def _visual_provider_status(
 def _source_html_path(run_dir: Path, source: Mapping[str, Any]) -> Path | None:
     path, _status = _source_html_path_status(run_dir, source)
     return path
+
+
+def _page_extractor_schema_origin(raw_origin: str) -> str:
+    if raw_origin in {"open_graph", "srcset", "lazy_loaded", "page_image"}:
+        return "page_image"
+    return "page_image"
 
 
 def _source_html_path_status(

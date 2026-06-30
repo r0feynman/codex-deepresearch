@@ -1184,6 +1184,112 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertEqual(page_status["remote_page_fetches"], 1)
         self.assertEqual(page_status["remote_page_fetch_status_counts"], {"fetched": 1})
 
+    def test_page_extractor_og_origin_is_schema_valid_after_vision_ingest(self) -> None:
+        prepared = prepare_run(
+            question="Analyze Open Graph visual evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        source = {
+            "id": "src_og_visual_page",
+            "type": "web",
+            "url": "https://science.example.test/og-visual/",
+            "title": "OG visual page",
+            "published_at": None,
+            "accessed_at": "2026-06-30T00:00:00Z",
+            "quality": "primary",
+            "retrieval_status": "fetched",
+            "local_artifact_path": "sources/missing-og-page.html",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "angle_id": "angle_001",
+            "route": "visual_required",
+            "search_result_id": "search_og_visual_page",
+        }
+        evidence["sources"] = [source]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        def page_transport(url: str) -> FetchResponse:
+            if url == source["url"]:
+                return FetchResponse(
+                    content=(
+                        b'<html><head><meta property="og:image" '
+                        b'content="/media/og-visual.png"></head><body></body></html>'
+                    ),
+                    mime_type="text/html",
+                    status_code=200,
+                    final_url=url,
+                )
+            return FetchResponse(
+                content=b"\x89PNG\r\n\x1a\n" + url.encode("ascii"),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        acquire = acquire_visual_candidates(
+            run=run_dir,
+            providers=["page-image-extractor"],
+            page_image_transport=page_transport,
+            max_fetches=1,
+        )
+
+        self.assertEqual(acquire["status"], "real_image_search_candidates_collected")
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(candidates[0]["origin"], "page_image")
+        self.assertEqual(candidates[0]["candidate_origin"], "open_graph")
+        self.assertEqual(candidates[0]["html_origin"], "open_graph")
+        evidence = self.read_json(run_dir / "evidence.json")
+        image = evidence["images"][0]
+        self.assertEqual(image["origin"], "page_image")
+        self.assertEqual(image["candidate_origin"], "open_graph")
+        self.assertEqual(image["html_origin"], "open_graph")
+
+        observations_path = run_dir / "og_observations.jsonl"
+        observations_path.write_text(
+            json.dumps(
+                {
+                    "id": image["id"],
+                    "image": image,
+                    "source_id": image["source_id"],
+                    "local_artifact_path": image["local_artifact_path"],
+                    "mime_type": image["mime_type"],
+                    "width": image["width"],
+                    "height": image["height"],
+                    "observations": ["The Open Graph image shows relevant visual evidence."],
+                    "inferences": [],
+                    "visual_tasks": ["image_claim_alignment"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            observations=observations_path,
+        )
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        validation = validate_artifacts(
+            evidence_path=run_dir / "evidence.json",
+            visual_observations_path=run_dir / "visual_observations.jsonl",
+        )
+        self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+        updated = self.read_json(run_dir / "evidence.json")
+        updated_image = next(item for item in updated["images"] if item["id"] == image["id"])
+        self.assertEqual(updated_image["origin"], "page_image")
+        self.assertEqual(updated_image["candidate_origin"], "open_graph")
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        self.assertEqual(observations[0]["origin"], "page_image")
+        self.assertEqual(observations[0]["candidate_origin"], "open_graph")
+        self.assertEqual(observations[0]["html_origin"], "open_graph")
+
     def test_real_brave_missing_config_blocks_without_fixture_candidates(self) -> None:
         prepared = prepare_run(
             question="Find image evidence but no provider credentials are configured",

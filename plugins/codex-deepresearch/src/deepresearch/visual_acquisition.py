@@ -2637,6 +2637,10 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "visual_validation": dict(candidate.get("validation_checks", {})),
         "source_url": candidate.get("source_url"),
     }
+    if candidate.get("candidate_origin"):
+        observation["candidate_origin"] = candidate.get("candidate_origin")
+    if candidate.get("html_origin"):
+        observation["html_origin"] = candidate.get("html_origin")
     if isinstance(candidate.get("screenshot"), Mapping):
         observation["screenshot"] = dict(candidate["screenshot"])
     for key in ("pdf_url", "pdf_local_path", "page_number"):

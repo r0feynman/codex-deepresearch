@@ -3363,6 +3363,10 @@ def _normalize_visual_record(
         caveats.append("metadata-only visual record; no local image artifact was provided")
 
     artifact_size_bytes = _artifact_size_bytes(record, image, artifact_file)
+    raw_origin = _first_optional_string(record, "origin") or _first_optional_string(
+        image,
+        "origin",
+    )
     visual = {
         "id": image_id,
         "source_id": source_id,
@@ -3392,6 +3396,9 @@ def _normalize_visual_record(
         "adapter_input_id": _first_optional_string(record, "adapter_input_id", "id", "image_id"),
         "vision_adapter_stage": VISION_ADAPTER_STAGE,
     }
+    if raw_origin and raw_origin != visual["origin"]:
+        visual.setdefault("candidate_origin", raw_origin)
+        visual.setdefault("html_origin", raw_origin)
     raw_provider_metadata = record.get("raw_provider_metadata")
     if isinstance(raw_provider_metadata, Mapping):
         visual["raw_provider_metadata"] = _redact_provider_value(
@@ -3509,10 +3516,16 @@ def _file_uri_exists(value: str) -> bool:
 def _origin(record: Mapping[str, Any], image: Mapping[str, Any], provider: str) -> str:
     origin = _first_optional_string(record, "origin") or _first_optional_string(image, "origin")
     if origin:
-        return origin
+        return _schema_visual_origin(origin)
     if provider == "manual-visual-review":
         return "manual"
     return "screenshot"
+
+
+def _schema_visual_origin(origin: str) -> str:
+    if origin in {"open_graph", "srcset", "lazy_loaded"}:
+        return "page_image"
+    return origin
 
 
 def _analysis_status(
@@ -3616,8 +3629,10 @@ def _copy_optional_visual_metadata(
         "angle_id",
         "candidate_id",
         "candidate_class",
+        "candidate_origin",
         "duplicate_of",
         "fetch_id",
+        "html_origin",
         "near_duplicate_group_id",
         "near_duplicate_of",
         "observation_id",

@@ -350,6 +350,7 @@ class PageImageExtractionTests(unittest.TestCase):
             image for image in evidence["images"] if image["candidate_origin"] == "open_graph"
         )
         self.assertEqual(og_image["origin"], "page_image")
+        self.assertEqual(og_image["html_origin"], "open_graph")
         self.assertTrue(og_image["observations"])
         self.assertTrue(og_image["hash"].startswith("sha256:"))
         self.assertTrue(og_image["phash"].startswith("phash:"))
@@ -364,6 +365,15 @@ class PageImageExtractionTests(unittest.TestCase):
             self.assertTrue(record["dedupe_target_fetch_id"])
 
         candidate_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+        og_candidate = next(
+            candidate for candidate in candidates if candidate["candidate_origin"] == "open_graph"
+        )
+        self.assertEqual(og_candidate["origin"], "page_image")
+        self.assertEqual(og_candidate["html_origin"], "open_graph")
+        og_fetch = next(fetch for fetch in fetches if fetch["candidate_id"] == og_candidate["candidate_id"])
+        self.assertEqual(og_fetch["origin"], "page_image")
+        self.assertEqual(og_fetch["candidate_origin"], "open_graph")
+        self.assertEqual(og_fetch["html_origin"], "open_graph")
         policy_blocks = {
             record["failure_code"]: candidate_by_id[record["candidate_id"]]
             for record in fetches
