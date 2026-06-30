@@ -29,6 +29,19 @@ class ReportGenerationTests(unittest.TestCase):
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+    def read_jsonl(self, path: Path) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def load_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
@@ -245,6 +258,57 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertIn("Image `img_001`", report)
         self.assertIn("claim `claim_visual`", report)
         self.assertIn("Images: `img_001`", report)
+
+    def test_report_links_preserve_visual_lineage_metadata(self) -> None:
+        run_dir = self.temp_run()
+        lineage = {
+            "plan_id": "plan_task_visual_001_angle_001_visual_required",
+            "task_id": "task_visual_001",
+            "angle_id": "angle_001",
+            "route": "visual_required",
+            "candidate_id": "cand_visual_001",
+            "fetch_id": "fetch_visual_001",
+            "evidence_image_id": "img_001",
+        }
+        image = self.image()
+        image.update(lineage)
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [image]
+        evidence["claims"] = [
+            self.claim(
+                claim_id="claim_visual",
+                text="The image shows Visible Example text.",
+                claim_type="visual",
+                supporting_images=["img_001"],
+                quote_spans=[],
+            )
+        ]
+        evidence["claims"][0]["visual_supports"] = [self.visual_support()]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": "obs_img_001",
+                    **lineage,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "observation_status": "analyzed",
+                    "observations": ["Visible Example text is present."],
+                    "verifier_links": [],
+                    "report_links": [],
+                }
+            ],
+        )
+
+        status = synthesize_report(run=run_dir)
+
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        self.assertEqual(status["visual_observation_report_links_written"], 1)
+        link = observations[0]["report_links"][0]
+        for field, value in lineage.items():
+            self.assertEqual(link[field], value)
 
     def test_unsupported_refuted_and_policy_blocked_claims_are_excluded(self) -> None:
         run_dir = self.temp_run()

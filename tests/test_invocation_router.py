@@ -162,6 +162,15 @@ class InvocationRouterTests(unittest.TestCase):
                     }
                     fetches.append(fetch)
                     images.append(self.evidence_image_from_fetch(fetch))
+                    link_lineage = {
+                        "plan_id": plan_id,
+                        "task_id": task["id"],
+                        "angle_id": task["angle_id"],
+                        "route": task["route"],
+                        "candidate_id": candidate_id,
+                        "fetch_id": fetch_id,
+                        "evidence_image_id": image_id,
+                    }
                     observations.append(
                         {
                             "observation_id": f"obs_{image_id}",
@@ -195,6 +204,7 @@ class InvocationRouterTests(unittest.TestCase):
                                     "claim_id": "claim_lineage_visual",
                                     "visual_support_ref": f"images.{image_id}.observations[0]",
                                     "verifier_vote_id": f"vote_lineage_{task_index:03d}",
+                                    **link_lineage,
                                 }
                             ],
                             "report_links": [
@@ -202,6 +212,7 @@ class InvocationRouterTests(unittest.TestCase):
                                     "claim_id": "claim_lineage_visual",
                                     "report_section_id": "visual-findings",
                                     "citation_id": f"img:{image_id}",
+                                    **link_lineage,
                                 }
                             ],
                             "estimated_cost_usd": 0.0,
@@ -986,7 +997,8 @@ class InvocationRouterTests(unittest.TestCase):
             call_order.append("synthesize")
             run_dir = Path(run)
             (run_dir / "report.md").write_text(
-                "Report cites img_auto_visual_001, img_auto_visual_002, and img_auto_visual_003.\n",
+                "Report cites claim_auto_visual_001 with img_auto_visual_001, "
+                "img_auto_visual_002, and img_auto_visual_003.\n",
                 encoding="utf-8",
             )
             status = {
@@ -997,7 +1009,31 @@ class InvocationRouterTests(unittest.TestCase):
                     "img_auto_visual_002",
                     "img_auto_visual_003",
                 ],
-                "included_claims": [{"id": "claim_auto_visual_001"}],
+                "included_claims": [
+                    {
+                        "claim_id": "claim_auto_visual_001",
+                        "claim_type": "mixed",
+                        "verification_status": "supported",
+                        "image_ids": [
+                            "img_auto_visual_001",
+                            "img_auto_visual_002",
+                            "img_auto_visual_003",
+                        ],
+                        "visual_supports": [
+                            {
+                                "image_id": f"img_auto_visual_{index:03d}",
+                                "evidence_image_id": f"img_auto_visual_{index:03d}",
+                                "plan_id": "plan_task_visual_001_angle_001_visual_required",
+                                "task_id": "task_visual_001",
+                                "angle_id": "angle_001",
+                                "route": "visual_required",
+                                "candidate_id": f"cand_auto_visual_{index:03d}",
+                                "fetch_id": f"fetch_auto_visual_{index:03d}",
+                            }
+                            for index in range(1, 4)
+                        ],
+                    }
+                ],
             }
             self.write_json(run_dir / "report_status.json", status)
             return status
@@ -1294,6 +1330,67 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertTrue(provider_status["minimums"]["satisfied"])
         self.assertEqual(provider_status["minimums"]["shortfall_reason"], "none")
 
+    def test_visual_release_gate_requires_included_claim_lineage(self) -> None:
+        run_dir = self.temp_runs_dir() / "visual-release-missing-included-claims"
+        run_dir.mkdir()
+        self.write_visual_lineage_fixture(run_dir)
+        image_id = self.read_json(run_dir / "evidence.json")["images"][0]["id"]
+        self.write_json(
+            run_dir / "report_status.json",
+            {
+                "status": "completed",
+                "used_images": [image_id],
+                "included_claims": [],
+            },
+        )
+        (run_dir / "report.md").write_text(
+            f"Report cites claim_lineage_visual with image {image_id}.\n",
+            encoding="utf-8",
+        )
+
+        result = invocation_router._finalize_automatic_visual_completion(
+            run_dir=run_dir,
+            visual_stage_status={},
+        )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["visual_release_gate"]["valid"])
+        self.assertEqual(result["visual_release_gate"]["report_cited_images"], 0)
+        self.assertEqual(
+            result["diagnostics"]["failure_code"],
+            "visual_report_linkage_missing",
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertEqual(provider_status["minimums"]["report_cited_images"], 0)
+
+    def test_visual_release_gate_requires_report_markdown_image_citation(self) -> None:
+        run_dir = self.temp_runs_dir() / "visual-release-missing-report-citation"
+        run_dir.mkdir()
+        self.write_visual_lineage_fixture(run_dir)
+        image_id = self.read_json(run_dir / "evidence.json")["images"][0]["id"]
+        self.write_json(run_dir / "report_status.json", self.report_status_payload(image_id))
+        (run_dir / "report.md").write_text(
+            "Report text intentionally omits the visual evidence identifiers.\n",
+            encoding="utf-8",
+        )
+
+        result = invocation_router._finalize_automatic_visual_completion(
+            run_dir=run_dir,
+            visual_stage_status={},
+        )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["visual_release_gate"]["valid"])
+        self.assertEqual(result["visual_release_gate"]["report_cited_images"], 0)
+        self.assertEqual(
+            result["diagnostics"]["failure_code"],
+            "visual_report_linkage_missing",
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertEqual(provider_status["minimums"]["report_cited_images"], 0)
+
     def test_partial_auto_visual_final_run_status_exposes_visual_shortfall_diagnostics(self) -> None:
         runs_dir = self.temp_runs_dir()
 
@@ -1439,11 +1536,38 @@ class InvocationRouterTests(unittest.TestCase):
 
         def fake_synthesize(*, run):
             run_dir = Path(run)
+            image_id = "img_shortfall_001"
             self.write_json(
                 run_dir / "report_status.json",
-                {"status": "completed", "used_images": ["img_shortfall_001"]},
+                {
+                    "status": "completed",
+                    "used_images": [image_id],
+                    "included_claims": [
+                        {
+                            "claim_id": "claim_visual_shortfall",
+                            "claim_type": "visual",
+                            "verification_status": "supported",
+                            "image_ids": [image_id],
+                            "visual_supports": [
+                                {
+                                    "image_id": image_id,
+                                    "evidence_image_id": image_id,
+                                    "plan_id": "plan_task_visual_001_angle_001_visual_required",
+                                    "task_id": "task_visual_001",
+                                    "angle_id": "angle_001",
+                                    "route": "visual_required",
+                                    "candidate_id": "cand_shortfall_001",
+                                    "fetch_id": "fetch_shortfall_001",
+                                }
+                            ],
+                        }
+                    ],
+                },
             )
-            (run_dir / "report.md").write_text("Report cites img_shortfall_001.\n", encoding="utf-8")
+            (run_dir / "report.md").write_text(
+                f"Report cites claim_visual_shortfall with image {image_id}.\n",
+                encoding="utf-8",
+            )
             return {"status": "completed", "ok": True}
 
         with (

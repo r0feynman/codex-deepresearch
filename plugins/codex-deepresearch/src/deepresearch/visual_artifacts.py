@@ -269,6 +269,7 @@ def visual_minimums_for_run(
         observations=_read_optional_artifact_jsonl(base / "visual_observations.jsonl"),
         evidence=evidence,
         report_status=report_status,
+        report_text=_read_optional_artifact_text(base / "report.md"),
         required_vlm_images=required,
     )
 
@@ -280,6 +281,7 @@ def visual_release_minimums(
     observations: Sequence[Mapping[str, Any]] = (),
     evidence: Mapping[str, Any] | None = None,
     report_status: Mapping[str, Any] | None = None,
+    report_text: str | None = None,
     required_vlm_images: int | None = None,
 ) -> dict[str, Any]:
     """Count only real automatic lineage eligible for visual release gates."""
@@ -351,6 +353,7 @@ def visual_release_minimums(
     report_cited_image_ids = _report_cited_visual_image_ids(
         evidence=evidence,
         report_status=report_status,
+        report_text=report_text,
         eligible_image_ids=eligible_observation_image_ids,
     )
     satisfied = (
@@ -460,6 +463,7 @@ def _report_cited_visual_image_ids(
     *,
     evidence: Mapping[str, Any] | None,
     report_status: Mapping[str, Any] | None,
+    report_text: str | None,
     eligible_image_ids: set[str],
 ) -> set[str]:
     if not isinstance(evidence, Mapping) or not isinstance(report_status, Mapping):
@@ -473,6 +477,12 @@ def _report_cited_visual_image_ids(
     claims = evidence.get("claims")
     if not isinstance(claims, list):
         return set()
+    included_claims = report_status.get("included_claims")
+    included_supports = _report_included_visual_supports_by_claim_image(
+        included_claims if isinstance(included_claims, list) else None
+    )
+    require_report_citation = report_text is not None
+    require_included_lineage = require_report_citation or isinstance(included_claims, list)
     cited: set[str] = set()
     for claim in claims:
         if not isinstance(claim, Mapping):
@@ -484,14 +494,83 @@ def _report_cited_visual_image_ids(
         supporting_images = claim.get("supporting_images")
         if not isinstance(supporting_images, list):
             continue
+        claim_id = str(claim.get("id") or "")
         for image_id in supporting_images:
-            if (
+            if not (
                 isinstance(image_id, str)
                 and image_id in used_image_ids
                 and image_id in eligible_image_ids
             ):
-                cited.add(image_id)
+                continue
+            if require_included_lineage and (claim_id, image_id) not in included_supports:
+                continue
+            if require_report_citation and not _report_text_cites_claim_image(
+                report_text or "",
+                claim_id=claim_id,
+                image_id=image_id,
+            ):
+                continue
+            cited.add(image_id)
     return cited
+
+
+def _report_included_visual_supports_by_claim_image(
+    included_claims: Sequence[Any] | None,
+) -> set[tuple[str, str]]:
+    if not isinstance(included_claims, Sequence):
+        return set()
+    pairs: set[tuple[str, str]] = set()
+    for claim_record in included_claims:
+        if not isinstance(claim_record, Mapping):
+            continue
+        claim_id = claim_record.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        image_ids = {
+            image_id
+            for image_id in claim_record.get("image_ids", [])
+            if isinstance(image_id, str) and image_id
+        }
+        visual_supports = claim_record.get("visual_supports")
+        if not isinstance(visual_supports, list):
+            continue
+        for support in visual_supports:
+            if not isinstance(support, Mapping):
+                continue
+            image_id = support.get("image_id")
+            if (
+                isinstance(image_id, str)
+                and image_id in image_ids
+                and _report_visual_support_has_lineage(support)
+            ):
+                pairs.add((claim_id, image_id))
+    return pairs
+
+
+def _report_visual_support_has_lineage(support: Mapping[str, Any]) -> bool:
+    for field in (
+        "plan_id",
+        "task_id",
+        "angle_id",
+        "route",
+        "candidate_id",
+        "fetch_id",
+        "evidence_image_id",
+    ):
+        if not _has_nonempty_string(support.get(field)):
+            return False
+    return True
+
+
+def _report_text_cites_claim_image(
+    report_text: str,
+    *,
+    claim_id: str,
+    image_id: str,
+) -> bool:
+    if not claim_id or not image_id:
+        return False
+    return claim_id in report_text and image_id in report_text
 
 
 def _artifact_identity(record: Mapping[str, Any]) -> str | None:
@@ -607,6 +686,13 @@ def _read_optional_artifact_jsonl(path: Path) -> list[Mapping[str, Any]]:
         if isinstance(payload, Mapping):
             records.append(payload)
     return records
+
+
+def _read_optional_artifact_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def build_visual_provider_status(
@@ -2017,6 +2103,39 @@ def _validate_observation_links(
                             "image_claim_lineage",
                             f"claim '{claim_id}' does not list supporting image '{image_id}'",
                         )
+            _validate_matching_lineage(
+                link,
+                observation,
+                link_path,
+                "visual observation",
+                (
+                    "plan_id",
+                    "task_id",
+                    "angle_id",
+                    "route",
+                    "candidate_id",
+                    "fetch_id",
+                    "evidence_image_id",
+                ),
+                collector,
+            )
+            image = context.image_by_id.get(image_id or "")
+            if image is not None:
+                _validate_matching_lineage(
+                    link,
+                    image,
+                    link_path,
+                    "evidence image",
+                    (
+                        "plan_id",
+                        "task_id",
+                        "angle_id",
+                        "route",
+                        "candidate_id",
+                        "fetch_id",
+                    ),
+                    collector,
+                )
 
 
 def _validate_claim_observation_report_lineage(

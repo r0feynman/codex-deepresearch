@@ -191,6 +191,8 @@ class VisualArtifactTests(unittest.TestCase):
         for observation in observations:
             fetch = fetch_by_id[observation["fetch_id"]]
             self.assert_lineage(observation, fetch)
+            self.assert_lineage(observation["verifier_links"][0], observation)
+            self.assert_lineage(observation["report_links"][0], observation)
 
         included_claim = report_status["included_claims"][0]
         support = included_claim["visual_supports"][0]
@@ -207,6 +209,23 @@ class VisualArtifactTests(unittest.TestCase):
             with self.subTest(expected_code=expected_code):
                 run_dir = self.write_multi_angle_lineage_fixture()
                 mutator(run_dir)
+
+                result = validate_visual_artifacts(run_dir=run_dir)
+
+                self.assertFalse(result.valid)
+                self.assertIn(expected_code, {error.code for error in result.errors})
+
+    def test_observation_link_lineage_mismatches_fail_validation(self) -> None:
+        cases = (
+            ("verifier_links", "angle_id", "angle_999", "angle_mismatch"),
+            ("report_links", "route", "text_only", "route_mismatch"),
+        )
+        for link_type, field, bad_value, expected_code in cases:
+            with self.subTest(link_type=link_type, field=field):
+                run_dir = self.write_multi_angle_lineage_fixture()
+                observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+                observations[0][link_type][0][field] = bad_value
+                self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
 
                 result = validate_visual_artifacts(run_dir=run_dir)
 
@@ -1299,11 +1318,21 @@ class VisualArtifactTests(unittest.TestCase):
         verifier_links = []
         report_links = []
         if claim_id:
+            lineage = {
+                "plan_id": candidate["plan_id"],
+                "task_id": candidate["task_id"],
+                "angle_id": candidate["angle_id"],
+                "route": candidate["route"],
+                "candidate_id": candidate["candidate_id"],
+                "fetch_id": fetch_id,
+                "evidence_image_id": evidence_image_id,
+            }
             verifier_links.append(
                 {
                     "claim_id": claim_id,
                     "visual_support_ref": f"images.{evidence_image_id}.observations[0]",
                     "verifier_vote_id": verifier_vote_id,
+                    **lineage,
                 }
             )
             report_links.append(
@@ -1311,6 +1340,7 @@ class VisualArtifactTests(unittest.TestCase):
                     "claim_id": claim_id,
                     "report_section_id": "visual-findings",
                     "citation_id": f"img:{evidence_image_id}",
+                    **lineage,
                 }
             )
         return {

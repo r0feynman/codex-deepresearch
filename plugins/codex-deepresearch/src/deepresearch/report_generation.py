@@ -1327,13 +1327,25 @@ def _persist_visual_observation_report_links(
                 continue
             if image_id not in item.get("image_ids", []):
                 continue
+            link = {
+                "claim_id": claim_id,
+                "visual_support_ref": observation_ref,
+                "report_section_id": "visual-findings",
+                "citation_id": f"img:{image_id}",
+            }
+            for field in (
+                "plan_id",
+                "task_id",
+                "angle_id",
+                "route",
+                "candidate_id",
+                "fetch_id",
+                "evidence_image_id",
+            ):
+                if isinstance(support.get(field), str) and support[field]:
+                    link[field] = support[field]
             links_by_image_id.setdefault(image_id, []).append(
-                {
-                    "claim_id": claim_id,
-                    "visual_support_ref": observation_ref,
-                    "report_section_id": "visual-findings",
-                    "citation_id": f"img:{image_id}",
-                }
+                link
             )
 
     if not links_by_image_id:
