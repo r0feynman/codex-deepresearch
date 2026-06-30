@@ -362,6 +362,7 @@ def _candidate_record(
 ) -> dict[str, Any]:
     source_id = _string(source.get("id")) or "source"
     route_id = _string(route.get("id")) or _string(source.get("angle_id")) or "angle_001"
+    route_name = _string(route.get("modality")) or _string(source.get("route")) or "visual_required"
     task_id = _string(route.get("task_id")) or _task_id_for_angle(route_id)
     candidate_id = "cand_" + _safe_id(f"{provider}_{source_id}_{mode}")
     screenshot = {
@@ -380,7 +381,11 @@ def _candidate_record(
     return {
         "id": candidate_id,
         "candidate_id": candidate_id,
-        "plan_id": f"plan_{task_id}",
+        "plan_id": _plan_id_for_visual_task(
+            task_id=task_id,
+            angle_id=route_id,
+            route=route_name,
+        ),
         "task_id": task_id,
         "angle_id": route_id,
         "provider": provider,
@@ -400,7 +405,7 @@ def _candidate_record(
         "source_id": source_id,
         "source_url": source.get("url"),
         "source_search_result_id": source.get("search_result_id"),
-        "route": _string(route.get("modality")) or _string(source.get("route")),
+        "route": route_name,
         "candidate_class": "screenshot",
         "origin": "screenshot",
         "image_url": None,
@@ -667,6 +672,10 @@ def _provider_mode(transport: BrowserScreenshotTransport) -> str:
 def _task_id_for_angle(angle_id: str) -> str:
     suffix = angle_id.removeprefix("angle_")
     return f"task_visual_{suffix}"
+
+
+def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
+    return "plan_" + _safe_id(f"{task_id}_{angle_id}_{route}")
 
 
 def _is_remote_url(url: str) -> bool:

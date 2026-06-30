@@ -1409,10 +1409,9 @@ def _status_claim_record(item: Mapping[str, Any], *, include_evidence: bool) -> 
 
 
 def _status_visual_support_records(item: Mapping[str, Any]) -> list[dict[str, Any]]:
-    claim = item["claim"]
     resolved_image_ids = set(item["image_ids"])
     records: list[dict[str, Any]] = []
-    for support in _mapping_records(claim.get("visual_supports")):
+    for support in _mapping_records(item.get("visual_supports")):
         image_id = _string_value(support.get("image_id"), "")
         if image_id not in resolved_image_ids:
             continue
@@ -1421,6 +1420,17 @@ def _status_visual_support_records(item: Mapping[str, Any]) -> list[dict[str, An
             "relation_type": _string_value(support.get("relation_type"), "visual_match"),
             "provider": _string_value(support.get("provider"), "unknown"),
         }
+        for field in (
+            "plan_id",
+            "task_id",
+            "angle_id",
+            "route",
+            "candidate_id",
+            "fetch_id",
+            "evidence_image_id",
+        ):
+            if isinstance(support.get(field), str) and support[field]:
+                record[field] = support[field]
         if isinstance(support.get("observation_ref"), str):
             record["observation_ref"] = support["observation_ref"]
         if isinstance(support.get("observation_index"), int):
@@ -1516,7 +1526,19 @@ def _resolved_visual_supports(
             continue
         if support.get("observation_text") != observations[observation_index]:
             continue
-        resolved.append(support)
+        enriched = dict(support)
+        for field in (
+            "plan_id",
+            "task_id",
+            "angle_id",
+            "route",
+            "candidate_id",
+            "fetch_id",
+        ):
+            if isinstance(image.get(field), str) and image[field]:
+                enriched.setdefault(field, image[field])
+        enriched.setdefault("evidence_image_id", image_id)
+        resolved.append(enriched)
     return resolved
 
 

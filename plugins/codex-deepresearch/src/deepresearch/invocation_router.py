@@ -1201,9 +1201,19 @@ def _finalize_automatic_visual_completion(
 
     diagnostics = validation.to_dict()
     diagnostics["visual_release_gate"] = release_gate
-    release_gate_diagnostics = _visual_release_gate_diagnostics(
-        release_gate if isinstance(release_gate, Mapping) else None
+    lineage_diagnostics = _visual_artifact_lineage_diagnostics(
+        diagnostics,
+        release_gate=release_gate,
     )
+    release_gate_diagnostics = (
+        lineage_diagnostics
+        if lineage_diagnostics is not None
+        else _visual_release_gate_diagnostics(
+            release_gate if isinstance(release_gate, Mapping) else None
+        )
+    )
+    if lineage_diagnostics is not None:
+        diagnostics["diagnostics"] = lineage_diagnostics
     _write_visual_completion_status(
         run_dir=run_dir,
         provider_status=_read_optional_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
@@ -1273,6 +1283,9 @@ def _write_visual_completion_status(
             )
         )
     if validation is not None:
+        validation_diagnostics = validation.get("diagnostics")
+        if isinstance(validation_diagnostics, Mapping):
+            diagnostics.update(dict(validation_diagnostics))
         diagnostics["visual_artifact_validation"] = dict(validation)
     payload["diagnostics"] = diagnostics
     artifacts = (
@@ -1379,6 +1392,39 @@ def _release_gate_from_validation(
         return None
     release_gate = validation.get("visual_release_gate")
     return release_gate if isinstance(release_gate, Mapping) else None
+
+
+def _visual_artifact_lineage_diagnostics(
+    validation: Mapping[str, Any],
+    *,
+    release_gate: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if validation.get("valid") is True:
+        return None
+    if release_gate.get("valid") is not True:
+        return None
+    error_codes = {
+        str(error.get("code"))
+        for error in validation.get("errors", [])
+        if isinstance(error, Mapping) and error.get("code")
+    }
+    lineage_codes = sorted(
+        error_codes
+        & {
+            "duplicate_id",
+            "angle_mismatch",
+            "route_mismatch",
+            "lineage_mismatch",
+        }
+    )
+    if not lineage_codes:
+        return None
+    return {
+        "shortfall_reason": "none",
+        "failure_category": "visual_artifact_lineage",
+        "failure_code": "visual_artifact_lineage_invalid",
+        "lineage_error_codes": lineage_codes,
+    }
 
 
 def _visual_release_gate_diagnostics(

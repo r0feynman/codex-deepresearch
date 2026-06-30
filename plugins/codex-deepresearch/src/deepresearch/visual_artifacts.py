@@ -894,6 +894,7 @@ def _validate_visual_candidates(
                 "plan_id",
                 "task_id",
                 "angle_id",
+                "route",
                 "provider",
                 "provider_kind",
                 "provider_mode",
@@ -931,6 +932,9 @@ def _validate_visual_candidates(
                 "dangling_reference",
                 f"candidate references unknown plan_id '{plan_id}'",
             )
+        elif plan_id:
+            _validate_plan_lineage(record, plan_id, path, context, collector)
+        _check_enum(record, "route", SEARCH_ROUTES, path, collector)
         _validate_provider_fields(
             record,
             path,
@@ -967,8 +971,10 @@ def _validate_image_fetch_status(
             (
                 "fetch_id",
                 "candidate_id",
+                "plan_id",
                 "task_id",
                 "angle_id",
+                "route",
                 "provider",
                 "provider_kind",
                 "provider_mode",
@@ -1001,6 +1007,10 @@ def _validate_image_fetch_status(
             seen.add(fetch_id)
             context.fetch_by_id[fetch_id] = record
         _validate_task_reference(record, path, context, collector)
+        plan_id = _check_string(record, "plan_id", path, collector)
+        if plan_id:
+            _validate_plan_lineage(record, plan_id, path, context, collector)
+        _check_enum(record, "route", SEARCH_ROUTES, path, collector)
         candidate_id = _check_string(record, "candidate_id", path, collector)
         if candidate_id:
             context.fetches_by_candidate_id.setdefault(candidate_id, []).append(record)
@@ -1017,7 +1027,14 @@ def _validate_image_fetch_status(
                     candidate,
                     path,
                     "candidate",
-                    ("task_id", "angle_id", "provider_mode", "provider_run_id"),
+                    (
+                        "plan_id",
+                        "task_id",
+                        "angle_id",
+                        "route",
+                        "provider_mode",
+                        "provider_run_id",
+                    ),
                     collector,
                 )
         _validate_provider_fields(
@@ -1064,8 +1081,10 @@ def _validate_phase3_visual_observations(
             (
                 "observation_id",
                 "evidence_image_id",
+                "plan_id",
                 "task_id",
                 "angle_id",
+                "route",
                 "candidate_id",
                 "fetch_id",
                 "provider",
@@ -1097,8 +1116,12 @@ def _validate_phase3_visual_observations(
                     "duplicate_id",
                     f"duplicate observation_id '{observation_id}'",
                 )
-            seen.add(observation_id)
+        seen.add(observation_id)
         _validate_task_reference(record, path, context, collector)
+        plan_id = _check_string(record, "plan_id", path, collector)
+        if plan_id:
+            _validate_plan_lineage(record, plan_id, path, context, collector)
+        _check_enum(record, "route", SEARCH_ROUTES, path, collector)
         _validate_provider_fields(
             record,
             path,
@@ -1138,7 +1161,14 @@ def _validate_phase3_visual_observations(
                 fetch,
                 path,
                 "fetch",
-                ("task_id", "angle_id", "candidate_id", "evidence_image_id"),
+                (
+                    "plan_id",
+                    "task_id",
+                    "angle_id",
+                    "route",
+                    "candidate_id",
+                    "evidence_image_id",
+                ),
                 collector,
             )
         if image_id and context.image_by_id and image_id not in context.image_by_id:
@@ -1216,7 +1246,16 @@ def _validate_visual_provider_status(
                     "completed_auto_visual_minimum_mismatch",
                     "completed_auto_visual requires at least one report-cited image",
                 )
-            if state == "partial_auto_visual" and minimums.get("shortfall_reason") == "none":
+            diagnostics = status.get("diagnostics")
+            lineage_failure = (
+                isinstance(diagnostics, Mapping)
+                and diagnostics.get("failure_code") == "visual_artifact_lineage_invalid"
+            )
+            if (
+                state == "partial_auto_visual"
+                and minimums.get("shortfall_reason") == "none"
+                and not lineage_failure
+            ):
                 collector.add(
                     f"{path}.minimums.shortfall_reason",
                     "partial_auto_visual_shortfall_missing",
@@ -1350,6 +1389,128 @@ def _validate_report_status(
             )
         else:
             context.report_used_image_ids.add(image_id)
+    included_claims = report_status.get("included_claims")
+    if included_claims is None:
+        return
+    if not isinstance(included_claims, list):
+        collector.add(
+            "$.report_status.included_claims",
+            "invalid_type",
+            "included_claims must be a list",
+        )
+        return
+    for index, claim_record in enumerate(included_claims):
+        claim_path = f"$.report_status.included_claims[{index}]"
+        if not _require_object(claim_record, claim_path, collector):
+            continue
+        claim_id = _check_string(claim_record, "claim_id", claim_path, collector)
+        claim = context.claim_by_id.get(claim_id or "")
+        if claim_id and context.claim_by_id and claim is None:
+            collector.add(
+                f"{claim_path}.claim_id",
+                "dangling_reference",
+                f"report status references unknown claim '{claim_id}'",
+            )
+        image_ids = _check_list(claim_record, "image_ids", claim_path, collector)
+        for image_index, image_id in enumerate(image_ids):
+            if not isinstance(image_id, str) or not image_id:
+                collector.add(
+                    f"{claim_path}.image_ids[{image_index}]",
+                    "invalid_type",
+                    "report image IDs must be non-empty strings",
+                )
+                continue
+            if context.image_by_id and image_id not in context.image_by_id:
+                collector.add(
+                    f"{claim_path}.image_ids[{image_index}]",
+                    "dangling_reference",
+                    f"report status references unknown image '{image_id}'",
+                )
+            if claim is not None:
+                supporting_images = claim.get("supporting_images", [])
+                if isinstance(supporting_images, list) and image_id not in supporting_images:
+                    collector.add(
+                        f"{claim_path}.image_ids[{image_index}]",
+                        "image_claim_lineage",
+                        f"claim '{claim_id}' does not list report image '{image_id}'",
+                    )
+        _validate_report_visual_supports(
+            claim_record,
+            claim_path,
+            claim=claim,
+            context=context,
+            collector=collector,
+        )
+
+
+def _validate_report_visual_supports(
+    claim_record: Mapping[str, Any],
+    claim_path: str,
+    *,
+    claim: Mapping[str, Any] | None,
+    context: _VisualContext,
+    collector: _Collector,
+) -> None:
+    visual_supports = claim_record.get("visual_supports")
+    if visual_supports is None:
+        return
+    if not isinstance(visual_supports, list):
+        collector.add(
+            f"{claim_path}.visual_supports",
+            "invalid_type",
+            "visual_supports must be a list",
+        )
+        return
+    report_image_ids = {
+        image_id
+        for image_id in claim_record.get("image_ids", [])
+        if isinstance(image_id, str) and image_id
+    }
+    for index, support in enumerate(visual_supports):
+        support_path = f"{claim_path}.visual_supports[{index}]"
+        if not _require_object(support, support_path, collector):
+            continue
+        image_id = _check_string(support, "image_id", support_path, collector)
+        if not image_id:
+            continue
+        if report_image_ids and image_id not in report_image_ids:
+            collector.add(
+                f"{support_path}.image_id",
+                "image_claim_lineage",
+                f"report visual support image '{image_id}' is not listed in image_ids",
+            )
+        if claim is not None:
+            supporting_images = claim.get("supporting_images", [])
+            if isinstance(supporting_images, list) and image_id not in supporting_images:
+                collector.add(
+                    f"{support_path}.image_id",
+                    "image_claim_lineage",
+                    f"claim does not list visual support image '{image_id}'",
+                )
+        image = context.image_by_id.get(image_id)
+        if context.image_by_id and image is None:
+            collector.add(
+                f"{support_path}.image_id",
+                "dangling_reference",
+                f"report visual support references unknown image '{image_id}'",
+            )
+            continue
+        if image is not None:
+            _validate_matching_lineage(
+                support,
+                image,
+                support_path,
+                "evidence image",
+                (
+                    "plan_id",
+                    "task_id",
+                    "angle_id",
+                    "route",
+                    "candidate_id",
+                    "fetch_id",
+                ),
+                collector,
+            )
 
 
 def _validate_completed_auto_visual_prerequisites(
@@ -1539,9 +1700,30 @@ def _collect_evidence(
     for task in evidence.get("search_tasks", []) if isinstance(evidence.get("search_tasks"), list) else []:
         if isinstance(task, Mapping) and isinstance(task.get("id"), str):
             context.task_by_id.setdefault(task["id"], task)
-    for image in evidence.get("images", []) if isinstance(evidence.get("images"), list) else []:
-        if isinstance(image, Mapping) and isinstance(image.get("id"), str):
-            context.image_by_id[image["id"]] = image
+    seen_image_ids: dict[str, int] = {}
+    for index, image in enumerate(
+        evidence.get("images", []) if isinstance(evidence.get("images"), list) else []
+    ):
+        if not isinstance(image, Mapping):
+            continue
+        record_ids = {
+            value
+            for value in (image.get("id"), image.get("evidence_image_id"))
+            if isinstance(value, str) and value
+        }
+        for image_id in sorted(record_ids):
+            previous = seen_image_ids.get(image_id)
+            if previous is not None:
+                collector.add(
+                    f"$.evidence.images[{index}].id",
+                    "duplicate_id",
+                    f"duplicate evidence image id '{image_id}' also used at index {previous}",
+                )
+            else:
+                seen_image_ids[image_id] = index
+        image_id = image.get("id")
+        if isinstance(image_id, str) and image_id:
+            context.image_by_id[image_id] = image
     for claim in evidence.get("claims", []) if isinstance(evidence.get("claims"), list) else []:
         if isinstance(claim, Mapping) and isinstance(claim.get("id"), str):
             context.claim_by_id[claim["id"]] = claim
@@ -1617,6 +1799,33 @@ def _validate_task_reference(
         )
 
 
+def _validate_plan_lineage(
+    record: Mapping[str, Any],
+    plan_id: str,
+    path: str,
+    context: _VisualContext,
+    collector: _Collector,
+) -> None:
+    if not context.plan_by_id:
+        return
+    plan = context.plan_by_id.get(plan_id)
+    if plan is None:
+        collector.add(
+            f"{path}.plan_id",
+            "dangling_reference",
+            f"record references unknown plan_id '{plan_id}'",
+        )
+        return
+    _validate_matching_lineage(
+        record,
+        plan,
+        path,
+        "visual plan",
+        ("task_id", "angle_id", "route"),
+        collector,
+    )
+
+
 def _validate_provider_fields(
     record: Mapping[str, Any],
     path: str,
@@ -1680,8 +1889,10 @@ def _validate_fetch_evidence_image(
     if image is None:
         return
     required_image_fields = (
+        "plan_id",
         "task_id",
         "angle_id",
+        "route",
         "candidate_id",
         "fetch_id",
         "local_artifact_path",
@@ -1701,14 +1912,27 @@ def _validate_fetch_evidence_image(
                 "missing_required_field",
                 f"evidence image must preserve visual artifact field '{field}'",
             )
+    image_plan_id = _check_string(image, "plan_id", f"$.evidence.images.{image_id}", collector)
+    if image_plan_id:
+        _validate_plan_lineage(
+            image,
+            image_plan_id,
+            f"$.evidence.images.{image_id}",
+            context,
+            collector,
+        )
+    _validate_task_reference(image, f"$.evidence.images.{image_id}", context, collector)
+    _check_enum(image, "route", SEARCH_ROUTES, f"$.evidence.images.{image_id}", collector)
     _validate_matching_lineage(
         image,
         fetch,
         f"$.evidence.images.{image_id}",
         "fetch",
         (
+            "plan_id",
             "task_id",
             "angle_id",
+            "route",
             "candidate_id",
             "fetch_id",
             "local_artifact_path",
@@ -1817,6 +2041,13 @@ def _validate_claim_observation_report_lineage(
         supporting_images = claim.get("supporting_images", [])
         if not isinstance(supporting_images, list):
             continue
+        _validate_claim_visual_support_metadata(
+            claim_id,
+            claim,
+            supporting_images=supporting_images,
+            context=context,
+            collector=collector,
+        )
         for image_id in supporting_images:
             if not isinstance(image_id, str):
                 continue
@@ -1839,6 +2070,64 @@ def _validate_claim_observation_report_lineage(
                 )
 
 
+def _validate_claim_visual_support_metadata(
+    claim_id: str,
+    claim: Mapping[str, Any],
+    *,
+    supporting_images: Sequence[Any],
+    context: _VisualContext,
+    collector: _Collector,
+) -> None:
+    supports = claim.get("visual_supports")
+    if supports is None:
+        return
+    if not isinstance(supports, list):
+        collector.add(
+            f"$.evidence.claims.{claim_id}.visual_supports",
+            "invalid_type",
+            "visual_supports must be a list",
+        )
+        return
+    image_ids = {image_id for image_id in supporting_images if isinstance(image_id, str)}
+    for index, support in enumerate(supports):
+        support_path = f"$.evidence.claims.{claim_id}.visual_supports[{index}]"
+        if not _require_object(support, support_path, collector):
+            continue
+        image_id = _check_string(support, "image_id", support_path, collector)
+        if not image_id:
+            continue
+        if image_ids and image_id not in image_ids:
+            collector.add(
+                f"{support_path}.image_id",
+                "image_claim_lineage",
+                f"visual support image '{image_id}' is not listed in supporting_images",
+            )
+        image = context.image_by_id.get(image_id)
+        if context.image_by_id and image is None:
+            collector.add(
+                f"{support_path}.image_id",
+                "dangling_reference",
+                f"visual support references unknown image '{image_id}'",
+            )
+            continue
+        if image is not None:
+            _validate_matching_lineage(
+                support,
+                image,
+                support_path,
+                "evidence image",
+                (
+                    "plan_id",
+                    "task_id",
+                    "angle_id",
+                    "route",
+                    "candidate_id",
+                    "fetch_id",
+                ),
+                collector,
+            )
+
+
 def _validate_matching_lineage(
     record: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -1851,9 +2140,17 @@ def _validate_matching_lineage(
         if field in record and field in expected and record.get(field) != expected.get(field):
             collector.add(
                 f"{path}.{field}",
-                "lineage_mismatch",
+                _lineage_mismatch_code(field),
                 f"{field} does not match {expected_name} value {expected.get(field)!r}",
             )
+
+
+def _lineage_mismatch_code(field: str) -> str:
+    if field == "angle_id":
+        return "angle_mismatch"
+    if field == "route":
+        return "route_mismatch"
+    return "lineage_mismatch"
 
 
 def _default_path(

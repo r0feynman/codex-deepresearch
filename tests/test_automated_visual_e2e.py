@@ -583,6 +583,7 @@ class AutomatedVisualE2ETests(unittest.TestCase):
             "plan_id": "plan_visual_001",
             "task_id": task_id,
             "angle_id": angle_id,
+            "route": "visual_required",
             "provider": provider,
             "provider_kind": provider_kind,
             "provider_mode": "real",
@@ -616,8 +617,10 @@ class AutomatedVisualE2ETests(unittest.TestCase):
         return {
             "fetch_id": f"fetch_real_{index:03d}",
             "candidate_id": candidate["candidate_id"],
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "provider": candidate["provider"],
             "provider_kind": candidate["provider_kind"],
             "provider_mode": candidate["provider_mode"],
@@ -670,8 +673,10 @@ class AutomatedVisualE2ETests(unittest.TestCase):
         return {
             "observation_id": f"obs_{evidence_image_id}",
             "evidence_image_id": evidence_image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "provider": "openai-responses-vision",
@@ -707,8 +712,10 @@ class AutomatedVisualE2ETests(unittest.TestCase):
     ) -> dict[str, Any]:
         return {
             "id": evidence_image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "local_artifact_path": fetch["local_artifact_path"],

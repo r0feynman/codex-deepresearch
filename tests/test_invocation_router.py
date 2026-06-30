@@ -44,6 +44,333 @@ class InvocationRouterTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def write_visual_lineage_fixture(
+        self,
+        run_dir: Path,
+        *,
+        duplicate_plan_id: bool = False,
+    ) -> None:
+        created_at = "2026-06-30T00:00:00Z"
+        tasks = [
+            {
+                "id": f"task_visual_{index:03d}",
+                "angle_id": f"angle_{index:03d}",
+                "route": "visual_required",
+            }
+            for index in range(1, 4)
+        ]
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.parallel.v0",
+                "run_id": run_dir.name,
+                "created_at": created_at,
+                "tasks": tasks,
+            },
+        )
+        plans = []
+        candidates = []
+        fetches = []
+        observations = []
+        images = []
+        image_ids = []
+        candidate_index = 1
+        for task_index, task in enumerate(tasks, start=1):
+            plan_id = self.visual_plan_id(task["id"], task["angle_id"], task["route"])
+            plans.append(
+                {
+                    "plan_id": plan_id,
+                    "task_id": task["id"],
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "target_evidence_type": "web_image",
+                    "query": f"visual lineage {task_index}",
+                    "providers": ["child-discovered-image-url"],
+                    "source_search_result_ids": [],
+                    "caps": {
+                        "max_candidates": 4,
+                        "max_fetches": 1,
+                        "max_vlm_images": 1,
+                        "max_cost_usd": 0.25,
+                    },
+                    "policy_constraints": {"robots": "allowed"},
+                    "estimated_cost_usd": 0.03,
+                    "state": "completed",
+                }
+            )
+            for local_index in range(1, 5 if task_index == 1 else 4):
+                candidate_id = f"cand_lineage_{candidate_index:03d}"
+                candidate = {
+                    "candidate_id": candidate_id,
+                    "plan_id": plan_id,
+                    "task_id": task["id"],
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "provider": "child-discovered-image-url",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "provider_run_id": "run_lineage_real",
+                    "provider_provenance": {
+                        "provider": "child-discovered-image-url",
+                        "provider_kind": "web_image_search",
+                        "provider_mode": "real",
+                    },
+                    "origin": "image_search",
+                    "page_url": f"https://example.com/page-{candidate_index}",
+                    "image_url": f"https://example.com/image-{candidate_index}.png",
+                    "rank": candidate_index,
+                    "score": 1.0 / candidate_index,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "analyzed" if local_index == 1 else "discovered",
+                    "rejection_reason": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                }
+                candidates.append(candidate)
+                if local_index == 1:
+                    image_id = f"img_lineage_{task_index:03d}"
+                    fetch_id = f"fetch_lineage_{task_index:03d}"
+                    image_ids.append(image_id)
+                    fetch = {
+                        "fetch_id": fetch_id,
+                        "candidate_id": candidate_id,
+                        "plan_id": plan_id,
+                        "task_id": task["id"],
+                        "angle_id": task["angle_id"],
+                        "route": task["route"],
+                        "provider": "child-discovered-image-url",
+                        "provider_kind": "web_image_search",
+                        "provider_mode": "real",
+                        "provider_run_id": "run_lineage_real",
+                        "provider_provenance": dict(candidate["provider_provenance"]),
+                        "fetch_status": "fetched",
+                        "http_status": 200,
+                        "mime_type": "image/png",
+                        "byte_size": 128,
+                        "width": 640,
+                        "height": 360,
+                        "hash": f"sha256:lineage:{task_index}",
+                        "phash": f"phash:lineage:{task_index}",
+                        "local_artifact_path": f"images/{image_id}.png",
+                        "evidence_image_id": image_id,
+                        "policy_decision": "allowed",
+                        "policy_flags": [],
+                        "failure_code": None,
+                        "estimated_cost_usd": 0.01,
+                        "actual_cost_usd": 0.01,
+                    }
+                    fetches.append(fetch)
+                    images.append(self.evidence_image_from_fetch(fetch))
+                    observations.append(
+                        {
+                            "observation_id": f"obs_{image_id}",
+                            "evidence_image_id": image_id,
+                            "plan_id": plan_id,
+                            "task_id": task["id"],
+                            "angle_id": task["angle_id"],
+                            "route": task["route"],
+                            "candidate_id": candidate_id,
+                            "fetch_id": fetch_id,
+                            "provider": "codex-interactive",
+                            "provider_kind": "vlm",
+                            "provider_mode": "real",
+                            "provider_run_id": "run_lineage_vlm",
+                            "provider_provenance": {
+                                "provider": "codex-interactive",
+                                "provider_kind": "vlm",
+                                "provider_mode": "real",
+                                "codex_native_handoff": True,
+                            },
+                            "model_or_tool": "codex-interactive",
+                            "observation_status": "analyzed",
+                            "observations": ["The image shows public visual evidence."],
+                            "inferences": ["The image can support the report claim."],
+                            "confidence": 0.87,
+                            "policy_decision": "allowed",
+                            "policy_flags": [],
+                            "caveats": [],
+                            "verifier_links": [
+                                {
+                                    "claim_id": "claim_lineage_visual",
+                                    "visual_support_ref": f"images.{image_id}.observations[0]",
+                                    "verifier_vote_id": f"vote_lineage_{task_index:03d}",
+                                }
+                            ],
+                            "report_links": [
+                                {
+                                    "claim_id": "claim_lineage_visual",
+                                    "report_section_id": "visual-findings",
+                                    "citation_id": f"img:{image_id}",
+                                }
+                            ],
+                            "estimated_cost_usd": 0.0,
+                            "actual_cost_usd": 0.0,
+                            "created_at": created_at,
+                        }
+                    )
+                candidate_index += 1
+        if duplicate_plan_id:
+            plans[1]["plan_id"] = plans[0]["plan_id"]
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": created_at,
+                "tasks": plans,
+            },
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        visual_supports = [
+            {
+                "image_id": image["id"],
+                "evidence_image_id": image["id"],
+                "observation_ref": f"images.{image['id']}.observations[0]",
+                "observation_index": 0,
+                "observation_text": image["observations"][0],
+                "relation_type": "visual_match",
+                "provider": "codex-interactive",
+                "plan_id": image["plan_id"],
+                "task_id": image["task_id"],
+                "angle_id": image["angle_id"],
+                "route": image["route"],
+                "candidate_id": image["candidate_id"],
+                "fetch_id": image["fetch_id"],
+            }
+            for image in images
+        ]
+        evidence = {
+            "schema_version": "0.1.0",
+            "run_id": run_dir.name,
+            "question": "Visual lineage finalizer fixture",
+            "mode": "codex-plugin",
+            "vlm_provider": "codex-interactive",
+            "routing": [
+                {"id": task["angle_id"], "modality": task["route"], "max_images": 4}
+                for task in tasks
+            ],
+            "images": images,
+            "claims": [
+                {
+                    "id": "claim_lineage_visual",
+                    "text": "The visual lineage fixture includes cited image evidence.",
+                    "claim_type": "mixed",
+                    "supporting_sources": [],
+                    "supporting_images": image_ids,
+                    "visual_supports": visual_supports,
+                    "quote_spans": [],
+                    "votes": [{"id": f"vote_lineage_{index:03d}"} for index in range(1, 4)],
+                    "verification_status": "supported",
+                    "review_status": "human_accepted",
+                    "promotion_status": "promoted_memory",
+                    "confidence": "high",
+                    "caveats": [],
+                }
+            ],
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / VISUAL_PROVIDER_STATUS_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "status": "visual_evidence_ingested",
+                "ok": True,
+                "terminal": False,
+                "metric_classification": "codex_native_visual_worker",
+                "providers": [
+                    self.provider_record("child-discovered-image-url", "web_image_search", 3, 10, 3, 0),
+                    self.provider_record("codex-interactive", "vlm", 1, 0, 3, 3),
+                ],
+                "diagnostics": {"actionable_cause": "fixture visual lineage artifacts ready"},
+            },
+        )
+
+    def evidence_image_from_fetch(self, fetch: dict) -> dict:
+        return {
+            "id": fetch["evidence_image_id"],
+            "plan_id": fetch["plan_id"],
+            "task_id": fetch["task_id"],
+            "angle_id": fetch["angle_id"],
+            "route": fetch["route"],
+            "candidate_id": fetch["candidate_id"],
+            "fetch_id": fetch["fetch_id"],
+            "local_artifact_path": fetch["local_artifact_path"],
+            "hash": fetch["hash"],
+            "provider": fetch["provider"],
+            "provider_kind": fetch["provider_kind"],
+            "provider_mode": fetch["provider_mode"],
+            "provider_provenance": dict(fetch["provider_provenance"]),
+            "policy_decision": "allowed",
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "analysis_status": "analyzed",
+            "observations": ["The image shows public visual evidence."],
+        }
+
+    def report_status_payload(self, image_id: str) -> dict:
+        return {
+            "status": "completed",
+            "used_images": [image_id],
+            "included_claims": [
+                {
+                    "claim_id": "claim_lineage_visual",
+                    "claim_type": "mixed",
+                    "verification_status": "supported",
+                    "image_ids": [image_id],
+                    "visual_supports": [
+                        {
+                            "image_id": image_id,
+                            "evidence_image_id": image_id,
+                            "observation_ref": f"images.{image_id}.observations[0]",
+                            "observation_index": 0,
+                            "observation_text": "The image shows public visual evidence.",
+                            "relation_type": "visual_match",
+                            "provider": "codex-interactive",
+                            "plan_id": "plan_task_visual_001_angle_001_visual_required",
+                            "task_id": "task_visual_001",
+                            "angle_id": "angle_001",
+                            "route": "visual_required",
+                            "candidate_id": "cand_lineage_001",
+                            "fetch_id": "fetch_lineage_001",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def provider_record(
+        self,
+        provider: str,
+        provider_kind: str,
+        invocations: int,
+        candidates_discovered: int,
+        artifacts_fetched: int,
+        vlm_images_analyzed: int,
+    ) -> dict:
+        return {
+            "provider": provider,
+            "provider_kind": provider_kind,
+            "provider_mode": "real",
+            "configured": True,
+            "available": True,
+            "blocked_reason": None,
+            "invocations": invocations,
+            "candidates_discovered": candidates_discovered,
+            "artifacts_fetched": artifacts_fetched,
+            "vlm_images_analyzed": vlm_images_analyzed,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "last_error": None,
+        }
+
+    def visual_plan_id(self, task_id: str, angle_id: str, route: str) -> str:
+        return "plan_" + "_".join((task_id, angle_id, route))
+
     def test_default_deep_research_invocation_runs_full_runner_fixture(self) -> None:
         result = run_skill_invocation(
             "$deep-research: investigate deterministic router fixture",
@@ -863,6 +1190,109 @@ class InvocationRouterTests(unittest.TestCase):
         )
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         self.assertEqual(provider_status["status"], "partial_auto_visual")
+
+    def test_visual_lineage_failure_wins_over_satisfied_minimums(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            payload = {
+                "status": "completed_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 3,
+                "failure_counts": {},
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 3,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "attempted_real_child_execution": True,
+                    "real_child_execution": True,
+                    "real_use_e2e_eligible": True,
+                },
+                "merge": {"accepted_shards": [{"task_id": "task_visual_001"}]},
+                "artifacts": {
+                    "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json")
+                },
+            }
+            self.write_json(run_dir / "parallel_orchestration_status.json", payload)
+            return payload
+
+        def fake_acquire(*, run, **_kwargs):
+            self.write_visual_lineage_fixture(Path(run), duplicate_plan_id=True)
+            return {"status": "real_image_search_candidates_collected", "ok": True}
+
+        def fake_ingest(*, run, **_kwargs):
+            run_dir = Path(run)
+            self.write_json(
+                run_dir / "vision_ingest_status.json",
+                {"status": "visual_evidence_ingested", "ok": True},
+            )
+            return {"status": "visual_evidence_ingested", "ok": True}
+
+        def fake_synthesize(*, run):
+            run_dir = Path(run)
+            evidence = self.read_json(run_dir / "evidence.json")
+            image_id = evidence["images"][0]["id"]
+            report_status = self.report_status_payload(image_id)
+            self.write_json(run_dir / "report_status.json", report_status)
+            (run_dir / "report.md").write_text(
+                f"Report cites claim_lineage_visual with image {image_id}.\n",
+                encoding="utf-8",
+            )
+            return report_status
+
+        with (
+            mock.patch("deepresearch.invocation_router.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch("deepresearch.invocation_router.acquire_visual_candidates", side_effect=fake_acquire),
+            mock.patch("deepresearch.invocation_router.ingest_vision_observations", side_effect=fake_ingest),
+            mock.patch("deepresearch.invocation_router.enforce_guardrails", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.verify_claims", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.synthesize_report", side_effect=fake_synthesize),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: inspect public images for lineage",
+                runs_dir=runs_dir,
+                route="visual_required",
+                budget_preset="quick",
+                min_tasks=3,
+                max_tasks=3,
+            )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["diagnostics"]["failure_code"],
+            "visual_artifact_lineage_invalid",
+        )
+        self.assertNotEqual(
+            result["diagnostics"].get("failure_code"),
+            "visual_minimum_shortfall",
+        )
+        self.assertNotEqual(
+            result["diagnostics"].get("failure_code"),
+            "visual_report_linkage_missing",
+        )
+
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        self.assertFalse(run_status["ok"])
+        self.assertEqual(run_status["diagnostics"]["failure_code"], "visual_artifact_lineage_invalid")
+        self.assertTrue(run_status["visual_release_gate"]["valid"])
+        self.assertFalse(run_status["visual_artifact_validation"]["valid"])
+
+        provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertEqual(
+            provider_status["diagnostics"]["failure_code"],
+            "visual_artifact_lineage_invalid",
+        )
+        self.assertTrue(provider_status["minimums"]["satisfied"])
+        self.assertEqual(provider_status["minimums"]["shortfall_reason"], "none")
 
     def test_partial_auto_visual_final_run_status_exposes_visual_shortfall_diagnostics(self) -> None:
         runs_dir = self.temp_runs_dir()

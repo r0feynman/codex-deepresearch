@@ -268,6 +268,8 @@ class VisionAdapterTests(unittest.TestCase):
         created_at = "2026-06-25T00:00:00Z"
         task_id = "task_visual_001"
         angle_id = "angle_001"
+        route = "visual_required"
+        plan_id = f"plan_{task_id}"
         candidate_id = "cand_checkout_001"
         fetch_id = "fetch_checkout_001"
         evidence_image_id = "img_checkout_001"
@@ -287,10 +289,10 @@ class VisionAdapterTests(unittest.TestCase):
                 "created_at": created_at,
                 "tasks": [
                     {
-                        "plan_id": f"plan_{task_id}",
+                        "plan_id": plan_id,
                         "task_id": task_id,
                         "angle_id": angle_id,
-                        "route": "visual_required",
+                        "route": route,
                         "target_evidence_type": "screenshot",
                         "query": "checkout screenshot",
                         "providers": ["browser-screenshot"],
@@ -313,9 +315,10 @@ class VisionAdapterTests(unittest.TestCase):
             [
                 {
                     "candidate_id": candidate_id,
-                    "plan_id": f"plan_{task_id}",
+                    "plan_id": plan_id,
                     "task_id": task_id,
                     "angle_id": angle_id,
+                    "route": route,
                     "provider": "browser-screenshot",
                     "provider_kind": "screenshot",
                     "provider_mode": "real",
@@ -350,8 +353,10 @@ class VisionAdapterTests(unittest.TestCase):
                 {
                     "fetch_id": fetch_id,
                     "candidate_id": candidate_id,
+                    "plan_id": plan_id,
                     "task_id": task_id,
                     "angle_id": angle_id,
+                    "route": route,
                     "provider": "browser-screenshot",
                     "provider_kind": "screenshot",
                     "provider_mode": "real",

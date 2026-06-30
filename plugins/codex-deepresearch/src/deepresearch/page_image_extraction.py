@@ -547,7 +547,11 @@ def _candidate_records_for_source(
         record = {
             "id": candidate_id,
             "candidate_id": candidate_id,
-            "plan_id": f"plan_{task_id}",
+            "plan_id": _plan_id_for_visual_task(
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route_name,
+            ),
             "task_id": task_id,
             "angle_id": angle_id,
             "source_search_result_id": source.get("search_result_id"),
@@ -883,8 +887,10 @@ def _base_fetch_record(candidate: Mapping[str, Any], fetch_id: str) -> dict[str,
     return {
         "fetch_id": fetch_id,
         "candidate_id": candidate.get("candidate_id"),
+        "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
         "angle_id": candidate.get("angle_id"),
+        "route": candidate.get("route"),
         "source_search_result_id": candidate.get("source_search_result_id"),
         "provider": candidate.get("provider"),
         "provider_kind": candidate.get("provider_kind"),
@@ -966,8 +972,10 @@ def _evidence_image(
         observations.append(f"Page context: {candidate['surrounding_text']}")
     return {
         "id": image_id,
+        "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
         "angle_id": candidate.get("angle_id"),
+        "route": candidate.get("route"),
         "candidate_id": candidate.get("candidate_id"),
         "fetch_id": fetch_id,
         "source_id": candidate.get("source_id"),
@@ -1881,6 +1889,10 @@ def _metadata_contains(record: Mapping[str, Any], needle: str) -> bool:
 def _safe_id(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
     return safe or "image"
+
+
+def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
+    return "plan_" + _safe_id(f"{task_id}_{angle_id}_{route}")
 
 
 def _dedupe(values: Sequence[str]) -> list[str]:

@@ -643,7 +643,15 @@ def _openai_result_from_response_payload(
         "mime_type": mime_type,
         "lineage": {
             key: metadata.get(key)
-            for key in ("candidate_id", "fetch_id", "task_id", "angle_id", "evidence_image_id")
+            for key in (
+                "candidate_id",
+                "fetch_id",
+                "plan_id",
+                "task_id",
+                "angle_id",
+                "route",
+                "evidence_image_id",
+            )
             if metadata.get(key) is not None
         },
     }
@@ -695,8 +703,10 @@ def _codex_result_from_stdout(
                         for key in (
                             "candidate_id",
                             "fetch_id",
+                            "plan_id",
                             "task_id",
                             "angle_id",
+                            "route",
                             "evidence_image_id",
                             "local_artifact_path",
                         )
@@ -1512,10 +1522,23 @@ def _base_openai_task(
         candidate or {},
         "task_id",
     ) or f"task_visual_{_sanitize_identifier(angle_id.removeprefix('angle_'))}"
+    route = _first_optional_string(fetch or {}, "route") or _first_optional_string(
+        candidate or {},
+        "route",
+    )
+    plan_id = _first_optional_string(fetch or {}, "plan_id") or _first_optional_string(
+        candidate or {},
+        "plan_id",
+    ) or _plan_id_for_visual_task(
+        task_id=task_id,
+        angle_id=angle_id,
+        route=route or "visual_required",
+    )
     return {
         "candidate_id": candidate_id,
         "fetch_id": fetch_id,
         "evidence_image_id": evidence_image_id,
+        "plan_id": plan_id,
         "source_id": source_id,
         "origin": _first_optional_string(candidate or {}, "origin") or "image_search",
         "image_url": image_url,
@@ -1529,7 +1552,7 @@ def _base_openai_task(
         "phash": phash,
         "task_id": task_id,
         "angle_id": angle_id,
-        "route": _first_optional_string(candidate or {}, "route"),
+        "route": route,
         "candidate_class": _first_optional_string(candidate or {}, "candidate_class"),
         "visual_tasks": _dedupe(_string_list(candidate or {}, "visual_tasks")),
         "policy_decision": _first_optional_string(fetch or {}, "policy_decision")
@@ -1736,6 +1759,12 @@ def _openai_observation_record(
         "hash": task.get("hash"),
         "phash": task.get("phash"),
         "source_url": task.get("source_url"),
+        "plan_id": task.get("plan_id"),
+        "task_id": task.get("task_id"),
+        "angle_id": task.get("angle_id"),
+        "route": task.get("route"),
+        "candidate_id": task.get("candidate_id"),
+        "fetch_id": task.get("fetch_id"),
     }
     if task.get("local_artifact_path"):
         image_record["local_artifact_path"] = task.get("local_artifact_path")
@@ -1759,6 +1788,7 @@ def _openai_observation_record(
         "caveats": caveats,
         "candidate_id": task["candidate_id"],
         "fetch_id": task["fetch_id"],
+        "plan_id": task.get("plan_id"),
         "task_id": task["task_id"],
         "candidate_class": task.get("candidate_class"),
         "angle_id": task["angle_id"],
@@ -1854,6 +1884,12 @@ def _codex_interactive_observation_record(
         "hash": task.get("hash"),
         "phash": task.get("phash"),
         "source_url": task.get("source_url"),
+        "plan_id": task.get("plan_id"),
+        "task_id": task.get("task_id"),
+        "angle_id": task.get("angle_id"),
+        "route": task.get("route"),
+        "candidate_id": task.get("candidate_id"),
+        "fetch_id": task.get("fetch_id"),
     }
     provider_provenance = {
         "provider": CODEX_INTERACTIVE_PROVIDER,
@@ -1889,6 +1925,7 @@ def _codex_interactive_observation_record(
         "caveats": caveats,
         "candidate_id": task["candidate_id"],
         "fetch_id": task["fetch_id"],
+        "plan_id": task.get("plan_id"),
         "task_id": task["task_id"],
         "candidate_class": task.get("candidate_class"),
         "angle_id": task["angle_id"],
@@ -2003,10 +2040,14 @@ def _openai_synthetic_fetch_record(
     return {
         "fetch_id": fetch_id,
         "candidate_id": candidate_id,
+        "plan_id": _first_optional_string(observation, "plan_id")
+        or _first_optional_string(candidate, "plan_id"),
         "task_id": _first_optional_string(observation, "task_id")
         or _first_optional_string(candidate, "task_id"),
         "angle_id": _first_optional_string(observation, "angle_id")
         or _first_optional_string(candidate, "angle_id"),
+        "route": _first_optional_string(observation, "route")
+        or _first_optional_string(candidate, "route"),
         "source_search_result_id": _first_optional_string(
             candidate,
             "source_search_result_id",
@@ -2604,6 +2645,10 @@ def _fetch_id_for_candidate_id(candidate_id: str) -> str:
 
 def _image_id_for_candidate_id(candidate_id: str) -> str:
     return "img_" + _sanitize_identifier(candidate_id.removeprefix("cand_"))
+
+
+def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
+    return "plan_" + _sanitize_identifier(f"{task_id}_{angle_id}_{route}")
 
 
 def _redact_provider_text(
@@ -3557,6 +3602,7 @@ def _copy_optional_visual_metadata(
         "observation_id",
         "pdf_local_path",
         "pdf_url",
+        "plan_id",
         "provider",
         "provider_kind",
         "provider_mode",
@@ -3632,6 +3678,16 @@ def _phase3_observation_records(
             or _first_optional_string(image, "task_id")
             or f"task_visual_{_sanitize_identifier(angle_id.removeprefix('angle_'))}"
         )
+        route = (
+            _first_optional_string(raw, "route")
+            or _first_optional_string(image, "route")
+            or "visual_required"
+        )
+        plan_id = (
+            _first_optional_string(raw, "plan_id")
+            or _first_optional_string(image, "plan_id")
+            or _plan_id_for_visual_task(task_id=task_id, angle_id=angle_id, route=route)
+        )
         provider_name = (
             _first_optional_string(raw, "provider")
             or _first_optional_string(image, "provider", "visual_provider")
@@ -3696,10 +3752,11 @@ def _phase3_observation_records(
             "fetch_id": _first_optional_string(raw, "fetch_id")
             or _first_optional_string(image, "fetch_id")
             or f"fetch_{_sanitize_identifier(candidate_id)}",
+            "plan_id": plan_id,
             "task_id": task_id,
             "candidate_class": image.get("candidate_class"),
             "angle_id": angle_id,
-            "route": image.get("route"),
+            "route": route,
             "visual_provider": image.get("visual_provider") or provider_name,
             "provider": provider_name,
             "provider_kind": provider_kind,
