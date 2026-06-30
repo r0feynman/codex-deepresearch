@@ -28,6 +28,12 @@ from .evidence_schema import (
 from .execution_mode import BudgetPreset, resolve_config
 from .modality_router import route_angles
 from .run_state import begin_stage, skipped_stage_status
+from .semantic_planner import (
+    SEMANTIC_PLANNER_SCHEMA_VERSION,
+    SEMANTIC_PLANNER_VALIDATION_FILENAME,
+    plan_semantic_angles,
+    write_semantic_planner_validation,
+)
 from .trace import record_stage_trace
 
 
@@ -93,14 +99,30 @@ def prepare_run(
             "with codex-native search"
         )
 
-    planner_angles = _normalize_planner_angles(angles)
-    decisions = route_angles(
+    semantic_plan = plan_semantic_angles(
         question=normalized_question,
-        angles=planner_angles,
-        max_images=config.budget.max_images,
-        route_override=route,
+        explicit_angles=_effective_explicit_angles_for_route(
+            angles=angles,
+            route=route,
+        ),
     )
-    routing = [_routing_record(decision, index) for index, decision in enumerate(decisions, start=1)]
+    decisions = []
+    for semantic_angle in semantic_plan.angles:
+        route_override = route
+        if route_override is None and semantic_plan.source != "explicit":
+            route_override = semantic_angle.route
+        decisions.extend(
+            route_angles(
+                question=normalized_question,
+                angles=[semantic_angle.title],
+                max_images=config.budget.max_images,
+                route_override=route_override,
+            )
+        )
+    routing = [
+        _routing_record(decision, index, semantic_angle=semantic_plan.angles[index - 1])
+        for index, decision in enumerate(decisions, start=1)
+    ]
     now = _utc_now()
     budget_estimate = estimate_budget(
         question=normalized_question,
@@ -166,6 +188,17 @@ def prepare_run(
         "search_provider": config.search_provider,
         "vlm_provider": config.vlm_provider,
         "routing": routing,
+        "semantic_planner": {
+            "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+            "question_class": semantic_plan.question_class,
+            "broad_question": semantic_plan.broad_question,
+            "source": semantic_plan.source,
+            "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
+        },
+        "semantic_angles": [
+            _semantic_angle_evidence_record(route_record)
+            for route_record in routing
+        ],
         "search_tasks": search_tasks,
         "budget": budget,
         "sources": [],
@@ -218,6 +251,9 @@ def prepare_run(
             "visual_tasks": str(run_dir / "visual_tasks.json"),
             "visual_observations": str(run_dir / "visual_observations.jsonl"),
             "status": str(run_dir / "status.json"),
+            "semantic_planner_validation": str(
+                run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+            ),
         },
         "budget_estimate": _budget_estimate_summary(budget_estimate),
     }
@@ -229,6 +265,7 @@ def prepare_run(
     _write_json(run_dir / "visual_tasks.json", visual_tasks_artifact)
     (run_dir / "visual_observations.jsonl").write_text("", encoding="utf-8")
     write_budget_estimate(run_dir, budget_estimate)
+    write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
 
     validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
     if not validation.valid:
@@ -276,6 +313,9 @@ def prepare_run(
             "run_trace": str(run_dir / "run_trace.jsonl"),
             "run_steps": str(run_dir / "run_steps.json"),
             "budget_estimate": str(run_dir / "budget_estimate.json"),
+            "semantic_planner_validation": str(
+                run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+            ),
         },
         "budget_estimate": status["budget_estimate"],
     }
@@ -598,15 +638,83 @@ def _normalize_planner_angles(angles: Sequence[str] | None) -> list[str]:
     return normalized
 
 
-def _routing_record(decision: Any, index: int) -> dict[str, Any]:
-    return {
-        "id": f"angle_{index:03d}",
+def _routing_record(
+    decision: Any,
+    index: int,
+    *,
+    semantic_angle: Any | None = None,
+) -> dict[str, Any]:
+    angle_id = (
+        str(getattr(semantic_angle, "angle_id", "") or "")
+        if semantic_angle is not None
+        else ""
+    )
+    if not angle_id:
+        angle_id = f"angle_{index:03d}"
+    record = {
+        "id": angle_id,
         "angle": decision.angle,
         "modality": decision.modality,
         "reason": decision.reason,
         "visual_tasks": list(decision.visual_tasks),
         "max_images": decision.max_images,
     }
+    if semantic_angle is not None:
+        record.update(
+            {
+                "title": semantic_angle.title,
+                "research_question": semantic_angle.research_question,
+                "question_context": getattr(semantic_angle, "question_context", ""),
+                "route": decision.modality,
+                "evidence_need": semantic_angle.evidence_need,
+                "expected_artifacts": list(semantic_angle.expected_artifacts),
+                "expected_evidence": _expected_evidence_for_angle(
+                    semantic_angle.evidence_need,
+                    decision.modality,
+                ),
+                "success_criteria": list(semantic_angle.success_criteria),
+                "report_section": semantic_angle.report_section,
+            }
+        )
+    return record
+
+
+def _effective_explicit_angles_for_route(
+    *,
+    angles: Sequence[str] | None,
+    route: str | None,
+) -> Sequence[str] | None:
+    if angles is not None:
+        return angles
+    if route in {"visual_required", "visual_optional"}:
+        return ["primary source discovery"]
+    return None
+
+
+def _semantic_angle_evidence_record(route_record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "angle_id": route_record["id"],
+        "title": route_record.get("title") or route_record["angle"],
+        "research_question": route_record.get("research_question") or route_record["angle"],
+        "question_context": route_record.get("question_context") or "",
+        "route": route_record["modality"],
+        "evidence_need": route_record.get("evidence_need") or "primary_source",
+        "expected_artifacts": list(route_record.get("expected_artifacts", [])),
+        "expected_evidence": list(route_record.get("expected_evidence", [])),
+        "success_criteria": list(route_record.get("success_criteria", [])),
+        "report_section": route_record.get("report_section") or route_record["angle"],
+    }
+
+
+def _expected_evidence_for_angle(evidence_need: str, route: str) -> list[str]:
+    expected = [evidence_need]
+    if evidence_need == "visual_example":
+        expected.append("visual_example")
+    if evidence_need == "visual_observation":
+        expected.extend(["visual_observation", "vlm_analysis"])
+    if route != "text_only" and "visual_observation" not in expected:
+        expected.append("visual_observation")
+    return list(dict.fromkeys(expected))
 
 
 def _apply_budget_image_allocations(
@@ -671,7 +779,15 @@ def _search_task(
         "id": f"task_search_{index:03d}",
         "angle_id": route_record["id"],
         "angle": angle,
+        "title": route_record.get("title") or angle,
+        "research_question": route_record.get("research_question") or angle,
+        "question_context": route_record.get("question_context") or question,
         "query": query,
+        "evidence_need": route_record.get("evidence_need") or "primary_source",
+        "expected_artifacts": list(route_record.get("expected_artifacts", [])),
+        "expected_evidence": list(route_record.get("expected_evidence", [])),
+        "success_criteria": list(route_record.get("success_criteria", [])),
+        "report_section": route_record.get("report_section") or angle,
         "freshness_requirement": freshness_requirement,
         "modality": route_record["modality"],
         "route": route_record["modality"],

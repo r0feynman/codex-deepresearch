@@ -1738,6 +1738,7 @@ def _artifact_paths(run_dir: Path, extra_artifacts: Mapping[str, Any] | None = N
         "run_trace": "run_trace.jsonl",
         "run_steps": "run_steps.json",
         "budget_estimate": "budget_estimate.json",
+        "semantic_planner_validation": "semantic_planner_validation.json",
         "visual_search_plan": VISUAL_SEARCH_PLAN_FILENAME,
         "visual_candidates": VISUAL_CANDIDATES_FILENAME,
         "image_fetch_status": IMAGE_FETCH_STATUS_FILENAME,

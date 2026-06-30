@@ -15,6 +15,7 @@ from .report_public_safety import (
 )
 from .run_state import begin_stage, skipped_stage_status
 from .search_handoff import SearchHandoffError, resolve_run_dir
+from .semantic_planner import write_semantic_planner_validation
 from .trace import record_stage_trace
 
 
@@ -274,7 +275,27 @@ def synthesize_report(
     )
     status = _public_report_status(status, run_dir=run_dir)
     _write_json(status_path, status)
+    _refresh_semantic_planner_validation(run_dir, evidence, status)
     return status
+
+
+def _refresh_semantic_planner_validation(
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    report_status: Mapping[str, Any],
+) -> None:
+    tasks_artifact = _read_optional_json(run_dir / "research_tasks.json")
+    tasks = []
+    if isinstance(tasks_artifact, Mapping) and isinstance(tasks_artifact.get("tasks"), list):
+        tasks = [
+            task for task in tasks_artifact["tasks"] if isinstance(task, Mapping)
+        ]
+    write_semantic_planner_validation(
+        run_dir=run_dir,
+        evidence=evidence,
+        tasks=tasks,
+        report_status=report_status,
+    )
 
 
 def report_evidence_model(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -1635,6 +1656,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ReportGenerationError(f"expected JSON object in {path}")
     return payload
+
+
+def _read_optional_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return _read_json(path)
+    except ReportGenerationError:
+        return None
 
 
 def _read_jsonl_records(path: Path) -> list[Any] | None:
