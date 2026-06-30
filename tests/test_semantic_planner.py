@@ -33,6 +33,7 @@ SEMANTIC_FIXTURES = [
             "risk_or_guardrail",
         },
         "expects_visual_route": False,
+        "critical_query_tokens": ["next.js", "app router", "캐싱", "saas"],
     },
     {
         "fixture_id": "product_market",
@@ -46,6 +47,7 @@ SEMANTIC_FIXTURES = [
             "risk_or_guardrail",
         },
         "expects_visual_route": False,
+        "critical_query_tokens": ["ai", "회의록", "서비스"],
     },
     {
         "fixture_id": "visual_style",
@@ -60,6 +62,7 @@ SEMANTIC_FIXTURES = [
             "policy_or_legal",
         },
         "expects_visual_route": True,
+        "critical_query_tokens": ["사진", "스냅사진"],
     },
     {
         "fixture_id": "policy_risk",
@@ -73,6 +76,7 @@ SEMANTIC_FIXTURES = [
             "comparative_analysis",
         },
         "expects_visual_route": False,
+        "critical_query_tokens": ["워터마크", "초상권", "리스크"],
     },
     {
         "fixture_id": "implementation_architecture",
@@ -90,6 +94,7 @@ SEMANTIC_FIXTURES = [
             "risk_or_guardrail",
         },
         "expects_visual_route": False,
+        "critical_query_tokens": ["codex", "deepresearch", "semantic planner", "fan-out"],
     },
 ]
 
@@ -138,11 +143,13 @@ class SemanticPlannerTests(unittest.TestCase):
 
                 angles = evidence["semantic_angles"]
                 for angle in angles:
+                    self.assertEqual(angle.get("question_context"), fixture["question"])
                     self.assertIn(angle["evidence_need"], ALLOWED_EVIDENCE_NEEDS)
                     for field in (
                         "angle_id",
                         "title",
                         "research_question",
+                        "question_context",
                         "route",
                         "evidence_need",
                         "expected_artifacts",
@@ -167,6 +174,9 @@ class SemanticPlannerTests(unittest.TestCase):
                 self.assertEqual(len(tasks), validation["angle_count"])
                 self.assertTrue(all(task["angle_id"] for task in tasks))
                 for task in tasks:
+                    lowered_query = task["query"].lower()
+                    for token in fixture["critical_query_tokens"]:
+                        self.assertIn(token.lower(), lowered_query)
                     for field in (
                         "query",
                         "route",
@@ -367,6 +377,40 @@ class SemanticPlannerTests(unittest.TestCase):
             [task["route"] for task in evidence["search_tasks"]],
             ["text_only", "visual_required", "visual_optional"],
         )
+
+    def test_route_override_preserves_semantic_fanout_and_overrides_routes(self) -> None:
+        result = prepare_run(
+            question=SEMANTIC_FIXTURES[0]["question"],
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+        )
+        run_dir = Path(result["run_dir"])
+        evidence = self.load_json(run_dir / "evidence.json")
+
+        self.assertEqual(evidence["semantic_planner"]["source"], "semantic")
+        self.assertEqual(evidence["semantic_planner"]["question_class"], "technical_api")
+        self.assertGreaterEqual(len(evidence["semantic_angles"]), 5)
+        self.assertLessEqual(len(evidence["semantic_angles"]), 8)
+        self.assertTrue(all(angle["route"] == "text_only" for angle in evidence["semantic_angles"]))
+
+        planned = plan_research_tasks(run=run_dir, min_tasks=1)
+        self.assertEqual(len(planned["tasks"]), len(evidence["semantic_angles"]))
+        self.assertTrue(all(task["route"] == "text_only" for task in planned["tasks"]))
+        for task in planned["tasks"]:
+            lowered_query = task["query"].lower()
+            for token in SEMANTIC_FIXTURES[0]["critical_query_tokens"]:
+                self.assertIn(token.lower(), lowered_query)
+
+    def test_visual_evidence_terms_win_over_implementation_wording(self) -> None:
+        result = prepare_run(
+            question="UI screenshot comparison implementation strategy 조사",
+            runs_dir=self.temp_runs_dir(),
+        )
+        evidence = self.load_json(Path(result["run_dir"]) / "evidence.json")
+        routes = [angle["route"] for angle in evidence["semantic_angles"]]
+
+        self.assertEqual(evidence["semantic_planner"]["question_class"], "visual_style")
+        self.assertIn("visual_required", routes)
 
 
 if __name__ == "__main__":

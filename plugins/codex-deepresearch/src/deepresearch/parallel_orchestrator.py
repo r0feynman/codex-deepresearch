@@ -687,6 +687,7 @@ def _semantic_task_query(
     question: str,
     occurrence: int,
 ) -> str:
+    question_context = str(task.get("question_context") or question or "").strip()
     research_question = str(
         task.get("research_question")
         or task.get("query")
@@ -699,12 +700,18 @@ def _semantic_task_query(
     expected_artifacts = _string_list(task.get("expected_artifacts"))
     artifact_hint = expected_artifacts[(occurrence - 1) % len(expected_artifacts)] if expected_artifacts else "evidence notes"
     normalized = " ".join(research_question.split()) or "research question"
+    context_prefix = (
+        f"Original question context: {question_context}. "
+        if question_context
+        else ""
+    )
     if occurrence <= 1:
-        return f"{title}: {normalized} Evidence need={evidence_need}; artifact={artifact_hint}."
+        return f"{title}: {context_prefix}{normalized} Evidence need={evidence_need}; artifact={artifact_hint}."
     variant = _TASK_QUERY_VARIANTS[(occurrence - 2) % len(_TASK_QUERY_VARIANTS)]
     return (
-        f"{title} / {variant}: investigate {artifact_hint} for report section "
-        f"{report_section}. Evidence need={evidence_need}; avoid repeating the root question."
+        f"{title} / {variant}: {context_prefix}Angle focus: {normalized}. "
+        f"Investigate {artifact_hint} for report section {report_section}. "
+        f"Evidence need={evidence_need}; occurrence={occurrence:03d}."
     )
 
 
@@ -1102,7 +1109,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
                     {"task_id": task["id"], "duplicate_id": source.get("id"), "kept_id": existing_id}
                 )
                 continue
-            source_copy = dict(source)
+            source_copy = _with_task_angle_metadata(source, task)
             new_id = _canonical_artifact_id(
                 old_id,
                 used_source_ids,
@@ -1115,7 +1122,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             id_map[old_id] = new_id
 
         for image in _list(shard.get("images")):
-            image_copy = dict(image)
+            image_copy = _with_task_angle_metadata(image, task)
             old_id = str(image_copy.get("id") or "")
             if image_copy.get("source_id") in id_map:
                 image_copy["source_id"] = id_map[str(image_copy["source_id"])]
@@ -1140,6 +1147,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
 
         for claim in _list(shard.get("claims")):
             claim_copy = _remap_claim_refs(claim, id_map)
+            claim_copy = _with_task_angle_metadata(claim_copy, task)
             old_id = str(claim.get("id") or "")
             if not _claim_is_mergeable(claim_copy):
                 claim_dedupe.append(
@@ -3174,6 +3182,26 @@ def _remap_claim_refs(claim: Mapping[str, Any], id_map: Mapping[str, str]) -> di
         votes.append(vote_copy)
     claim_copy["votes"] = votes
     return claim_copy
+
+
+def _with_task_angle_metadata(
+    record: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    enriched = dict(record)
+    defaults = {
+        "angle_id": task.get("angle_id"),
+        "route": task.get("route"),
+        "source_task_id": task.get("id"),
+        "report_section": task.get("report_section"),
+        "expected_evidence": list(task.get("expected_evidence") or []),
+    }
+    for key, value in defaults.items():
+        if key in enriched and enriched.get(key):
+            continue
+        if value:
+            enriched[key] = value
+    return enriched
 
 
 def _claim_is_mergeable(claim: Mapping[str, Any]) -> bool:

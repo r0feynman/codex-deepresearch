@@ -79,6 +79,7 @@ class SemanticAngle:
     angle_id: str
     title: str
     research_question: str
+    question_context: str
     route: str
     evidence_need: str
     expected_artifacts: list[str]
@@ -137,6 +138,7 @@ def plan_semantic_angles(
             angle_id="angle_001",
             title="Primary source discovery",
             research_question="Find authoritative sources that directly answer the research question.",
+            question_context=normalized_question,
             route="text_only",
             evidence_need="primary_source",
             expected_artifacts=["source list", "supporting quotes"],
@@ -161,6 +163,7 @@ def plan_semantic_angles(
             angle_id=f"angle_{index:03d}",
             title=template["title"],
             research_question=template["research_question"],
+            question_context=normalized_question,
             route=template["route"],
             evidence_need=template["evidence_need"],
             expected_artifacts=list(template["expected_artifacts"]),
@@ -181,6 +184,8 @@ def plan_semantic_angles(
 
 def classify_question(question: str) -> str:
     text = question.lower()
+    if _mentions_explicit_visual_evidence(text):
+        return _CLASS_VISUAL
     if _contains_any(
         text,
         (
@@ -406,6 +411,18 @@ def question_mentions_visual_evidence(question: str) -> bool:
     return _contains_any(question.lower(), _VISUAL_KEYWORDS)
 
 
+def _mentions_explicit_visual_evidence(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b("
+            r"ui|screenshot(s)?|screen(s)?|interface|chart(s)?|graph(s)?|"
+            r"image[- ]quality|visual evidence|visual comparison|image comparison"
+            r")\b",
+            text,
+        )
+    )
+
+
 def _normalize_explicit_angles(angles: Sequence[str]) -> list[str]:
     normalized = [" ".join(angle.strip().split()) for angle in angles if angle.strip()]
     if not normalized:
@@ -424,6 +441,7 @@ def _explicit_angle_record(
         angle_id=f"angle_{index:03d}",
         title=angle,
         research_question=f"Investigate {angle}.",
+        question_context="",
         route="text_only",
         evidence_need=evidence_need,
         expected_artifacts=_default_expected_artifacts(evidence_need),
@@ -760,6 +778,7 @@ def _semantic_angles_from_evidence(evidence: Mapping[str, Any]) -> list[dict[str
 def _normalized_angle_record(record: Mapping[str, Any], index: int) -> dict[str, Any]:
     title = str(record.get("title") or record.get("angle") or f"Angle {index}")
     research_question = str(record.get("research_question") or title)
+    question_context = str(record.get("question_context") or "")
     route = str(record.get("route") or record.get("modality") or "text_only")
     evidence_need = str(record.get("evidence_need") or _infer_evidence_need(title))
     expected_artifacts = _string_list(record.get("expected_artifacts"))
@@ -772,6 +791,7 @@ def _normalized_angle_record(record: Mapping[str, Any], index: int) -> dict[str,
         "angle_id": str(record.get("angle_id") or record.get("id") or f"angle_{index:03d}"),
         "title": title,
         "research_question": research_question,
+        "question_context": question_context,
         "route": route,
         "evidence_need": evidence_need,
         "expected_artifacts": expected_artifacts,

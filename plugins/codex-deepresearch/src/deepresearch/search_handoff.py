@@ -101,11 +101,7 @@ def prepare_run(
 
     semantic_plan = plan_semantic_angles(
         question=normalized_question,
-        explicit_angles=(
-            ["primary source discovery"]
-            if angles is None and route is not None
-            else angles
-        ),
+        explicit_angles=angles,
     )
     decisions = []
     for semantic_angle in semantic_plan.angles:
@@ -665,6 +661,7 @@ def _routing_record(
             {
                 "title": semantic_angle.title,
                 "research_question": semantic_angle.research_question,
+                "question_context": getattr(semantic_angle, "question_context", ""),
                 "route": decision.modality,
                 "evidence_need": semantic_angle.evidence_need,
                 "expected_artifacts": list(semantic_angle.expected_artifacts),
@@ -684,6 +681,7 @@ def _semantic_angle_evidence_record(route_record: Mapping[str, Any]) -> dict[str
         "angle_id": route_record["id"],
         "title": route_record.get("title") or route_record["angle"],
         "research_question": route_record.get("research_question") or route_record["angle"],
+        "question_context": route_record.get("question_context") or "",
         "route": route_record["modality"],
         "evidence_need": route_record.get("evidence_need") or "primary_source",
         "expected_artifacts": list(route_record.get("expected_artifacts", [])),
@@ -768,6 +766,7 @@ def _search_task(
         "angle": angle,
         "title": route_record.get("title") or angle,
         "research_question": route_record.get("research_question") or angle,
+        "question_context": route_record.get("question_context") or question,
         "query": query,
         "evidence_need": route_record.get("evidence_need") or "primary_source",
         "expected_artifacts": list(route_record.get("expected_artifacts", [])),

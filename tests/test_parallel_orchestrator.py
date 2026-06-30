@@ -28,6 +28,7 @@ from deepresearch import (  # noqa: E402
     prepare_run,
     read_trace_records,
     run_parallel_orchestration,
+    synthesize_report,
     validate_artifacts,
     validate_trace_file,
 )
@@ -47,7 +48,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
 
     def prepare(self, *, route: str = "text_only", budget: str = "standard") -> Path:
         prepared = prepare_run(
-            question="Research a broad private alpha launch with competitors, policies, visuals, and pricing.",
+            question="Research a deterministic orchestration fixture.",
             runs_dir=self.temp_runs_dir(),
             route=route,
             budget_preset=budget,
@@ -1273,6 +1274,38 @@ class ParallelOrchestratorTests(unittest.TestCase):
             self.assertIn(claim["votes"][0]["evidence_refs"][0], source_ids)
             self.assertIn(claim["votes"][0]["evidence_refs"][1], image_ids)
         self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_backfills_missing_angle_metadata_before_report_counts(self) -> None:
+        run_dir = self.prepare()
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        shard = self.shard(run_dir, task)
+        shard["claims"][0]["promotion_status"] = "eligible"
+        for record in [*shard["sources"], *shard["images"], *shard["claims"]]:
+            record.pop("angle_id", None)
+            record.pop("route", None)
+            record.pop("source_task_id", None)
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, shard)
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(report["status"], "completed", report)
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["sources"][0]["angle_id"], task["angle_id"])
+        self.assertEqual(evidence["images"][0]["angle_id"], task["angle_id"])
+        self.assertEqual(evidence["claims"][0]["angle_id"], task["angle_id"])
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assertEqual(
+            validation["report_angle_claim_counts"].get(task["angle_id"]),
+            1,
+        )
 
     def test_completed_task_requires_schema_valid_shard(self) -> None:
         run_dir = self.prepare()
