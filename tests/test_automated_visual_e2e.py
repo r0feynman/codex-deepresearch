@@ -583,6 +583,7 @@ class AutomatedVisualE2ETests(unittest.TestCase):
             "plan_id": "plan_visual_001",
             "task_id": task_id,
             "angle_id": angle_id,
+            "route": "visual_required",
             "provider": provider,
             "provider_kind": provider_kind,
             "provider_mode": "real",
@@ -616,8 +617,10 @@ class AutomatedVisualE2ETests(unittest.TestCase):
         return {
             "fetch_id": f"fetch_real_{index:03d}",
             "candidate_id": candidate["candidate_id"],
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "provider": candidate["provider"],
             "provider_kind": candidate["provider_kind"],
             "provider_mode": candidate["provider_mode"],
@@ -653,11 +656,21 @@ class AutomatedVisualE2ETests(unittest.TestCase):
         verifier_links = []
         report_links = []
         if claim_id:
+            link_lineage = {
+                "plan_id": candidate["plan_id"],
+                "task_id": candidate["task_id"],
+                "angle_id": candidate["angle_id"],
+                "route": candidate["route"],
+                "candidate_id": candidate["candidate_id"],
+                "fetch_id": fetch["fetch_id"],
+                "evidence_image_id": evidence_image_id,
+            }
             verifier_links.append(
                 {
                     "claim_id": claim_id,
                     "visual_support_ref": f"images.{evidence_image_id}.observations[0]",
                     "verifier_vote_id": vote_id,
+                    **link_lineage,
                 }
             )
             report_links.append(
@@ -665,13 +678,16 @@ class AutomatedVisualE2ETests(unittest.TestCase):
                     "claim_id": claim_id,
                     "report_section_id": "findings",
                     "citation_id": f"img:{evidence_image_id}",
+                    **link_lineage,
                 }
             )
         return {
             "observation_id": f"obs_{evidence_image_id}",
             "evidence_image_id": evidence_image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "provider": "openai-responses-vision",
@@ -707,8 +723,10 @@ class AutomatedVisualE2ETests(unittest.TestCase):
     ) -> dict[str, Any]:
         return {
             "id": evidence_image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "local_artifact_path": fetch["local_artifact_path"],

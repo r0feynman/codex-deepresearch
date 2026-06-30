@@ -595,9 +595,10 @@ def _fetch_record(
     return {
         "fetch_id": f"fetch_sanitized_real_{index:03d}",
         "candidate_id": candidate["candidate_id"],
+        "plan_id": candidate["plan_id"],
         "task_id": candidate["task_id"],
         "angle_id": candidate["angle_id"],
-        "route": "visual_required",
+        "route": candidate["route"],
         "source_id": SANITIZED_REAL_SOURCE_ID,
         "source_search_result_id": SANITIZED_REAL_SEARCH_RESULT_ID,
         "provider": candidate["provider"],

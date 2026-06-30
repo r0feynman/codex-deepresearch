@@ -350,6 +350,7 @@ class PageImageExtractionTests(unittest.TestCase):
             image for image in evidence["images"] if image["candidate_origin"] == "open_graph"
         )
         self.assertEqual(og_image["origin"], "page_image")
+        self.assertEqual(og_image["html_origin"], "open_graph")
         self.assertTrue(og_image["observations"])
         self.assertTrue(og_image["hash"].startswith("sha256:"))
         self.assertTrue(og_image["phash"].startswith("phash:"))
@@ -364,6 +365,15 @@ class PageImageExtractionTests(unittest.TestCase):
             self.assertTrue(record["dedupe_target_fetch_id"])
 
         candidate_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+        og_candidate = next(
+            candidate for candidate in candidates if candidate["candidate_origin"] == "open_graph"
+        )
+        self.assertEqual(og_candidate["origin"], "page_image")
+        self.assertEqual(og_candidate["html_origin"], "open_graph")
+        og_fetch = next(fetch for fetch in fetches if fetch["candidate_id"] == og_candidate["candidate_id"])
+        self.assertEqual(og_fetch["origin"], "page_image")
+        self.assertEqual(og_fetch["candidate_origin"], "open_graph")
+        self.assertEqual(og_fetch["html_origin"], "open_graph")
         policy_blocks = {
             record["failure_code"]: candidate_by_id[record["candidate_id"]]
             for record in fetches
@@ -393,6 +403,167 @@ class PageImageExtractionTests(unittest.TestCase):
             visual_validation.valid,
             [error.to_dict() for error in visual_validation.errors],
         )
+
+    def test_real_mode_fetches_remote_source_html_when_local_artifact_missing_or_empty(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Recover page images from reachable remote source HTML",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        tiny_page = run_dir / "sources" / "tiny-page.html"
+        tiny_page.write_text("<html><body>No images here.</body></html>", encoding="utf-8")
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_missing_remote_page",
+                "type": "web",
+                "url": "https://science.example.test/missing-source/",
+                "title": "Missing local source",
+                "published_at": None,
+                "accessed_at": "2026-06-30T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/missing-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "search_result_id": "search_missing_remote_page",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            },
+            {
+                "id": "src_tiny_remote_page",
+                "type": "web",
+                "url": "https://science.example.test/tiny-source/",
+                "title": "Tiny local source",
+                "published_at": None,
+                "accessed_at": "2026-06-30T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/tiny-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "search_result_id": "search_tiny_remote_page",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            },
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        remote_html = {
+            "https://science.example.test/missing-source/": """
+                <html><body>
+                  <img src="/media/missing-a.png" alt="Missing remote A">
+                  <img src="/media/missing-b.png" alt="Missing remote B">
+                </body></html>
+            """,
+            "https://science.example.test/tiny-source/": """
+                <html><head>
+                  <meta property="og:image" content="/media/tiny-og.png">
+                </head><body></body></html>
+            """,
+        }
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            if url in remote_html:
+                return FetchResponse(
+                    content=remote_html[url].encode("utf-8"),
+                    mime_type="text/html",
+                    status_code=200,
+                    final_url=url,
+                )
+            return FetchResponse(
+                content=PNG_1X1 + url.encode("utf-8"),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = extract_and_fetch_page_images(
+            run=run_dir,
+            transport=transport,
+            provider_mode="real",
+            max_fetches=3,
+        )
+
+        self.assertEqual(result["remote_page_fetches"], 2)
+        self.assertEqual(result["remote_page_fetch_status_counts"], {"fetched": 2})
+        self.assertEqual(result["candidate_records"], 3)
+        self.assertEqual(result["images_linked"], 3)
+        self.assertEqual(calls[:2], list(remote_html))
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        self.assertEqual({candidate["provider"] for candidate in candidates}, {"page-image-extractor"})
+        self.assertEqual(
+            {candidate["provider_provenance"]["page_html_source"] for candidate in candidates},
+            {"remote_fetch"},
+        )
+        self.assertTrue(
+            {
+                "https://science.example.test/media/missing-a.png",
+                "https://science.example.test/media/missing-b.png",
+                "https://science.example.test/media/tiny-og.png",
+            }.issubset({candidate["image_url"] for candidate in candidates})
+        )
+        provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
+        provider = provider_status["providers"][0]
+        self.assertTrue(provider["external_network_call"])
+        self.assertEqual(provider["diagnostics"]["remote_page_fetches"], 2)
+
+    def test_fixture_mode_does_not_fetch_remote_source_html_for_missing_local_artifact(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Fixture mode should remain no-network",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_missing_fixture_page",
+                "type": "web",
+                "url": "https://science.example.test/missing-source/",
+                "title": "Missing local source",
+                "published_at": None,
+                "accessed_at": "2026-06-30T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/missing-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            raise AssertionError(f"unexpected network fixture call: {url}")
+
+        result = extract_and_fetch_page_images(
+            run=run_dir,
+            transport=transport,
+            provider_mode="fixture",
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["page_sources_scanned"], 0)
+        self.assertEqual(result["remote_page_fetches"], 0)
+        self.assertEqual(result["candidate_records"], 0)
+        self.assertEqual(result["images_linked"], 0)
 
     def test_remote_page_file_url_is_policy_blocked_without_local_read(self) -> None:
         prepared = prepare_run(

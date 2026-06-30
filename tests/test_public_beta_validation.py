@@ -993,8 +993,10 @@ class PublicBetaValidationTests(unittest.TestCase):
     def visual_candidate_record(self) -> dict[str, Any]:
         return {
             "candidate_id": "cand_real_001",
+            "plan_id": "plan_task_visual_001_angle_001_visual_required",
             "task_id": "task_visual_001",
             "angle_id": "angle_001",
+            "route": "visual_required",
             "provider": "codex-native",
             "provider_kind": "web_image_search",
             "provider_mode": "real",
@@ -1020,8 +1022,10 @@ class PublicBetaValidationTests(unittest.TestCase):
         return {
             "fetch_id": "fetch_real_001",
             "candidate_id": candidate["candidate_id"],
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "provider": candidate["provider"],
             "provider_kind": candidate["provider_kind"],
             "provider_mode": "real",
@@ -1044,11 +1048,22 @@ class PublicBetaValidationTests(unittest.TestCase):
         *,
         image_id: str,
     ) -> dict[str, Any]:
+        link_lineage = {
+            "plan_id": candidate["plan_id"],
+            "task_id": candidate["task_id"],
+            "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
+            "candidate_id": candidate["candidate_id"],
+            "fetch_id": fetch["fetch_id"],
+            "evidence_image_id": image_id,
+        }
         return {
             "observation_id": "obs_real_001",
             "evidence_image_id": image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "provider": "codex-interactive",
@@ -1075,6 +1090,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "claim_id": "claim_visual_001",
                     "visual_support_ref": f"images.{image_id}.observations[0]",
                     "verifier_vote_id": "vote_visual_001",
+                    **link_lineage,
                 }
             ],
             "report_links": [
@@ -1082,6 +1098,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "claim_id": "claim_visual_001",
                     "report_section_id": "findings",
                     "citation_id": f"img:{image_id}",
+                    **link_lineage,
                 }
             ],
         }

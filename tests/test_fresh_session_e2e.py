@@ -926,6 +926,21 @@ class FreshSessionE2ETests(unittest.TestCase):
         self._write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
         self._write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
         self._write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        primary_visual_support = {
+            "image_id": "img_real_001",
+            "evidence_image_id": "img_real_001",
+            "observation_ref": "images.img_real_001.observations[0]",
+            "observation_index": 0,
+            "observation_text": images[0]["observations"][0],
+            "provider": "codex-interactive",
+            "confidence": 0.92,
+            "plan_id": images[0]["plan_id"],
+            "task_id": images[0]["task_id"],
+            "angle_id": images[0]["angle_id"],
+            "route": images[0]["route"],
+            "candidate_id": images[0]["candidate_id"],
+            "fetch_id": images[0]["fetch_id"],
+        }
         self._write_json(
             run_dir / "visual_provider_status.json",
             {
@@ -989,16 +1004,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                         "claim_type": "visual",
                         "supporting_sources": [],
                         "supporting_images": ["img_real_001"],
-                        "visual_supports": [
-                            {
-                                "image_id": "img_real_001",
-                                "observation_ref": "images.img_real_001.observations[0]",
-                                "observation_index": 0,
-                                "observation_text": images[0]["observations"][0],
-                                "provider": "codex-interactive",
-                                "confidence": 0.92,
-                            }
-                        ],
+                        "visual_supports": [primary_visual_support],
                         "quote_spans": [],
                         "votes": [{"id": vote_id}],
                         "verification_status": "supported",
@@ -1021,12 +1027,7 @@ class FreshSessionE2ETests(unittest.TestCase):
                         "claim_id": claim_id,
                         "claim_type": "visual",
                         "image_ids": ["img_real_001"],
-                        "visual_supports": [
-                            {
-                                "image_id": "img_real_001",
-                                "observation_ref": "images.img_real_001.observations[0]",
-                            }
-                        ],
+                        "visual_supports": [primary_visual_support],
                     }
                 ],
             },
@@ -1172,6 +1173,7 @@ class FreshSessionE2ETests(unittest.TestCase):
             "plan_id": "plan_visual_001",
             "task_id": task_id,
             "angle_id": angle_id,
+            "route": "visual_required",
             "provider": "page-image-extractor",
             "provider_kind": "page_extractor",
             "provider_mode": "real",
@@ -1198,8 +1200,10 @@ class FreshSessionE2ETests(unittest.TestCase):
         return {
             "fetch_id": fetch_id,
             "candidate_id": candidate["candidate_id"],
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "provider": candidate["provider"],
             "provider_kind": candidate["provider_kind"],
             "provider_mode": candidate["provider_mode"],
@@ -1235,11 +1239,21 @@ class FreshSessionE2ETests(unittest.TestCase):
         verifier_links = []
         report_links = []
         if claim_id:
+            link_lineage = {
+                "plan_id": candidate["plan_id"],
+                "task_id": candidate["task_id"],
+                "angle_id": candidate["angle_id"],
+                "route": candidate["route"],
+                "candidate_id": candidate["candidate_id"],
+                "fetch_id": fetch["fetch_id"],
+                "evidence_image_id": evidence_image_id,
+            }
             verifier_links.append(
                 {
                     "claim_id": claim_id,
                     "visual_support_ref": f"images.{evidence_image_id}.observations[0]",
                     "verifier_vote_id": vote_id,
+                    **link_lineage,
                 }
             )
             report_links.append(
@@ -1247,13 +1261,16 @@ class FreshSessionE2ETests(unittest.TestCase):
                     "claim_id": claim_id,
                     "report_section_id": "visual-findings",
                     "citation_id": f"img:{evidence_image_id}",
+                    **link_lineage,
                 }
             )
         return {
             "observation_id": f"obs_{evidence_image_id}",
             "evidence_image_id": evidence_image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "provider": "codex-interactive",
@@ -1300,6 +1317,8 @@ class FreshSessionE2ETests(unittest.TestCase):
             "caveats": [],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
+            "plan_id": candidate["plan_id"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "hash": fetch["hash"],

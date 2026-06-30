@@ -722,12 +722,24 @@ def _persist_visual_observation_verifier_links(
             if not isinstance(image_id, str) or not isinstance(observation_ref, str):
                 continue
             for vote_id in vote_ids:
+                link = {
+                    "claim_id": claim_id,
+                    "visual_support_ref": observation_ref,
+                    "verifier_vote_id": vote_id,
+                }
+                for field in (
+                    "plan_id",
+                    "task_id",
+                    "angle_id",
+                    "route",
+                    "candidate_id",
+                    "fetch_id",
+                    "evidence_image_id",
+                ):
+                    if isinstance(support.get(field), str) and support[field]:
+                        link[field] = support[field]
                 links_by_image_id.setdefault(image_id, []).append(
-                    {
-                        "claim_id": claim_id,
-                        "visual_support_ref": observation_ref,
-                        "verifier_vote_id": vote_id,
-                    }
+                    link
                 )
 
     if not links_by_image_id:

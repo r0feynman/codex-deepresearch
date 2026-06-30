@@ -146,6 +146,112 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertEqual(counts["real_observations"], 3)
         self.assertGreaterEqual(counts["excluded_non_real_provider_records"], 3)
 
+    def test_multi_angle_visual_lineage_fixture_validates_full_chain(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+        research_tasks = self.read_json(run_dir / "research_tasks.json")["tasks"]
+        plans = self.read_json(run_dir / VISUAL_SEARCH_PLAN_FILENAME)["tasks"]
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        evidence = self.read_json(run_dir / "evidence.json")
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        report_status = self.read_json(run_dir / "report_status.json")
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+
+        self.assertEqual(len(research_tasks), 3)
+        self.assertEqual(len(plans), 3)
+        self.assertEqual(len(candidates), 10)
+        self.assertEqual(len(fetches), 3)
+        self.assertEqual(len(evidence["images"]), 3)
+        self.assertEqual(len(observations), 3)
+        self.assertGreaterEqual(len(report_status["used_images"]), 1)
+        self.assertIn(report_status["used_images"][0], report)
+
+        self.assert_unique(plans, "plan_id")
+        self.assert_unique(candidates, "candidate_id")
+        self.assert_unique(fetches, "fetch_id")
+        self.assert_unique(evidence["images"], "id")
+        self.assert_unique(observations, "observation_id")
+
+        plan_by_id = {record["plan_id"]: record for record in plans}
+        candidate_by_id = {record["candidate_id"]: record for record in candidates}
+        fetch_by_id = {record["fetch_id"]: record for record in fetches}
+        image_by_id = {record["id"]: record for record in evidence["images"]}
+        for candidate in candidates:
+            plan = plan_by_id[candidate["plan_id"]]
+            self.assert_lineage(candidate, plan)
+        for fetch in fetches:
+            candidate = candidate_by_id[fetch["candidate_id"]]
+            self.assert_lineage(fetch, candidate)
+            image = image_by_id[fetch["evidence_image_id"]]
+            self.assert_lineage(image, fetch)
+        for observation in observations:
+            fetch = fetch_by_id[observation["fetch_id"]]
+            self.assert_lineage(observation, fetch)
+            self.assert_lineage(observation["verifier_links"][0], observation)
+            self.assert_lineage(observation["report_links"][0], observation)
+
+        included_claim = report_status["included_claims"][0]
+        support = included_claim["visual_supports"][0]
+        image = image_by_id[support["image_id"]]
+        self.assert_lineage(support, image)
+
+    def test_multi_angle_visual_lineage_reports_specific_error_classes(self) -> None:
+        cases = {
+            "duplicate_id": self.break_duplicate_plan_id,
+            "angle_mismatch": self.break_fetch_angle,
+            "route_mismatch": self.break_observation_route,
+        }
+        for expected_code, mutator in cases.items():
+            with self.subTest(expected_code=expected_code):
+                run_dir = self.write_multi_angle_lineage_fixture()
+                mutator(run_dir)
+
+                result = validate_visual_artifacts(run_dir=run_dir)
+
+                self.assertFalse(result.valid)
+                self.assertIn(expected_code, {error.code for error in result.errors})
+
+    def test_observation_link_lineage_mismatches_fail_validation(self) -> None:
+        cases = (
+            ("verifier_links", "angle_id", "angle_999", "angle_mismatch"),
+            ("report_links", "route", "text_only", "route_mismatch"),
+        )
+        for link_type, field, bad_value, expected_code in cases:
+            with self.subTest(link_type=link_type, field=field):
+                run_dir = self.write_multi_angle_lineage_fixture()
+                observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+                observations[0][link_type][0][field] = bad_value
+                self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+                result = validate_visual_artifacts(run_dir=run_dir)
+
+                self.assertFalse(result.valid)
+                self.assertIn(expected_code, {error.code for error in result.errors})
+
+    def test_verifier_link_missing_lineage_fails_validation(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["verifier_links"][0] = {
+            "claim_id": "claim_multi_visual_001",
+            "visual_support_ref": "images.img_multi_001.observations[0]",
+            "verifier_vote_id": "vote_multi_001",
+        }
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        missing = [error for error in result.errors if error.code == "missing_lineage"]
+        self.assertTrue(missing, [error.to_dict() for error in result.errors])
+        self.assertIn(
+            "$.visual_observations[0].verifier_links[0].plan_id",
+            {error.path for error in missing},
+        )
+
     def test_run_dir_validation_requires_phase3_visual_artifacts(self) -> None:
         for filename, expected_path in (
             (VISUAL_SEARCH_PLAN_FILENAME, "$.visual_search_plan"),
@@ -880,6 +986,272 @@ class VisualArtifactTests(unittest.TestCase):
         self.write_json(run_dir / "report_status.json", report_status_payload)
         return run_dir
 
+    def write_multi_angle_lineage_fixture(self) -> Path:
+        run_dir = self.temp_dir() / "dr_multi_angle_visual_lineage_fixture"
+        run_dir.mkdir()
+        run_id = run_dir.name
+        created_at = "2026-06-30T00:00:00Z"
+        tasks = [
+            {
+                "id": f"task_visual_{index:03d}",
+                "angle_id": f"angle_{index:03d}",
+                "route": "visual_required",
+                "query": f"multi angle visual lineage {index}",
+            }
+            for index in range(1, 4)
+        ]
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.parallel.v0",
+                "run_id": run_id,
+                "created_at": created_at,
+                "tasks": tasks,
+            },
+        )
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.search-handoff.v0",
+                "run_id": run_id,
+                "created_at": created_at,
+                "tasks": [
+                    {
+                        "id": task["id"],
+                        "angle_id": task["angle_id"],
+                        "route": task["route"],
+                    }
+                    for task in tasks
+                ],
+            },
+        )
+        plans = []
+        candidates = []
+        fetches = []
+        observations = []
+        images = []
+        image_ids = []
+        candidate_index = 1
+        for task_index, task in enumerate(tasks, start=1):
+            plan_id = self.plan_id(task["id"], task["angle_id"], task["route"])
+            plans.append(
+                {
+                    "plan_id": plan_id,
+                    "task_id": task["id"],
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "target_evidence_type": "web_image",
+                    "query": task["query"],
+                    "providers": ["child-discovered-image-url"],
+                    "source_search_result_ids": [],
+                    "caps": {
+                        "max_candidates": 4,
+                        "max_fetches": 1,
+                        "max_vlm_images": 1,
+                        "max_cost_usd": 0.25,
+                    },
+                    "policy_constraints": {"robots": "allowed"},
+                    "estimated_cost_usd": 0.03,
+                    "state": "completed",
+                }
+            )
+            candidates_for_task = 4 if task_index == 1 else 3
+            for local_index in range(1, candidates_for_task + 1):
+                candidate = self.candidate_record(
+                    candidate_id=f"cand_multi_{candidate_index:03d}",
+                    task_id=task["id"],
+                    angle_id=task["angle_id"],
+                    route=task["route"],
+                    plan_id=plan_id,
+                    provider="child-discovered-image-url",
+                    provider_kind="web_image_search",
+                    provider_mode="real",
+                    status="analyzed" if local_index == 1 else "discovered",
+                )
+                candidates.append(candidate)
+                if local_index == 1:
+                    image_id = f"img_multi_{task_index:03d}"
+                    image_ids.append(image_id)
+                    fetch = self.fetch_record(
+                        candidate=candidate,
+                        fetch_id=f"fetch_multi_{task_index:03d}",
+                        evidence_image_id=image_id,
+                    )
+                    fetches.append(fetch)
+                    observations.append(
+                        self.observation_record(
+                            candidate=candidate,
+                            fetch_id=fetch["fetch_id"],
+                            evidence_image_id=image_id,
+                            claim_id="claim_multi_visual_001",
+                            verifier_vote_id=f"vote_multi_{task_index:03d}",
+                            provider="codex-interactive",
+                            provider_kind="vlm",
+                            provider_mode="real",
+                        )
+                    )
+                    images.append(
+                        self.evidence_image(
+                            candidate=candidate,
+                            fetch=fetch,
+                            evidence_image_id=image_id,
+                        )
+                    )
+                candidate_index += 1
+        self.write_json(
+            run_dir / VISUAL_SEARCH_PLAN_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_id,
+                "created_at": created_at,
+                "tasks": plans,
+            },
+        )
+        self.write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, candidates)
+        self.write_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME, fetches)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        visual_supports = [
+            {
+                "image_id": image["id"],
+                "evidence_image_id": image["id"],
+                "observation_ref": f"images.{image['id']}.observations[0]",
+                "observation_index": 0,
+                "observation_text": image["observations"][0],
+                "relation_type": "visual_match",
+                "provider": "codex-interactive",
+                "plan_id": image["plan_id"],
+                "task_id": image["task_id"],
+                "angle_id": image["angle_id"],
+                "route": image["route"],
+                "candidate_id": image["candidate_id"],
+                "fetch_id": image["fetch_id"],
+                "confidence": 0.86,
+            }
+            for image in images
+        ]
+        evidence_payload = {
+            "schema_version": "0.1.0",
+            "run_id": run_id,
+            "created_at": created_at,
+            "question": "Multi-angle visual lineage fixture",
+            "mode": "codex-plugin",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+            "routing": [
+                {
+                    "id": task["angle_id"],
+                    "modality": task["route"],
+                    "task_id": task["id"],
+                    "max_images": 4,
+                }
+                for task in tasks
+            ],
+            "search_tasks": [],
+            "images": images,
+            "claims": [
+                {
+                    "id": "claim_multi_visual_001",
+                    "text": "The multi-angle visual fixture has cited image-backed evidence.",
+                    "claim_type": "mixed",
+                    "supporting_sources": [],
+                    "supporting_images": image_ids,
+                    "visual_supports": visual_supports,
+                    "quote_spans": [],
+                    "votes": [{"id": f"vote_multi_{index:03d}"} for index in range(1, 4)],
+                    "verification_status": "supported",
+                    "review_status": "human_accepted",
+                    "promotion_status": "promoted_memory",
+                    "confidence": "high",
+                    "caveats": [],
+                }
+            ],
+        }
+        report_status_payload = {
+            "status": "completed",
+            "used_images": [image_ids[0]],
+            "included_claims": [
+                {
+                    "claim_id": "claim_multi_visual_001",
+                    "claim_type": "mixed",
+                    "verification_status": "supported",
+                    "image_ids": [image_ids[0]],
+                    "visual_supports": [visual_supports[0]],
+                }
+            ],
+        }
+        minimums = visual_release_minimums(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            evidence=evidence_payload,
+            report_status=report_status_payload,
+        )
+        self.write_json(
+            run_dir / VISUAL_PROVIDER_STATUS_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-provider-status.v0",
+                "run_id": run_id,
+                "status": "completed_auto_visual",
+                "ok": True,
+                "terminal": True,
+                "metric_classification": "success",
+                "minimums": minimums,
+                "providers": [
+                    self.provider_status(
+                        provider="child-discovered-image-url",
+                        provider_kind="web_image_search",
+                        provider_mode="real",
+                        invocations=3,
+                        candidates_discovered=10,
+                        artifacts_fetched=3,
+                        vlm_images_analyzed=0,
+                    ),
+                    self.provider_status(
+                        provider="codex-interactive",
+                        provider_kind="vlm",
+                        provider_mode="real",
+                        invocations=1,
+                        candidates_discovered=0,
+                        artifacts_fetched=3,
+                        vlm_images_analyzed=3,
+                    ),
+                ],
+            },
+        )
+        self.write_json(run_dir / "evidence.json", evidence_payload)
+        self.write_json(run_dir / "report_status.json", report_status_payload)
+        (run_dir / "report.md").write_text(
+            f"Report cites claim_multi_visual_001 with image {image_ids[0]}.\n",
+            encoding="utf-8",
+        )
+        return run_dir
+
+    def break_duplicate_plan_id(self, run_dir: Path) -> None:
+        plan = self.read_json(run_dir / VISUAL_SEARCH_PLAN_FILENAME)
+        plan["tasks"][1]["plan_id"] = plan["tasks"][0]["plan_id"]
+        self.write_json(run_dir / VISUAL_SEARCH_PLAN_FILENAME, plan)
+
+    def break_fetch_angle(self, run_dir: Path) -> None:
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        fetches[0]["angle_id"] = "angle_999"
+        self.write_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME, fetches)
+
+    def break_observation_route(self, run_dir: Path) -> None:
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["route"] = "text_only"
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+    def plan_id(self, task_id: str, angle_id: str, route: str) -> str:
+        return "plan_" + "_".join((task_id, angle_id, route))
+
+    def assert_unique(self, records: list[dict], field: str) -> None:
+        values = [record[field] for record in records]
+        self.assertEqual(len(values), len(set(values)), field)
+
+    def assert_lineage(self, record: dict, expected: dict) -> None:
+        for field in ("plan_id", "task_id", "angle_id", "route"):
+            self.assertEqual(record[field], expected[field], field)
+
     def candidate_record(
         self,
         *,
@@ -889,12 +1261,16 @@ class VisualArtifactTests(unittest.TestCase):
         provider: str,
         provider_kind: str,
         provider_mode: str,
+        plan_id: str = "plan_visual_001",
+        route: str = "visual_required",
+        status: str = "analyzed",
     ) -> dict:
         return {
             "candidate_id": candidate_id,
-            "plan_id": "plan_visual_001",
+            "plan_id": plan_id,
             "task_id": task_id,
             "angle_id": angle_id,
+            "route": route,
             "provider": provider,
             "provider_kind": provider_kind,
             "provider_mode": provider_mode,
@@ -911,7 +1287,7 @@ class VisualArtifactTests(unittest.TestCase):
             "score": 0.99,
             "policy_decision": "allowed",
             "policy_flags": [],
-            "candidate_status": "analyzed",
+            "candidate_status": status,
             "rejection_reason": None,
             "estimated_cost_usd": 0.01,
             "actual_cost_usd": 0.01,
@@ -921,8 +1297,10 @@ class VisualArtifactTests(unittest.TestCase):
         return {
             "fetch_id": fetch_id,
             "candidate_id": candidate["candidate_id"],
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "provider": candidate["provider"],
             "provider_kind": candidate["provider_kind"],
             "provider_mode": candidate["provider_mode"],
@@ -960,11 +1338,21 @@ class VisualArtifactTests(unittest.TestCase):
         verifier_links = []
         report_links = []
         if claim_id:
+            lineage = {
+                "plan_id": candidate["plan_id"],
+                "task_id": candidate["task_id"],
+                "angle_id": candidate["angle_id"],
+                "route": candidate["route"],
+                "candidate_id": candidate["candidate_id"],
+                "fetch_id": fetch_id,
+                "evidence_image_id": evidence_image_id,
+            }
             verifier_links.append(
                 {
                     "claim_id": claim_id,
                     "visual_support_ref": f"images.{evidence_image_id}.observations[0]",
                     "verifier_vote_id": verifier_vote_id,
+                    **lineage,
                 }
             )
             report_links.append(
@@ -972,6 +1360,7 @@ class VisualArtifactTests(unittest.TestCase):
                     "claim_id": claim_id,
                     "report_section_id": "visual-findings",
                     "citation_id": f"img:{evidence_image_id}",
+                    **lineage,
                 }
             )
         return {
@@ -979,8 +1368,10 @@ class VisualArtifactTests(unittest.TestCase):
             "evidence_image_id": evidence_image_id,
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch_id,
+            "plan_id": candidate["plan_id"],
             "provider": provider,
             "provider_kind": provider_kind,
             "provider_mode": provider_mode,
@@ -1008,8 +1399,10 @@ class VisualArtifactTests(unittest.TestCase):
     def evidence_image(self, *, candidate: dict, fetch: dict, evidence_image_id: str) -> dict:
         return {
             "id": evidence_image_id,
+            "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
             "angle_id": candidate["angle_id"],
+            "route": candidate["route"],
             "candidate_id": candidate["candidate_id"],
             "fetch_id": fetch["fetch_id"],
             "local_artifact_path": fetch["local_artifact_path"],

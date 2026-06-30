@@ -1255,15 +1255,34 @@ def _child_discovered_image_candidates(
         }
         if url_resolution:
             provider_provenance.update(url_resolution)
-        task_id = _string(image.get("task_id")) or _string(route.get("task_id")) or _task_id_for_angle(
-            route.get("id") or image.get("angle_id")
-        )
         angle_id = _string(image.get("angle_id")) or _string(route.get("id")) or "angle_001"
+        angle_route = _route_for_angle(context.routes, angle_id)
+        effective_route = angle_route or route
+        route_name = (
+            _string(image.get("route"))
+            or _string(effective_route.get("modality"))
+            or _string(route.get("modality"))
+            or "visual_required"
+        )
+        task_id = _visual_task_id_for_angle(
+            angle_id=angle_id,
+            routes=context.routes,
+            route=effective_route,
+        )
+        route_visual_tasks = (
+            list(effective_route.get("visual_tasks", []))
+            if isinstance(effective_route.get("visual_tasks"), list)
+            else []
+        )
         candidates.append(
             {
                 "id": candidate_id,
                 "candidate_id": candidate_id,
-                "plan_id": f"plan_{task_id}",
+                "plan_id": _plan_id_for_visual_task(
+                    task_id=task_id,
+                    angle_id=angle_id,
+                    route=route_name,
+                ),
                 "task_id": task_id,
                 "angle_id": angle_id,
                 "source_search_result_id": image.get("source_search_result_id")
@@ -1275,7 +1294,7 @@ def _child_discovered_image_candidates(
                 "provider_mode": "real",
                 "provider_run_id": provider_run_id,
                 "provider_provenance": provider_provenance,
-                "route": _string(image.get("route")) or _string(route.get("modality")) or "visual_required",
+                "route": route_name,
                 "candidate_class": "child_discovered_image_url",
                 "origin": _string(image.get("origin")) or "image_search",
                 "candidate_origin": _string(image.get("origin")) or "image_search",
@@ -1290,10 +1309,7 @@ def _child_discovered_image_candidates(
                 "surrounding_text": _string(image.get("surrounding_text")),
                 "phash_hint": _string(image.get("phash")),
                 "visual_tasks": _dedupe(
-                    _string_list(image.get("visual_tasks"))
-                    + list(route.get("visual_tasks", []))
-                    if isinstance(route.get("visual_tasks"), list)
-                    else _string_list(image.get("visual_tasks"))
+                    _string_list(image.get("visual_tasks")) + route_visual_tasks
                 ),
                 "analysis_status": "skipped",
                 "observations": [],
@@ -1871,7 +1887,9 @@ class _BraveImageSearchProvider:
             page_url = _result_page_url(result)
             if not image_url or not page_url:
                 continue
-            task_id = _string(route.get("task_id")) or _task_id_for_angle(route.get("id"))
+            angle_id = _string(route.get("id")) or "angle_001"
+            route_name = _string(route.get("modality")) or "visual_required"
+            task_id = _string(route.get("task_id")) or _task_id_for_angle(angle_id)
             candidate_id = "cand_" + _safe_id(
                 f"{self.name}_{task_id}_{index}_{hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:12]}"
             )
@@ -1892,15 +1910,19 @@ class _BraveImageSearchProvider:
             record = {
                 "id": candidate_id,
                 "candidate_id": candidate_id,
-                "plan_id": f"plan_{task_id}",
+                "plan_id": _plan_id_for_visual_task(
+                    task_id=task_id,
+                    angle_id=angle_id,
+                    route=route_name,
+                ),
                 "task_id": task_id,
                 "provider": self.name,
                 "provider_kind": "web_image_search",
                 "provider_mode": "real",
                 "provider_run_id": provider_run_id,
                 "provider_provenance": provider_provenance,
-                "route": route.get("modality"),
-                "angle_id": route.get("id"),
+                "route": route_name,
+                "angle_id": angle_id,
                 "candidate_class": "image_search",
                 "origin": "image_search",
                 "image_url": image_url,
@@ -2062,13 +2084,19 @@ def _candidate(
     candidate_id = "cand_" + _safe_id(
         f"{provider}_{source.get('id')}_{candidate_class}_{local_artifact_path}"
     )
-    task_id = _string(route.get("task_id")) or f"task_visual_{_safe_id(str(route.get('id') or 'angle_001'))}"
+    angle_id = _string(route.get("id")) or "angle_001"
+    route_name = _string(route.get("modality")) or "visual_required"
+    task_id = _string(route.get("task_id")) or _task_id_for_angle(angle_id)
     provider_kind = _provider_kind(provider)
     provider_run_id = _string(source.get("run_id")) or _string(route.get("run_id")) or "fixture-local"
     record = {
         "id": candidate_id,
         "candidate_id": candidate_id,
-        "plan_id": f"plan_{task_id}",
+        "plan_id": _plan_id_for_visual_task(
+            task_id=task_id,
+            angle_id=angle_id,
+            route=route_name,
+        ),
         "task_id": task_id,
         "provider": provider,
         "provider_kind": provider_kind,
@@ -2085,8 +2113,8 @@ def _candidate(
         },
         "source_id": source["id"],
         "source_url": source.get("url"),
-        "route": route["modality"],
-        "angle_id": route["id"],
+        "route": route_name,
+        "angle_id": angle_id,
         "candidate_class": candidate_class,
         "origin": origin,
         "image_url": image_url,
@@ -2585,6 +2613,7 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         else [],
         "candidate_id": candidate["candidate_id"],
         "fetch_id": fetch_id,
+        "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
         "candidate_class": candidate["candidate_class"],
         "angle_id": candidate.get("angle_id"),
@@ -2608,6 +2637,10 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "visual_validation": dict(candidate.get("validation_checks", {})),
         "source_url": candidate.get("source_url"),
     }
+    if candidate.get("candidate_origin"):
+        observation["candidate_origin"] = candidate.get("candidate_origin")
+    if candidate.get("html_origin"):
+        observation["html_origin"] = candidate.get("html_origin")
     if isinstance(candidate.get("screenshot"), Mapping):
         observation["screenshot"] = dict(candidate["screenshot"])
     for key in ("pdf_url", "pdf_local_path", "page_number"):
@@ -2637,9 +2670,16 @@ def _apply_phase3_candidate_defaults(
         record["id"] = candidate_id
     record["candidate_id"] = candidate_id
     record.setdefault("id", candidate_id)
-    task_id = _string(record.get("task_id")) or _task_id_for_angle(record.get("angle_id"))
+    angle_id = _string(record.get("angle_id")) or "angle_001"
+    route_name = _string(record.get("route")) or "visual_required"
+    task_id = _string(record.get("task_id")) or _task_id_for_angle(angle_id)
     record["task_id"] = task_id
-    record.setdefault("plan_id", f"plan_{task_id}")
+    record.setdefault("angle_id", angle_id)
+    record.setdefault("route", route_name)
+    record.setdefault(
+        "plan_id",
+        _plan_id_for_visual_task(task_id=task_id, angle_id=angle_id, route=route_name),
+    )
     provider = _string(record.get("provider")) or "local-fixture"
     provider_kind = _string(record.get("provider_kind")) or _provider_kind(provider)
     provider_mode = _string(record.get("provider_mode")) or "fixture"
@@ -2748,8 +2788,10 @@ def _image_fetch_records_from_candidates(
         record = {
             "fetch_id": _fetch_id_for_candidate_id(candidate_id),
             "candidate_id": candidate_id,
+            "plan_id": candidate.get("plan_id"),
             "task_id": candidate.get("task_id"),
             "angle_id": candidate.get("angle_id"),
+            "route": candidate.get("route"),
             "source_search_result_id": candidate.get("source_search_result_id"),
             "provider": candidate.get("provider"),
             "provider_kind": candidate.get("provider_kind"),
@@ -2883,14 +2925,20 @@ def _visual_search_plan(
 ) -> dict[str, Any]:
     tasks = []
     for route in routes:
-        task_id = _string(route.get("task_id")) or _task_id_for_angle(route.get("id"))
+        angle_id = _string(route.get("id")) or "angle_001"
+        route_name = _string(route.get("modality")) or "visual_required"
+        task_id = _string(route.get("task_id")) or _task_id_for_angle(angle_id)
         max_images = int(route.get("max_images") or selected_observations or 0)
         tasks.append(
             {
-                "plan_id": f"plan_{task_id}",
+                "plan_id": _plan_id_for_visual_task(
+                    task_id=task_id,
+                    angle_id=angle_id,
+                    route=route_name,
+                ),
                 "task_id": task_id,
-                "angle_id": route.get("id"),
-                "route": route.get("modality"),
+                "angle_id": angle_id,
+                "route": route_name,
                 "target_evidence_type": _target_evidence_type(provider_names),
                 "query": str(evidence.get("question") or ""),
                 "providers": list(provider_names),
@@ -3168,6 +3216,40 @@ def _task_id_for_angle(angle_id: Any) -> str:
     raw = _string(angle_id) or "angle_001"
     suffix = raw.removeprefix("angle_")
     return f"task_visual_{suffix}"
+
+
+def _route_for_angle(
+    routes: Sequence[Mapping[str, Any]],
+    angle_id: Any,
+) -> Mapping[str, Any]:
+    normalized_angle_id = _string(angle_id)
+    if not normalized_angle_id:
+        return {}
+    for route in routes:
+        if _string(route.get("id")) == normalized_angle_id:
+            return route
+    return {}
+
+
+def _visual_task_id_for_angle(
+    *,
+    angle_id: str,
+    routes: Sequence[Mapping[str, Any]],
+    route: Mapping[str, Any],
+) -> str:
+    angle_route = _route_for_angle(routes, angle_id)
+    task_id = _string(angle_route.get("task_id"))
+    if task_id:
+        return task_id
+    if _string(route.get("id")) == angle_id:
+        task_id = _string(route.get("task_id"))
+        if task_id:
+            return task_id
+    return _task_id_for_angle(angle_id)
+
+
+def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
+    return "plan_" + _safe_id(f"{task_id}_{angle_id}_{route}")
 
 
 def _fetch_id_for_candidate_id(candidate_id: str) -> str:
