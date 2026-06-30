@@ -822,6 +822,28 @@ class VisionAdapterTests(unittest.TestCase):
         ]
         self.assertTrue(visual_claims)
         self.assertEqual(visual_claims[0]["verification_status"], "supported")
+        expected_lineage = {
+            "plan_id": "plan_task_visual_001",
+            "task_id": "task_visual_001",
+            "angle_id": "angle_001",
+            "route": "visual_required",
+            "candidate_id": "cand_checkout_001",
+            "fetch_id": "fetch_checkout_001",
+            "evidence_image_id": "img_checkout_001",
+        }
+        visual_support = visual_claims[0]["visual_supports"][0]
+        for field, value in expected_lineage.items():
+            self.assertEqual(visual_support[field], value)
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        verifier_link = observations[0]["verifier_links"][0]
+        for field, value in expected_lineage.items():
+            self.assertEqual(verifier_link[field], value)
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
         self.assertTrue((run_dir / "report.md").is_file())
 
     def test_codex_interactive_without_worker_blocks_when_artifacts_exist(self) -> None:

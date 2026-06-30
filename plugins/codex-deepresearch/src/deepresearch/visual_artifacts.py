@@ -2103,6 +2103,13 @@ def _validate_observation_links(
                             "image_claim_lineage",
                             f"claim '{claim_id}' does not list supporting image '{image_id}'",
                         )
+            _require_link_lineage_fields(
+                link,
+                observation,
+                link_path,
+                link_type,
+                collector,
+            )
             _validate_matching_lineage(
                 link,
                 observation,
@@ -2136,6 +2143,33 @@ def _validate_observation_links(
                     ),
                     collector,
                 )
+
+
+def _require_link_lineage_fields(
+    link: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    link_path: str,
+    link_type: str,
+    collector: _Collector,
+) -> None:
+    for field in (
+        "plan_id",
+        "task_id",
+        "angle_id",
+        "route",
+        "candidate_id",
+        "fetch_id",
+        "evidence_image_id",
+    ):
+        expected = observation.get(field)
+        if not _has_nonempty_string(expected):
+            continue
+        if not _has_nonempty_string(link.get(field)):
+            collector.add(
+                f"{link_path}.{field}",
+                "missing_lineage",
+                f"{link_type} must preserve visual observation {field}",
+            )
 
 
 def _validate_claim_observation_report_lineage(

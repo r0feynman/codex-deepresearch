@@ -232,6 +232,26 @@ class VisualArtifactTests(unittest.TestCase):
                 self.assertFalse(result.valid)
                 self.assertIn(expected_code, {error.code for error in result.errors})
 
+    def test_verifier_link_missing_lineage_fails_validation(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["verifier_links"][0] = {
+            "claim_id": "claim_multi_visual_001",
+            "visual_support_ref": "images.img_multi_001.observations[0]",
+            "verifier_vote_id": "vote_multi_001",
+        }
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        missing = [error for error in result.errors if error.code == "missing_lineage"]
+        self.assertTrue(missing, [error.to_dict() for error in result.errors])
+        self.assertIn(
+            "$.visual_observations[0].verifier_links[0].plan_id",
+            {error.path for error in missing},
+        )
+
     def test_run_dir_validation_requires_phase3_visual_artifacts(self) -> None:
         for filename, expected_path in (
             (VISUAL_SEARCH_PLAN_FILENAME, "$.visual_search_plan"),

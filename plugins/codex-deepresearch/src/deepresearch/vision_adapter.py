@@ -2964,7 +2964,7 @@ def _visual_support_from_image(
     observation_text: str,
 ) -> dict[str, Any]:
     image_id = str(image["id"])
-    return {
+    support = {
         "image_id": image_id,
         "observation_ref": f"images.{image_id}.observations[{observation_index}]",
         "observation_index": observation_index,
@@ -2974,6 +2974,30 @@ def _visual_support_from_image(
         "rationale": "Generated from an explicit VLM observation, not an inference-only note.",
         "confidence": 0.74,
     }
+    support.update(_visual_lineage_from_image(image))
+    return support
+
+
+def _visual_lineage_from_image(image: Mapping[str, Any]) -> dict[str, str]:
+    lineage: dict[str, str] = {}
+    for field in (
+        "plan_id",
+        "task_id",
+        "angle_id",
+        "route",
+        "candidate_id",
+        "fetch_id",
+    ):
+        value = _first_optional_string(image, field)
+        if value:
+            lineage[field] = value
+    evidence_image_id = _first_optional_string(
+        image,
+        "evidence_image_id",
+    ) or _first_optional_string(image, "id")
+    if evidence_image_id:
+        lineage["evidence_image_id"] = evidence_image_id
+    return lineage
 
 
 def _visual_claim_text(observation_text: str) -> str:
@@ -3029,18 +3053,13 @@ def _link_visual_evidence_to_claims(evidence: dict[str, Any]) -> int:
             image_id = str(image["id"])
             key = (image_id, observation_index)
             if key not in support_keys:
-                supports.append(
-                    {
-                        "image_id": image_id,
-                        "observation_ref": f"images.{image_id}.observations[{observation_index}]",
-                        "observation_index": observation_index,
-                        "observation_text": observation_text,
-                        "relation_type": _visual_relation_type(image),
-                        "provider": _visual_support_provider(image),
-                        "rationale": _visual_support_rationale(claim, image),
-                        "confidence": 0.74,
-                    }
+                support = _visual_support_from_image(
+                    image,
+                    observation_index=observation_index,
+                    observation_text=observation_text,
                 )
+                support["rationale"] = _visual_support_rationale(claim, image)
+                supports.append(support)
                 support_keys.add(key)
                 created += 1
             if image_id not in supporting_images:
@@ -3087,6 +3106,8 @@ def _valid_existing_visual_supports(
         support = dict(raw_support)
         support["observation_ref"] = f"images.{image_id}.observations[{observation_index}]"
         support["observation_text"] = observation_text
+        for field, value in _visual_lineage_from_image(image).items():
+            support.setdefault(field, value)
         supports.append(support)
     return supports
 
