@@ -1,0 +1,55 @@
+name: Project Sync
+
+on:
+  pull_request:
+    types:
+      - closed
+  issues:
+    types:
+      - opened
+      - closed
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+      - milestoned
+      - demilestoned
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require PROJECT_TOKEN
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          if [ -z "$PROJECT_TOKEN" ]; then
+            echo "::error title=Missing PROJECT_TOKEN::Configure the PROJECT_TOKEN repository Actions secret with a token that can update GitHub Projects."
+            exit 1
+          fi
+      - name: Sync GitHub Project fields
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: >
+          python3 scripts/sync_github_project.py
+          --project-owner r0feynman
+          --project-number 1
+          --limit 500
+          --apply
