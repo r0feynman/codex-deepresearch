@@ -401,6 +401,23 @@ class SemanticPlannerTests(unittest.TestCase):
             for token in SEMANTIC_FIXTURES[0]["critical_query_tokens"]:
                 self.assertIn(token.lower(), lowered_query)
 
+    def test_visual_route_override_without_angles_uses_legacy_single_route(self) -> None:
+        for route in ("visual_required", "visual_optional"):
+            with self.subTest(route=route):
+                result = prepare_run(
+                    question=SEMANTIC_FIXTURES[2]["question"],
+                    runs_dir=self.temp_runs_dir(),
+                    route=route,
+                    budget_preset="quick",
+                )
+                evidence = self.load_json(Path(result["run_dir"]) / "evidence.json")
+
+                self.assertEqual(evidence["semantic_planner"]["source"], "explicit")
+                self.assertEqual(len(evidence["semantic_angles"]), 1)
+                self.assertEqual(len(evidence["routing"]), 1)
+                self.assertEqual(evidence["semantic_angles"][0]["route"], route)
+                self.assertEqual(evidence["routing"][0]["modality"], route)
+
     def test_visual_evidence_terms_win_over_implementation_wording(self) -> None:
         result = prepare_run(
             question="UI screenshot comparison implementation strategy 조사",

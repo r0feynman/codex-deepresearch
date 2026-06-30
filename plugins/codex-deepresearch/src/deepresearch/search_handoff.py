@@ -101,7 +101,10 @@ def prepare_run(
 
     semantic_plan = plan_semantic_angles(
         question=normalized_question,
-        explicit_angles=angles,
+        explicit_angles=_effective_explicit_angles_for_route(
+            angles=angles,
+            route=route,
+        ),
     )
     decisions = []
     for semantic_angle in semantic_plan.angles:
@@ -674,6 +677,18 @@ def _routing_record(
             }
         )
     return record
+
+
+def _effective_explicit_angles_for_route(
+    *,
+    angles: Sequence[str] | None,
+    route: str | None,
+) -> Sequence[str] | None:
+    if angles is not None:
+        return angles
+    if route in {"visual_required", "visual_optional"}:
+        return ["primary source discovery"]
+    return None
 
 
 def _semantic_angle_evidence_record(route_record: Mapping[str, Any]) -> dict[str, Any]:

@@ -235,7 +235,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect product screenshots for evidence",
                 runs_dir=self.temp_runs_dir(),
                 route="visual_required",
-                budget_preset="standard",
+                budget_preset="quick",
             )
 
         self.assertFalse(result["ok"])
@@ -327,7 +327,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect product screenshots for evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
-                budget_preset="standard",
+                budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
             )
@@ -695,7 +695,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
-                budget_preset="standard",
+                budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
             )
@@ -1033,7 +1033,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
-                budget_preset="standard",
+                budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
             )
@@ -1217,7 +1217,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots and chart images for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
-                budget_preset="standard",
+                budget_preset="quick",
                 max_images=12,
                 min_tasks=1,
                 max_tasks=1,
@@ -1636,7 +1636,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
-                budget_preset="standard",
+                budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
             )
@@ -1914,7 +1914,7 @@ class InvocationRouterTests(unittest.TestCase):
             runs_dir=self.temp_runs_dir(),
             adapter_name="fixture",
             route="visual_required",
-            budget_preset="standard",
+            budget_preset="quick",
             min_tasks=1,
             max_tasks=1,
         )
