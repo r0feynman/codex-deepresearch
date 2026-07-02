@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     real_automatic_visual_release_counts,
+    visual_release_minimums,
 )
 
 
@@ -37,6 +38,9 @@ REPORT_STATUS_SCHEMA_VERSIONS = {
     "codex-deepresearch.report-generation.v0",
 }
 SUPPLIED_RUN_MAX_AGE_DAYS = 30
+MIN_PUBLIC_BETA_REAL_VISUAL_CANDIDATES = 10
+MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED = 3
+MIN_PUBLIC_BETA_REPORT_CITED_VISUAL_OR_MIXED_CLAIMS = 1
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST = (
@@ -161,6 +165,8 @@ _CODEX_NATIVE_SEARCH_PROVIDERS = {
 }
 _CODEX_NATIVE_VISUAL_ACQUISITION_PROVIDERS = _CODEX_NATIVE_SEARCH_PROVIDERS | {
     "browser-screenshot",
+    "child-discovered-image-url",
+    "child_discovered_image_url",
     "codex-browser-screenshot",
     "page-image-extractor",
     "page_extractor",
@@ -1770,12 +1776,17 @@ def _supplied_run_binding(
         "run_status",
         identity_artifacts,
         names=("prompt_id", "public_beta_prompt_id"),
-    ) or not _artifact_has_any_field(
-        "evidence",
+    ):
+        failures.append("prompt_id is missing from run_status metadata")
+    missing_prompt_id = _identity_artifacts_missing_field(
         identity_artifacts,
         names=("prompt_id", "public_beta_prompt_id"),
-    ):
-        failures.append("prompt_id is missing from supplied run metadata")
+    )
+    if missing_prompt_id:
+        failures.append(
+            "prompt_id is missing from required identity artifact(s): "
+            + ", ".join(missing_prompt_id)
+        )
     elif any(value != prompt_id for value in prompt_ids):
         failures.append(
             "prompt_id does not match manifest prompt "
@@ -1811,12 +1822,17 @@ def _supplied_run_binding(
         "run_status",
         identity_artifacts,
         names=("suite_id", "validation_suite_id", "public_beta_suite_id"),
-    ) or not _artifact_has_any_field(
-        "evidence",
+    ):
+        failures.append("suite_id is missing from run_status metadata")
+    missing_suite_id = _identity_artifacts_missing_field(
         identity_artifacts,
         names=("suite_id", "validation_suite_id", "public_beta_suite_id"),
-    ):
-        failures.append("suite_id is missing from supplied run metadata")
+    )
+    if missing_suite_id:
+        failures.append(
+            "suite_id is missing from required identity artifact(s): "
+            + ", ".join(missing_suite_id)
+        )
     elif any(value != suite_id for value in suite_ids):
         failures.append(
             "suite_id does not match validation suite "
@@ -1918,6 +1934,10 @@ def _identity_artifact_payloads(
         payload = loaded_artifacts.get(name)
         if isinstance(payload, Mapping):
             payloads[name] = payload
+    for name in sorted(identity_names):
+        payload = loaded_artifacts.get(name)
+        if isinstance(payload, Mapping):
+            payloads.setdefault(name, payload)
     return payloads
 
 
@@ -1953,6 +1973,18 @@ def _artifact_has_any_field(
         isinstance(payload.get(name), str) and bool(payload.get(name).strip())
         for name in names
     )
+
+
+def _identity_artifacts_missing_field(
+    payloads: Mapping[str, Mapping[str, Any]],
+    *,
+    names: Sequence[str],
+) -> list[str]:
+    missing = []
+    for artifact_name in sorted(payloads):
+        if not _artifact_has_any_field(artifact_name, payloads, names=names):
+            missing.append(artifact_name)
+    return missing
 
 
 def _artifact_field_sources(
@@ -2138,6 +2170,14 @@ def _visual_release_checks(
         observations=observations,
         visual_provider_status=visual_provider_status,
     )
+    minimums = visual_release_minimums(
+        candidates=candidates,
+        fetches=fetches,
+        observations=observations,
+        evidence=evidence,
+        report_status=report_status,
+        report_text=report_text,
+    )
     real_candidates = _codex_native_acquisition_records(candidates)
     real_fetches = _codex_native_fetch_records(fetches)
     real_observations = _codex_interactive_observations(observations)
@@ -2170,6 +2210,17 @@ def _visual_release_checks(
                 "detail": "visual_provider_status lacks a configured Codex-native acquisition provider",
             }
         )
+    if len(real_candidates) < MIN_PUBLIC_BETA_REAL_VISUAL_CANDIDATES:
+        failures.append(
+            {
+                "check": "at_least_10_real_image_centric_candidates",
+                "classification": "fetch",
+                "detail": (
+                    "visual artifacts must include at least "
+                    f"{MIN_PUBLIC_BETA_REAL_VISUAL_CANDIDATES} real Codex-native candidates"
+                ),
+            }
+        )
     if not real_candidates or not real_fetches:
         failures.append(
             {
@@ -2186,6 +2237,32 @@ def _visual_release_checks(
                 "detail": "visual artifacts lack real Codex-interactive VLM handoff observations",
             }
         )
+    if _visual_observations_claim_hidden_codex_api(observations):
+        failures.append(
+            {
+                "check": "codex_interactive_hidden_api_rejected",
+                "classification": "vlm",
+                "detail": (
+                    "visual observations must use explicit Codex-interactive "
+                    "artifact handoff, not hidden API markers"
+                ),
+            }
+        )
+    if (
+        int(minimums.get("vlm_images_analyzed") or 0)
+        < MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED
+    ):
+        failures.append(
+            {
+                "check": "at_least_3_codex_interactive_real_analyzed_images",
+                "classification": "vlm",
+                "detail": (
+                    "visual artifacts must include at least "
+                    f"{MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED} eligible "
+                    "Codex-interactive VLM-analyzed images"
+                ),
+            }
+        )
     if _policy_blocks_release(candidates, fetches, observations):
         failures.append(
             {
@@ -2194,7 +2271,7 @@ def _visual_release_checks(
                 "detail": "policy-blocked visual records cannot enter release validation",
             }
         )
-    if not report_claims:
+    if len(report_claims) < MIN_PUBLIC_BETA_REPORT_CITED_VISUAL_OR_MIXED_CLAIMS:
         failures.append(
             {
                 "check": "report_cited_visual_or_mixed_claim",
@@ -2209,10 +2286,25 @@ def _visual_release_checks(
             "real_candidates": len(real_candidates),
             "real_fetches": len(real_fetches),
             "real_vlm_observations": len(real_observations),
+            "real_vlm_images_analyzed": int(
+                minimums.get("vlm_images_analyzed") or 0
+            ),
             "report_cited_visual_or_mixed_claims": len(report_claims),
         },
         "failures": failures,
     }
+
+
+def _visual_observations_claim_hidden_codex_api(
+    observations: Sequence[Mapping[str, Any]],
+) -> bool:
+    for observation in observations:
+        if _claims_hidden_codex_api(observation):
+            return True
+        provenance = observation.get("provider_provenance")
+        if isinstance(provenance, Mapping) and _claims_hidden_codex_api(provenance):
+            return True
+    return False
 
 
 def _visual_failure_category(failures: Sequence[Mapping[str, Any]]) -> str:
@@ -2499,7 +2591,6 @@ def _policy_blocks_release(
         if record.get("policy_decision") in {
             "blocked",
             "manual_review",
-            "budget_pruned",
             "disallowed",
             "restricted",
         }:
@@ -2601,7 +2692,16 @@ def _has_real_report_cited_observation(
     verifier_vote_ids: set[str],
 ) -> bool:
     image = images_by_id.get(image_id)
-    if image is None or not _is_codex_native_policy_allowed_acquisition_record(image):
+    if image is None:
+        return False
+    if image.get("policy_decision") != "allowed":
+        return False
+    if str(image.get("provider_mode") or "").strip().lower().replace("_", "-") in {
+        "fixture",
+        "manual",
+        "user-provided",
+        "post-hoc",
+    }:
         return False
     for observation in observations:
         if observation.get("evidence_image_id") != image_id:

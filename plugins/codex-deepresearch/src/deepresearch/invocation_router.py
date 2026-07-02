@@ -1337,6 +1337,7 @@ def _write_visual_completion_status(
         }
     )
     payload["artifacts"] = artifacts
+    _apply_run_release_identity(run_dir, payload)
     _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, payload)
 
 
