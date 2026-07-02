@@ -14,7 +14,12 @@ from .report_public_safety import (
     sanitize_public_value,
 )
 from .run_state import begin_stage, skipped_stage_status
-from .search_handoff import SearchHandoffError, resolve_run_dir
+from .search_handoff import (
+    SearchHandoffError,
+    apply_release_validation_identity,
+    release_validation_identity_from_payload,
+    resolve_run_dir,
+)
 from .semantic_planner import write_semantic_planner_validation
 from .trace import record_stage_trace
 
@@ -137,6 +142,7 @@ def synthesize_report(
         if report_path.exists():
             status["report_path"] = str(report_path)
             status["artifacts"]["report"] = str(report_path)
+        status = _with_release_validation_identity(status, run_dir=run_dir)
         status = _public_report_status(status, run_dir=run_dir)
         record_stage_trace(
             run_dir,
@@ -183,6 +189,7 @@ def synthesize_report(
             },
             "external_model_call": False,
         }
+        status = _with_release_validation_identity(status, run_dir=run_dir, evidence=evidence)
         status = _public_report_status(status, run_dir=run_dir)
         record_stage_trace(
             run_dir,
@@ -264,6 +271,7 @@ def synthesize_report(
             included,
         )
     )
+    status = _with_release_validation_identity(status, run_dir=run_dir, evidence=evidence)
     status = _public_report_status(status, run_dir=run_dir)
     record_stage_trace(
         run_dir,
@@ -296,6 +304,19 @@ def _refresh_semantic_planner_validation(
         tasks=tasks,
         report_status=report_status,
     )
+
+
+def _with_release_validation_identity(
+    status: dict[str, Any],
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if evidence is None:
+        maybe_evidence = _read_optional_json(run_dir / "evidence.json")
+        evidence = maybe_evidence if isinstance(maybe_evidence, Mapping) else {}
+    identity = release_validation_identity_from_payload(evidence)
+    return apply_release_validation_identity(status, identity)
 
 
 def report_evidence_model(evidence: Mapping[str, Any]) -> dict[str, Any]:

@@ -46,6 +46,13 @@ class ParallelOrchestratorTests(unittest.TestCase):
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
     def prepare(self, *, route: str = "text_only", budget: str = "standard") -> Path:
         prepared = prepare_run(
             question="Research a deterministic orchestration fixture.",
@@ -292,6 +299,49 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(tasks[0]["discard_reason"], "invalid_output_shard_path")
         evidence = self.load_json(run_dir / "evidence.json")
         self.assertEqual(evidence["claims"], [])
+
+    def test_release_validation_child_search_sidecar_requires_complete_record(self) -> None:
+        prepared = prepare_run(
+            question="Release validation child sidecar fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-001",
+            suite_id="issue-118-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, self.shard(run_dir, task))
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [
+                {
+                    "provider": "codex-native",
+                    "provider_mode": "real",
+                    "retrieval_status": "fetched",
+                    "policy_decision": "allowed",
+                    "url": "https://example.com/incomplete",
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        handoff = merge["codex_native_search_handoff"]
+        self.assertEqual(handoff["records"], 0)
+        self.assertEqual(len(handoff["rejections"]), 1)
+        self.assertIn(
+            "missing_required_release_field",
+            handoff["rejections"][0]["reason"],
+        )
+        self.assertEqual((run_dir / "search_results.jsonl").read_text(encoding="utf-8"), "")
 
     def test_codex_exec_adapter_runs_from_project_root_and_reports_trust_errors(self) -> None:
         run_dir = self.prepare()

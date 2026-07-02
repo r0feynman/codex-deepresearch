@@ -105,6 +105,19 @@ plugins/codex-deepresearch/scripts/codex-deepresearch public-beta-validation \
 
 When real Codex-native run artifacts are unavailable, the command records explicit blocked diagnostics and exits zero only with `--allow-blocked`; blocked runs are counted separately from failed non-blocked runs and never satisfy release readiness or issue #75 completion. To classify sanitized real runs, pass repeated `--run prompt_id=/path/to/run-dir` values. Each supplied run must be fresh, public-safe, bound to the evaluated prompt by prompt id plus original question or prompt hash, bound to the validation suite id, and internally consistent across run status, evidence, report status, and visual provider status. Visual prompts also require non-fixture Codex-native acquisition evidence, Codex-interactive VLM handoff observations, and report-cited supported visual or mixed claims. To attach existing gate artifacts from `fresh-session-e2e`, `fresh-session-visual-e2e`, or `automated-visual-e2e`, pass repeated `--gate-result gate_id=/path/to/results.json` values. External gate artifacts must declare their schema version, `public_safe=true`, a fresh `generated_at`, explicit release success, and required outcome counts or thresholds before they can pass as diagnostics. The classifier stores prompt IDs, status artifact paths, provider provenance summaries, failure categories, release-gate readiness, and remaining gaps; it does not copy raw evidence bundles, credentials, non-public screenshots, or personal data. The public Markdown summary uses prompt-scoped references instead of private absolute run paths.
 
+Ad hoc `invoke` runs are still valid for normal local research, but they are not release-validation runs unless they are launched with identity flags before child execution starts. For Public Beta signoff, invoke the exact manifest prompt text and pass `--prompt-id` plus `--suite-id`; `--prompt-hash` is optional because the runner computes the canonical hash from `--original-question` or the normalized invocation question.
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch invoke \
+  '$deep-research: <manifest prompt text>' \
+  --runs-dir /tmp/codex-deepresearch-public-beta-runs \
+  --route text_only \
+  --prompt-id pb-text-001 \
+  --suite-id public-beta-validation
+```
+
+Release-validation `invoke` writes `prompt_id`, `suite_id`, `prompt_hash`, `original_question`, `execution_mode=codex-plugin`, and `runner_mode=full-runner` to the initial `run_status.json` and `evidence.json` before parallel child work starts. Downstream status artifacts such as `report_status.json`, `visual_provider_status.json`, and `visual_search_plan.json` preserve the same identity when they are present. Codex-native child search handoff records are accepted into top-level `search_results.jsonl` only when the child sidecar already contains explicit SearchResult v0 fields, `provider=codex-native`, `provider_mode=real`, `retrieval_status=fetched`, `policy_decision=allowed`, matching prompt identity, `handoff_artifact=search_results.jsonl`, and no hidden API marker fields.
+
 By default `--completion-mode codex-native` treats issue #75 as complete when all 20 supplied runs are `codex-plugin` runs with Codex-native `search_tasks.json`/`search_results.jsonl` handoff artifacts, at least 8 visual prompt runs reach `completed_auto_visual` through real Codex-native visual candidate/fetch artifacts plus explicit `codex-interactive` `visual_observations.jsonl` handoff records, and the report cites supported visual or mixed claims. The runner does not call hidden Codex search or VLM APIs. `--gate-result` artifacts, including `automated-visual-e2e` and `openai-responses-vision` diagnostics, are validated and reported separately in this mode. Use `--completion-mode external-gated` only when the release decision intentionally requires every supported external gate artifact to be supplied and pass as well; the `automated_cli_real_provider_visual_e2e` gate is satisfied by its external gate result JSON rather than by prompt-manifest metrics.
 
 ## Resolve Config
@@ -126,6 +139,8 @@ plugins/codex-deepresearch/scripts/codex-deepresearch prepare "What evidence is 
 ```
 
 The command writes `evidence.json`, `search_tasks.json`, an empty `search_results.jsonl`, `visual_tasks.json`, and an empty `visual_observations.jsonl` under `research-runs/<run_id>/`. Codex should perform search in the active session and append one `SearchResult` JSON object per line to `search_results.jsonl`.
+
+For handoff-only release-validation setup, `prepare` accepts the same `--prompt-id`, `--suite-id`, optional `--prompt-hash`, and optional `--original-question` identity flags. This stamps the prepared artifacts, but a run still must be completed through the full runner before `public-beta-validation` can count it as a passing supplied run.
 
 `prepare` also writes `budget_estimate.json` before any search, fetch, VLM, verifier, or subagent work starts. Use `--max-sources`, `--max-images`, `--max-subagents`, `--max-agents`, `--max-cost-usd`, and `--codex-runner codex-exec|codex-sdk|serial` to request lower caps; the estimate records deterministic reduction suggestions and the generated handoff files use the reduced source/image caps. `deep` and `exhaustive` presets require `--confirm-budget`; `exhaustive` also requires `--max-cost-usd`.
 

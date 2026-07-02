@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -457,6 +458,70 @@ class InvocationRouterTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "blocked_parallel_execution")
         self.assertEqual(captured_kwargs[0]["codex_exec_timeout_seconds"], 900)
+
+    def test_release_validation_identity_is_written_before_parallel_orchestration(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        question = "Investigate release validation identity handoff."
+        expected_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()
+        inspected = False
+
+        def fake_parallel(*, run, **_kwargs):
+            nonlocal inspected
+            inspected = True
+            run_dir = Path(run)
+            run_status = self.read_json(run_dir / "run_status.json")
+            evidence = self.read_json(run_dir / "evidence.json")
+            for payload in (run_status, evidence):
+                self.assertEqual(payload["run_id"], run_dir.name)
+                self.assertEqual(payload["prompt_id"], "pb-text-001")
+                self.assertEqual(payload["suite_id"], "issue-118-suite")
+                self.assertEqual(payload["prompt_hash"], expected_hash)
+                self.assertEqual(payload["original_question"], question)
+                self.assertEqual(payload["execution_mode"], "codex-plugin")
+                self.assertEqual(payload["runner_mode"], "full-runner")
+            self.assertEqual(run_status["selected_mode"], "full-runner")
+            self.assertIn("updated_at", run_status)
+            self.assertIn("created_at", evidence)
+            return {
+                "status": "blocked_parallel_execution",
+                "ok": False,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": True,
+                "planned_task_count": 1,
+                "failure_counts": {},
+                "diagnostics": {"actionable_cause": "fake blocked parallel status"},
+                "evidence_source": {
+                    "type": "blocked_parallel_execution",
+                    "adapter": "codex-exec",
+                },
+                "merge": {"accepted_shards": []},
+                "artifacts": {},
+            }
+
+        with mock.patch(
+            "deepresearch.invocation_router.run_parallel_orchestration",
+            side_effect=fake_parallel,
+        ):
+            result = run_skill_invocation(
+                f"$deep-research: {question}",
+                runs_dir=runs_dir,
+                adapter_name="codex-exec",
+                route="text_only",
+                budget_preset="quick",
+                min_tasks=1,
+                max_tasks=1,
+                prompt_id="pb-text-001",
+                suite_id="issue-118-suite",
+            )
+
+        self.assertTrue(inspected)
+        self.assertEqual(result["status"], "blocked_parallel_execution")
+        self.assertEqual(result["prompt_id"], "pb-text-001")
+        self.assertEqual(result["suite_id"], "issue-118-suite")
+        self.assertEqual(result["prompt_hash"], expected_hash)
+        self.assertEqual(result["execution_mode"], "codex-plugin")
+        self.assertEqual(result["runner_mode"], "full-runner")
 
     def test_quick_chat_is_explicit_and_declares_no_evidence_bundle(self) -> None:
         result = run_skill_invocation(

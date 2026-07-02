@@ -289,6 +289,10 @@ def run_prepare(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             codex_runner=args.codex_runner,
             confirm_budget=args.confirm_budget,
+            prompt_id=args.prompt_id,
+            suite_id=args.suite_id,
+            prompt_hash=args.prompt_hash,
+            original_question=args.original_question,
         )
     except BudgetEstimateError as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True, allow_nan=False), file=sys.stderr)
@@ -328,6 +332,10 @@ def run_invoke(args: argparse.Namespace) -> int:
         max_tasks=args.max_tasks,
         allow_degraded=not args.no_degrade,
         require_codex_exec=args.require_codex_exec,
+        prompt_id=args.prompt_id,
+        suite_id=args.suite_id,
+        prompt_hash=args.prompt_hash,
+        original_question=args.original_question,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok") is True else 2
@@ -938,6 +946,34 @@ def run_public_beta_validation_command(args: argparse.Namespace) -> int:
 
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] == "passed" else 2
+
+
+def add_release_validation_identity_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--prompt-id",
+        help=(
+            "Public Beta release-validation prompt id. When set, --suite-id is "
+            "also required and identity is written before child execution starts."
+        ),
+    )
+    parser.add_argument(
+        "--suite-id",
+        help="Public Beta validation suite id for release-validation artifacts.",
+    )
+    parser.add_argument(
+        "--prompt-hash",
+        help=(
+            "Optional canonical Public Beta prompt hash. If omitted, the hash is "
+            "computed from --original-question or the normalized invocation question."
+        ),
+    )
+    parser.add_argument(
+        "--original-question",
+        help=(
+            "Optional manifest prompt text used for prompt_hash binding. Defaults "
+            "to the normalized invocation question."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1677,6 +1713,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat a missing codex exec binary as blocked preflight before orchestration.",
     )
+    add_release_validation_identity_args(invoke)
     invoke.set_defaults(func=run_invoke)
 
     prepare = subparsers.add_parser(
@@ -1768,6 +1805,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Confirm execution for deep and exhaustive budget presets.",
     )
+    add_release_validation_identity_args(prepare)
     prepare.set_defaults(func=run_prepare)
 
     ingest = subparsers.add_parser(
