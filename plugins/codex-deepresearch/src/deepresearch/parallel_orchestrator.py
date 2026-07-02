@@ -81,6 +81,7 @@ CODEX_CHILD_PERMISSION_DENIED = "codex_child_permission_denied"
 CODEX_CHILD_MISSING_SHARD = "codex_child_missing_shard"
 CODEX_CHILD_EXEC_FAILED = "codex_child_exec_failed"
 CODEX_CHILD_RELEASE_HANDOFF_INVALID = "codex_child_release_handoff_invalid"
+FAILED_RELEASE_HANDOFF_INVALID = "failed_release_handoff_invalid"
 CAPACITY_RETRY_MAX_ATTEMPTS = 3
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300.0
 CAPACITY_RETRY_POLICY_DEFAULTS = {
@@ -1780,6 +1781,7 @@ def _parallel_status_ok(status: str) -> bool:
         "failed",
         "failed_validation",
         "failed_parallel_no_accepted_shards",
+        FAILED_RELEASE_HANDOFF_INVALID,
         "blocked_parallel_execution",
     }
 
@@ -1819,6 +1821,8 @@ def _parallel_status_value(
             return "blocked_parallel_execution"
         return "failed_parallel_no_accepted_shards"
     if final_adapter_name == "codex-exec" and accepted_count > 0:
+        if _merge_has_exhausted_release_handoff_failure(merge_status):
+            return FAILED_RELEASE_HANDOFF_INVALID
         if accepted_count < planned_task_count or has_failures:
             return "completed_partial_parallel"
         return "completed_parallel"
@@ -1834,6 +1838,7 @@ def _needs_serial_handoff(
     if status in {
         "degraded_serial_handoff_required",
         "failed_parallel_no_accepted_shards",
+        FAILED_RELEASE_HANDOFF_INVALID,
         "blocked_parallel_execution",
     }:
         return True
@@ -1866,6 +1871,45 @@ def _merge_has_parallel_execution_blocker(merge_status: Mapping[str, Any]) -> bo
         "not inside a trusted directory",
     )
     return any(marker in blocker_text for marker in markers)
+
+
+def _task_has_exhausted_release_handoff_failure(task: Mapping[str, Any]) -> bool:
+    if task.get("child_failure_code") != CODEX_CHILD_RELEASE_HANDOFF_INVALID:
+        return False
+    diagnostics = task.get("attempt_diagnostics")
+    if isinstance(diagnostics, list):
+        for attempt in diagnostics:
+            if (
+                isinstance(attempt, Mapping)
+                and attempt.get("retry_decision") == "retry_exhausted"
+            ):
+                return True
+    summary = task.get("retry_summary")
+    if isinstance(summary, Mapping) and summary.get("retry_exhausted") is True:
+        return True
+    attempt = int(task.get("attempt") or 0)
+    max_attempts = int(task.get("max_attempts") or 0)
+    return (
+        attempt > 0
+        and max_attempts > 0
+        and attempt >= max_attempts
+        and task.get("retryable") is False
+    )
+
+
+def _merge_has_exhausted_release_handoff_failure(merge_status: Mapping[str, Any]) -> bool:
+    for task in _list(merge_status.get("failed_tasks")):
+        if _task_has_exhausted_release_handoff_failure(task):
+            return True
+    retry_summary = merge_status.get("retry_summary")
+    if isinstance(retry_summary, Mapping):
+        for task in _list(retry_summary.get("tasks")):
+            if (
+                task.get("final_child_failure_code") == CODEX_CHILD_RELEASE_HANDOFF_INVALID
+                and task.get("retry_exhausted") is True
+            ):
+                return True
+    return False
 
 
 def _skip_serial_handoff_after_parallel(
@@ -3955,6 +3999,25 @@ def _merge_diagnostics(
                 "recovered_after_capacity_count"
             )
             diagnostics["capacity_retry_count"] = retry_summary.get("retry_count")
+        exhausted_release_failures = [
+            task for task in failed_tasks if _task_has_exhausted_release_handoff_failure(task)
+        ]
+        if exhausted_release_failures:
+            first = exhausted_release_failures[0]
+            diagnostics.update(
+                {
+                    "actionable_cause": "release validation search handoff retries exhausted",
+                    "first_failure_category": first.get("failure_category"),
+                    "first_child_failure_code": first.get("child_failure_code"),
+                    "first_failed_task_id": first.get("task_id"),
+                    "first_failed_adapter": first.get("adapter"),
+                    "first_failed_retryable": first.get("retryable"),
+                    "first_failed_diagnostic": first.get("diagnostic"),
+                    "retry_exhausted": True,
+                    "retry_exhausted_count": retry_summary.get("retry_exhausted_count"),
+                    "child_failure_counts": retry_summary.get("child_failure_counts"),
+                }
+            )
         return diagnostics
     if failed_tasks:
         first = failed_tasks[0]
