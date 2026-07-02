@@ -1600,6 +1600,10 @@ class _BrowserScreenshotProvider:
     def initial_status(self) -> dict[str, Any]:
         active_transport = self._transport or PlaywrightBrowserTransport()
         available, unavailable_reason = active_transport.availability()
+        availability_diagnostics = _browser_transport_availability_diagnostics(
+            active_transport,
+            reason=unavailable_reason,
+        )
         return {
             "provider": self.name,
             "provider_kind": "screenshot",
@@ -1620,7 +1624,7 @@ class _BrowserScreenshotProvider:
             "external_network_call": False,
             "external_vlm_call": False,
             "transport": active_transport.name,
-            "diagnostics": {"transport": active_transport.name},
+            "diagnostics": availability_diagnostics,
         }
 
     def collect(self, context: _VisualContext) -> list[dict[str, Any]]:
@@ -4320,17 +4324,49 @@ def _browser_transport_provider_mode(transport: BrowserScreenshotTransport) -> s
     return "real"
 
 
+def _browser_transport_availability_diagnostics(
+    transport: BrowserScreenshotTransport,
+    *,
+    reason: str | None,
+) -> dict[str, Any]:
+    diagnostics = getattr(transport, "availability_diagnostics", None)
+    if callable(diagnostics):
+        value = diagnostics()
+        if isinstance(value, Mapping):
+            payload = dict(value)
+            payload.setdefault("transport", transport.name)
+            if reason:
+                payload.setdefault("reason", reason)
+            return payload
+    payload: dict[str, Any] = {"transport": transport.name}
+    if reason:
+        payload["reason"] = reason
+    return payload
+
+
 def _blocked_actionable_cause(provider_statuses: Sequence[Mapping[str, Any]]) -> str:
     reasons = []
+    install_guidance: list[str] = []
     for status in provider_statuses:
         provider = _string(status.get("provider")) or "unknown-provider"
         reason = _string(status.get("blocked_reason")) or _string(status.get("last_error"))
         if reason:
             reasons.append(f"{provider}: {reason}")
+        diagnostics = status.get("diagnostics")
+        if isinstance(diagnostics, Mapping):
+            guidance = diagnostics.get("install_guidance")
+            if isinstance(guidance, list):
+                install_guidance.extend(
+                    item for item in guidance if isinstance(item, str) and item
+                )
     suffix = "; ".join(reasons) if reasons else "no configured or available real visual provider"
+    guidance_suffix = ""
+    if install_guidance:
+        guidance_suffix = "; install guidance: " + "; ".join(_dedupe(install_guidance))
     return (
         "visual_required route needs a configured and available real visual acquisition provider; "
         + suffix
+        + guidance_suffix
     )
 
 

@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +15,10 @@ PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import acquire_visual_candidates, prepare_run  # noqa: E402
-from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
+from deepresearch.browser_screenshot import (  # noqa: E402
+    BrowserScreenshotCapture,
+    PlaywrightBrowserTransport,
+)
 
 
 class FakeBrowserTransport:
@@ -75,6 +80,48 @@ class FakeBrowserTransport:
             external_network_call=url.startswith(("http://", "https://")),
             provider_metadata={"fake": True},
         )
+
+
+class MissingDependencyBrowserTransport:
+    name = "playwright"
+    provider_mode = "real"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def availability(self) -> tuple[bool, str | None]:
+        return False, "missing_browser_dependency"
+
+    def availability_diagnostics(self) -> dict[str, Any]:
+        return {
+            "transport": self.name,
+            "reason": "missing_browser_dependency",
+            "check": "chromium_launch",
+            "install_guidance": [
+                "python3 -m playwright install chromium",
+                "python3 -m playwright install-deps chromium",
+            ],
+        }
+
+    def capture(
+        self,
+        *,
+        url: str,
+        output_path: Path,
+        viewport: Mapping[str, int],
+        full_page: bool,
+        timeout_ms: int,
+    ) -> BrowserScreenshotCapture:
+        self.calls.append(
+            {
+                "url": url,
+                "output_path": output_path,
+                "viewport": dict(viewport),
+                "full_page": full_page,
+                "timeout_ms": timeout_ms,
+            }
+        )
+        raise AssertionError("capture should not be called when launch preflight fails")
 
 
 class BrowserScreenshotTests(unittest.TestCase):
@@ -271,6 +318,99 @@ class BrowserScreenshotTests(unittest.TestCase):
         self.assertEqual(provider["blocked_reason"], "fake_browser_unavailable")
         self.assertEqual(provider["invocations"], 0)
         self.assertFalse(provider["external_network_call"])
+
+    def test_playwright_availability_launch_preflight_reports_missing_browser_dependency(
+        self,
+    ) -> None:
+        class FailingChromium:
+            def launch(self, *, headless: bool) -> object:
+                raise RuntimeError(
+                    "Executable doesn't exist at /home/user/.cache/ms-playwright/chromium/chrome"
+                )
+
+        class FakePlaywright:
+            chromium = FailingChromium()
+
+        class FakeSyncPlaywright:
+            def __enter__(self) -> FakePlaywright:
+                return FakePlaywright()
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+        sync_api = types.ModuleType("playwright.sync_api")
+        sync_api.Error = RuntimeError
+        sync_api.TimeoutError = TimeoutError
+        sync_api.sync_playwright = lambda: FakeSyncPlaywright()
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "playwright": types.ModuleType("playwright"),
+                    "playwright.sync_api": sync_api,
+                },
+            ),
+            mock.patch(
+                "deepresearch.browser_screenshot.importlib.util.find_spec",
+                return_value=object(),
+            ),
+        ):
+            transport = PlaywrightBrowserTransport()
+            available, reason = transport.availability()
+
+        self.assertFalse(available)
+        self.assertEqual(reason, "missing_browser_dependency")
+        diagnostics = transport.availability_diagnostics()
+        self.assertEqual(diagnostics["reason"], "missing_browser_dependency")
+        self.assertEqual(diagnostics["check"], "chromium_launch")
+        self.assertEqual(
+            diagnostics["install_guidance"],
+            [
+                "python3 -m playwright install chromium",
+                "python3 -m playwright install-deps chromium",
+            ],
+        )
+        self.assertNotIn("/home/user/.cache", json.dumps(diagnostics, sort_keys=True))
+
+    def test_missing_browser_dependency_blocks_required_screenshot_provider_with_guidance(
+        self,
+    ) -> None:
+        run_dir = self.prepared_visual_run()
+        transport = MissingDependencyBrowserTransport()
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=("browser-screenshot",),
+            screenshot_modes=("first_viewport",),
+            browser_transport=transport,
+        )
+
+        self.assertEqual(result["status"], "blocked_missing_visual_provider")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(result["candidate_records"], 0)
+        self.assertEqual(self.read_jsonl(run_dir / "visual_candidates.jsonl"), [])
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][0]
+        self.assertEqual(provider["provider"], "browser-screenshot")
+        self.assertEqual(provider["provider_kind"], "screenshot")
+        self.assertEqual(provider["provider_mode"], "real")
+        self.assertFalse(provider["available"])
+        self.assertEqual(provider["blocked_reason"], "missing_browser_dependency")
+        self.assertEqual(provider["last_error"], "missing_browser_dependency")
+        self.assertEqual(
+            provider["diagnostics"]["install_guidance"],
+            [
+                "python3 -m playwright install chromium",
+                "python3 -m playwright install-deps chromium",
+            ],
+        )
+        actionable_cause = provider_status["diagnostics"]["actionable_cause"]
+        self.assertIn("missing_browser_dependency", actionable_cause)
+        self.assertIn("python3 -m playwright install chromium", actionable_cause)
+        self.assertIn("python3 -m playwright install-deps chromium", actionable_cause)
 
     def test_remote_capture_error_is_failed_acquisition_without_external_network(self) -> None:
         run_dir = self.prepared_visual_run()

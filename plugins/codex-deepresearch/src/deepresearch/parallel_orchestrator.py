@@ -80,6 +80,7 @@ CODEX_CHILD_POLICY_BLOCKED = "codex_child_policy_blocked"
 CODEX_CHILD_PERMISSION_DENIED = "codex_child_permission_denied"
 CODEX_CHILD_MISSING_SHARD = "codex_child_missing_shard"
 CODEX_CHILD_EXEC_FAILED = "codex_child_exec_failed"
+CODEX_CHILD_RELEASE_HANDOFF_INVALID = "codex_child_release_handoff_invalid"
 CAPACITY_RETRY_MAX_ATTEMPTS = 3
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300.0
 CAPACITY_RETRY_POLICY_DEFAULTS = {
@@ -99,6 +100,7 @@ RETRY_SAFE_FAILURES = {
     "codex_exec_failed",
     CODEX_CHILD_MODEL_CAPACITY,
     "invalid_shard",
+    "invalid_release_search_handoff",
     "missing_shard",
 }
 TASK_STATES = (
@@ -1138,6 +1140,28 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             )
             discarded_tasks.append(_task_status_record(task, "invalid_evidence_shard"))
             continue
+        if release_identity and str(task.get("last_adapter") or "") == "codex-exec":
+            sidecar_status = _release_validation_child_search_sidecar_status(
+                run_dir=run_dir,
+                task=task,
+                shard_path=shard_path,
+                identity=release_identity,
+            )
+            if not sidecar_status["valid"]:
+                task["state"] = "failed"
+                task["failure_category"] = "invalid_release_search_handoff"
+                task["child_failure_code"] = CODEX_CHILD_RELEASE_HANDOFF_INVALID
+                task["last_error"] = _release_validation_child_search_handoff_message(
+                    sidecar_status
+                )
+                task["release_search_handoff_validation"] = sidecar_status
+                child_search_handoff_rejections.extend(
+                    dict(rejection)
+                    for rejection in sidecar_status.get("rejections", [])
+                    if isinstance(rejection, Mapping)
+                )
+                failed_tasks.append(_task_failure_record(task))
+                continue
         shard = _read_json(shard_path)
         id_map: dict[str, str] = {}
         new_claims = 0
@@ -1222,14 +1246,22 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             task["state"] = "merged"
             accepted_shards.append(_accepted_shard_record(task, shard_path))
             if release_identity and str(task.get("last_adapter") or "") == "codex-exec":
-                records, rejections = _release_validation_child_search_results(
+                sidecar_status = _release_validation_child_search_sidecar_status(
                     run_dir=run_dir,
                     task=task,
                     shard_path=shard_path,
                     identity=release_identity,
                 )
-                child_search_handoff_records.extend(records)
-                child_search_handoff_rejections.extend(rejections)
+                child_search_handoff_records.extend(
+                    dict(record)
+                    for record in sidecar_status.get("records_payload", [])
+                    if isinstance(record, Mapping)
+                )
+                child_search_handoff_rejections.extend(
+                    dict(rejection)
+                    for rejection in sidecar_status.get("rejections", [])
+                    if isinstance(rejection, Mapping)
+                )
         else:
             task["state"] = "discarded"
             task["discard_reason"] = "dedupe_or_no_mergeable_claims"
@@ -1353,6 +1385,70 @@ def _release_validation_child_search_results(
             continue
         accepted.append(normalized)
     return accepted, rejected
+
+
+def _release_validation_child_search_sidecar_status(
+    *,
+    run_dir: Path,
+    task: Mapping[str, Any],
+    shard_path: Path,
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    sidecar = shard_path.parent / "search_results.jsonl"
+    records, rejections = _release_validation_child_search_results(
+        run_dir=run_dir,
+        task=task,
+        shard_path=shard_path,
+        identity=identity,
+    )
+    normalized_rejections = [
+        dict(rejection) for rejection in rejections if isinstance(rejection, Mapping)
+    ]
+    if not records and not normalized_rejections:
+        normalized_rejections.append(
+            {
+                "task_id": task.get("id"),
+                "path": str(sidecar.relative_to(run_dir)),
+                "reason": "empty_child_search_results",
+            }
+        )
+    valid = bool(records) and not normalized_rejections
+    reason = None
+    if not valid:
+        first_rejection = normalized_rejections[0] if normalized_rejections else {}
+        reason = str(first_rejection.get("reason") or "invalid_child_search_results")
+    return {
+        "valid": valid,
+        "path": str(sidecar.relative_to(run_dir)),
+        "records": len(records),
+        "records_payload": records,
+        "rejections": normalized_rejections,
+        "reason": reason,
+    }
+
+
+def _release_validation_child_search_handoff_message(
+    sidecar_status: Mapping[str, Any],
+) -> str:
+    rejections = [
+        item
+        for item in sidecar_status.get("rejections", [])
+        if isinstance(item, Mapping)
+    ] if isinstance(sidecar_status.get("rejections"), list) else []
+    reasons = list(
+        dict.fromkeys(
+            str(item.get("reason") or "invalid_child_search_results")
+            for item in rejections
+        )
+    )
+    reason_text = ", ".join(reasons) if reasons else str(sidecar_status.get("reason") or "")
+    return (
+        "release validation child search_results.jsonl is invalid"
+        f"; reason={reason_text or 'invalid_child_search_results'}"
+        f"; records={int(sidecar_status.get('records') or 0)}"
+        f"; rejections={len(rejections)}"
+        f"; path={sidecar_status.get('path')}"
+    )
 
 
 def _release_validation_search_result(
@@ -2020,7 +2116,11 @@ def _maybe_retry_capacity_failure(
         task["state"] = "failed"
         _set_latest_attempt_retry_decision(task, "do_not_retry")
         return {"retry_decision": "do_not_retry", "should_retry": False}
-    if attempt_record.get("child_failure_code") != CODEX_CHILD_MODEL_CAPACITY:
+    retryable_child_failure_codes = {
+        CODEX_CHILD_MODEL_CAPACITY,
+        CODEX_CHILD_RELEASE_HANDOFF_INVALID,
+    }
+    if attempt_record.get("child_failure_code") not in retryable_child_failure_codes:
         task["state"] = "failed"
         _set_latest_attempt_retry_decision(task, "do_not_retry")
         return {"retry_decision": "do_not_retry", "should_retry": False}
@@ -2164,7 +2264,38 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
         trace_ids.append(trace_record["event_id"])
     task["trace_event_ids"] = trace_ids
     if result.status == "completed" and result.shard_path and Path(result.shard_path).exists():
-        validation = validate_artifacts(evidence_path=result.shard_path)
+        shard_path = Path(result.shard_path)
+        release_identity = release_validation_identity_from_payload(task)
+        if (
+            release_identity
+            and str(task.get("last_adapter") or "") == "codex-exec"
+        ):
+            sidecar_status = _release_validation_child_search_sidecar_status(
+                run_dir=run_dir,
+                task=task,
+                shard_path=shard_path,
+                identity=release_identity,
+            )
+            if not sidecar_status["valid"]:
+                diagnostic = _release_validation_child_search_handoff_message(
+                    sidecar_status
+                )
+                task["failure_category"] = "invalid_release_search_handoff"
+                task["child_failure_code"] = CODEX_CHILD_RELEASE_HANDOFF_INVALID
+                task["last_error"] = diagnostic
+                task["release_search_handoff_validation"] = sidecar_status
+                attempt_record["status"] = "failed"
+                attempt_record["failure_category"] = "invalid_release_search_handoff"
+                attempt_record["release_search_handoff_validation"] = sidecar_status
+                attempt_record["last_message_text_preview"] = _bounded_preview(diagnostic)
+                _update_attempt_diagnostic(
+                    attempt_record,
+                    child_failure_code=CODEX_CHILD_RELEASE_HANDOFF_INVALID,
+                    retry_decision="do_not_retry",
+                )
+                task["state"] = "failed"
+                return
+        validation = validate_artifacts(evidence_path=shard_path)
         if not validation.valid:
             task["failure_category"] = "invalid_shard"
             task["child_failure_code"] = CODEX_CHILD_SCHEMA_INVALID
@@ -2181,6 +2312,7 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
         task["child_failure_code"] = None
         _update_attempt_diagnostic(attempt_record, retry_decision="do_not_retry")
         task.pop("validation", None)
+        task.pop("release_search_handoff_validation", None)
         return
     if result.status == "blocked":
         task["state"] = "blocked"
@@ -3582,6 +3714,9 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
         "stdout_stderr_summary": _stdout_stderr_summary(diagnostic),
         "command_context": dict(command_context),
     }
+    release_validation = task.get("release_search_handoff_validation")
+    if isinstance(release_validation, Mapping):
+        record["release_search_handoff_validation"] = copy.deepcopy(release_validation)
     _add_attempt_diagnostics(record, task)
     return record
 

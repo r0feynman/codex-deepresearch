@@ -162,6 +162,31 @@ class ParallelOrchestratorTests(unittest.TestCase):
             ],
         }
 
+    def release_search_result(self, task: dict, **overrides: object) -> dict:
+        record = {
+            "id": f"sr_{task['id']}",
+            "task_id": task.get("search_task_id") or task["id"],
+            "angle_id": task["angle_id"],
+            "route": task["route"],
+            "provider": "codex-native",
+            "provider_mode": "real",
+            "query": task["query"],
+            "url": f"https://example.com/search/{task['id']}",
+            "title": "Release search result",
+            "snippet": "A release validation search result.",
+            "result_type": "web",
+            "rank": 1,
+            "accessed_at": "2026-06-23T00:00:00Z",
+            "retrieval_status": "fetched",
+            "policy_decision": "allowed",
+            "prompt_id": task["prompt_id"],
+            "suite_id": task["suite_id"],
+            "prompt_hash": task["prompt_hash"],
+            "handoff_artifact": "search_results.jsonl",
+        }
+        record.update(overrides)
+        return record
+
     def test_planner_output_expands_to_twenty_bounded_research_tasks(self) -> None:
         run_dir = self.prepare()
 
@@ -317,31 +342,217 @@ class ParallelOrchestratorTests(unittest.TestCase):
         shard_path = run_dir / task["output_shard_path"]
         shard_path.parent.mkdir(parents=True, exist_ok=True)
         self.write_json(shard_path, self.shard(run_dir, task))
+        invalid_record = self.release_search_result(
+            task,
+            url="https://example.com/incomplete",
+        )
+        invalid_record.pop("retrieval_status")
         self.write_jsonl(
             shard_path.parent / "search_results.jsonl",
-            [
-                {
-                    "provider": "codex-native",
-                    "provider_mode": "real",
-                    "retrieval_status": "fetched",
-                    "policy_decision": "allowed",
-                    "url": "https://example.com/incomplete",
-                }
-            ],
+            [invalid_record],
         )
         self.write_json(run_dir / "research_tasks.json", tasks_artifact)
 
         merge = merge_evidence_shards(run=run_dir)
 
         self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_search_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        self.assertIn("missing_required_release_field:retrieval_status", failed_task["diagnostic"])
+        self.assertIn(
+            "missing_required_release_field:retrieval_status",
+            failed_task["release_search_handoff_validation"]["rejections"][0]["reason"],
+        )
         handoff = merge["codex_native_search_handoff"]
         self.assertEqual(handoff["records"], 0)
         self.assertEqual(len(handoff["rejections"]), 1)
         self.assertIn(
-            "missing_required_release_field",
+            "missing_required_release_field:retrieval_status",
             handoff["rejections"][0]["reason"],
         )
         self.assertEqual((run_dir / "search_results.jsonl").read_text(encoding="utf-8"), "")
+
+    def test_release_validation_invalid_child_search_sidecar_retries_and_recovers(self) -> None:
+        prepared = prepare_run(
+            question="Release validation sidecar retry fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-001",
+            suite_id="issue-122-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        call_count = 0
+
+        def fake_codex_exec(command, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            record = self.release_search_result(
+                task,
+                url=f"https://example.com/retry-{call_count}",
+            )
+            if call_count == 1:
+                record.pop("retrieval_status")
+            self.write_jsonl(shard_path.parent / "search_results.jsonl", [record])
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        def validate_artifacts_after_release_sidecar(*args, **kwargs):
+            evidence_path = kwargs.get("evidence_path")
+            if evidence_path and call_count == 1:
+                sidecar_path = Path(evidence_path).parent / "search_results.jsonl"
+                if sidecar_path.exists():
+                    sidecar_records = [
+                        json.loads(line)
+                        for line in sidecar_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                    if any("retrieval_status" not in record for record in sidecar_records):
+                        raise AssertionError(
+                            "release sidecar validation must run before generic artifact validation"
+                        )
+            return validate_artifacts(*args, **kwargs)
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.random.uniform", return_value=0.0),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.validate_artifacts",
+                side_effect=validate_artifacts_after_release_sidecar,
+            ),
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        self.assertTrue(result["ok"])
+        self.assertEqual(call_count, 2)
+        self.assertEqual(run_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(5.0)
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "merged")
+        attempts = task["attempt_diagnostics"]
+        self.assertEqual([attempt["retry_decision"] for attempt in attempts], ["retry", "do_not_retry"])
+        self.assertEqual(
+            attempts[0]["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        self.assertIn(
+            "missing_required_release_field:retrieval_status",
+            attempts[0]["release_search_handoff_validation"]["rejections"][0]["reason"],
+        )
+        self.assertIsNone(attempts[1]["child_failure_code"])
+        handoff = result["merge"]["codex_native_search_handoff"]
+        self.assertEqual(handoff["records"], 1)
+        self.assertEqual(handoff["rejections"], [])
+        records = [
+            json.loads(line)
+            for line in (run_dir / "search_results.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["retrieval_status"], "fetched")
+        self.assertEqual(records[0]["url"], "https://example.com/retry-2")
+
+    def test_release_validation_invalid_child_search_sidecar_retry_exhaustion_fails(self) -> None:
+        prepared = prepare_run(
+            question="Release validation sidecar retry exhaustion fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-001",
+            suite_id="issue-122-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+
+        def fake_codex_exec(command, **_kwargs):
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            record = self.release_search_result(task)
+            record.pop("retrieval_status")
+            self.write_jsonl(shard_path.parent / "search_results.jsonl", [record])
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.random.uniform", return_value=0.0),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_args_list, [mock.call(5.0), mock.call(10.0)])
+        self.assertEqual(result["merge"]["accepted_shards"], [])
+        self.assertEqual((run_dir / "search_results.jsonl").read_text(encoding="utf-8"), "")
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "failed")
+        self.assertTrue(task["retry_exhausted"])
+        self.assertEqual(task["retry_exhausted_reason"], "max_attempts_reached")
+        self.assertEqual(task["failure_category"], "invalid_release_search_handoff")
+        self.assertEqual(task["child_failure_code"], "codex_child_release_handoff_invalid")
+        attempts = task["attempt_diagnostics"]
+        self.assertEqual(
+            [attempt["retry_decision"] for attempt in attempts],
+            ["retry", "retry", "retry_exhausted"],
+        )
+        self.assertTrue(
+            all(
+                attempt["child_failure_code"] == "codex_child_release_handoff_invalid"
+                for attempt in attempts
+            )
+        )
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertIn(
+            "missing_required_release_field:retrieval_status",
+            failed_task["diagnostic"],
+        )
+        self.assertIn(
+            "missing_required_release_field:retrieval_status",
+            result["diagnostics"]["first_failed_diagnostic"],
+        )
+        self.assertEqual(result["retry_summary"]["retry_exhausted_count"], 1)
 
     def test_codex_exec_adapter_runs_from_project_root_and_reports_trust_errors(self) -> None:
         run_dir = self.prepare()

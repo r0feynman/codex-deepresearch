@@ -49,6 +49,10 @@ BLOCKED_RETRIEVAL_STATUSES = {
     "robots_disallowed",
     "unauthorized",
 }
+PLAYWRIGHT_CHROMIUM_INSTALL_GUIDANCE = (
+    "python3 -m playwright install chromium",
+    "python3 -m playwright install-deps chromium",
+)
 
 
 class BrowserScreenshotError(RuntimeError):
@@ -103,10 +107,46 @@ class PlaywrightBrowserTransport:
     name = "playwright"
     provider_mode = "real"
 
+    def __init__(self) -> None:
+        self._availability_diagnostics: dict[str, Any] = {}
+
     def availability(self) -> tuple[bool, str | None]:
         if importlib.util.find_spec("playwright") is None:
+            self._availability_diagnostics = {
+                "reason": "playwright_python_package_missing",
+                "check": "python_package_import",
+                "install_guidance": list(PLAYWRIGHT_CHROMIUM_INSTALL_GUIDANCE),
+            }
             return False, "playwright_python_package_missing"
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self._availability_diagnostics = {
+                "reason": "playwright_python_package_missing",
+                "check": "python_package_import",
+                "install_guidance": list(PLAYWRIGHT_CHROMIUM_INSTALL_GUIDANCE),
+            }
+            return False, "playwright_python_package_missing"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                browser.close()
+        except PlaywrightError as exc:
+            self._availability_diagnostics = _missing_browser_dependency_diagnostics(exc)
+            return False, "missing_browser_dependency"
+        except Exception as exc:
+            self._availability_diagnostics = _missing_browser_dependency_diagnostics(exc)
+            return False, "missing_browser_dependency"
+        self._availability_diagnostics = {
+            "reason": None,
+            "check": "chromium_launch",
+            "browser": "chromium",
+        }
         return True, None
+
+    def availability_diagnostics(self) -> Mapping[str, Any]:
+        return dict(self._availability_diagnostics)
 
     def capture(
         self,
@@ -190,6 +230,10 @@ def collect_browser_screenshot_candidates(
     provider_run_id = str(evidence.get("run_id") or run_dir.name)
     viewport_payload = _viewport(viewport)
     available, unavailable_reason = active_transport.availability()
+    availability_diagnostics = _transport_availability_diagnostics(
+        active_transport,
+        reason=unavailable_reason,
+    )
     candidates: list[dict[str, Any]] = []
     captures_attempted = 0
     captures_succeeded = 0
@@ -246,10 +290,13 @@ def collect_browser_screenshot_candidates(
                 continue
             if not available:
                 captures_skipped += 1
+                reason = unavailable_reason or "browser_transport_unavailable"
                 candidates.append(
                     _removed_record(
                         base_record,
-                        reason="browser_transport_unavailable",
+                        reason=reason
+                        if reason == "missing_browser_dependency"
+                        else "browser_transport_unavailable",
                         unsupported_reason=unavailable_reason
                         or "browser transport is unavailable",
                         candidate_status="fetch_failed",
@@ -340,8 +387,41 @@ def collect_browser_screenshot_candidates(
         "external_vlm_call": False,
         "transport": active_transport.name,
         "last_error": last_error,
+        "diagnostics": availability_diagnostics,
     }
     return BrowserScreenshotCollection(candidates=candidates, provider_status=provider_status)
+
+
+def _transport_availability_diagnostics(
+    transport: BrowserScreenshotTransport,
+    *,
+    reason: str | None,
+) -> dict[str, Any]:
+    diagnostics = getattr(transport, "availability_diagnostics", None)
+    if callable(diagnostics):
+        value = diagnostics()
+        if isinstance(value, Mapping):
+            return dict(value)
+    payload: dict[str, Any] = {
+        "transport": transport.name,
+        "check": "browser_transport_availability",
+    }
+    if reason:
+        payload["reason"] = reason
+    if reason == "missing_browser_dependency":
+        payload["install_guidance"] = list(PLAYWRIGHT_CHROMIUM_INSTALL_GUIDANCE)
+    return payload
+
+
+def _missing_browser_dependency_diagnostics(exc: BaseException) -> dict[str, Any]:
+    return {
+        "reason": "missing_browser_dependency",
+        "check": "chromium_launch",
+        "browser": "chromium",
+        "error_type": exc.__class__.__name__,
+        "message": "Playwright Chromium could not launch; install the browser and required system dependencies.",
+        "install_guidance": list(PLAYWRIGHT_CHROMIUM_INSTALL_GUIDANCE),
+    }
 
 
 def _candidate_record(
