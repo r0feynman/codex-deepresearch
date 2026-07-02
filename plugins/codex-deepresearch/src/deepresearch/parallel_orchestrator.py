@@ -21,7 +21,12 @@ from typing import Any, Mapping, Sequence
 from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
 from .execution_mode import BUDGET_PRESETS
 from .run_state import add_run_steps_artifact, begin_stage, skip_stage, transition_stage
-from .search_handoff import SearchHandoffError, resolve_run_dir
+from .search_handoff import (
+    SearchHandoffError,
+    apply_release_validation_identity,
+    release_validation_identity_from_payload,
+    resolve_run_dir,
+)
 from .semantic_planner import (
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
     write_semantic_planner_validation,
@@ -591,26 +596,30 @@ def plan_research_tasks(
             question=str(evidence.get("question") or ""),
             occurrence=angle_occurrences[angle_id],
         )
-        tasks.append(
-            ResearchTask(
-                id=task_id,
-                angle_id=angle_id,
-                route=route,
-                query=query,
-                expected_evidence=_expected_evidence_for_task(base, route=route),
-                success_criteria=_success_criteria_for_task(base),
-                report_section=str(base.get("report_section") or base.get("angle") or "Findings"),
-                state="queued",
-                assigned_subagent_id=None,
-                attempt=0,
-                max_attempts=CAPACITY_RETRY_MAX_ATTEMPTS,
-                max_sources=max(1, int(base.get("max_results") or 3)),
-                max_images=max_images if route != "text_only" else 0,
-                source_policy={"decision": "allowed", "flags": []},
-                output_shard_path=f"{EVIDENCE_SHARDS_DIRNAME}/{task_id}/evidence_shard.json",
-                trace_event_ids=[],
-            ).to_dict()
+        task = ResearchTask(
+            id=task_id,
+            angle_id=angle_id,
+            route=route,
+            query=query,
+            expected_evidence=_expected_evidence_for_task(base, route=route),
+            success_criteria=_success_criteria_for_task(base),
+            report_section=str(base.get("report_section") or base.get("angle") or "Findings"),
+            state="queued",
+            assigned_subagent_id=None,
+            attempt=0,
+            max_attempts=CAPACITY_RETRY_MAX_ATTEMPTS,
+            max_sources=max(1, int(base.get("max_results") or 3)),
+            max_images=max_images if route != "text_only" else 0,
+            source_policy={"decision": "allowed", "flags": []},
+            output_shard_path=f"{EVIDENCE_SHARDS_DIRNAME}/{task_id}/evidence_shard.json",
+            trace_event_ids=[],
+        ).to_dict()
+        task["search_task_id"] = str(base.get("id") or task_id)
+        apply_release_validation_identity(
+            task,
+            release_validation_identity_from_payload(evidence),
         )
+        tasks.append(task)
     payload = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
@@ -624,6 +633,10 @@ def plan_research_tasks(
         ),
         "tasks": tasks,
     }
+    apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence),
+    )
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, payload)
     write_semantic_planner_validation(
         run_dir=run_dir,
@@ -1040,6 +1053,9 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     blocked_tasks: list[dict[str, Any]] = []
     discarded_tasks: list[dict[str, Any]] = []
     failed_tasks: list[dict[str, Any]] = []
+    release_identity = release_validation_identity_from_payload(evidence)
+    child_search_handoff_records: list[dict[str, Any]] = []
+    child_search_handoff_rejections: list[dict[str, Any]] = []
 
     evidence.setdefault("sources", [])
     evidence.setdefault("images", [])
@@ -1179,11 +1195,25 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         if new_claims or state == "merged":
             task["state"] = "merged"
             accepted_shards.append(_accepted_shard_record(task, shard_path))
+            if release_identity and str(task.get("last_adapter") or "") == "codex-exec":
+                records, rejections = _release_validation_child_search_results(
+                    run_dir=run_dir,
+                    task=task,
+                    shard_path=shard_path,
+                    identity=release_identity,
+                )
+                child_search_handoff_records.extend(records)
+                child_search_handoff_rejections.extend(rejections)
         else:
             task["state"] = "discarded"
             task["discard_reason"] = "dedupe_or_no_mergeable_claims"
             discarded_tasks.append(_task_status_record(task, "dedupe_or_no_mergeable_claims"))
 
+    if release_identity:
+        _write_release_validation_search_results(
+            run_dir,
+            child_search_handoff_records,
+        )
     _write_json(evidence_path, evidence)
     validation = validate_artifacts(evidence_path=evidence_path)
     tasks_artifact["attempted_real_child_execution"] = any(
@@ -1220,6 +1250,11 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         "failed_tasks": failed_tasks,
         "failure_counts": failure_counts,
         "retry_summary": retry_summary,
+        "codex_native_search_handoff": {
+            "search_results_path": str(run_dir / "search_results.jsonl"),
+            "records": len(child_search_handoff_records),
+            "rejections": child_search_handoff_rejections,
+        },
         "diagnostics": _merge_diagnostics(
             accepted_shards=accepted_shards,
             failed_tasks=failed_tasks,
@@ -1235,6 +1270,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             "evidence": str(evidence_path),
             "research_tasks": str(run_dir / RESEARCH_TASKS_FILENAME),
             "merge_status": str(run_dir / MERGE_STATUS_FILENAME),
+            "search_results": str(run_dir / "search_results.jsonl"),
         },
         "validation": validation.to_dict(),
     }
@@ -1243,6 +1279,153 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     _write_json(run_dir / MERGE_STATUS_FILENAME, merge_status)
     return merge_status
+
+
+def _release_validation_child_search_results(
+    *,
+    run_dir: Path,
+    task: Mapping[str, Any],
+    shard_path: Path,
+    identity: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    sidecar = shard_path.parent / "search_results.jsonl"
+    if not sidecar.exists():
+        return [], [
+            {
+                "task_id": task.get("id"),
+                "path": str(sidecar.relative_to(run_dir)),
+                "reason": "missing_child_search_results",
+            }
+        ]
+    records = _read_jsonl(sidecar)
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, Mapping):
+            rejected.append(
+                {
+                    "task_id": task.get("id"),
+                    "record_index": index,
+                    "reason": "invalid_jsonl_record",
+                }
+            )
+            continue
+        normalized, reason = _release_validation_search_result(
+            record,
+            task=task,
+            identity=identity,
+            index=index,
+        )
+        if normalized is None:
+            rejected.append(
+                {
+                    "task_id": task.get("id"),
+                    "record_index": index,
+                    "reason": reason or "not_release_eligible",
+                }
+            )
+            continue
+        accepted.append(normalized)
+    return accepted, rejected
+
+
+def _release_validation_search_result(
+    record: Mapping[str, Any],
+    *,
+    task: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    index: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if _truthy(record.get("hidden_codex_api_call")) or _truthy(
+        record.get("codex_native_api_call")
+    ):
+        return None, "hidden_codex_api_marker"
+    provider_mode = (
+        str(record.get("provider_mode") or "real").strip().lower().replace("_", "-")
+    )
+    provider = (
+        str(record.get("provider") or "codex-native").strip().lower().replace("_", "-")
+    )
+    if provider_mode in {"fixture", "manual", "user-provided", "post-hoc"}:
+        return None, "non_release_provider_mode"
+    if provider in {"fixture", "manual", "manual-sources", "user-provided", "post-hoc"}:
+        return None, "non_release_provider"
+    if _truthy(record.get("post_hoc_patch")) or _truthy(record.get("post_hoc_patched")):
+        return None, "post_hoc_patch_marker"
+    if str(record.get("policy_decision") or "allowed") != "allowed":
+        return None, "policy_not_allowed"
+    if str(record.get("retrieval_status") or "fetched").strip().lower() != "fetched":
+        return None, "retrieval_not_fetched"
+
+    raw_metadata = record.get("raw_provider_metadata")
+    if not isinstance(raw_metadata, Mapping):
+        raw_metadata = {}
+    result = {
+        "id": str(record.get("id") or f"sr_{task.get('id')}_{index:03d}"),
+        "task_id": str(
+            task.get("search_task_id") or record.get("task_id") or task.get("id")
+        ),
+        "angle_id": str(record.get("angle_id") or task.get("angle_id") or "angle_001"),
+        "route": str(record.get("route") or task.get("route") or "text_only"),
+        "provider": "codex-native",
+        "provider_mode": "real",
+        "query": str(record.get("query") or task.get("query") or ""),
+        "url": str(record.get("url") or ""),
+        "title": str(record.get("title") or "Codex-native search result"),
+        "snippet": str(record.get("snippet") or ""),
+        "result_type": str(record.get("result_type") or "web"),
+        "rank": int(record.get("rank") or index),
+        "freshness_requirement": str(record.get("freshness_requirement") or "any"),
+        "published_at": record.get("published_at"),
+        "accessed_at": str(record.get("accessed_at") or _utc_now()),
+        "language": str(record.get("language") or "en"),
+        "region": str(record.get("region") or "US"),
+        "retrieval_status": "fetched",
+        "policy_decision": "allowed",
+        "policy_flags": list(record.get("policy_flags") or []),
+        "raw_provider_metadata": dict(raw_metadata),
+        "prompt_id": identity["prompt_id"],
+        "suite_id": identity["suite_id"],
+        "prompt_hash": identity["prompt_hash"],
+        "handoff_artifact": "search_results.jsonl",
+    }
+    if not result["url"]:
+        return None, "missing_url"
+    return result, None
+
+
+def _write_release_validation_search_results(
+    run_dir: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    path = run_dir / "search_results.jsonl"
+    if not records:
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        return
+    path.write_text(
+        "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def _read_jsonl(path: Path) -> list[Any]:
+    records: list[Any] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            records.append(None)
+    return records
+
+
+def _truthy(value: Any) -> bool:
+    return value is True or (
+        isinstance(value, str)
+        and value.strip().lower() in {"1", "true", "yes"}
+    )
 
 
 def _adapter(
@@ -2526,6 +2709,21 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "inferences empty for later runner VLM analysis. Do not use user-uploaded, manual, login-walled, "
             "paywalled, CAPTCHA-gated, DRM-restricted, or robots-disallowed images. "
         )
+    release_identity = release_validation_identity_from_payload(task)
+    release_instruction = ""
+    if release_identity:
+        release_instruction = (
+            "This is a Public Beta release-validation run. For every SearchResult record, "
+            f"set task_id `{task.get('search_task_id') or task.get('id')}`, "
+            f"angle_id `{task.get('angle_id')}`, route `{task.get('route')}`, "
+            "provider `codex-native`, provider_mode `real`, retrieval_status `fetched`, "
+            "policy_decision `allowed`, handoff_artifact `search_results.jsonl`, "
+            f"prompt_id `{release_identity['prompt_id']}`, "
+            f"suite_id `{release_identity['suite_id']}`, "
+            f"prompt_hash `{release_identity['prompt_hash']}`, "
+            "and do not set hidden_codex_api_call or codex_native_api_call. "
+            "Do not use fixture, manual, user-provided-only, or post-hoc provider_mode values. "
+        )
     return (
         "Run this bounded research shard task and write only schema-valid "
         f"evidence to {shard_path}. "
@@ -2537,6 +2735,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         "Only direct quote_spans.quote values should remain verbatim in the source language. "
         "Prioritize a compact shard with decision-ready claims and do not read repository docs or skills unless the schema is otherwise impossible to satisfy. "
         "Use `vlm_provider` exactly `codex-interactive` unless the input evidence specifies another allowed value. "
+        f"{release_instruction}"
         f"{visual_instruction}"
         "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
         "Verifier vote `method` must be one of `codex-subagent`, `runner-agent`, `model-call`, or `manual-review`; "

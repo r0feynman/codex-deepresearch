@@ -70,6 +70,7 @@ from .public_beta_validation import (
     normalize_public_beta_completion_mode,
     parse_public_beta_gate_result,
     parse_public_beta_run,
+    public_beta_prompt_hash,
     run_public_beta_validation,
 )
 from .report_generation import ReportGenerationError, synthesize_report

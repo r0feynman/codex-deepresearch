@@ -20,7 +20,13 @@ from .parallel_orchestrator import (
     run_parallel_orchestration,
 )
 from .report_generation import ReportGenerationError, synthesize_report
-from .search_handoff import SearchHandoffError, prepare_run
+from .search_handoff import (
+    SearchHandoffError,
+    apply_release_validation_identity,
+    build_release_validation_identity,
+    prepare_run,
+    release_validation_identity_from_payload,
+)
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
@@ -177,6 +183,10 @@ def run_skill_invocation(
     max_tasks: int | None = None,
     allow_degraded: bool = True,
     require_codex_exec: bool = False,
+    prompt_id: str | None = None,
+    suite_id: str | None = None,
+    prompt_hash: str | None = None,
+    original_question: str | None = None,
 ) -> dict[str, Any]:
     """Route one ``$deep-research`` skill invocation to an explicit mode."""
 
@@ -214,6 +224,22 @@ def run_skill_invocation(
             budget_preset=budget_preset,
         )
 
+    try:
+        release_identity = build_release_validation_identity(
+            question=question,
+            prompt_id=prompt_id,
+            suite_id=suite_id,
+            prompt_hash=prompt_hash,
+            original_question=original_question,
+        )
+    except SearchHandoffError as exc:
+        return _blocked_without_run(
+            invocation=normalized_invocation,
+            question=question,
+            status="blocked_preflight",
+            actionable_cause=str(exc),
+        )
+
     preflight = _preflight_full_runner(
         invocation=normalized_invocation,
         question=question,
@@ -241,6 +267,10 @@ def run_skill_invocation(
             max_cost_usd=max_cost_usd,
             codex_runner="codex-exec",
             confirm_budget=confirm_budget,
+            prompt_id=release_identity.get("prompt_id"),
+            suite_id=release_identity.get("suite_id"),
+            prompt_hash=release_identity.get("prompt_hash"),
+            original_question=release_identity.get("original_question"),
         )
     except (BudgetEstimateError, ConfigResolutionError, SearchHandoffError, OSError) as exc:
         return _blocked_preflight_with_status_dir(
@@ -882,7 +912,7 @@ def _visual_provider_status(
     blocked_reason: str | None,
     actionable_cause: str,
 ) -> dict[str, Any]:
-    return build_visual_provider_status(
+    payload = build_visual_provider_status(
         run_dir=run_dir,
         status=status,
         ok=ok,
@@ -897,6 +927,7 @@ def _visual_provider_status(
         actionable_cause=actionable_cause,
         created_at=_utc_now(),
     )
+    return _apply_run_release_identity(run_dir, payload)
 
 
 def _run_requires_visual_provider(run_dir: Path) -> bool:
@@ -1801,6 +1832,7 @@ def _artifact_paths(run_dir: Path, extra_artifacts: Mapping[str, Any] | None = N
 
 def _write_run_status(run_dir: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     output = _finalize_handoff_payload(run_dir, payload)
+    output = _apply_run_release_identity(run_dir, output)
     _write_json(run_dir / RUN_STATUS_FILENAME, output)
     return output
 
@@ -1849,6 +1881,14 @@ def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict
     if isinstance(output.get("visual_summary"), Mapping):
         output["artifact_handoff"]["visual_summary"] = dict(output["visual_summary"])
     return output
+
+
+def _apply_run_release_identity(run_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    if isinstance(evidence, Mapping):
+        identity = release_validation_identity_from_payload(evidence)
+        apply_release_validation_identity(payload, identity)
+    return payload
 
 
 def _missing_required_synthesized_artifacts(

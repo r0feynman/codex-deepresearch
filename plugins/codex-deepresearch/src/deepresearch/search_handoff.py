@@ -27,6 +27,7 @@ from .evidence_schema import (
 )
 from .execution_mode import BudgetPreset, resolve_config
 from .modality_router import route_angles
+from .public_beta_validation import public_beta_prompt_hash
 from .run_state import begin_stage, skipped_stage_status
 from .semantic_planner import (
     SEMANTIC_PLANNER_SCHEMA_VERSION,
@@ -40,6 +41,14 @@ from .trace import record_stage_trace
 HANDOFF_SCHEMA_VERSION = "codex-deepresearch.search-handoff.v0"
 INGEST_STATUS_SCHEMA_VERSION = "codex-deepresearch.search-ingest.v0"
 FETCH_QUEUE_SCHEMA_VERSION = "codex-deepresearch.fetch-queue.v0"
+RELEASE_VALIDATION_IDENTITY_FIELDS = (
+    "prompt_id",
+    "suite_id",
+    "prompt_hash",
+    "original_question",
+    "execution_mode",
+    "runner_mode",
+)
 
 
 class SearchHandoffError(ValueError):
@@ -65,6 +74,10 @@ def prepare_run(
     max_cost_usd: float | None = None,
     codex_runner: str = "codex-exec",
     confirm_budget: bool = False,
+    prompt_id: str | None = None,
+    suite_id: str | None = None,
+    prompt_hash: str | None = None,
+    original_question: str | None = None,
 ) -> dict[str, Any]:
     """Create a run directory and the Codex search handoff artifacts."""
 
@@ -86,6 +99,14 @@ def prepare_run(
             value=max_results,
             minimum_supported=1,
         )
+
+    release_identity = build_release_validation_identity(
+        question=normalized_question,
+        prompt_id=prompt_id,
+        suite_id=suite_id,
+        prompt_hash=prompt_hash,
+        original_question=original_question,
+    )
 
     config = resolve_config(
         mode=mode,
@@ -211,6 +232,7 @@ def prepare_run(
             "visual_observations_path": "visual_observations.jsonl",
         },
     }
+    apply_release_validation_identity(evidence, release_identity)
 
     search_tasks_artifact = {
         "schema_version": HANDOFF_SCHEMA_VERSION,
@@ -221,6 +243,7 @@ def prepare_run(
         "search_provider": config.search_provider,
         "tasks": search_tasks,
     }
+    apply_release_validation_identity(search_tasks_artifact, release_identity)
     visual_tasks_artifact = {
         "schema_version": HANDOFF_SCHEMA_VERSION,
         "run_id": run_id,
@@ -231,6 +254,7 @@ def prepare_run(
             if route_record["modality"] != "text_only"
         ],
     }
+    apply_release_validation_identity(visual_tasks_artifact, release_identity)
     status = {
         "schema_version": HANDOFF_SCHEMA_VERSION,
         "run_id": run_id,
@@ -257,6 +281,7 @@ def prepare_run(
         },
         "budget_estimate": _budget_estimate_summary(budget_estimate),
     }
+    apply_release_validation_identity(status, release_identity)
     add_budget_estimate_artifact(status, run_dir)
 
     _write_json(run_dir / "evidence.json", evidence)
@@ -318,7 +343,82 @@ def prepare_run(
             ),
         },
         "budget_estimate": status["budget_estimate"],
+        **release_identity,
     }
+
+
+def build_release_validation_identity(
+    *,
+    question: str,
+    prompt_id: str | None = None,
+    suite_id: str | None = None,
+    prompt_hash: str | None = None,
+    original_question: str | None = None,
+) -> dict[str, str]:
+    """Build the canonical release-validation identity envelope if requested."""
+
+    provided = any(
+        isinstance(value, str) and value.strip()
+        for value in (prompt_id, suite_id, prompt_hash, original_question)
+    )
+    if not provided:
+        return {}
+    clean_prompt_id = (prompt_id or "").strip()
+    clean_suite_id = (suite_id or "").strip()
+    if not clean_prompt_id:
+        raise SearchHandoffError("prompt_id is required for release-validation identity")
+    if not clean_suite_id:
+        raise SearchHandoffError("suite_id is required for release-validation identity")
+    clean_original_question = " ".join((original_question or question).strip().split())
+    if not clean_original_question:
+        raise SearchHandoffError(
+            "original_question cannot be empty for release-validation identity"
+        )
+    expected_hash = public_beta_prompt_hash(clean_original_question)
+    clean_prompt_hash = (prompt_hash or expected_hash).strip()
+    if clean_prompt_hash != expected_hash:
+        raise SearchHandoffError(
+            "prompt_hash does not match the canonical hash of original_question"
+        )
+    return {
+        "prompt_id": clean_prompt_id,
+        "suite_id": clean_suite_id,
+        "prompt_hash": clean_prompt_hash,
+        "original_question": clean_original_question,
+        "execution_mode": "codex-plugin",
+        "runner_mode": "full-runner",
+    }
+
+
+def release_validation_identity_from_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+    """Return canonical release identity fields from an artifact payload."""
+
+    identity: dict[str, str] = {}
+    for field in RELEASE_VALIDATION_IDENTITY_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            identity[field] = value.strip()
+    required = {"prompt_id", "suite_id", "prompt_hash", "original_question"}
+    if not required.issubset(identity):
+        return {}
+    identity.setdefault("execution_mode", "codex-plugin")
+    identity.setdefault("runner_mode", "full-runner")
+    return identity
+
+
+def apply_release_validation_identity(
+    payload: dict[str, Any],
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Overlay canonical release identity onto a mutable artifact payload."""
+
+    if not isinstance(identity, Mapping):
+        return payload
+    clean_identity = release_validation_identity_from_payload(identity)
+    if not clean_identity:
+        return payload
+    payload.update(clean_identity)
+    return payload
 
 
 def ingest_run(
@@ -442,6 +542,10 @@ def ingest_run(
         "created_at": now,
         "entries": fetch_entries,
     }
+    apply_release_validation_identity(
+        fetch_queue,
+        release_validation_identity_from_payload(evidence),
+    )
     _write_json(run_dir / "fetch_queue.json", fetch_queue)
 
     evidence_validation = validate_artifacts(evidence_path=evidence_path)
@@ -615,18 +719,21 @@ def _budget_to_evidence(preset: str, budget: BudgetPreset) -> dict[str, Any]:
 
 def _base_ingest_status(run_dir: Path, status: str) -> dict[str, Any]:
     run_id = run_dir.name
+    identity: Mapping[str, Any] = {}
     try:
         evidence = _read_json(run_dir / "evidence.json")
         run_id = evidence.get("run_id", run_id)
+        identity = release_validation_identity_from_payload(evidence)
     except SearchHandoffError:
         pass
-    return {
+    payload = {
         "schema_version": INGEST_STATUS_SCHEMA_VERSION,
         "run_id": run_id,
         "run_dir": str(run_dir),
         "status": status,
         "created_at": _utc_now(),
     }
+    return apply_release_validation_identity(payload, identity)
 
 
 def _normalize_planner_angles(angles: Sequence[str] | None) -> list[str]:

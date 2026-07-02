@@ -550,6 +550,8 @@ def evaluate_public_beta_prompt_run(
         report_status=report_status if isinstance(report_status, Mapping) else {},
     )
     codex_native_checks = _codex_native_handoff_checks(
+        prompt=prompt,
+        suite_id=suite_id,
         run_path=run_path,
         artifacts=artifacts,
         run_status=run_status if isinstance(run_status, Mapping) else {},
@@ -1335,7 +1337,7 @@ def _acceptance(
             run.get("status") != "passed"
             or (
                 isinstance(run.get("codex_native_handoff_checks"), Mapping)
-                and run["codex_native_handoff_checks"].get("selected_mode")
+                and run["codex_native_handoff_checks"].get("execution_mode")
                 == "codex-plugin"
             )
             for run in evaluated_runs
@@ -1974,16 +1976,20 @@ def _status_consistency_failures(
 
 def _codex_native_handoff_checks(
     *,
+    prompt: Mapping[str, Any],
+    suite_id: str,
     run_path: Path,
     artifacts: Mapping[str, Path],
     run_status: Mapping[str, Any],
     evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     failures: list[str] = []
+    execution_mode = _execution_mode(run_status, evidence)
+    runner_mode = _runner_mode(run_status, evidence)
     selected_mode = _selected_mode(run_status, evidence)
-    if selected_mode != "codex-plugin":
+    if execution_mode != "codex-plugin":
         failures.append(
-            "selected mode must be codex-plugin for Codex-native completion"
+            "execution_mode must be codex-plugin for Codex-native completion"
         )
     for payload_name, payload in (("run_status", run_status), ("evidence", evidence)):
         hidden_api = payload.get("hidden_codex_api_call")
@@ -2002,18 +2008,39 @@ def _codex_native_handoff_checks(
     codex_native_results = [
         record for record in search_results if _is_codex_native_search_result(record)
     ]
-    if not codex_native_results:
+    invalid_codex_api_records = [
+        record
+        for record in search_results
+        if _claims_hidden_codex_api(record)
+    ]
+    if invalid_codex_api_records:
         failures.append(
-            "search_results.jsonl lacks allowed Codex-native search handoff results"
+            "search_results.jsonl contains hidden Codex-native API markers"
+        )
+    expected_hash = public_beta_prompt_hash(str(prompt.get("prompt") or ""))
+    matching_codex_native_results = [
+        record
+        for record in codex_native_results
+        if record.get("prompt_id") == prompt.get("id")
+        and record.get("suite_id") == suite_id
+        and record.get("prompt_hash") == expected_hash
+    ]
+    if not matching_codex_native_results:
+        failures.append(
+            "search_results.jsonl lacks allowed Codex-native search handoff results "
+            "with matching prompt_id, suite_id, and prompt_hash"
         )
     if _has_non_release_handoff_records(search_results):
         failures.append(
-            "search_results.jsonl contains fixture, manual, or user-provided-only records"
+            "search_results.jsonl contains fixture, manual, user-provided-only, or post-hoc records"
         )
     return {
         "valid": not failures,
+        "execution_mode": execution_mode,
+        "runner_mode": runner_mode,
         "selected_mode": selected_mode,
         "codex_native_search_results": len(codex_native_results),
+        "matching_codex_native_search_results": len(matching_codex_native_results),
         "search_results": len(search_results),
         "failures": failures,
     }
@@ -2168,6 +2195,8 @@ def _provider_provenance(
         "route": prompt.get("route"),
         "mode_targets": list(prompt.get("mode_targets", [])),
         "selected_mode": run_status.get("selected_mode") or evidence.get("mode"),
+        "execution_mode": _execution_mode(run_status, evidence),
+        "runner_mode": _runner_mode(run_status, evidence),
         "evidence_mode": evidence.get("mode"),
         "parallel_adapter": run_status.get("adapter") or run_status.get("parallel_adapter"),
         "expected_visual_providers": expected_visual_providers,
@@ -2233,13 +2262,25 @@ def _terminal_status(payload: Any) -> str:
     return str(status) if status else "unknown"
 
 
-def _prompt_hash(prompt: str) -> str:
-    normalized = _normalize_prompt_text(prompt)
+def public_beta_prompt_hash(prompt: str) -> str:
+    """Return the canonical Public Beta prompt identity hash."""
+
+    normalized = normalize_public_beta_prompt_text(prompt)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _normalize_prompt_text(value: str) -> str:
+def _prompt_hash(prompt: str) -> str:
+    return public_beta_prompt_hash(prompt)
+
+
+def normalize_public_beta_prompt_text(value: str) -> str:
+    """Normalize prompt text before hashing or equality checks."""
+
     return " ".join(value.strip().split())
+
+
+def _normalize_prompt_text(value: str) -> str:
+    return normalize_public_beta_prompt_text(value)
 
 
 def _string_field_values(
@@ -2645,6 +2686,38 @@ def _selected_mode(
     return None
 
 
+def _execution_mode(
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> str | None:
+    for value in (
+        run_status.get("execution_mode"),
+        evidence.get("execution_mode"),
+        evidence.get("mode"),
+        run_status.get("mode"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    selected = _selected_mode(run_status, evidence)
+    if selected == "codex-plugin":
+        return selected
+    return None
+
+
+def _runner_mode(
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> str | None:
+    for value in (
+        run_status.get("runner_mode"),
+        evidence.get("runner_mode"),
+        run_status.get("selected_mode"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _provider_name(record: Mapping[str, Any]) -> str:
     for name in ("provider", "search_provider", "analysis_provider", "vlm_provider"):
         value = record.get(name)
@@ -2655,29 +2728,31 @@ def _provider_name(record: Mapping[str, Any]) -> str:
 
 def _is_codex_native_search_result(record: Mapping[str, Any]) -> bool:
     provider = _provider_name(record)
-    retrieval_status = str(record.get("retrieval_status") or "fetched")
-    provider_mode = str(record.get("provider_mode") or "real")
+    retrieval_status = str(record.get("retrieval_status") or "fetched").strip().lower()
+    provider_mode = (
+        str(record.get("provider_mode") or "real").strip().lower().replace("_", "-")
+    )
     return (
         provider in _CODEX_NATIVE_SEARCH_PROVIDERS
         and provider_mode == "real"
-        and record.get("policy_decision") in {None, "allowed"}
-        and retrieval_status not in {
-            "failed",
-            "blocked",
-            "policy_blocked",
-            "manual_review",
-        }
+        and record.get("policy_decision") == "allowed"
+        and retrieval_status == "fetched"
+        and _handoff_artifact_mentions(record, {"search_results.jsonl"})
         and not _claims_hidden_codex_api(record)
     )
 
 
 def _has_non_release_handoff_records(records: Sequence[Mapping[str, Any]]) -> bool:
     for record in records:
-        mode = record.get("provider_mode")
+        mode = (
+            str(record.get("provider_mode") or "").strip().lower().replace("_", "-")
+        )
         provider = _provider_name(record)
-        if mode in {"fixture", "manual", "user_provided"}:
+        if mode in {"fixture", "manual", "user-provided", "post-hoc"}:
             return True
-        if provider in {"fixture", "manual", "manual-sources", "user-provided"}:
+        if provider in {"fixture", "manual", "manual-sources", "user-provided", "post-hoc"}:
+            return True
+        if record.get("post_hoc_patch") is True or record.get("post_hoc_patched") is True:
             return True
     return False
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,40 @@ class SearchHandoffTests(unittest.TestCase):
 
         validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
         self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+
+    def test_prepare_records_release_validation_identity_before_child_work(self) -> None:
+        question = "  Example release validation   prompt. "
+        normalized_question = "Example release validation prompt."
+        expected_hash = hashlib.sha256(normalized_question.encode("utf-8")).hexdigest()
+        result = prepare_run(
+            question=question,
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-001",
+            suite_id="issue-118-suite",
+        )
+        run_dir = Path(result["run_dir"])
+
+        self.assertEqual(result["prompt_id"], "pb-text-001")
+        self.assertEqual(result["suite_id"], "issue-118-suite")
+        self.assertEqual(result["prompt_hash"], expected_hash)
+        self.assertEqual(result["original_question"], normalized_question)
+        for artifact_name in (
+            "evidence.json",
+            "status.json",
+            "search_tasks.json",
+            "visual_tasks.json",
+        ):
+            with self.subTest(artifact_name=artifact_name):
+                payload = self.load_json(run_dir / artifact_name)
+                self.assertEqual(payload["run_id"], run_dir.name)
+                self.assertEqual(payload["prompt_id"], "pb-text-001")
+                self.assertEqual(payload["suite_id"], "issue-118-suite")
+                self.assertEqual(payload["prompt_hash"], expected_hash)
+                self.assertEqual(payload["original_question"], normalized_question)
+                self.assertEqual(payload["execution_mode"], "codex-plugin")
+                self.assertEqual(payload["runner_mode"], "full-runner")
+                self.assertIn("created_at", payload)
 
     def test_prepare_records_modality_routes_for_planner_angles(self) -> None:
         result = prepare_run(

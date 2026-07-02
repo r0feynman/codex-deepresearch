@@ -39,7 +39,11 @@ from .page_image_extraction import (
     _fetch_candidates as _fetch_page_image_candidates,
     _max_fetches as _page_image_max_fetches,
 )
-from .search_handoff import resolve_run_dir
+from .search_handoff import (
+    apply_release_validation_identity,
+    release_validation_identity_from_payload,
+    resolve_run_dir,
+)
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
     VISUAL_ARTIFACT_SCHEMA_VERSION,
@@ -2958,12 +2962,16 @@ def _visual_search_plan(
                 "state": state,
             }
         )
-    return {
+    payload = {
         "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "created_at": created_at,
         "tasks": tasks,
     }
+    return apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence),
+    )
 
 
 def _combined_visual_search_plan(
@@ -3044,12 +3052,16 @@ def _combined_visual_search_plan(
             task["caps"]["max_vlm_images"],
             selected_observations,
         )
-    return {
+    payload = {
         "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "created_at": created_at,
         "tasks": tasks,
     }
+    return apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence),
+    )
 
 
 def _visual_provider_status(
@@ -3149,17 +3161,18 @@ def _visual_provider_status(
         ):
             if counter in provider_status:
                 providers[-1][counter] = _int_or_zero(provider_status.get(counter))
+    evidence_payload = _read_json_object(run_dir / "evidence.json")
     minimums = visual_release_minimums(
         candidates=candidate_records,
         fetches=image_fetch_records,
         observations=observations,
-        evidence=_read_json_object(run_dir / "evidence.json"),
+        evidence=evidence_payload,
         report_status=_read_optional_json_object(run_dir / "report_status.json"),
     )
     diagnostics = {"actionable_cause": actionable_cause}
     if status == "partial_auto_visual":
         diagnostics.update(visual_minimum_diagnostics(minimums))
-    return {
+    payload = {
         "schema_version": VISUAL_PROVIDER_STATUS_SCHEMA_VERSION,
         "run_id": run_dir.name,
         "run_dir": str(run_dir),
@@ -3179,6 +3192,10 @@ def _visual_provider_status(
             "visual_provider_status": str(run_dir / VISUAL_PROVIDER_STATUS_FILENAME),
         },
     }
+    return apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence_payload),
+    )
 
 
 def _provider_kind(provider: str) -> str:

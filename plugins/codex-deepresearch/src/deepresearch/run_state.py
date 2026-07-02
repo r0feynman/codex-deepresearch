@@ -1862,6 +1862,7 @@ def _write_control_run_status(
         },
         "artifacts": artifacts,
     })
+    _overlay_release_validation_identity(payload, evidence)
     artifact_handoff = (
         dict(existing.get("artifact_handoff", {}))
         if isinstance(existing.get("artifact_handoff"), Mapping)
@@ -1886,6 +1887,34 @@ def _write_control_run_status(
     })
     payload["artifact_handoff"] = artifact_handoff
     _write_json_artifact(run_dir / RUN_STATUS_FILENAME, payload)
+
+
+def _overlay_release_validation_identity(
+    payload: dict[str, Any],
+    evidence: Mapping[str, Any],
+) -> None:
+    for key in (
+        "prompt_id",
+        "suite_id",
+        "prompt_hash",
+        "original_question",
+        "execution_mode",
+        "runner_mode",
+    ):
+        existing = payload.get(key)
+        if isinstance(existing, str) and existing.strip():
+            continue
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            payload[key] = value.strip()
+    if (
+        isinstance(payload.get("prompt_id"), str)
+        and isinstance(payload.get("suite_id"), str)
+        and isinstance(payload.get("prompt_hash"), str)
+        and isinstance(payload.get("original_question"), str)
+    ):
+        payload.setdefault("execution_mode", "codex-plugin")
+        payload.setdefault("runner_mode", "full-runner")
 
 
 def _control_provenance(

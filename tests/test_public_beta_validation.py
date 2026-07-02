@@ -273,6 +273,163 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(any("run_id values disagree" in failure for failure in failures), failures)
         self.assertTrue(any("report_status=other-run" in failure for failure in failures), failures)
 
+    def test_missing_prompt_or_suite_identity_still_fails_artifact_handoff(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+
+        for missing_field in ("prompt_id", "suite_id"):
+            with self.subTest(missing_field=missing_field):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / f"missing-{missing_field}",
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_parallel",
+                )
+                for artifact_name in (
+                    "run_status.json",
+                    "evidence.json",
+                    "report_status.json",
+                    "search_tasks.json",
+                ):
+                    payload = self.read_json(run_dir / artifact_name)
+                    payload.pop(missing_field, None)
+                    self.write_json(run_dir / artifact_name, payload)
+                search_results = self.read_jsonl(run_dir / "search_results.jsonl")
+                search_results[0].pop(missing_field, None)
+                self.write_jsonl(run_dir / "search_results.jsonl", search_results)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+                failures = result["supplied_run_binding"]["failures"]
+                self.assertTrue(
+                    any(missing_field in failure for failure in failures),
+                    failures,
+                )
+
+    def test_completed_codex_plugin_full_runner_identity_envelope_passes_contract(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "full-runner-contract",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed", result)
+        self.assertTrue(result["supplied_run_binding"]["valid"])
+        checks = result["codex_native_handoff_checks"]
+        self.assertTrue(checks["valid"], checks)
+        self.assertEqual(checks["execution_mode"], "codex-plugin")
+        self.assertEqual(checks["runner_mode"], "full-runner")
+        self.assertEqual(checks["selected_mode"], "full-runner")
+        self.assertGreaterEqual(checks["matching_codex_native_search_results"], 1)
+        search_result = self.read_jsonl(run_dir / "search_results.jsonl")[0]
+        for field in (
+            "id",
+            "task_id",
+            "angle_id",
+            "route",
+            "query",
+            "url",
+            "title",
+            "snippet",
+            "result_type",
+            "rank",
+            "accessed_at",
+            "policy_decision",
+            "provider",
+            "provider_mode",
+            "retrieval_status",
+            "prompt_id",
+            "suite_id",
+            "prompt_hash",
+            "handoff_artifact",
+        ):
+            self.assertIn(field, search_result)
+        self.assertEqual(search_result["provider"], "codex-native")
+        self.assertEqual(search_result["provider_mode"], "real")
+        self.assertEqual(search_result["retrieval_status"], "fetched")
+        self.assertEqual(search_result["policy_decision"], "allowed")
+        self.assertNotIn("hidden_codex_api_call", search_result)
+        self.assertNotIn("codex_native_api_call", search_result)
+
+    def test_non_codex_plugin_execution_mode_remains_rejected(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "manual-mode",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        for artifact_name in ("run_status.json", "evidence.json"):
+            payload = self.read_json(run_dir / artifact_name)
+            payload["execution_mode"] = "manual"
+            payload["mode"] = "manual"
+            self.write_json(run_dir / artifact_name, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+        checks = result["codex_native_handoff_checks"]
+        self.assertFalse(checks["valid"])
+        self.assertIn(
+            "execution_mode must be codex-plugin for Codex-native completion",
+            checks["failures"],
+        )
+
+    def test_non_release_search_handoff_markers_remain_rejected(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        cases = (
+            {"provider_mode": "fixture"},
+            {"provider_mode": "manual"},
+            {"provider_mode": "user_provided"},
+            {"provider_mode": "post_hoc"},
+            {"codex_native_api_call": True},
+            {"hidden_codex_api_call": True},
+        )
+
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / ("search-marker-" + str(len(overrides))),
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_parallel",
+                )
+                search_results = self.read_jsonl(run_dir / "search_results.jsonl")
+                search_results[0].update(overrides)
+                self.write_jsonl(run_dir / "search_results.jsonl", search_results)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+                self.assertFalse(result["codex_native_handoff_checks"]["valid"])
+
     def test_supplied_run_rejects_hidden_codex_native_api_assumption(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = manifest["prompts"][0]
@@ -295,6 +452,49 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_category"], "artifact_handoff_failure")
         self.assertIn("hidden Codex-native API call", result["failure_detail"])
+
+    def test_visual_identity_status_artifacts_have_matching_run_id_and_fresh_timestamp(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "visual-identity",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed", result)
+        for artifact_name in (
+            "report_status.json",
+            "visual_provider_status.json",
+            "visual_search_plan.json",
+        ):
+            with self.subTest(artifact_name=artifact_name):
+                payload = self.read_json(run_dir / artifact_name)
+                self.assertEqual(payload["run_id"], run_dir.name)
+                self.assertEqual(payload["prompt_id"], prompt["id"])
+                self.assertEqual(payload["suite_id"], "public-beta-validation")
+                self.assertEqual(payload["prompt_hash"], self.prompt_hash(prompt["prompt"]))
+                self.assertEqual(payload["original_question"], prompt["prompt"])
+                self.assertEqual(payload["execution_mode"], "codex-plugin")
+                self.assertEqual(payload["runner_mode"], "full-runner")
+                timestamp = (
+                    payload.get("completed_at")
+                    or payload.get("generated_at")
+                    or payload.get("created_at")
+                    or payload.get("updated_at")
+                )
+                self.assertIsInstance(timestamp, str)
+                self.assertTrue(timestamp.endswith("Z"), timestamp)
 
     def test_visual_supplied_run_rejects_mismatched_visual_provider_run_id(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -579,13 +779,16 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "prompt_id": prompt["id"],
                 "prompt_hash": self.prompt_hash(prompt["prompt"]),
                 "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "question": prompt["prompt"],
                 "status": status,
                 "ok": ok,
                 "terminal": terminal,
                 "created_at": timestamp,
                 "completed_at": timestamp,
-                "selected_mode": "codex-plugin",
+                "selected_mode": "full-runner",
                 "search_provider": "codex-native",
                 "adapter": "codex-exec",
             },
@@ -598,6 +801,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "prompt_id": prompt["id"],
                 "prompt_hash": self.prompt_hash(prompt["prompt"]),
                 "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "created_at": timestamp,
                 "tasks": [
                     {
@@ -622,6 +828,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "prompt_id": prompt["id"],
                     "prompt_hash": self.prompt_hash(prompt["prompt"]),
                     "suite_id": suite_id,
+                    "original_question": prompt["prompt"],
+                    "execution_mode": "codex-plugin",
+                    "runner_mode": "full-runner",
                     "question": prompt["prompt"],
                     "created_at": timestamp,
                     "mode": "codex-plugin",
@@ -633,6 +842,12 @@ class PublicBetaValidationTests(unittest.TestCase):
                 {
                     "schema_version": "codex-deepresearch.report-status.v0",
                     "run_id": run_dir.name,
+                    "prompt_id": prompt["id"],
+                    "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                    "suite_id": suite_id,
+                    "original_question": prompt["prompt"],
+                    "execution_mode": "codex-plugin",
+                    "runner_mode": "full-runner",
                     "status": "completed",
                     "created_at": timestamp,
                     "generated_at": timestamp,
@@ -667,13 +882,16 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "prompt_id": prompt["id"],
                 "prompt_hash": self.prompt_hash(prompt["prompt"]),
                 "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "question": prompt["prompt"],
                 "status": run_status,
                 "ok": run_status == "completed_auto_visual",
                 "terminal": True,
                 "created_at": timestamp,
                 "completed_at": timestamp,
-                "selected_mode": "codex-plugin",
+                "selected_mode": "full-runner",
                 "search_provider": "codex-native",
                 "vlm_provider": "codex-interactive",
             },
@@ -686,6 +904,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "prompt_id": prompt["id"],
                 "prompt_hash": self.prompt_hash(prompt["prompt"]),
                 "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "created_at": timestamp,
                 "tasks": [
                     {
@@ -713,6 +934,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "prompt_id": prompt["id"],
                 "prompt_hash": self.prompt_hash(prompt["prompt"]),
                 "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "question": prompt["prompt"],
                 "created_at": timestamp,
                 "mode": "codex-plugin",
@@ -759,6 +983,12 @@ class PublicBetaValidationTests(unittest.TestCase):
             {
                 "schema_version": "codex-deepresearch.report-generation.v0",
                 "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "status": "completed",
                 "created_at": timestamp,
                 "generated_at": timestamp,
@@ -770,6 +1000,12 @@ class PublicBetaValidationTests(unittest.TestCase):
             {
                 "schema_version": "codex-deepresearch.visual-provider-status.v0",
                 "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "status": provider_status,
                 "ok": provider_status == "completed_auto_visual",
                 "terminal": True,
@@ -809,6 +1045,12 @@ class PublicBetaValidationTests(unittest.TestCase):
             {
                 "schema_version": "codex-deepresearch.visual-artifacts.v0",
                 "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
                 "created_at": timestamp,
                 "tasks": [],
             },
@@ -1112,6 +1354,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         return {
             "id": f"search_{prompt['id']}",
             "task_id": "task_search_001",
+            "angle_id": "angle_001",
             "route": prompt["route"],
             "provider": "codex-native",
             "provider_mode": "real",
@@ -1119,13 +1362,20 @@ class PublicBetaValidationTests(unittest.TestCase):
             "url": "https://example.com/public-beta-source",
             "title": "Public beta source",
             "snippet": "A public-safe source supports the validation prompt.",
+            "result_type": "web",
+            "rank": 1,
+            "freshness_requirement": "any",
             "retrieval_status": "fetched",
             "policy_decision": "allowed",
+            "policy_flags": [],
             "prompt_id": prompt["id"],
             "prompt_hash": self.prompt_hash(prompt["prompt"]),
             "suite_id": suite_id,
             "accessed_at": self.now(),
+            "language": "en",
+            "region": "US",
             "handoff_artifact": "search_results.jsonl",
+            "raw_provider_metadata": {},
         }
 
     def prompt_hash(self, prompt: str) -> str:

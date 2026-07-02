@@ -487,6 +487,34 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(self.read_json(run_dir / "evidence.json"), evidence_before)
         self.assertTrue(files_before_pause.issubset(self.relative_files(run_dir)))
 
+    def test_control_run_status_preserves_release_validation_identity(self) -> None:
+        question = "State machine release validation identity."
+        expected_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()
+        prepared = prepare_run(
+            question=question,
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-001",
+            suite_id="issue-118-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+
+        pause_run(
+            run_dir,
+            reason="identity-check",
+            timestamp="2026-07-01T00:00:00Z",
+        )
+
+        run_status = self.read_json(run_dir / "run_status.json")
+        self.assertEqual(run_status["run_id"], run_dir.name)
+        self.assertEqual(run_status["prompt_id"], "pb-text-001")
+        self.assertEqual(run_status["suite_id"], "issue-118-suite")
+        self.assertEqual(run_status["prompt_hash"], expected_hash)
+        self.assertEqual(run_status["original_question"], question)
+        self.assertEqual(run_status["execution_mode"], "codex-plugin")
+        self.assertEqual(run_status["runner_mode"], "full-runner")
+        self.assertEqual(run_status["updated_at"], "2026-07-01T00:00:00Z")
+
     def test_pause_resume_cancel_preserve_existing_run_status_artifacts(self) -> None:
         runs_dir = self.temp_runs_dir()
         prepared = prepare_run(
