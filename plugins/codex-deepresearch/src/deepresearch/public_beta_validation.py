@@ -44,6 +44,29 @@ DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST = (
 )
 
 VISUAL_ROUTES = {"visual_required", "visual_optional"}
+SEARCH_RESULT_ROUTES = {"text_only", "visual_required", "visual_optional"}
+RELEASE_SEARCH_RESULT_TYPES = {"web", "pdf", "image", "news", "academic", "manual"}
+RELEASE_SEARCH_RESULT_REQUIRED_FIELDS = (
+    "id",
+    "task_id",
+    "angle_id",
+    "route",
+    "query",
+    "url",
+    "title",
+    "snippet",
+    "result_type",
+    "rank",
+    "accessed_at",
+    "policy_decision",
+    "provider",
+    "provider_mode",
+    "retrieval_status",
+    "prompt_id",
+    "suite_id",
+    "prompt_hash",
+    "handoff_artifact",
+)
 PASS_TERMINAL_STATUSES = {
     "completed_parallel",
     "completed_partial_parallel",
@@ -1800,6 +1823,48 @@ def _supplied_run_binding(
             f"{suite_id}: {_format_artifact_sources(suite_id_sources)}"
         )
 
+    execution_modes = _string_field_values(
+        *identity_artifacts.values(),
+        names=("execution_mode",),
+    )
+    execution_mode_sources = _artifact_field_sources(
+        identity_artifacts,
+        names=("execution_mode",),
+    )
+    missing_execution_mode = sorted(
+        set(identity_artifacts) - set(execution_mode_sources)
+    )
+    if missing_execution_mode:
+        failures.append(
+            "execution_mode is missing from required identity artifact(s): "
+            + ", ".join(missing_execution_mode)
+        )
+    elif any(value != "codex-plugin" for value in execution_modes):
+        failures.append(
+            "execution_mode must be codex-plugin for supplied release runs: "
+            + _format_artifact_sources(execution_mode_sources)
+        )
+
+    runner_modes = _string_field_values(
+        *identity_artifacts.values(),
+        names=("runner_mode",),
+    )
+    runner_mode_sources = _artifact_field_sources(
+        identity_artifacts,
+        names=("runner_mode",),
+    )
+    missing_runner_mode = sorted(set(identity_artifacts) - set(runner_mode_sources))
+    if missing_runner_mode:
+        failures.append(
+            "runner_mode is missing from required identity artifact(s): "
+            + ", ".join(missing_runner_mode)
+        )
+    elif any(value != "full-runner" for value in runner_modes):
+        failures.append(
+            "runner_mode must be full-runner for supplied release runs: "
+            + _format_artifact_sources(runner_mode_sources)
+        )
+
     freshness = _freshness_check_by_artifact(
         identity_artifacts,
         validation_time=validation_time,
@@ -1825,6 +1890,8 @@ def _supplied_run_binding(
         "prompt_id": prompt_id,
         "suite_id": suite_ids[0] if suite_ids else None,
         "prompt_hash": expected_hash,
+        "execution_mode": execution_modes[0] if execution_modes else None,
+        "runner_mode": runner_modes[0] if runner_modes else None,
         "created_at": freshness.get("selected_timestamp"),
         "max_age_days": SUPPLIED_RUN_MAX_AGE_DAYS,
         "bound_artifacts": sorted(identity_artifacts),
@@ -1990,6 +2057,10 @@ def _codex_native_handoff_checks(
     if execution_mode != "codex-plugin":
         failures.append(
             "execution_mode must be codex-plugin for Codex-native completion"
+        )
+    if runner_mode != "full-runner":
+        failures.append(
+            "runner_mode must be full-runner for Codex-native completion"
         )
     for payload_name, payload in (("run_status", run_status), ("evidence", evidence)):
         hidden_api = payload.get("hidden_codex_api_call")
@@ -2693,14 +2764,9 @@ def _execution_mode(
     for value in (
         run_status.get("execution_mode"),
         evidence.get("execution_mode"),
-        evidence.get("mode"),
-        run_status.get("mode"),
     ):
         if isinstance(value, str) and value.strip():
             return value.strip()
-    selected = _selected_mode(run_status, evidence)
-    if selected == "codex-plugin":
-        return selected
     return None
 
 
@@ -2711,7 +2777,6 @@ def _runner_mode(
     for value in (
         run_status.get("runner_mode"),
         evidence.get("runner_mode"),
-        run_status.get("selected_mode"),
     ):
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -2728,17 +2793,57 @@ def _provider_name(record: Mapping[str, Any]) -> str:
 
 def _is_codex_native_search_result(record: Mapping[str, Any]) -> bool:
     provider = _provider_name(record)
-    retrieval_status = str(record.get("retrieval_status") or "fetched").strip().lower()
+    retrieval_status = str(record.get("retrieval_status") or "").strip().lower()
     provider_mode = (
-        str(record.get("provider_mode") or "real").strip().lower().replace("_", "-")
+        str(record.get("provider_mode") or "").strip().lower().replace("_", "-")
+    )
+    policy_decision = (
+        str(record.get("policy_decision") or "").strip().lower().replace("_", "-")
     )
     return (
-        provider in _CODEX_NATIVE_SEARCH_PROVIDERS
+        _has_complete_release_search_result_fields(record)
+        and record.get("route") in SEARCH_RESULT_ROUTES
+        and record.get("result_type") in RELEASE_SEARCH_RESULT_TYPES
+        and provider == "codex-native"
         and provider_mode == "real"
-        and record.get("policy_decision") == "allowed"
+        and policy_decision == "allowed"
         and retrieval_status == "fetched"
-        and _handoff_artifact_mentions(record, {"search_results.jsonl"})
-        and not _claims_hidden_codex_api(record)
+        and str(record.get("handoff_artifact") or "").strip() == "search_results.jsonl"
+        and not _has_hidden_codex_api_marker_field(record)
+    )
+
+
+def _has_complete_release_search_result_fields(record: Mapping[str, Any]) -> bool:
+    return all(
+        _release_search_result_field_present(record, field)
+        for field in RELEASE_SEARCH_RESULT_REQUIRED_FIELDS
+    )
+
+
+def _release_search_result_field_present(
+    record: Mapping[str, Any],
+    field: str,
+) -> bool:
+    if field not in record:
+        return False
+    value = record.get(field)
+    if value is None:
+        return False
+    if field == "rank":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _has_hidden_codex_api_marker_field(record: Mapping[str, Any]) -> bool:
+    return any(
+        field in record
+        for field in (
+            "hidden_codex_api_call",
+            "codex_native_api_call",
+            "hidden_api_call",
+        )
     )
 
 

@@ -18,7 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .evidence_schema import EVIDENCE_SCHEMA_VERSION, validate_artifacts
+from .evidence_schema import (
+    EVIDENCE_SCHEMA_VERSION,
+    SEARCH_RESULT_TYPES,
+    SEARCH_ROUTES,
+    validate_artifacts,
+)
 from .execution_mode import BUDGET_PRESETS
 from .run_state import add_run_steps_artifact, begin_stage, skip_stage, transition_stage
 from .search_handoff import (
@@ -38,6 +43,27 @@ PARALLEL_SCHEMA_VERSION = "codex-deepresearch.parallel-orchestration.v0"
 RESEARCH_TASKS_FILENAME = "research_tasks.json"
 ASSIGNMENTS_FILENAME = "subagent_assignments.jsonl"
 MERGE_STATUS_FILENAME = "merge_status.json"
+RELEASE_SEARCH_RESULT_REQUIRED_FIELDS = (
+    "id",
+    "task_id",
+    "angle_id",
+    "route",
+    "provider",
+    "provider_mode",
+    "query",
+    "url",
+    "title",
+    "snippet",
+    "result_type",
+    "rank",
+    "accessed_at",
+    "retrieval_status",
+    "policy_decision",
+    "prompt_id",
+    "suite_id",
+    "prompt_hash",
+    "handoff_artifact",
+)
 EVIDENCE_SHARDS_DIRNAME = "evidence_shards"
 CHILD_EVENTS_DIRNAME = "child_events"
 CODEX_EXEC_STDOUT_FILENAME = "codex_exec_stdout.jsonl"
@@ -1336,62 +1362,119 @@ def _release_validation_search_result(
     identity: Mapping[str, Any],
     index: int,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if _truthy(record.get("hidden_codex_api_call")) or _truthy(
-        record.get("codex_native_api_call")
+    missing_fields = [
+        field
+        for field in RELEASE_SEARCH_RESULT_REQUIRED_FIELDS
+        if not _release_child_field_present(record, field)
+    ]
+    if missing_fields:
+        return None, "missing_required_release_field:" + ",".join(missing_fields)
+    if any(
+        field in record
+        for field in (
+            "hidden_codex_api_call",
+            "codex_native_api_call",
+            "hidden_api_call",
+        )
     ):
         return None, "hidden_codex_api_marker"
-    provider_mode = (
-        str(record.get("provider_mode") or "real").strip().lower().replace("_", "-")
-    )
-    provider = (
-        str(record.get("provider") or "codex-native").strip().lower().replace("_", "-")
-    )
-    if provider_mode in {"fixture", "manual", "user-provided", "post-hoc"}:
-        return None, "non_release_provider_mode"
-    if provider in {"fixture", "manual", "manual-sources", "user-provided", "post-hoc"}:
-        return None, "non_release_provider"
     if _truthy(record.get("post_hoc_patch")) or _truthy(record.get("post_hoc_patched")):
         return None, "post_hoc_patch_marker"
-    if str(record.get("policy_decision") or "allowed") != "allowed":
+
+    provider = _normalized_release_string(record, "provider")
+    provider_mode = _normalized_release_string(record, "provider_mode")
+    retrieval_status = _normalized_release_string(record, "retrieval_status")
+    policy_decision = _normalized_release_string(record, "policy_decision")
+    handoff_artifact = _string_value(record, "handoff_artifact")
+    if provider != "codex-native":
+        return None, "non_release_provider"
+    if provider_mode != "real":
+        return None, "non_release_provider_mode"
+    if policy_decision != "allowed":
         return None, "policy_not_allowed"
-    if str(record.get("retrieval_status") or "fetched").strip().lower() != "fetched":
+    if retrieval_status != "fetched":
         return None, "retrieval_not_fetched"
+    if handoff_artifact.replace("\\", "/").split("/")[-1] != "search_results.jsonl":
+        return None, "invalid_handoff_artifact"
+
+    expected_task_id = str(task.get("search_task_id") or task.get("id") or "")
+    task_id = _string_value(record, "task_id")
+    angle_id = _string_value(record, "angle_id")
+    route = _string_value(record, "route")
+    result_type = _string_value(record, "result_type")
+    if task_id != expected_task_id:
+        return None, "task_id_mismatch"
+    if angle_id != str(task.get("angle_id") or ""):
+        return None, "angle_id_mismatch"
+    if route != str(task.get("route") or "") or route not in SEARCH_ROUTES:
+        return None, "route_mismatch"
+    if result_type not in SEARCH_RESULT_TYPES:
+        return None, "invalid_result_type"
+    if _string_value(record, "prompt_id") != identity["prompt_id"]:
+        return None, "prompt_id_mismatch"
+    if _string_value(record, "suite_id") != identity["suite_id"]:
+        return None, "suite_id_mismatch"
+    if _string_value(record, "prompt_hash") != identity["prompt_hash"]:
+        return None, "prompt_hash_mismatch"
 
     raw_metadata = record.get("raw_provider_metadata")
-    if not isinstance(raw_metadata, Mapping):
-        raw_metadata = {}
     result = {
-        "id": str(record.get("id") or f"sr_{task.get('id')}_{index:03d}"),
-        "task_id": str(
-            task.get("search_task_id") or record.get("task_id") or task.get("id")
-        ),
-        "angle_id": str(record.get("angle_id") or task.get("angle_id") or "angle_001"),
-        "route": str(record.get("route") or task.get("route") or "text_only"),
-        "provider": "codex-native",
-        "provider_mode": "real",
-        "query": str(record.get("query") or task.get("query") or ""),
-        "url": str(record.get("url") or ""),
-        "title": str(record.get("title") or "Codex-native search result"),
-        "snippet": str(record.get("snippet") or ""),
-        "result_type": str(record.get("result_type") or "web"),
-        "rank": int(record.get("rank") or index),
-        "freshness_requirement": str(record.get("freshness_requirement") or "any"),
-        "published_at": record.get("published_at"),
-        "accessed_at": str(record.get("accessed_at") or _utc_now()),
-        "language": str(record.get("language") or "en"),
-        "region": str(record.get("region") or "US"),
-        "retrieval_status": "fetched",
-        "policy_decision": "allowed",
-        "policy_flags": list(record.get("policy_flags") or []),
-        "raw_provider_metadata": dict(raw_metadata),
-        "prompt_id": identity["prompt_id"],
-        "suite_id": identity["suite_id"],
-        "prompt_hash": identity["prompt_hash"],
+        "id": _string_value(record, "id"),
+        "task_id": task_id,
+        "angle_id": angle_id,
+        "route": route,
+        "provider": provider,
+        "provider_mode": provider_mode,
+        "query": _string_value(record, "query"),
+        "url": _string_value(record, "url"),
+        "title": _string_value(record, "title"),
+        "snippet": _string_value(record, "snippet"),
+        "result_type": result_type,
+        "rank": int(record["rank"]),
+        "accessed_at": _string_value(record, "accessed_at"),
+        "retrieval_status": retrieval_status,
+        "policy_decision": policy_decision,
+        "prompt_id": _string_value(record, "prompt_id"),
+        "suite_id": _string_value(record, "suite_id"),
+        "prompt_hash": _string_value(record, "prompt_hash"),
         "handoff_artifact": "search_results.jsonl",
     }
-    if not result["url"]:
-        return None, "missing_url"
+    optional_values = {
+        "freshness_requirement": record.get("freshness_requirement"),
+        "published_at": record.get("published_at"),
+        "language": record.get("language"),
+        "region": record.get("region"),
+    }
+    for key, value in optional_values.items():
+        if value is not None:
+            result[key] = value
+    if "policy_flags" in record:
+        result["policy_flags"] = list(record.get("policy_flags") or [])
+    if raw_metadata is not None:
+        result["raw_provider_metadata"] = (
+            dict(raw_metadata) if isinstance(raw_metadata, Mapping) else raw_metadata
+        )
     return result, None
+
+
+def _release_child_field_present(record: Mapping[str, Any], field: str) -> bool:
+    if field not in record or record.get(field) is None:
+        return False
+    value = record.get(field)
+    if field == "rank":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _normalized_release_string(record: Mapping[str, Any], field: str) -> str:
+    return _string_value(record, field).lower().replace("_", "-")
+
+
+def _string_value(record: Mapping[str, Any], field: str) -> str:
+    value = record.get(field)
+    return value.strip() if isinstance(value, str) else str(value)
 
 
 def _write_release_validation_search_results(

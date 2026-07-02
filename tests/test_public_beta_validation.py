@@ -273,11 +273,11 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(any("run_id values disagree" in failure for failure in failures), failures)
         self.assertTrue(any("report_status=other-run" in failure for failure in failures), failures)
 
-    def test_missing_prompt_or_suite_identity_still_fails_artifact_handoff(self) -> None:
+    def test_missing_canonical_identity_still_fails_artifact_handoff(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = manifest["prompts"][0]
 
-        for missing_field in ("prompt_id", "suite_id"):
+        for missing_field in ("prompt_id", "suite_id", "execution_mode", "runner_mode"):
             with self.subTest(missing_field=missing_field):
                 run_dir = self.write_text_run(
                     self.temp_dir() / f"missing-{missing_field}",
@@ -311,6 +311,71 @@ class PublicBetaValidationTests(unittest.TestCase):
                     any(missing_field in failure for failure in failures),
                     failures,
                 )
+
+    def test_legacy_mode_field_does_not_satisfy_execution_mode_contract(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "legacy-mode-only",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        for artifact_name in ("run_status.json", "evidence.json", "report_status.json"):
+            payload = self.read_json(run_dir / artifact_name)
+            payload.pop("execution_mode", None)
+            payload["mode"] = "codex-plugin"
+            self.write_json(run_dir / artifact_name, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+        self.assertTrue(
+            any(
+                "execution_mode is missing" in failure
+                for failure in result["supplied_run_binding"]["failures"]
+            ),
+            result["supplied_run_binding"]["failures"],
+        )
+        self.assertIn(
+            "execution_mode must be codex-plugin for Codex-native completion",
+            result["codex_native_handoff_checks"]["failures"],
+        )
+
+    def test_non_full_runner_mode_remains_rejected(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "quick-runner-mode",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        for artifact_name in ("run_status.json", "evidence.json", "report_status.json"):
+            payload = self.read_json(run_dir / artifact_name)
+            payload["runner_mode"] = "quick-chat"
+            self.write_json(run_dir / artifact_name, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+        self.assertTrue(
+            any(
+                "runner_mode must be full-runner" in failure
+                for failure in result["supplied_run_binding"]["failures"]
+            ),
+            result["supplied_run_binding"]["failures"],
+        )
 
     def test_completed_codex_plugin_full_runner_identity_envelope_passes_contract(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -406,6 +471,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             {"provider_mode": "post_hoc"},
             {"codex_native_api_call": True},
             {"hidden_codex_api_call": True},
+            {"hidden_codex_api_call": False},
         )
 
         for overrides in cases:
@@ -429,6 +495,36 @@ class PublicBetaValidationTests(unittest.TestCase):
                 self.assertEqual(result["status"], "failed")
                 self.assertEqual(result["failure_category"], "artifact_handoff_failure")
                 self.assertFalse(result["codex_native_handoff_checks"]["valid"])
+
+    def test_incomplete_codex_native_search_result_is_rejected(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "incomplete-search-result",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_parallel",
+        )
+        search_results = self.read_jsonl(run_dir / "search_results.jsonl")
+        search_results[0].pop("angle_id")
+        self.write_jsonl(run_dir / "search_results.jsonl", search_results)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+        checks = result["codex_native_handoff_checks"]
+        self.assertFalse(checks["valid"])
+        self.assertEqual(checks["codex_native_search_results"], 0)
+        self.assertIn(
+            "search_results.jsonl lacks allowed Codex-native search handoff results "
+            "with matching prompt_id, suite_id, and prompt_hash",
+            checks["failures"],
+        )
 
     def test_supplied_run_rejects_hidden_codex_native_api_assumption(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
