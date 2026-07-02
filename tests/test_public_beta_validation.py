@@ -708,6 +708,93 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(counts["real_vlm_images_analyzed"], 1)
         self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
 
+    def test_visual_gate_rejects_loose_vlm_observations_without_handoff_markers(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "loose-vlm-observations",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        for observation in observations[1:]:
+            for key in (
+                "codex_native_handoff",
+                "codex_interactive_handoff",
+                "handoff_recorded",
+                "handoff_artifact",
+                "explicit_artifact_handoff",
+            ):
+                observation.pop(key, None)
+            provenance = dict(observation.get("provider_provenance") or {})
+            for key in (
+                "codex_native_handoff",
+                "codex_interactive_handoff",
+                "handoff_recorded",
+                "handoff_artifact",
+                "explicit_artifact_handoff",
+            ):
+                provenance.pop(key, None)
+            observation["provider_provenance"] = provenance
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("at_least_3_codex_interactive_real_analyzed_images", checks)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_vlm_observations"], 1)
+        self.assertEqual(counts["real_vlm_images_analyzed"], 1)
+        self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
+
+    def test_visual_gate_rejects_budget_pruned_vlm_observations(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "budget-pruned-vlm-observations",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        for observation in observations[1:]:
+            observation["policy_decision"] = "budget_pruned"
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("at_least_3_codex_interactive_real_analyzed_images", checks)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_vlm_observations"], 1)
+        self.assertEqual(counts["real_vlm_images_analyzed"], 1)
+        self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
+
     def test_visual_gate_counts_codex_interactive_images_with_real_candidate_fetch_lineage(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = next(
@@ -905,7 +992,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertIn("codex_interactive_vlm_handoff_observations", checks)
         self.assertEqual(
             result["visual_release_checks"]["counts"]["real_vlm_images_analyzed"],
-            3,
+            0,
         )
         self.assertEqual(
             result["visual_release_checks"]["counts"]["real_vlm_observations"],

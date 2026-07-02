@@ -19,7 +19,6 @@ from typing import Any, Mapping, Sequence
 from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     real_automatic_visual_release_counts,
-    visual_release_minimums,
 )
 
 
@@ -2170,17 +2169,19 @@ def _visual_release_checks(
         observations=observations,
         visual_provider_status=visual_provider_status,
     )
-    minimums = visual_release_minimums(
+    real_candidates = _codex_native_acquisition_records(candidates)
+    real_fetches = _codex_native_fetch_records(fetches)
+    real_observations = _codex_interactive_observations(
         candidates=candidates,
         fetches=fetches,
         observations=observations,
-        evidence=evidence,
-        report_status=report_status,
-        report_text=report_text,
     )
-    real_candidates = _codex_native_acquisition_records(candidates)
-    real_fetches = _codex_native_fetch_records(fetches)
-    real_observations = _codex_interactive_observations(observations)
+    real_vlm_image_ids = {
+        str(observation.get("evidence_image_id"))
+        for observation in real_observations
+        if isinstance(observation.get("evidence_image_id"), str)
+        and observation.get("evidence_image_id")
+    }
     report_claims = _report_cited_visual_claims(
         evidence=evidence,
         report_status=report_status,
@@ -2248,10 +2249,7 @@ def _visual_release_checks(
                 ),
             }
         )
-    if (
-        int(minimums.get("vlm_images_analyzed") or 0)
-        < MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED
-    ):
+    if len(real_vlm_image_ids) < MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED:
         failures.append(
             {
                 "check": "at_least_3_codex_interactive_real_analyzed_images",
@@ -2286,9 +2284,7 @@ def _visual_release_checks(
             "real_candidates": len(real_candidates),
             "real_fetches": len(real_fetches),
             "real_vlm_observations": len(real_observations),
-            "real_vlm_images_analyzed": int(
-                minimums.get("vlm_images_analyzed") or 0
-            ),
+            "real_vlm_images_analyzed": len(real_vlm_image_ids),
             "report_cited_visual_or_mixed_claims": len(report_claims),
         },
         "failures": failures,
@@ -2546,8 +2542,52 @@ def _codex_native_fetch_records(records: Sequence[Mapping[str, Any]]) -> list[Ma
     ]
 
 
-def _codex_interactive_observations(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    return [record for record in records if _is_codex_interactive_vlm_observation(record)]
+def _codex_interactive_observations(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    fetches: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    candidates_by_id = {
+        str(item.get("candidate_id")): item
+        for item in candidates
+        if isinstance(item.get("candidate_id"), str) and item.get("candidate_id")
+    }
+    fetches_by_id = {
+        str(item.get("fetch_id")): item
+        for item in fetches
+        if isinstance(item.get("fetch_id"), str) and item.get("fetch_id")
+    }
+    eligible: list[Mapping[str, Any]] = []
+    for observation in observations:
+        if not _is_codex_interactive_vlm_observation(observation):
+            continue
+        candidate_id = observation.get("candidate_id")
+        fetch_id = observation.get("fetch_id")
+        image_id = observation.get("evidence_image_id")
+        if not (
+            isinstance(candidate_id, str)
+            and candidate_id
+            and isinstance(fetch_id, str)
+            and fetch_id
+            and isinstance(image_id, str)
+            and image_id
+        ):
+            continue
+        candidate = candidates_by_id.get(candidate_id)
+        fetch = fetches_by_id.get(fetch_id)
+        if candidate is None or fetch is None:
+            continue
+        if not _is_codex_native_policy_allowed_acquisition_record(candidate):
+            continue
+        if not _is_codex_native_policy_allowed_fetch(
+            fetch,
+            image_id=image_id,
+            candidate_id=candidate_id,
+        ):
+            continue
+        eligible.append(observation)
+    return eligible
 
 
 def _has_codex_native_acquisition_provider(payload: Mapping[str, Any]) -> bool:
@@ -2750,6 +2790,8 @@ def _is_codex_interactive_vlm_observation(record: Mapping[str, Any]) -> bool:
         and _is_explicit_codex_handoff(provenance)
         and not _claims_hidden_codex_api(record)
         and not _claims_hidden_codex_api(provenance)
+        and record.get("external_vlm_call") is not True
+        and provenance.get("external_vlm_call") is not True
     )
 
 
