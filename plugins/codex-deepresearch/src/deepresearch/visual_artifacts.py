@@ -210,9 +210,25 @@ def real_automatic_visual_release_counts(
     providers = visual_provider_status.get("providers", []) if visual_provider_status else []
     provider_records = [item for item in providers if isinstance(item, Mapping)]
     real_providers = [item for item in provider_records if _is_real_acquisition_record(item)]
-    excluded_providers = [
-        item for item in provider_records if not _is_real_acquisition_record(item)
+    real_vlm_providers = [
+        item
+        for item in provider_records
+        if item.get("provider_mode") == "real" and item.get("provider_kind") == "vlm"
     ]
+    excluded_providers = [
+        item
+        for item in provider_records
+        if not _is_real_acquisition_record(item)
+        and not (
+            item.get("provider_mode") == "real" and item.get("provider_kind") == "vlm"
+        )
+    ]
+    vlm_provider_count = sum(
+        _int(item.get("vlm_images_analyzed")) for item in real_vlm_providers
+    )
+    legacy_acquisition_vlm_count = sum(
+        _int(item.get("vlm_images_analyzed")) for item in real_providers
+    )
     return {
         "real_candidates": sum(1 for item in candidates if _is_real_acquisition_record(item)),
         "real_fetches": sum(1 for item in fetches if _is_real_acquisition_record(item)),
@@ -226,8 +242,8 @@ def real_automatic_visual_release_counts(
         "real_artifacts_fetched": sum(
             _int(item.get("artifacts_fetched")) for item in real_providers
         ),
-        "real_vlm_images_analyzed": sum(
-            _int(item.get("vlm_images_analyzed")) for item in real_providers
+        "real_vlm_images_analyzed": (
+            vlm_provider_count if vlm_provider_count > 0 else legacy_acquisition_vlm_count
         ),
         "excluded_non_real_provider_records": len(excluded_providers),
     }

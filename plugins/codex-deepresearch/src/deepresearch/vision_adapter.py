@@ -21,7 +21,11 @@ from urllib.request import Request, urlopen
 from .cache_keys import image_cache_key
 from .evidence_schema import VLM_PROVIDERS, validate_artifacts
 from .run_state import begin_stage, skipped_stage_status
-from .search_handoff import resolve_run_dir
+from .search_handoff import (
+    apply_release_validation_identity,
+    release_validation_identity_from_payload,
+    resolve_run_dir,
+)
 from .trace import record_stage_trace
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
@@ -2421,6 +2425,14 @@ def _write_visual_provider_status(
             "visual_provider_status": VISUAL_PROVIDER_STATUS_FILENAME,
         },
     }
+    evidence_path = run_dir / "evidence.json"
+    if evidence_path.exists():
+        evidence = _read_json(evidence_path)
+        if isinstance(evidence, Mapping):
+            apply_release_validation_identity(
+                payload,
+                release_validation_identity_from_payload(evidence),
+            )
     _write_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME, _redact_provider_value(payload, config=None))
 
 
@@ -3632,6 +3644,7 @@ def _copy_optional_visual_metadata(
         "candidate_origin",
         "duplicate_of",
         "fetch_id",
+        "handoff_artifact",
         "html_origin",
         "near_duplicate_group_id",
         "near_duplicate_of",
@@ -3651,6 +3664,15 @@ def _copy_optional_visual_metadata(
         "visual_acquisition_provider",
     )
     list_keys = ("removal_reasons",)
+    bool_keys = (
+        "codex_interactive_handoff",
+        "codex_native_handoff",
+        "explicit_artifact_handoff",
+        "external_network_call",
+        "external_vlm_call",
+        "handoff_recorded",
+        "hidden_codex_api_call",
+    )
     number_keys = ("estimated_cost_usd", "actual_cost_usd", "page_number")
     mapping_keys = (
         "provider_provenance",
@@ -3674,6 +3696,12 @@ def _copy_optional_visual_metadata(
         )
         if values:
             visual[key] = values
+    for key in bool_keys:
+        for container in (record, image):
+            value = container.get(key)
+            if isinstance(value, bool):
+                visual[key] = value
+                break
     for key in number_keys:
         for container in (record, image):
             value = container.get(key)

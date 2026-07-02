@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -696,6 +697,11 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(observations[0]["provider"], "codex-interactive")
         self.assertEqual(observations[0]["evidence_image_id"], "img_checkout_001")
         self.assertEqual(observations[0]["local_artifact_path"], "images/checkout.png")
+        self.assertTrue(observations[0]["codex_native_handoff"])
+        self.assertTrue(observations[0]["codex_interactive_handoff"])
+        self.assertTrue(observations[0]["explicit_artifact_handoff"])
+        self.assertEqual(observations[0]["handoff_artifact"], "visual_observations.jsonl")
+        self.assertFalse(observations[0]["hidden_codex_api_call"])
         self.assertTrue(observations[0]["provider_provenance"]["codex_native_handoff"])
         self.assertFalse(observations[0]["provider_provenance"]["external_vlm_call"])
 
@@ -845,6 +851,43 @@ class VisionAdapterTests(unittest.TestCase):
         visual_validation = validate_visual_artifacts(run_dir=run_dir)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
         self.assertTrue((run_dir / "report.md").is_file())
+
+    def test_codex_interactive_provider_status_preserves_release_identity(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        evidence = self.load_json(run_dir / "evidence.json")
+        original_question = "Compare checkout UI screenshots"
+        evidence.update(
+            {
+                "prompt_id": "pb-visual-identity",
+                "suite_id": "public-beta-validation",
+                "prompt_hash": hashlib.sha256(
+                    original_question.encode("utf-8")
+                ).hexdigest(),
+                "original_question": original_question,
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_codex_vlm_handoff(run_dir)
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        for field in (
+            "prompt_id",
+            "suite_id",
+            "prompt_hash",
+            "original_question",
+            "execution_mode",
+            "runner_mode",
+        ):
+            self.assertEqual(provider_status[field], evidence[field])
 
     def test_codex_interactive_without_worker_blocks_when_artifacts_exist(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")

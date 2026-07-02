@@ -29,6 +29,7 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     load_public_beta_prompt_manifest,
     run_public_beta_validation,
 )
+from deepresearch.visual_artifacts import visual_release_minimums  # noqa: E402
 
 
 class PublicBetaValidationTests(unittest.TestCase):
@@ -569,6 +570,21 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "passed", result)
+        self.assertTrue(result["visual_release_checks"]["valid"], result)
+        self.assertGreaterEqual(
+            result["visual_release_checks"]["counts"]["real_candidates"],
+            10,
+        )
+        self.assertGreaterEqual(
+            result["visual_release_checks"]["counts"]["real_vlm_images_analyzed"],
+            3,
+        )
+        self.assertGreaterEqual(
+            result["visual_release_checks"]["counts"][
+                "report_cited_visual_or_mixed_claims"
+            ],
+            1,
+        )
         for artifact_name in (
             "report_status.json",
             "visual_provider_status.json",
@@ -591,6 +607,43 @@ class PublicBetaValidationTests(unittest.TestCase):
                 )
                 self.assertIsInstance(timestamp, str)
                 self.assertTrue(timestamp.endswith("Z"), timestamp)
+
+    def test_visual_partial_supplied_run_binding_uses_present_identity_artifacts(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "partial-visual-binding",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="partial_auto_visual",
+            provider_status="partial_auto_visual",
+            candidate_count=10,
+            analyzed_image_count=1,
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["terminal_status"], "partial_auto_visual")
+        binding = result["supplied_run_binding"]
+        self.assertTrue(binding["valid"], binding)
+        self.assertIn("evidence", binding["bound_artifacts"])
+        self.assertIn("report_status", binding["bound_artifacts"])
+        self.assertIn("visual_provider_status", binding["bound_artifacts"])
+        self.assertFalse(
+            any("prompt_id is missing" in failure for failure in binding["failures"]),
+            binding["failures"],
+        )
+        self.assertFalse(
+            any("suite_id is missing" in failure for failure in binding["failures"]),
+            binding["failures"],
+        )
 
     def test_visual_supplied_run_rejects_mismatched_visual_provider_run_id(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -622,6 +675,257 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
+    def test_visual_gate_rejects_one_eligible_vlm_image_even_with_report_citation(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "one-vlm-image",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+            candidate_count=10,
+            analyzed_image_count=1,
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("at_least_3_codex_interactive_real_analyzed_images", checks)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_candidates"], 10)
+        self.assertEqual(counts["real_vlm_images_analyzed"], 1)
+        self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
+
+    def test_visual_gate_rejects_loose_vlm_observations_without_handoff_markers(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "loose-vlm-observations",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        for observation in observations[1:]:
+            for key in (
+                "codex_native_handoff",
+                "codex_interactive_handoff",
+                "handoff_recorded",
+                "handoff_artifact",
+                "explicit_artifact_handoff",
+            ):
+                observation.pop(key, None)
+            provenance = dict(observation.get("provider_provenance") or {})
+            for key in (
+                "codex_native_handoff",
+                "codex_interactive_handoff",
+                "handoff_recorded",
+                "handoff_artifact",
+                "explicit_artifact_handoff",
+            ):
+                provenance.pop(key, None)
+            observation["provider_provenance"] = provenance
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("at_least_3_codex_interactive_real_analyzed_images", checks)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_vlm_observations"], 1)
+        self.assertEqual(counts["real_vlm_images_analyzed"], 1)
+        self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
+
+    def test_visual_gate_rejects_budget_pruned_vlm_observations(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "budget-pruned-vlm-observations",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        for observation in observations[1:]:
+            observation["policy_decision"] = "budget_pruned"
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("at_least_3_codex_interactive_real_analyzed_images", checks)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_vlm_observations"], 1)
+        self.assertEqual(counts["real_vlm_images_analyzed"], 1)
+        self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
+
+    def test_visual_gate_counts_codex_interactive_images_with_real_candidate_fetch_lineage(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "codex-interactive-image-lineage",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        for record in [*candidates, *fetches]:
+            record["provider"] = "child-discovered-image-url"
+            record["provider_run_id"] = "child-discovered-image-url:real-001"
+            record.pop("search_provider", None)
+            provenance = dict(record.get("provider_provenance") or {})
+            provenance["provider"] = "child-discovered-image-url"
+            provenance["provider_run_id"] = "child-discovered-image-url:real-001"
+            provenance.pop("search_provider", None)
+            record["provider_provenance"] = provenance
+        provider_status["providers"][0]["provider"] = "child-discovered-image-url"
+        provider_status["providers"][0]["provider_run_id"] = "child-discovered-image-url:real-001"
+
+        evidence = self.read_json(run_dir / "evidence.json")
+        for image in evidence["images"]:
+            image["provider"] = "codex-interactive"
+            image["provider_kind"] = "vlm"
+            image["analysis_provider"] = "codex-interactive"
+            image["handoff_artifact"] = "visual_observations.jsonl"
+            image["codex_interactive_handoff"] = True
+            image["codex_native_handoff"] = True
+            image["provider_provenance"] = {
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "codex_interactive_handoff": True,
+                "codex_native_handoff": True,
+                "handoff_artifact": "visual_observations.jsonl",
+                "external_vlm_call": False,
+            }
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self.write_json(run_dir / "visual_provider_status.json", provider_status)
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed")
+        counts = result["visual_release_checks"]["counts"]
+        self.assertGreaterEqual(counts["real_candidates"], 10)
+        self.assertGreaterEqual(counts["real_vlm_images_analyzed"], 3)
+        self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
+
+    def test_visual_gate_ignores_budget_pruned_surplus_records(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "budget-pruned-surplus",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        pruned_candidate = dict(candidates[0])
+        pruned_candidate["candidate_id"] = "cand_pruned_surplus"
+        pruned_candidate["policy_decision"] = "budget_pruned"
+        pruned_candidate["candidate_status"] = "budget_pruned"
+        pruned_fetch = dict(fetches[0])
+        pruned_fetch["fetch_id"] = "fetch_pruned_surplus"
+        pruned_fetch["candidate_id"] = "cand_pruned_surplus"
+        pruned_fetch["policy_decision"] = "budget_pruned"
+        pruned_fetch["fetch_status"] = "budget_pruned"
+        fetches.append(pruned_fetch)
+        candidates.append(pruned_candidate)
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(result["visual_release_checks"]["valid"])
+
+    def test_visual_gate_rejects_policy_denied_surplus_records(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "policy-denied-surplus",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        denied_candidate = dict(candidates[0])
+        denied_candidate["candidate_id"] = "cand_policy_denied_surplus"
+        denied_candidate["policy_decision"] = "disallowed"
+        candidates.append(denied_candidate)
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("policy_allows_release_counting", checks)
+
     def test_visual_run_rejects_hidden_codex_interactive_api_assumption(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = next(
@@ -650,7 +954,50 @@ class PublicBetaValidationTests(unittest.TestCase):
             failure["check"]
             for failure in result["visual_release_checks"]["failures"]
         }
+        self.assertIn("codex_interactive_hidden_api_rejected", checks)
+
+    def test_visual_observation_must_keep_handoff_flags_with_report_links(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "split-handoff-links",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        for observation in observations:
+            observation.pop("codex_native_handoff", None)
+            observation.pop("codex_interactive_handoff", None)
+            observation.pop("handoff_recorded", None)
+            observation.pop("handoff_artifact", None)
+            observation.pop("explicit_artifact_handoff", None)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "vlm_failure")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
         self.assertIn("codex_interactive_vlm_handoff_observations", checks)
+        self.assertEqual(
+            result["visual_release_checks"]["counts"]["real_vlm_images_analyzed"],
+            0,
+        )
+        self.assertEqual(
+            result["visual_release_checks"]["counts"]["real_vlm_observations"],
+            0,
+        )
 
     def test_codex_native_runs_can_complete_without_external_gate_results(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -962,6 +1309,8 @@ class PublicBetaValidationTests(unittest.TestCase):
         run_status: str,
         provider_status: str,
         release_grade: bool = True,
+        candidate_count: int = 10,
+        analyzed_image_count: int = 3,
     ) -> Path:
         run_dir.mkdir(parents=True)
         prompt = prompt or next(
@@ -1018,10 +1367,55 @@ class PublicBetaValidationTests(unittest.TestCase):
             run_dir / "search_results.jsonl",
             [self.codex_native_search_result(prompt, suite_id=suite_id)],
         )
-        image_id = "img_real_001"
-        candidate = self.visual_candidate_record()
-        fetch = self.visual_fetch_record(candidate, image_id=image_id)
-        observation = self.visual_observation_record(candidate, fetch, image_id=image_id)
+        candidates = [
+            self.visual_candidate_record(
+                index=index,
+                analyzed=release_grade and index <= analyzed_image_count,
+            )
+            for index in range(1, candidate_count + 1)
+        ] if release_grade else []
+        fetches = []
+        observations = []
+        image_ids = []
+        images = []
+        for index, candidate in enumerate(candidates[:analyzed_image_count], start=1):
+            image_id = f"img_real_{index:03d}"
+            image_ids.append(image_id)
+            fetch = self.visual_fetch_record(candidate, image_id=image_id, index=index)
+            fetches.append(fetch)
+            observations.append(
+                self.visual_observation_record(
+                    candidate,
+                    fetch,
+                    image_id=image_id,
+                    index=index,
+                )
+            )
+            images.append(
+                {
+                    "id": image_id,
+                    "candidate_id": candidate["candidate_id"],
+                    "fetch_id": fetch["fetch_id"],
+                    "local_artifact_path": f"images/{image_id}.png",
+                    "provider": candidate["provider"],
+                    "provider_kind": candidate["provider_kind"],
+                    "provider_mode": "real",
+                    "provider_provenance": candidate["provider_provenance"],
+                    "policy_decision": "allowed",
+                }
+            )
+        cited_image_id = image_ids[0] if image_ids else "img_001"
+        visual_support = {
+            "image_id": cited_image_id,
+            "evidence_image_id": cited_image_id,
+            "observation_ref": f"images.{cited_image_id}.observations[0]",
+            "plan_id": candidates[0]["plan_id"] if candidates else "plan_visual_001",
+            "task_id": candidates[0]["task_id"] if candidates else "task_visual_001",
+            "angle_id": candidates[0]["angle_id"] if candidates else "angle_001",
+            "route": candidates[0]["route"] if candidates else "visual_required",
+            "candidate_id": candidates[0]["candidate_id"] if candidates else "cand_001",
+            "fetch_id": fetches[0]["fetch_id"] if fetches else "fetch_001",
+        }
         self.write_json(
             run_dir / "evidence.json",
             {
@@ -1038,34 +1432,15 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "mode": "codex-plugin",
                 "search_provider": "codex-native",
                 "vlm_provider": "codex-interactive",
-                "images": [
-                    {
-                        "id": image_id,
-                        "candidate_id": candidate["candidate_id"],
-                        "fetch_id": fetch["fetch_id"],
-                        "local_artifact_path": f"images/{image_id}.png",
-                        "provider": candidate["provider"],
-                        "provider_kind": candidate["provider_kind"],
-                        "provider_mode": "real",
-                        "provider_provenance": candidate["provider_provenance"],
-                        "policy_decision": "allowed",
-                    }
-                ]
-                if release_grade
-                else [],
+                "images": images if release_grade else [],
                 "claims": [
                     {
                         "id": "claim_visual_001",
                         "text": "The real visual provider image supports the claim.",
                         "claim_type": "visual",
                         "supporting_sources": [],
-                        "supporting_images": [image_id],
-                        "visual_supports": [
-                            {
-                                "image_id": image_id,
-                                "observation_ref": f"images.{image_id}.observations[0]",
-                            }
-                        ],
+                        "supporting_images": [cited_image_id],
+                        "visual_supports": [visual_support],
                         "verification_status": "supported",
                         "confidence": "high",
                     }
@@ -1088,8 +1463,55 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "status": "completed",
                 "created_at": timestamp,
                 "generated_at": timestamp,
-                "used_images": [image_id] if release_grade else ["img_001"],
+                "used_images": [cited_image_id] if release_grade else ["img_001"],
+                "included_claims": [
+                    {
+                        "claim_id": "claim_visual_001",
+                        "claim_type": "visual",
+                        "verification_status": "supported",
+                        "image_ids": [cited_image_id],
+                        "visual_supports": [visual_support],
+                    }
+                ]
+                if release_grade
+                else [],
             },
+        )
+        minimums = visual_release_minimums(
+            candidates=candidates,
+            fetches=fetches,
+            observations=observations,
+            evidence={
+                "routing": [{"id": "angle_001", "modality": "visual_required"}],
+                "images": images,
+                "claims": [
+                    {
+                        "id": "claim_visual_001",
+                        "claim_type": "visual",
+                        "supporting_images": [cited_image_id],
+                        "verification_status": "supported",
+                    }
+                ]
+                if release_grade
+                else [],
+            },
+            report_status={
+                "used_images": [cited_image_id] if release_grade else [],
+                "included_claims": [
+                    {
+                        "claim_id": "claim_visual_001",
+                        "image_ids": [cited_image_id],
+                        "visual_supports": [visual_support],
+                    }
+                ]
+                if release_grade
+                else [],
+            },
+            report_text=(
+                f"Claim `claim_visual_001` is supported by Image `{cited_image_id}`.\n"
+                if release_grade
+                else ""
+            ),
         )
         self.write_json(
             run_dir / "visual_provider_status.json",
@@ -1106,6 +1528,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "ok": provider_status == "completed_auto_visual",
                 "terminal": True,
                 "created_at": timestamp,
+                "minimums": minimums,
                 "providers": [
                     {
                         "provider": "codex-native",
@@ -1116,8 +1539,8 @@ class PublicBetaValidationTests(unittest.TestCase):
                         "configured": provider_status == "completed_auto_visual",
                         "available": provider_status == "completed_auto_visual",
                         "invocations": 1 if provider_status == "completed_auto_visual" else 0,
-                        "candidates_discovered": 1 if release_grade else 0,
-                        "artifacts_fetched": 1 if release_grade else 0,
+                        "candidates_discovered": len(candidates) if release_grade else 0,
+                        "artifacts_fetched": len(fetches) if release_grade else 0,
                         "vlm_images_analyzed": 0,
                     },
                     {
@@ -1130,8 +1553,8 @@ class PublicBetaValidationTests(unittest.TestCase):
                         "available": provider_status == "completed_auto_visual",
                         "invocations": 1 if provider_status == "completed_auto_visual" else 0,
                         "candidates_discovered": 0,
-                        "artifacts_fetched": 1 if release_grade else 0,
-                        "vlm_images_analyzed": 1 if release_grade else 0,
+                        "artifacts_fetched": len(fetches) if release_grade else 0,
+                        "vlm_images_analyzed": len(observations) if release_grade else 0,
                     },
                 ],
             },
@@ -1151,15 +1574,22 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "tasks": [],
             },
         )
-        self.write_jsonl(run_dir / "visual_candidates.jsonl", [candidate] if release_grade else [{}])
-        self.write_jsonl(run_dir / "image_fetch_status.jsonl", [fetch] if release_grade else [{}])
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            candidates if release_grade else [{}],
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches if release_grade else [{}])
         self.write_jsonl(
             run_dir / "visual_observations.jsonl",
-            [observation] if release_grade else [{}],
+            observations if release_grade else [{}],
         )
-        self.write_jsonl(run_dir / "verifier_votes.jsonl", [{"id": "vote_visual_001"}])
+        self.write_jsonl(
+            run_dir / "verifier_votes.jsonl",
+            [{"id": f"vote_visual_{index:03d}"} for index in range(1, len(observations) + 1)]
+            or [{"id": "vote_visual_001"}],
+        )
         report = (
-            "Claim `claim_visual_001` is supported by Image `img_real_001`.\n"
+            f"Claim `claim_visual_001` is supported by Image `{cited_image_id}`.\n"
             if release_grade
             else "# Public-safe visual report\n"
         )
@@ -1328,9 +1758,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def visual_candidate_record(self) -> dict[str, Any]:
+    def visual_candidate_record(self, *, index: int = 1, analyzed: bool = True) -> dict[str, Any]:
         return {
-            "candidate_id": "cand_real_001",
+            "candidate_id": f"cand_real_{index:03d}",
             "plan_id": "plan_task_visual_001_angle_001_visual_required",
             "task_id": "task_visual_001",
             "angle_id": "angle_001",
@@ -1353,12 +1783,18 @@ class PublicBetaValidationTests(unittest.TestCase):
             },
             "origin": "image_search",
             "policy_decision": "allowed",
-            "candidate_status": "analyzed",
+            "candidate_status": "analyzed" if analyzed else "selected",
         }
 
-    def visual_fetch_record(self, candidate: dict[str, Any], *, image_id: str) -> dict[str, Any]:
+    def visual_fetch_record(
+        self,
+        candidate: dict[str, Any],
+        *,
+        image_id: str,
+        index: int = 1,
+    ) -> dict[str, Any]:
         return {
-            "fetch_id": "fetch_real_001",
+            "fetch_id": f"fetch_real_{index:03d}",
             "candidate_id": candidate["candidate_id"],
             "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
@@ -1385,6 +1821,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         fetch: dict[str, Any],
         *,
         image_id: str,
+        index: int = 1,
     ) -> dict[str, Any]:
         link_lineage = {
             "plan_id": candidate["plan_id"],
@@ -1396,7 +1833,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "evidence_image_id": image_id,
         }
         return {
-            "observation_id": "obs_real_001",
+            "observation_id": f"obs_real_{index:03d}",
             "evidence_image_id": image_id,
             "plan_id": candidate["plan_id"],
             "task_id": candidate["task_id"],
@@ -1427,7 +1864,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 {
                     "claim_id": "claim_visual_001",
                     "visual_support_ref": f"images.{image_id}.observations[0]",
-                    "verifier_vote_id": "vote_visual_001",
+                    "verifier_vote_id": f"vote_visual_{index:03d}",
                     **link_lineage,
                 }
             ],
