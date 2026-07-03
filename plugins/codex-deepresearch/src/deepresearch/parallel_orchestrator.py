@@ -2446,6 +2446,31 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
         task["blocked_reason"] = result.message or "parallel execution unavailable"
         _update_attempt_diagnostic(attempt_record, retry_decision="do_not_retry")
         return
+    failed_shard_path = _probe_output_shard_path(task, command_context or {}, {})
+    if failed_shard_path is not None and failed_shard_path.exists():
+        validation = validate_artifacts(evidence_path=failed_shard_path)
+        if not validation.valid:
+            validation_payload = validation.to_dict()
+            task["failure_category"] = "invalid_shard"
+            task["child_failure_code"] = CODEX_CHILD_SCHEMA_INVALID
+            task["validation"] = validation_payload
+            if result.message:
+                task["last_error"] = result.message
+            attempt_record["status"] = "failed"
+            attempt_record["failure_category"] = "invalid_shard"
+            attempt_record["validation"] = validation_payload
+            _update_attempt_probe_validation(
+                attempt_record,
+                validation=validation_payload,
+                child_failure_code=CODEX_CHILD_SCHEMA_INVALID,
+            )
+            _update_attempt_diagnostic(
+                attempt_record,
+                child_failure_code=CODEX_CHILD_SCHEMA_INVALID,
+                retry_decision="do_not_retry",
+            )
+            task["state"] = "failed"
+            return
     failure = result.failure_category or "missing_shard"
     child_failure_code = str(attempt_record.get("child_failure_code") or "")
     if not child_failure_code and failure == "missing_shard":
@@ -2582,11 +2607,12 @@ def _build_child_attempt_probe(
         and str(task.get("last_adapter") or "") == "codex-exec"
         and result.status == "completed"
     )
+    timed_out = bool(child_summary.get("timeout"))
     shard_state = _probe_shard_state(
         shard_path,
         defer_parent_validation=defer_parent_validation,
+        timed_out=timed_out,
     )
-    timed_out = bool(child_summary.get("timeout"))
     runner_recoverable_valid_shard = bool(
         shard_state["shard_parent_valid"]
         and (timed_out or result.status == "completed")
@@ -2613,6 +2639,10 @@ def _build_child_attempt_probe(
         "last_validation_attempt_at": shard_state["last_validation_attempt_at"],
         "last_validation_result": shard_state["last_validation_result"],
         "shard_exists": shard_state["shard_exists"],
+        "parent_probe_after_timeout": shard_state["parent_probe_after_timeout"],
+        "parent_probe_observed_shard_at": shard_state["parent_probe_observed_shard_at"],
+        "parent_probe_validation_attempt_at": shard_state["parent_probe_validation_attempt_at"],
+        "parent_probe_validated_shard_at": shard_state["parent_probe_validated_shard_at"],
         "shard_schema_version": shard_state["shard_schema_version"],
         "shard_parent_valid": shard_state["shard_parent_valid"],
         "missing_required_fields": shard_state["missing_required_fields"],
@@ -2662,11 +2692,13 @@ def _probe_shard_state(
     shard_path: Path | None,
     *,
     defer_parent_validation: bool = False,
+    timed_out: bool = False,
 ) -> dict[str, Any]:
     if shard_path is None:
         return _missing_probe_shard_state(
             reason="output_shard_path_unobservable",
             validation_attempt_at=None,
+            timed_out=timed_out,
         )
     validation_attempt_at = _utc_now()
     if not shard_path.exists():
@@ -2674,11 +2706,13 @@ def _probe_shard_state(
             reason="shard_file_not_present_when_parent_probe_ran",
             validation_attempt_at=validation_attempt_at,
             shard_dir=shard_path.parent,
+            timed_out=timed_out,
         )
     if defer_parent_validation:
         shard_schema_version = _shard_schema_version(shard_path)
+        parent_probe_after_timeout = bool(timed_out)
         return {
-            "first_shard_observed_at": validation_attempt_at,
+            "first_shard_observed_at": None if timed_out else validation_attempt_at,
             "first_parent_valid_shard_at": None,
             "last_validation_attempt_at": None,
             "last_validation_result": {
@@ -2688,6 +2722,10 @@ def _probe_shard_state(
                 "errors": [],
             },
             "shard_exists": True,
+            "parent_probe_after_timeout": parent_probe_after_timeout,
+            "parent_probe_observed_shard_at": validation_attempt_at,
+            "parent_probe_validation_attempt_at": None,
+            "parent_probe_validated_shard_at": None,
             "shard_schema_version": shard_schema_version,
             "shard_parent_valid": None,
             "missing_required_fields": [],
@@ -2695,6 +2733,15 @@ def _probe_shard_state(
             "validation_errors": [],
             "sidecars": _expected_sidecar_probe_status(shard_path.parent),
             "unobservable_reasons": {
+                **(
+                    {
+                        "first_shard_observed_at": (
+                            "no_pre_timeout_shard_observation_watcher_available"
+                        )
+                    }
+                    if timed_out
+                    else {}
+                ),
                 "last_validation_attempt_at": (
                     "parent_validation_deferred_until_release_sidecar_validation"
                 ),
@@ -2707,9 +2754,10 @@ def _probe_shard_state(
     validation_errors = _bounded_validation_errors(validation)
     valid = bool(validation.get("valid"))
     shard_schema_version = _shard_schema_version(shard_path)
+    parent_probe_after_timeout = bool(timed_out)
     return {
-        "first_shard_observed_at": validation_attempt_at,
-        "first_parent_valid_shard_at": validation_attempt_at if valid else None,
+        "first_shard_observed_at": None if timed_out else validation_attempt_at,
+        "first_parent_valid_shard_at": None if timed_out else validation_attempt_at if valid else None,
         "last_validation_attempt_at": validation_attempt_at,
         "last_validation_result": {
             "state": "valid" if valid else "invalid",
@@ -2720,6 +2768,10 @@ def _probe_shard_state(
             "errors": validation_errors,
         },
         "shard_exists": True,
+        "parent_probe_after_timeout": parent_probe_after_timeout,
+        "parent_probe_observed_shard_at": validation_attempt_at,
+        "parent_probe_validation_attempt_at": validation_attempt_at,
+        "parent_probe_validated_shard_at": validation_attempt_at if valid else None,
         "shard_schema_version": shard_schema_version,
         "shard_parent_valid": valid,
         "missing_required_fields": _missing_required_fields(validation_errors),
@@ -2729,9 +2781,24 @@ def _probe_shard_state(
         "validation_errors": validation_errors,
         "sidecars": _expected_sidecar_probe_status(shard_path.parent),
         "unobservable_reasons": {
-            "first_parent_valid_shard_at": None
-            if valid
-            else "shard_was_not_parent_valid_when_parent_probe_ran"
+            **(
+                {
+                    "first_shard_observed_at": (
+                        "no_pre_timeout_shard_observation_watcher_available"
+                    ),
+                    "first_parent_valid_shard_at": (
+                        "parent_valid_shard_was_observed_only_during_parent_probe_after_timeout"
+                        if valid
+                        else "shard_was_not_parent_valid_when_parent_probe_ran"
+                    ),
+                }
+                if timed_out
+                else {
+                    "first_parent_valid_shard_at": None
+                    if valid
+                    else "shard_was_not_parent_valid_when_parent_probe_ran"
+                }
+            )
         },
     }
 
@@ -2741,6 +2808,7 @@ def _missing_probe_shard_state(
     reason: str,
     validation_attempt_at: str | None,
     shard_dir: Path | None = None,
+    timed_out: bool = False,
 ) -> dict[str, Any]:
     error = {
         "path": "$.evidence",
@@ -2758,6 +2826,10 @@ def _missing_probe_shard_state(
             "errors": [error],
         },
         "shard_exists": False,
+        "parent_probe_after_timeout": bool(timed_out),
+        "parent_probe_observed_shard_at": None,
+        "parent_probe_validation_attempt_at": validation_attempt_at,
+        "parent_probe_validated_shard_at": None,
         "shard_schema_version": None,
         "shard_parent_valid": False,
         "missing_required_fields": list(EVIDENCE_SCHEMA_V0_REQUIRED_TOP_LEVEL_FIELDS),
@@ -2937,28 +3009,31 @@ def _probe_unknowns(
 def _probe_candidate_causes(probe: Mapping[str, Any]) -> list[dict[str, Any]]:
     child_failure_code = str(probe.get("child_failure_code") or "")
     timed_out = probe.get("timeout") is True
-    shard_exists = _probe_shard_exists(probe)
+    parent_observed_shard = probe.get("parent_probe_observed_shard_at") is not None
     shard_parent_valid = probe.get("shard_parent_valid") is True
-    if timed_out and not shard_exists:
+    if timed_out and not parent_observed_shard:
         return [
             {
-                "cause": "no_parent_observable_shard_before_timeout",
+                "cause": "no_shard_observed_during_parent_probe_after_timeout",
                 "basis": [
                     "timeout",
                     "child_timeout_at",
-                    "shard_exists_at_timeout",
+                    "parent_probe_after_timeout",
+                    "parent_probe_observed_shard_at",
                     "last_validation_result",
                 ],
-                "confidence": "high",
+                "confidence": "medium",
             }
         ]
-    if timed_out and shard_exists and not shard_parent_valid:
+    if timed_out and parent_observed_shard and not shard_parent_valid:
         return [
             {
-                "cause": "shard_schema_invalid_at_timeout_probe",
+                "cause": "invalid_shard_observed_during_parent_probe_after_timeout",
                 "basis": [
                     "timeout",
-                    "shard_exists_at_timeout",
+                    "parent_probe_after_timeout",
+                    "parent_probe_observed_shard_at",
+                    "parent_probe_validation_attempt_at",
                     "shard_parent_valid",
                     "last_validation_result.errors",
                     "top_level_missing_fields",
@@ -2969,10 +3044,11 @@ def _probe_candidate_causes(probe: Mapping[str, Any]) -> list[dict[str, Any]]:
     if timed_out and shard_parent_valid:
         return [
             {
-                "cause": "timeout_after_parent_valid_shard",
+                "cause": "valid_shard_recoverable_during_parent_probe_after_timeout",
                 "basis": [
                     "timeout",
-                    "first_parent_valid_shard_at",
+                    "parent_probe_after_timeout",
+                    "parent_probe_validated_shard_at",
                     "runner_recoverability",
                 ],
                 "confidence": "medium",
@@ -3009,21 +3085,11 @@ def _probe_candidate_causes(probe: Mapping[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def _probe_shard_exists(probe: Mapping[str, Any]) -> bool:
-    if probe.get("shard_exists_at_timeout") is True:
-        return True
-    if probe.get("shard_exists_at_timeout") is False:
-        return False
-    return probe.get("shard_exists") is True
-
-
 def _finalize_child_attempt_probe_contract(probe: Mapping[str, Any]) -> dict[str, Any]:
     updated = dict(probe)
     updated["child_timeout_at"] = updated.get("child_timed_out_at")
     updated["child_elapsed_seconds"] = updated.get("elapsed_seconds")
-    updated["shard_exists_at_timeout"] = (
-        updated.get("shard_exists") if updated.get("timeout") is True else None
-    )
+    updated["shard_exists_at_timeout"] = None
     updated["top_level_missing_fields"] = list(updated.get("missing_required_fields") or [])
     updated["sidecar_status"] = copy.deepcopy(updated.get("sidecars") or {})
     updated["runner_recoverability"] = _probe_runner_recoverability(updated)
@@ -3054,10 +3120,15 @@ def _primary_probe_candidate_cause(probe: Mapping[str, Any]) -> dict[str, Any]:
 
 def _probe_runner_recoverability(probe: Mapping[str, Any]) -> dict[str, Any]:
     if probe.get("runner_recoverable_valid_shard") is True:
+        basis = (
+            ["parent_probe_validated_shard_at", "last_validation_result"]
+            if probe.get("parent_probe_after_timeout") is True
+            else ["first_parent_valid_shard_at", "last_validation_result"]
+        )
         return {
             "state": "recoverable_valid_shard",
             "recoverable": True,
-            "basis": ["first_parent_valid_shard_at", "last_validation_result"],
+            "basis": basis,
         }
     if probe.get("shard_parent_valid") is False:
         return {
@@ -3110,7 +3181,12 @@ def _probe_unobservable_reasons(probe: Mapping[str, Any]) -> dict[str, str]:
     if probe.get("child_elapsed_seconds") is None:
         reasons.setdefault("child_elapsed_seconds", "adapter_did_not_report_child_elapsed_time")
     if probe.get("shard_exists_at_timeout") is None:
-        reasons.setdefault("shard_exists_at_timeout", "child_did_not_timeout")
+        reasons.setdefault(
+            "shard_exists_at_timeout",
+            "no_direct_timeout_instant_shard_observation_available"
+            if probe.get("timeout") is True
+            else "child_did_not_timeout",
+        )
     if probe.get("last_child_event") is None:
         reasons.setdefault("last_child_event", "no_child_json_event_observed")
     if probe.get("last_tool_or_command_call") is None:
@@ -3160,7 +3236,14 @@ def _update_attempt_probe_validation(
     valid = bool(validation.get("valid"))
     validation_at = _utc_now()
     updated["last_validation_attempt_at"] = validation_at
-    if valid and not updated.get("first_parent_valid_shard_at"):
+    if updated.get("timeout") is True:
+        updated["parent_probe_after_timeout"] = True
+        if not updated.get("parent_probe_observed_shard_at"):
+            updated["parent_probe_observed_shard_at"] = validation_at
+        updated["parent_probe_validation_attempt_at"] = validation_at
+        updated["parent_probe_validated_shard_at"] = validation_at if valid else None
+        updated["first_parent_valid_shard_at"] = None
+    elif valid and not updated.get("first_parent_valid_shard_at"):
         updated["first_parent_valid_shard_at"] = validation_at
     updated["last_validation_result"] = {
         "state": "valid" if valid else "invalid",

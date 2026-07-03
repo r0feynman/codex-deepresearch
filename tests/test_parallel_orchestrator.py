@@ -905,18 +905,24 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(probe["child_elapsed_seconds"], probe["elapsed_seconds"])
         self.assertEqual(probe["timeout_seconds"], 12)
         self.assertFalse(probe["shard_exists"])
-        self.assertFalse(probe["shard_exists_at_timeout"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertTrue(probe["parent_probe_after_timeout"])
+        self.assertIsNone(probe["parent_probe_observed_shard_at"])
+        self.assertIn(
+            "no_direct_timeout_instant_shard_observation_available",
+            probe["unobservable_reasons"]["shard_exists_at_timeout"],
+        )
         self.assertFalse(probe["shard_parent_valid"])
         self.assertIn("run_id", probe["top_level_missing_fields"])
         self.assertEqual(probe["last_validation_result"]["state"], "invalid")
         self.assertIn("first_shard_observed_at", {item["field"] for item in probe["unknowns"]})
         self.assertEqual(
             probe["candidate_causes"][0]["cause"],
-            "no_parent_observable_shard_before_timeout",
+            "no_shard_observed_during_parent_probe_after_timeout",
         )
-        self.assertEqual(probe["candidate_causes"][0]["confidence"], "high")
-        self.assertEqual(probe["candidate_cause_confidence"], "high")
-        self.assertIn("child_timeout_at", probe["candidate_cause_basis"])
+        self.assertEqual(probe["candidate_causes"][0]["confidence"], "medium")
+        self.assertEqual(probe["candidate_cause_confidence"], "medium")
+        self.assertIn("parent_probe_observed_shard_at", probe["candidate_cause_basis"])
         self.assertIn("search_results", probe["sidecars"])
         self.assertIn("search_results", probe["sidecar_status"])
         self.assertIn("visual_observations", probe["sidecars"])
@@ -978,7 +984,11 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(probe["timeout"])
         self.assertEqual(probe["child_failure_code"], "codex_child_schema_invalid")
         self.assertTrue(probe["shard_exists"])
-        self.assertTrue(probe["shard_exists_at_timeout"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertTrue(probe["parent_probe_after_timeout"])
+        self.assertIsNotNone(probe["parent_probe_observed_shard_at"])
+        self.assertIsNotNone(probe["parent_probe_validation_attempt_at"])
+        self.assertIsNone(probe["parent_probe_validated_shard_at"])
         self.assertEqual(
             probe["shard_schema_version"],
             "codex-deepresearch.evidence-shard.v0",
@@ -994,7 +1004,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(probe["last_tool_or_command_call"]["kind"], "command")
         self.assertEqual(
             probe["candidate_causes"][0]["cause"],
-            "shard_schema_invalid_at_timeout_probe",
+            "invalid_shard_observed_during_parent_probe_after_timeout",
         )
         self.assertEqual(probe["candidate_causes"][0]["confidence"], "medium")
         self.assertEqual(probe["candidate_cause_confidence"], "medium")
@@ -1161,15 +1171,25 @@ class ParallelOrchestratorTests(unittest.TestCase):
         probe = task_record["attempt_diagnostics"][0]["attempt_probe"]
         self.assertTrue(probe["timeout"])
         self.assertTrue(probe["shard_exists"])
-        self.assertTrue(probe["shard_exists_at_timeout"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertTrue(probe["parent_probe_after_timeout"])
+        self.assertIsNotNone(probe["parent_probe_observed_shard_at"])
+        self.assertIsNotNone(probe["parent_probe_validation_attempt_at"])
+        self.assertIsNotNone(probe["parent_probe_validated_shard_at"])
         self.assertTrue(probe["shard_parent_valid"])
         self.assertTrue(probe["runner_recoverable_valid_shard"])
         self.assertEqual(probe["runner_recoverability"]["state"], "recoverable_valid_shard")
-        self.assertIsNotNone(probe["first_parent_valid_shard_at"])
+        self.assertIn("parent_probe_validated_shard_at", probe["runner_recoverability"]["basis"])
+        self.assertIsNone(probe["first_parent_valid_shard_at"])
+        self.assertEqual(
+            probe["unobservable_reasons"]["first_parent_valid_shard_at"],
+            "parent_valid_shard_was_observed_only_during_parent_probe_after_timeout",
+        )
         self.assertEqual(
             probe["candidate_causes"][0]["cause"],
-            "timeout_after_parent_valid_shard",
+            "valid_shard_recoverable_during_parent_probe_after_timeout",
         )
+        self.assertIn("parent_probe_validated_shard_at", probe["candidate_cause_basis"])
         self.assertEqual(
             result["merge"]["accepted_shards"][0]["diagnostics"]["attempt_diagnostics"][0][
                 "attempt_probe"
@@ -1474,6 +1494,83 @@ class ParallelOrchestratorTests(unittest.TestCase):
             ),
             failed_task["validation"],
         )
+
+    def test_codex_exec_failed_child_with_invalid_legacy_shard_is_schema_invalid(self) -> None:
+        run_dir = self.prepare()
+
+        def fake_codex_exec(command, **_kwargs):
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(
+                shard_path,
+                {
+                    "schema_version": "codex-deepresearch.evidence-shard.v0",
+                    "sources": [],
+                    "claims": [],
+                },
+            )
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout='{"type":"message","status":"error","message":"wrote invalid shard then failed"}\n',
+                stderr="child exited after invalid shard",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        run_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["failure_category"], "invalid_shard")
+        self.assertEqual(task["child_failure_code"], "codex_child_schema_invalid")
+        attempt = task["attempt_diagnostics"][0]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["failure_category"], "invalid_shard")
+        self.assertEqual(attempt["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(attempt["retry_decision"], "do_not_retry")
+        self.assertFalse(attempt["timeout"])
+        self.assertIn("validation", attempt)
+        probe = attempt["attempt_probe"]
+        self.assertFalse(probe["timeout"])
+        self.assertTrue(probe["shard_exists"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertEqual(
+            probe["shard_schema_version"],
+            "codex-deepresearch.evidence-shard.v0",
+        )
+        self.assertFalse(probe["shard_parent_valid"])
+        self.assertEqual(probe["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(probe["candidate_causes"][0]["cause"], "child_shard_schema_invalid")
+        self.assertEqual(probe["last_validation_result"]["state"], "invalid")
+        self.assertTrue(
+            any(
+                error["code"] == "invalid_enum"
+                for error in probe["validation_errors"]
+            ),
+            probe["validation_errors"],
+        )
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_shard")
+        self.assertEqual(failed_task["child_failure_code"], "codex_child_schema_invalid")
+        self.assertFalse(failed_task["retryable"])
 
     def test_codex_exec_capacity_retry_exhaustion_fails_without_timeout(self) -> None:
         run_dir = self.prepare()
