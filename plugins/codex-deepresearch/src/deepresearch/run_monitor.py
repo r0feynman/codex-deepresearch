@@ -134,6 +134,11 @@ def inspect_run_monitor(run_dir: str | Path) -> dict[str, Any]:
             subagent_assignments,
             run_trace,
         ),
+        "child_attempt_probes": _child_attempt_probe_summary(
+            research_tasks,
+            parallel_status,
+            merge_status,
+        ),
         "evidence_counts": _evidence_counts(evidence, visual_acquisition, visual_provider, image_fetch_status),
         "budget": _budget_summary(budget_estimate, evidence),
         "visual": _visual_summary(visual_acquisition, visual_provider, image_fetch_status),
@@ -206,6 +211,7 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
     control = _mapping(payload.get("control"))
     mode = _mapping(payload.get("mode"))
     shards = _mapping(payload.get("shards"))
+    child_attempt_probes = _mapping(payload.get("child_attempt_probes"))
     counts = _mapping(payload.get("evidence_counts"))
     budget = _mapping(payload.get("budget"))
     visual = _mapping(payload.get("visual"))
@@ -232,6 +238,13 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
             f"retried={_int(shards.get('retried'))} "
             f"blocked={_int(shards.get('blocked'))} "
             f"planned={_display_optional_int(shards.get('planned'))}"
+        ),
+        (
+            "Child probes: "
+            f"count={_int(child_attempt_probes.get('count'))} "
+            f"timeouts={_int(child_attempt_probes.get('timeout_count'))} "
+            f"schema_invalid={_int(child_attempt_probes.get('schema_invalid_count'))} "
+            f"recoverable_valid={_int(child_attempt_probes.get('recoverable_valid_shard_count'))}"
         ),
         f"Evidence: sources={_int(counts.get('sources'))}; images={_int(counts.get('images'))}; claims={_int(counts.get('claims'))}",
         _budget_detail_line(budget),
@@ -745,6 +758,118 @@ def _shard_summary(
     )
     counts["runnable"] = _first_int(parallel_status.get("runnable_task_count"))
     return counts
+
+
+def _child_attempt_probe_summary(
+    research_tasks: Mapping[str, Any],
+    parallel_status: Mapping[str, Any],
+    merge_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    probes = _collect_child_attempt_probes(research_tasks, parallel_status, merge_status)
+    timeout_count = sum(1 for probe in probes if probe.get("timeout") is True)
+    schema_invalid_count = sum(
+        1
+        for probe in probes
+        if probe.get("child_failure_code") == "codex_child_schema_invalid"
+    )
+    recoverable_count = sum(
+        1
+        for probe in probes
+        if probe.get("runner_recoverable_valid_shard") is True
+    )
+    return {
+        "count": len(probes),
+        "timeout_count": timeout_count,
+        "schema_invalid_count": schema_invalid_count,
+        "recoverable_valid_shard_count": recoverable_count,
+        "probes": [_summarize_child_attempt_probe(probe) for probe in probes[:8]],
+    }
+
+
+def _collect_child_attempt_probes(
+    research_tasks: Mapping[str, Any],
+    parallel_status: Mapping[str, Any],
+    merge_status: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    probes: list[dict[str, Any]] = []
+    for task in _list(research_tasks.get("tasks")):
+        if isinstance(task, Mapping):
+            probes.extend(_attempt_probes_from_record(task))
+    parallel_merge = _mapping(parallel_status.get("merge"))
+    for payload in (merge_status, parallel_merge):
+        for key in ("failed_tasks", "blocked_tasks", "discarded_tasks"):
+            for task in _list(payload.get(key)):
+                if isinstance(task, Mapping):
+                    probes.extend(_attempt_probes_from_record(task))
+        for shard in _list(payload.get("accepted_shards")):
+            if not isinstance(shard, Mapping):
+                continue
+            diagnostics = shard.get("diagnostics")
+            if isinstance(diagnostics, Mapping):
+                probes.extend(_attempt_probes_from_record(diagnostics))
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str | None]] = set()
+    for probe in probes:
+        key = (
+            str(probe.get("task_id") or ""),
+            _int(probe.get("attempt")),
+            probe.get("child_failure_code") if isinstance(probe.get("child_failure_code"), str) else None,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(probe)
+    return deduped
+
+
+def _attempt_probes_from_record(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    attempts = record.get("attempt_diagnostics")
+    if not isinstance(attempts, list):
+        return []
+    probes: list[dict[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        probe = attempt.get("attempt_probe")
+        if isinstance(probe, Mapping):
+            probes.append(dict(probe))
+    return probes
+
+
+def _summarize_child_attempt_probe(probe: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": probe.get("task_id"),
+        "attempt": probe.get("attempt"),
+        "child_failure_code": probe.get("child_failure_code"),
+        "timeout": probe.get("timeout"),
+        "child_timeout_at": probe.get("child_timeout_at"),
+        "child_elapsed_seconds": probe.get("child_elapsed_seconds"),
+        "elapsed_seconds": probe.get("elapsed_seconds"),
+        "timeout_seconds": probe.get("timeout_seconds"),
+        "shard_exists_at_timeout": probe.get("shard_exists_at_timeout"),
+        "shard_exists": probe.get("shard_exists"),
+        "shard_schema_version": probe.get("shard_schema_version"),
+        "shard_parent_valid": probe.get("shard_parent_valid"),
+        "top_level_missing_fields": probe.get("top_level_missing_fields"),
+        "runner_recoverable_valid_shard": probe.get("runner_recoverable_valid_shard"),
+        "runner_recoverability": probe.get("runner_recoverability"),
+        "last_validation_result": probe.get("last_validation_result"),
+        "last_child_event": probe.get("last_child_event"),
+        "last_child_event_type": probe.get("last_child_event_type"),
+        "last_tool_or_command_call": probe.get("last_tool_or_command_call"),
+        "last_tool_or_command_kind": probe.get("last_tool_or_command_kind"),
+        "last_tool_or_command_preview": probe.get("last_tool_or_command_preview"),
+        "last_child_message_preview": probe.get("last_child_message_preview"),
+        "last_message_text_preview": probe.get("last_message_text_preview"),
+        "candidate_cause_confidence": probe.get("candidate_cause_confidence"),
+        "candidate_cause_basis": probe.get("candidate_cause_basis"),
+        "candidate_causes": list(probe.get("candidate_causes") or [])[:3]
+        if isinstance(probe.get("candidate_causes"), list)
+        else [],
+        "unknowns": list(probe.get("unknowns") or [])[:5]
+        if isinstance(probe.get("unknowns"), list)
+        else [],
+    }
 
 
 def _overlay_live_task_records(

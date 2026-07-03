@@ -2638,6 +2638,193 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(result["shard_summary"]["accepted_shard_count"], 1)
         self.assertFalse(result["fallback"]["parallel_degraded"])
 
+    def test_partial_degraded_parallel_continues_to_synthesis_and_syncs_terminal_artifacts(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            merge = {
+                "status": "completed",
+                "accepted_shard_count": 1,
+                "accepted_shards": [{"task_id": "task_research_001"}],
+                "failed_tasks": [{"task_id": "task_research_002"}],
+                "rejected_shards": [{"task_id": "task_research_003"}],
+                "discarded_tasks": [{"task_id": "task_research_004"}],
+                "blocked_tasks": [{"task_id": "task_research_005"}],
+                "failure_counts": {
+                    "failed_tasks": 1,
+                    "rejected_shards": 1,
+                    "discarded_tasks": 1,
+                    "blocked_tasks": 1,
+                },
+                "diagnostics": {
+                    "shard_counts": {
+                        "accepted_shards": 1,
+                        "rejected_shards": 1,
+                        "failed_tasks": 1,
+                        "discarded_tasks": 1,
+                        "blocked_tasks": 1,
+                    }
+                },
+            }
+            self.write_json(run_dir / "merge_status.json", merge)
+            payload = {
+                "status": "degraded_serial_handoff_required",
+                "ok": True,
+                "adapter": "serial-degraded",
+                "parallel_degraded": True,
+                "degraded_reason": "codex_child_sandbox_blocked",
+                "needs_serial_handoff": False,
+                "planned_task_count": 5,
+                "accepted_shard_count": 1,
+                "failure_counts": merge["failure_counts"],
+                "diagnostics": merge["diagnostics"],
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "serial-degraded",
+                    "accepted_shards": 1,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "attempted_real_child_execution": True,
+                    "real_child_execution": True,
+                    "real_use_e2e_eligible": False,
+                },
+                "merge": merge,
+                "artifacts": {
+                    "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json"),
+                    "merge_status": str(run_dir / "merge_status.json"),
+                },
+            }
+            self.write_json(run_dir / "parallel_orchestration_status.json", payload)
+            return payload
+
+        def fake_synthesize(*, run, **_kwargs):
+            run_dir = Path(run)
+            (run_dir / "report.md").write_text("# Partial report\n", encoding="utf-8")
+            payload = {
+                "status": "completed",
+                "ok": True,
+                "artifacts": {
+                    "report": str(run_dir / "report.md"),
+                    "report_status": str(run_dir / "report_status.json"),
+                },
+            }
+            self.write_json(run_dir / "report_status.json", payload)
+            return payload
+
+        with (
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch("deepresearch.invocation_router.enforce_guardrails", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.verify_claims", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.synthesize_report", side_effect=fake_synthesize),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: synthesize from partial degraded evidence",
+                runs_dir=runs_dir,
+                route="text_only",
+                budget_preset="quick",
+                min_tasks=5,
+                max_tasks=5,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "completed_partial_parallel")
+        self.assertNotEqual(result["status"], "blocked_parallel_execution")
+        self.assertEqual(result["parallel"]["status"], "degraded_serial_handoff_required")
+        self.assertIn("report", result["artifacts"])
+        self.assertIn("report_status", result["artifacts"])
+        self.assertEqual(result["diagnostics"]["shard_counts"]["accepted_shards"], 1)
+        self.assertEqual(result["parallel"]["accepted_shard_count"], 1)
+        self.assertEqual(result["shard_summary"]["accepted_shard_count"], 1)
+        self.assertNotIn("no accepted shards", json.dumps(result["diagnostics"]))
+
+        run_dir = Path(result["run_dir"])
+        run_status = self.read_json(run_dir / "run_status.json")
+        parallel_status = self.read_json(run_dir / "parallel_orchestration_status.json")
+        merge_status = self.read_json(run_dir / "merge_status.json")
+        run_steps = self.read_json(run_dir / "run_steps.json")
+        for payload in (run_status, parallel_status, merge_status, run_steps):
+            self.assertEqual(payload["terminal_status"], "completed_partial_parallel")
+            self.assertEqual(payload["accepted_shard_count"], 1)
+            self.assertIsNone(payload["next_safe_stage"])
+        self.assertEqual(run_status["status"], "completed_partial_parallel")
+
+    def test_partial_parallel_failed_synthesis_diagnostics_include_shard_counts(self) -> None:
+        runs_dir = self.temp_runs_dir()
+
+        def fake_parallel(*, run, **_kwargs):
+            run_dir = Path(run)
+            merge = {
+                "status": "completed",
+                "accepted_shard_count": 1,
+                "accepted_shards": [{"task_id": "task_research_001"}],
+                "failed_tasks": [{"task_id": "task_research_002"}],
+                "rejected_shards": [{"task_id": "task_research_003"}],
+                "discarded_tasks": [],
+                "blocked_tasks": [],
+                "failure_counts": {
+                    "failed_tasks": 1,
+                    "rejected_shards": 1,
+                    "discarded_tasks": 0,
+                    "blocked_tasks": 0,
+                },
+            }
+            self.write_json(run_dir / "merge_status.json", merge)
+            payload = {
+                "status": "completed_partial_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "needs_serial_handoff": False,
+                "planned_task_count": 3,
+                "accepted_shard_count": 1,
+                "failure_counts": merge["failure_counts"],
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 1,
+                },
+                "merge": merge,
+                "artifacts": {},
+            }
+            self.write_json(run_dir / "parallel_orchestration_status.json", payload)
+            return payload
+
+        with (
+            mock.patch("deepresearch.invocation_router.run_parallel_orchestration", side_effect=fake_parallel),
+            mock.patch("deepresearch.invocation_router.enforce_guardrails", return_value={"status": "completed", "ok": True}),
+            mock.patch("deepresearch.invocation_router.verify_claims", return_value={"status": "completed", "ok": True}),
+            mock.patch(
+                "deepresearch.invocation_router.synthesize_report",
+                side_effect=invocation_router.ReportGenerationError("partial evidence is insufficient for synthesis"),
+            ),
+        ):
+            result = run_skill_invocation(
+                "$deep-research: fail synthesis from insufficient partial evidence",
+                runs_dir=runs_dir,
+                route="text_only",
+                budget_preset="quick",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed_synthesis")
+        self.assertEqual(
+            result["diagnostics"]["actionable_cause"],
+            "partial evidence is insufficient for synthesis",
+        )
+        self.assertEqual(
+            result["diagnostics"]["shard_counts"],
+            {
+                "accepted_shards": 1,
+                "rejected_shards": 1,
+                "failed_tasks": 1,
+                "discarded_tasks": 0,
+                "blocked_tasks": 0,
+            },
+        )
+        self.assertEqual(result["shard_summary"]["accepted_shard_count"], 1)
+        self.assertNotIn("no accepted shards", json.dumps(result["diagnostics"]))
+
     def test_successful_synthesis_without_report_status_fails_handoff_validation(self) -> None:
         runs_dir = self.temp_runs_dir()
 

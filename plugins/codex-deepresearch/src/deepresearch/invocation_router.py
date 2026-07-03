@@ -20,6 +20,7 @@ from .parallel_orchestrator import (
     run_parallel_orchestration,
 )
 from .report_generation import ReportGenerationError, synthesize_report
+from .run_state import initialize_run_steps
 from .search_handoff import (
     SearchHandoffError,
     apply_release_validation_identity,
@@ -115,6 +116,7 @@ _NEGATED_QUICK_CHAT_PATTERNS = (
 _PARALLEL_SYNTHESIS_STATUSES = {
     "completed_parallel",
     "completed_partial_parallel",
+    "degraded_serial_handoff_required",
     "completed_fixture",
 }
 _SYNTHESIZED_SUCCESS_STATUSES = {
@@ -365,7 +367,7 @@ def run_skill_invocation(
         )
         return _write_run_status(run_dir, status)
 
-    if parallel_status.get("status") not in _PARALLEL_SYNTHESIS_STATUSES:
+    if not _parallel_status_allows_synthesis(parallel_status):
         status = _terminal_from_parallel(
             invocation=normalized_invocation,
             question=question,
@@ -440,7 +442,10 @@ def run_skill_invocation(
             ok=False,
             terminal=True,
             provenance=_provenance_from_parallel(parallel_status),
-            diagnostics={"actionable_cause": str(exc) or exc.__class__.__name__},
+            diagnostics=_with_parallel_count_diagnostics(
+                {"actionable_cause": str(exc) or exc.__class__.__name__},
+                parallel_status,
+            ),
             artifacts=_artifact_paths(run_dir),
         )
         status["parallel"] = _parallel_summary(parallel_status)
@@ -455,6 +460,11 @@ def run_skill_invocation(
             visual_stage_status=visual_stage_status,
         )
     final_status = str(parallel_status.get("status") or "completed_parallel")
+    if (
+        final_status == "degraded_serial_handoff_required"
+        and _parallel_count_diagnostics(parallel_status).get("accepted_shards", 0) > 0
+    ):
+        final_status = "completed_partial_parallel"
     if isinstance(automatic_visual_completion, Mapping):
         final_status = str(automatic_visual_completion.get("status") or final_status)
         final_ok = automatic_visual_completion.get("ok") is True
@@ -467,6 +477,10 @@ def run_skill_invocation(
             else "report synthesis did not complete"
         )
     }
+    final_diagnostics = _with_parallel_count_diagnostics(
+        final_diagnostics,
+        parallel_status,
+    )
     if automatic_visual_completion is not None:
         final_diagnostics.update(
             _visual_completion_diagnostics(
@@ -681,8 +695,18 @@ def _terminal_from_parallel(
 ) -> dict[str, Any]:
     status_value = str(parallel_status.get("status") or "blocked_parallel_execution")
     if status_value == "degraded_serial_handoff_required":
-        terminal_status = "blocked_parallel_execution"
-        actionable = "parallel execution degraded to serial handoff and produced no accepted shards"
+        shard_counts = _parallel_count_diagnostics(parallel_status)
+        if int(shard_counts.get("accepted_shards") or 0) > 0:
+            terminal_status = status_value
+            actionable = (
+                "parallel execution degraded after accepting evidence shards, "
+                "but synthesis was not started"
+            )
+        else:
+            terminal_status = "blocked_parallel_execution"
+            actionable = (
+                "parallel execution degraded to serial handoff and produced no accepted shards"
+            )
     else:
         terminal_status = status_value
         actionable = _actionable_cause_from_parallel(parallel_status)
@@ -695,11 +719,23 @@ def _terminal_from_parallel(
         ok=False,
         terminal=True,
         provenance=_provenance_from_parallel(parallel_status),
-        diagnostics={"actionable_cause": actionable},
+        diagnostics=_with_parallel_count_diagnostics(
+            {"actionable_cause": actionable},
+            parallel_status,
+        ),
         artifacts=_artifact_paths(run_dir, parallel_status.get("artifacts")),
     )
     status["parallel"] = _parallel_summary(parallel_status)
     return status
+
+
+def _parallel_status_allows_synthesis(parallel_status: Mapping[str, Any]) -> bool:
+    status_value = str(parallel_status.get("status") or "")
+    if status_value not in _PARALLEL_SYNTHESIS_STATUSES:
+        return False
+    if status_value != "degraded_serial_handoff_required":
+        return True
+    return _parallel_count_diagnostics(parallel_status).get("accepted_shards", 0) > 0
 
 
 def _visual_provider_preflight_status(
@@ -1835,6 +1871,12 @@ def _write_run_status(run_dir: Path, payload: Mapping[str, Any]) -> dict[str, An
     output = _finalize_handoff_payload(run_dir, payload)
     output = _apply_run_release_identity(run_dir, output)
     _write_json(run_dir / RUN_STATUS_FILENAME, output)
+    if output.get("terminal") is True:
+        try:
+            initialize_run_steps(run_dir)
+            _sync_terminal_status_artifacts(run_dir, output)
+        except Exception:
+            pass
     return output
 
 
@@ -1861,6 +1903,14 @@ def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict
         output["terminal"] = True
         output["diagnostics"] = diagnostics
     output["shard_summary"] = _shard_summary(output)
+    if output.get("terminal") is True:
+        output["terminal_status"] = output.get("status")
+        output["terminal_ok"] = output.get("ok")
+        output["terminal_run_status"] = output.get("status")
+        output["accepted_shard_count"] = _int_or_zero(
+            output["shard_summary"].get("accepted_shard_count")
+        )
+        output["next_safe_stage"] = None
     output["fallback"] = _fallback_summary(output)
     output["artifact_handoff"] = {
         "run_dir": output.get("run_dir"),
@@ -1882,6 +1932,34 @@ def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict
     if isinstance(output.get("visual_summary"), Mapping):
         output["artifact_handoff"]["visual_summary"] = dict(output["visual_summary"])
     return output
+
+
+def _sync_terminal_status_artifacts(run_dir: Path, run_status: Mapping[str, Any]) -> None:
+    shard_summary = _mapping(run_status.get("shard_summary"))
+    accepted_shard_count = _int_or_zero(shard_summary.get("accepted_shard_count"))
+    alignment = {
+        "terminal_status": run_status.get("status"),
+        "terminal_ok": run_status.get("ok"),
+        "terminal_run_status": run_status.get("status"),
+        "accepted_shard_count": accepted_shard_count,
+        "next_safe_stage": None,
+        "run_status_path": str(run_dir / RUN_STATUS_FILENAME),
+        "run_steps_path": str(run_dir / "run_steps.json"),
+    }
+    for filename in ("parallel_orchestration_status.json", "merge_status.json"):
+        path = run_dir / filename
+        payload = _read_optional_json(path)
+        if not payload:
+            continue
+        payload.update(alignment)
+        if filename == "parallel_orchestration_status.json":
+            payload.setdefault("accepted_shard_count", accepted_shard_count)
+        _write_json(path, payload)
+    run_steps_path = run_dir / "run_steps.json"
+    run_steps = _read_optional_json(run_steps_path)
+    if run_steps:
+        run_steps.update(alignment)
+        _write_json(run_steps_path, run_steps)
 
 
 def _apply_run_release_identity(run_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1975,6 +2053,14 @@ def _resolve_artifact_path(run_dir: Path, artifact_path: str) -> Path:
     return run_dir / path
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _list(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
 def _int_or_zero(value: Any) -> int:
     try:
         return int(value)
@@ -2047,11 +2133,15 @@ def _parallel_summary(parallel_status: Mapping[str, Any]) -> dict[str, Any]:
         accepted = merge.get("accepted_shards")
         if isinstance(accepted, list):
             accepted_shards = accepted
+    accepted_count = len(accepted_shards)
+    if accepted_count == 0:
+        accepted_count = _int_or_zero(parallel_status.get("accepted_shard_count"))
     failure_counts = (
         dict(parallel_status.get("failure_counts", {}))
         if isinstance(parallel_status.get("failure_counts"), Mapping)
         else {}
     )
+    child_probe_summary = _child_attempt_probe_summary(parallel_status)
     return {
         "status": parallel_status.get("status"),
         "ok": parallel_status.get("ok"),
@@ -2060,13 +2150,122 @@ def _parallel_summary(parallel_status: Mapping[str, Any]) -> dict[str, Any]:
         "degraded_reason": parallel_status.get("degraded_reason"),
         "needs_serial_handoff": parallel_status.get("needs_serial_handoff"),
         "planned_task_count": parallel_status.get("planned_task_count"),
-        "accepted_shard_count": len(accepted_shards),
-        "merged_shard_count": len(accepted_shards),
+        "accepted_shard_count": accepted_count,
+        "merged_shard_count": accepted_count,
         "failed_task_count": _int_or_zero(failure_counts.get("failed_tasks")),
         "blocked_task_count": _int_or_zero(failure_counts.get("blocked_tasks")),
         "rejected_shard_count": _int_or_zero(failure_counts.get("rejected_shards")),
         "discarded_task_count": _int_or_zero(failure_counts.get("discarded_tasks")),
         "failure_counts": failure_counts,
+        "child_attempt_probes": child_probe_summary,
+    }
+
+
+def _with_parallel_count_diagnostics(
+    diagnostics: Mapping[str, Any],
+    parallel_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = dict(diagnostics)
+    result.setdefault("shard_counts", _parallel_count_diagnostics(parallel_status))
+    return result
+
+
+def _parallel_count_diagnostics(parallel_status: Mapping[str, Any]) -> dict[str, int]:
+    summary = _parallel_summary(parallel_status)
+    return {
+        "accepted_shards": _int_or_zero(summary.get("accepted_shard_count")),
+        "rejected_shards": _int_or_zero(summary.get("rejected_shard_count")),
+        "failed_tasks": _int_or_zero(summary.get("failed_task_count")),
+        "discarded_tasks": _int_or_zero(summary.get("discarded_task_count")),
+        "blocked_tasks": _int_or_zero(summary.get("blocked_task_count")),
+    }
+
+
+def _child_attempt_probe_summary(parallel_status: Mapping[str, Any]) -> dict[str, Any]:
+    probes = _collect_child_attempt_probes(parallel_status)
+    timeout_count = sum(1 for probe in probes if probe.get("timeout") is True)
+    schema_invalid_count = sum(
+        1
+        for probe in probes
+        if probe.get("child_failure_code") == "codex_child_schema_invalid"
+    )
+    recoverable_count = sum(
+        1
+        for probe in probes
+        if probe.get("runner_recoverable_valid_shard") is True
+    )
+    return {
+        "count": len(probes),
+        "timeout_count": timeout_count,
+        "schema_invalid_count": schema_invalid_count,
+        "recoverable_valid_shard_count": recoverable_count,
+        "probes": [_summarize_child_attempt_probe(probe) for probe in probes[:8]],
+    }
+
+
+def _collect_child_attempt_probes(parallel_status: Mapping[str, Any]) -> list[dict[str, Any]]:
+    merge = _mapping(parallel_status.get("merge"))
+    probes: list[dict[str, Any]] = []
+    for key in ("failed_tasks", "blocked_tasks", "discarded_tasks"):
+        for task in _list(merge.get(key)):
+            if isinstance(task, Mapping):
+                probes.extend(_attempt_probes_from_record(task))
+    for shard in _list(merge.get("accepted_shards")):
+        if not isinstance(shard, Mapping):
+            continue
+        diagnostics = shard.get("diagnostics")
+        if isinstance(diagnostics, Mapping):
+            probes.extend(_attempt_probes_from_record(diagnostics))
+    return probes
+
+
+def _attempt_probes_from_record(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    attempts = record.get("attempt_diagnostics")
+    if not isinstance(attempts, list):
+        return []
+    probes: list[dict[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        probe = attempt.get("attempt_probe")
+        if isinstance(probe, Mapping):
+            probes.append(dict(probe))
+    return probes
+
+
+def _summarize_child_attempt_probe(probe: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": probe.get("task_id"),
+        "attempt": probe.get("attempt"),
+        "child_failure_code": probe.get("child_failure_code"),
+        "timeout": probe.get("timeout"),
+        "child_timeout_at": probe.get("child_timeout_at"),
+        "child_elapsed_seconds": probe.get("child_elapsed_seconds"),
+        "elapsed_seconds": probe.get("elapsed_seconds"),
+        "timeout_seconds": probe.get("timeout_seconds"),
+        "shard_exists_at_timeout": probe.get("shard_exists_at_timeout"),
+        "shard_exists": probe.get("shard_exists"),
+        "shard_schema_version": probe.get("shard_schema_version"),
+        "shard_parent_valid": probe.get("shard_parent_valid"),
+        "top_level_missing_fields": probe.get("top_level_missing_fields"),
+        "runner_recoverable_valid_shard": probe.get("runner_recoverable_valid_shard"),
+        "runner_recoverability": probe.get("runner_recoverability"),
+        "last_validation_result": probe.get("last_validation_result"),
+        "last_child_event": probe.get("last_child_event"),
+        "last_child_event_type": probe.get("last_child_event_type"),
+        "last_tool_or_command_call": probe.get("last_tool_or_command_call"),
+        "last_tool_or_command_kind": probe.get("last_tool_or_command_kind"),
+        "last_tool_or_command_preview": probe.get("last_tool_or_command_preview"),
+        "last_child_message_preview": probe.get("last_child_message_preview"),
+        "last_message_text_preview": probe.get("last_message_text_preview"),
+        "candidate_cause_confidence": probe.get("candidate_cause_confidence"),
+        "candidate_cause_basis": probe.get("candidate_cause_basis"),
+        "candidate_causes": list(probe.get("candidate_causes") or [])[:3]
+        if isinstance(probe.get("candidate_causes"), list)
+        else [],
+        "unknowns": list(probe.get("unknowns") or [])[:5]
+        if isinstance(probe.get("unknowns"), list)
+        else [],
     }
 
 

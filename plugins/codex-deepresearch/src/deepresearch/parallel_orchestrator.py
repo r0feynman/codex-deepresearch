@@ -96,6 +96,31 @@ EXPECTED_CHILD_SIDECARS = {
     "visual_observations": "visual_observations.jsonl",
     "verifier_votes": "verifier_votes.jsonl",
 }
+EVIDENCE_SCHEMA_V0_REQUIRED_TOP_LEVEL_FIELDS = (
+    "schema_version",
+    "run_id",
+    "created_at",
+    "mode",
+    "search_provider",
+    "vlm_provider",
+)
+CHILD_ATTEMPT_PROBE_SCHEMA_VERSION = "codex-deepresearch.child-attempt-probe.v0"
+REDACTED_CHILD_PROBE_SECRET = "<redacted-secret>"
+CHILD_PROBE_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b("
+    r"[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|authorization|bearer|token|"
+    r"secret|password|credential|credentials|client[_-]?secret|session[_-]?token)"
+    r"[A-Za-z0-9_.-]*"
+    r")\b\s*[:=]\s*([^\s,;]+)"
+)
+CHILD_PROBE_BEARER_PATTERN = re.compile(
+    r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"
+)
+CHILD_PROBE_SECRET_FLAG_PATTERN = re.compile(
+    r"(?i)(--(?:api[_-]?key|access[_-]?token|authorization|bearer|token|"
+    r"secret|password|credential|client[_-]?secret|session[_-]?token))"
+    r"(?:=|\s+)([^\s,;]+)"
+)
 RETRY_SAFE_FAILURES = {
     "adapter_unavailable",
     "codex_exec_failed",
@@ -262,6 +287,8 @@ class CodexExecAdapter:
                 raw_event=command_context,
             )
         ]
+        child_started_at = _utc_now()
+        child_started_monotonic = time.monotonic()
         try:
             completed = subprocess.run(
                 command,
@@ -273,6 +300,8 @@ class CodexExecAdapter:
                 timeout=self.timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
+            child_timed_out_at = _utc_now()
+            elapsed_seconds = _elapsed_seconds(child_started_monotonic)
             stdout = _timeout_stdout(exc)
             stderr = getattr(exc, "stderr", None)
             child_summary = _write_codex_exec_child_diagnostics(
@@ -282,6 +311,11 @@ class CodexExecAdapter:
                 stderr=stderr,
                 timeout=True,
                 timeout_seconds=exc.timeout,
+                child_started_at=child_started_at,
+                child_timed_out_at=child_timed_out_at,
+                elapsed_seconds=elapsed_seconds,
+                child_thread_id=child_thread_id,
+                output_shard_path=shard_path,
             )
             command_context["last_child_event_summary"] = child_summary
             diagnostic = _codex_exec_failure_message(
@@ -354,12 +388,20 @@ class CodexExecAdapter:
                 message=diagnostic,
             )
         except OSError as exc:
+            child_finished_at = _utc_now()
+            elapsed_seconds = _elapsed_seconds(child_started_monotonic)
             child_summary = _write_codex_exec_child_diagnostics(
                 task=task,
                 artifacts=child_artifacts,
                 stdout=getattr(exc, "stdout", None),
                 stderr=getattr(exc, "stderr", None),
                 os_error=exc.__class__.__name__,
+                timeout_seconds=self.timeout_seconds,
+                child_started_at=child_started_at,
+                child_finished_at=child_finished_at,
+                elapsed_seconds=elapsed_seconds,
+                child_thread_id=child_thread_id,
+                output_shard_path=shard_path,
             )
             command_context["last_child_event_summary"] = child_summary
             diagnostic = _codex_exec_failure_message(
@@ -396,12 +438,20 @@ class CodexExecAdapter:
                 message=diagnostic,
             )
 
+        child_finished_at = _utc_now()
+        elapsed_seconds = _elapsed_seconds(child_started_monotonic)
         child_summary = _write_codex_exec_child_diagnostics(
             task=task,
             artifacts=child_artifacts,
             stdout=completed.stdout,
             stderr=completed.stderr,
             returncode=completed.returncode,
+            timeout_seconds=self.timeout_seconds,
+            child_started_at=child_started_at,
+            child_finished_at=child_finished_at,
+            elapsed_seconds=elapsed_seconds,
+            child_thread_id=child_thread_id,
+            output_shard_path=shard_path,
         )
         command_context["last_child_event_summary"] = child_summary
         parsed_events = _parse_json_events(completed.stdout)
@@ -1302,6 +1352,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         "status": "completed" if validation.valid else "failed_validation",
         "parallel_degraded": bool(tasks_artifact.get("parallel_degraded")),
         "evidence_source": evidence_source,
+        "accepted_shard_count": len(accepted_shards),
         "accepted_shards": accepted_shards,
         "rejected_shards": rejected_shards,
         "blocked_tasks": blocked_tasks,
@@ -1319,6 +1370,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             failed_tasks=failed_tasks,
             blocked_tasks=blocked_tasks,
             rejected_shards=rejected_shards,
+            discarded_tasks=discarded_tasks,
             retry_summary=retry_summary,
         ),
         "source_dedupe": source_dedupe,
@@ -1704,6 +1756,7 @@ def _parallel_status(
         "planned_task_count": planned_task_count,
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
+        "accepted_shard_count": len(accepted_shards),
         "needs_serial_handoff": needs_serial_handoff,
         "artifacts": {
             "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json"),
@@ -1745,14 +1798,26 @@ def _parallel_evidence_source(
         if accepted_count == 0 and not attempted_real_child_execution:
             source_type = "blocked_parallel_execution"
             description = "real Codex child execution was blocked before launch"
-        elif accepted_count > 0 and not parallel_degraded:
+        elif accepted_count > 0:
             attempted_real_child_execution = True
             source_type = "real_child_execution"
-            description = "accepted evidence shards from real Codex child execution"
+            if parallel_degraded:
+                description = (
+                    "accepted evidence shards from real Codex child execution before "
+                    "parallel execution degraded"
+                )
+            else:
+                description = "accepted evidence shards from real Codex child execution"
         else:
             attempted_real_child_execution = True
             source_type = "failed_real_child_execution"
             description = "real Codex child execution was attempted, but no evidence shard was accepted"
+    elif (adapter_name == "serial-degraded" or parallel_degraded) and accepted_count > 0 and attempted_real_child_execution:
+        source_type = "real_child_execution"
+        description = (
+            "accepted evidence shards from real Codex child execution before "
+            "parallel execution degraded"
+        )
     elif adapter_name == "serial-degraded" or parallel_degraded:
         source_type = "serial_handoff"
         description = "serial degraded handoff after parallel execution could not provide accepted shards"
@@ -1808,6 +1873,12 @@ def _parallel_status_value(
         )
     if final_adapter_name == "fixture":
         return "completed_fixture" if accepted_count > 0 else "failed_parallel_no_accepted_shards"
+    if accepted_count > 0:
+        if _merge_has_exhausted_release_handoff_failure(merge_status):
+            return FAILED_RELEASE_HANDOFF_INVALID
+        if accepted_count < planned_task_count or has_failures or parallel_degraded:
+            return "completed_partial_parallel"
+        return "completed_parallel"
     if final_adapter_name == "serial-degraded" or parallel_degraded:
         if requested_adapter_name in {"serial-degraded", "serial-fallback"} and accepted_count == 0:
             return "blocked_parallel_execution"
@@ -1820,12 +1891,6 @@ def _parallel_status_value(
         if _merge_has_parallel_execution_blocker(merge_status):
             return "blocked_parallel_execution"
         return "failed_parallel_no_accepted_shards"
-    if final_adapter_name == "codex-exec" and accepted_count > 0:
-        if _merge_has_exhausted_release_handoff_failure(merge_status):
-            return FAILED_RELEASE_HANDOFF_INVALID
-        if accepted_count < planned_task_count or has_failures:
-            return "completed_partial_parallel"
-        return "completed_parallel"
     return "completed_partial_parallel" if accepted_count > 0 else "failed_parallel_no_accepted_shards"
 
 
@@ -1843,6 +1908,8 @@ def _needs_serial_handoff(
     }:
         return True
     if status == "completed_serial_handoff":
+        return False
+    if status == "completed_partial_parallel" and accepted_shards:
         return False
     return bool(parallel_degraded or not accepted_shards)
 
@@ -2341,9 +2408,16 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
                 return
         validation = validate_artifacts(evidence_path=shard_path)
         if not validation.valid:
+            validation_payload = validation.to_dict()
             task["failure_category"] = "invalid_shard"
             task["child_failure_code"] = CODEX_CHILD_SCHEMA_INVALID
-            task["validation"] = validation.to_dict()
+            task["validation"] = validation_payload
+            attempt_record["validation"] = validation_payload
+            _update_attempt_probe_validation(
+                attempt_record,
+                validation=validation_payload,
+                child_failure_code=CODEX_CHILD_SCHEMA_INVALID,
+            )
             _update_attempt_diagnostic(
                 attempt_record,
                 child_failure_code=CODEX_CHILD_SCHEMA_INVALID,
@@ -2351,6 +2425,13 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
             )
             task["state"] = "failed"
             return
+        validation_payload = validation.to_dict()
+        attempt_record["validation"] = validation_payload
+        _update_attempt_probe_validation(
+            attempt_record,
+            validation=validation_payload,
+            child_failure_code=attempt_record.get("child_failure_code"),
+        )
         task["state"] = "completed"
         task["failure_category"] = None
         task["child_failure_code"] = None
@@ -2392,15 +2473,30 @@ def _append_attempt_diagnostic(
     if not isinstance(summary, Mapping):
         summary = {}
     attempt = int(task.get("attempt") or 0)
+    child_failure_code = _classify_child_failure_code(
+        result=result,
+        command_context=context,
+        child_summary=summary,
+    )
+    probe = _build_child_attempt_probe(
+        task=task,
+        result=result,
+        command_context=context,
+        child_summary=summary,
+        child_failure_code=child_failure_code,
+    )
+    if (
+        probe.get("timeout") is True
+        and probe.get("shard_exists") is True
+        and probe.get("shard_parent_valid") is False
+    ):
+        child_failure_code = CODEX_CHILD_SCHEMA_INVALID
+        probe = _with_probe_failure_code(probe, child_failure_code)
     record = {
         "attempt": attempt,
         "max_attempts": int(task.get("max_attempts") or 0),
         "child_thread_id": result.child_thread_id,
-        "child_failure_code": _classify_child_failure_code(
-            result=result,
-            command_context=context,
-            child_summary=summary,
-        ),
+        "child_failure_code": child_failure_code,
         "timeout": bool(summary.get("timeout")),
         "returncode": summary.get("returncode"),
         "last_message_text_preview": _attempt_last_message_preview(
@@ -2413,6 +2509,7 @@ def _append_attempt_diagnostic(
         "retry_decision": "do_not_retry",
         "status": result.status,
         "failure_category": result.failure_category,
+        "attempt_probe": probe,
     }
     diagnostics = task.setdefault("attempt_diagnostics", [])
     if not isinstance(diagnostics, list):
@@ -2458,12 +2555,634 @@ def _update_attempt_diagnostic(
 ) -> None:
     if child_failure_code is not None:
         attempt_record["child_failure_code"] = child_failure_code
+        _update_attempt_probe_failure_code(attempt_record, child_failure_code)
     if retry_decision is not None:
         attempt_record["retry_decision"] = retry_decision
     if computed_backoff_seconds is not None:
         attempt_record["computed_backoff_seconds"] = computed_backoff_seconds
     if actual_sleep_seconds is not None:
         attempt_record["actual_sleep_seconds"] = actual_sleep_seconds
+
+
+def _build_child_attempt_probe(
+    *,
+    task: Mapping[str, Any],
+    result: RunnerResult,
+    command_context: Mapping[str, Any],
+    child_summary: Mapping[str, Any],
+    child_failure_code: str | None,
+) -> dict[str, Any]:
+    shard_path = (
+        Path(result.shard_path)
+        if isinstance(result.shard_path, str) and result.shard_path
+        else _probe_output_shard_path(task, command_context, child_summary)
+    )
+    defer_parent_validation = bool(
+        release_validation_identity_from_payload(task)
+        and str(task.get("last_adapter") or "") == "codex-exec"
+        and result.status == "completed"
+    )
+    shard_state = _probe_shard_state(
+        shard_path,
+        defer_parent_validation=defer_parent_validation,
+    )
+    timed_out = bool(child_summary.get("timeout"))
+    runner_recoverable_valid_shard = bool(
+        shard_state["shard_parent_valid"]
+        and (timed_out or result.status == "completed")
+    )
+    probe: dict[str, Any] = {
+        "schema_version": CHILD_ATTEMPT_PROBE_SCHEMA_VERSION,
+        "task_id": str(task.get("id") or result.task_id or "unknown"),
+        "attempt": int(task.get("attempt") or 0),
+        "child_thread_id": result.child_thread_id or child_summary.get("child_thread_id"),
+        "child_started_at": _string_or_none(child_summary.get("child_started_at")),
+        "child_finished_at": _string_or_none(child_summary.get("child_finished_at")),
+        "child_timed_out_at": _string_or_none(child_summary.get("child_timed_out_at")),
+        "elapsed_seconds": _number_or_none(child_summary.get("elapsed_seconds")),
+        "timeout_seconds": _number_or_none(child_summary.get("timeout_seconds")),
+        "timeout": timed_out,
+        "output_shard_path": str(shard_path) if shard_path is not None else _string_or_none(
+            child_summary.get("output_shard_path")
+            or command_context.get("output_shard_path")
+            or task.get("output_shard_path")
+        ),
+        "child_failure_code": child_failure_code,
+        "first_shard_observed_at": shard_state["first_shard_observed_at"],
+        "first_parent_valid_shard_at": shard_state["first_parent_valid_shard_at"],
+        "last_validation_attempt_at": shard_state["last_validation_attempt_at"],
+        "last_validation_result": shard_state["last_validation_result"],
+        "shard_exists": shard_state["shard_exists"],
+        "shard_schema_version": shard_state["shard_schema_version"],
+        "shard_parent_valid": shard_state["shard_parent_valid"],
+        "missing_required_fields": shard_state["missing_required_fields"],
+        "validation_error_count": shard_state["validation_error_count"],
+        "validation_errors": shard_state["validation_errors"],
+        "runner_recoverable_valid_shard": runner_recoverable_valid_shard,
+        "sidecars": shard_state["sidecars"],
+        "last_child_event_type": _string_or_none(child_summary.get("last_event_type")),
+        "last_tool_or_command_kind": _last_tool_or_command_kind(child_summary),
+        "last_tool_or_command_preview": _last_tool_or_command_preview(child_summary),
+        "last_message_text_preview": _bounded_preview(
+            child_summary.get("last_message_text_preview")
+        ),
+        "facts": [],
+        "unknowns": [],
+        "candidate_causes": [],
+        "root_cause": None,
+    }
+    probe["unknowns"] = _probe_unknowns(probe, shard_state)
+    probe["facts"] = _probe_facts(probe)
+    probe["candidate_causes"] = _probe_candidate_causes(probe)
+    return _finalize_child_attempt_probe_contract(probe)
+
+
+def _probe_output_shard_path(
+    task: Mapping[str, Any],
+    command_context: Mapping[str, Any],
+    child_summary: Mapping[str, Any],
+) -> Path | None:
+    for value in (
+        command_context.get("output_shard_path"),
+        child_summary.get("output_shard_path"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return Path(value)
+    try:
+        run_dir_value = command_context.get("run_dir")
+        run_dir = Path(str(run_dir_value)) if run_dir_value else None
+        if run_dir is not None:
+            return _resolve_task_shard_path(task, run_dir)
+    except ParallelOrchestrationError:
+        return None
+    return None
+
+
+def _probe_shard_state(
+    shard_path: Path | None,
+    *,
+    defer_parent_validation: bool = False,
+) -> dict[str, Any]:
+    if shard_path is None:
+        return _missing_probe_shard_state(
+            reason="output_shard_path_unobservable",
+            validation_attempt_at=None,
+        )
+    validation_attempt_at = _utc_now()
+    if not shard_path.exists():
+        return _missing_probe_shard_state(
+            reason="shard_file_not_present_when_parent_probe_ran",
+            validation_attempt_at=validation_attempt_at,
+            shard_dir=shard_path.parent,
+        )
+    if defer_parent_validation:
+        shard_schema_version = _shard_schema_version(shard_path)
+        return {
+            "first_shard_observed_at": validation_attempt_at,
+            "first_parent_valid_shard_at": None,
+            "last_validation_attempt_at": None,
+            "last_validation_result": {
+                "state": "unknown",
+                "valid": None,
+                "error_count": 0,
+                "errors": [],
+            },
+            "shard_exists": True,
+            "shard_schema_version": shard_schema_version,
+            "shard_parent_valid": None,
+            "missing_required_fields": [],
+            "validation_error_count": 0,
+            "validation_errors": [],
+            "sidecars": _expected_sidecar_probe_status(shard_path.parent),
+            "unobservable_reasons": {
+                "last_validation_attempt_at": (
+                    "parent_validation_deferred_until_release_sidecar_validation"
+                ),
+                "first_parent_valid_shard_at": (
+                    "parent_validation_deferred_until_release_sidecar_validation"
+                ),
+            },
+        }
+    validation = validate_artifacts(evidence_path=shard_path).to_dict()
+    validation_errors = _bounded_validation_errors(validation)
+    valid = bool(validation.get("valid"))
+    shard_schema_version = _shard_schema_version(shard_path)
+    return {
+        "first_shard_observed_at": validation_attempt_at,
+        "first_parent_valid_shard_at": validation_attempt_at if valid else None,
+        "last_validation_attempt_at": validation_attempt_at,
+        "last_validation_result": {
+            "state": "valid" if valid else "invalid",
+            "valid": valid,
+            "error_count": len(validation.get("errors", []))
+            if isinstance(validation.get("errors"), list)
+            else 0,
+            "errors": validation_errors,
+        },
+        "shard_exists": True,
+        "shard_schema_version": shard_schema_version,
+        "shard_parent_valid": valid,
+        "missing_required_fields": _missing_required_fields(validation_errors),
+        "validation_error_count": len(validation.get("errors", []))
+        if isinstance(validation.get("errors"), list)
+        else 0,
+        "validation_errors": validation_errors,
+        "sidecars": _expected_sidecar_probe_status(shard_path.parent),
+        "unobservable_reasons": {
+            "first_parent_valid_shard_at": None
+            if valid
+            else "shard_was_not_parent_valid_when_parent_probe_ran"
+        },
+    }
+
+
+def _missing_probe_shard_state(
+    *,
+    reason: str,
+    validation_attempt_at: str | None,
+    shard_dir: Path | None = None,
+) -> dict[str, Any]:
+    error = {
+        "path": "$.evidence",
+        "code": "missing_file",
+        "message": reason,
+    }
+    return {
+        "first_shard_observed_at": None,
+        "first_parent_valid_shard_at": None,
+        "last_validation_attempt_at": validation_attempt_at,
+        "last_validation_result": {
+            "state": "invalid",
+            "valid": False,
+            "error_count": 1,
+            "errors": [error],
+        },
+        "shard_exists": False,
+        "shard_schema_version": None,
+        "shard_parent_valid": False,
+        "missing_required_fields": list(EVIDENCE_SCHEMA_V0_REQUIRED_TOP_LEVEL_FIELDS),
+        "validation_error_count": 1,
+        "validation_errors": [error],
+        "sidecars": _expected_sidecar_probe_status(shard_dir) if shard_dir is not None else _unknown_sidecar_probe_status(),
+        "unobservable_reasons": {
+            "first_shard_observed_at": reason,
+            "first_parent_valid_shard_at": "parent_valid_shard_was_not_observed",
+            **(
+                {"last_validation_attempt_at": "output_shard_path_unobservable"}
+                if validation_attempt_at is None
+                else {}
+            ),
+        },
+    }
+
+
+def _shard_schema_version(shard_path: Path) -> str | None:
+    try:
+        payload = json.loads(shard_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("schema_version")
+    return str(value) if value is not None else None
+
+
+def _expected_sidecar_probe_status(shard_dir: Path) -> dict[str, dict[str, Any]]:
+    status: dict[str, dict[str, Any]] = {}
+    for key, filename in EXPECTED_CHILD_SIDECARS.items():
+        path = shard_dir / filename
+        record: dict[str, Any] = {
+            "filename": filename,
+            "path": str(path),
+            "exists": path.exists(),
+        }
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                record["read_error"] = exc.__class__.__name__
+            else:
+                record["size_bytes"] = path.stat().st_size
+                record["line_count"] = len([line for line in text.splitlines() if line.strip()])
+        status[key] = record
+    return status
+
+
+def _unknown_sidecar_probe_status() -> dict[str, dict[str, Any]]:
+    return {
+        key: {
+            "filename": filename,
+            "path": None,
+            "exists": None,
+            "unobservable_reason": "output_shard_path_unobservable",
+        }
+        for key, filename in EXPECTED_CHILD_SIDECARS.items()
+    }
+
+
+def _bounded_validation_errors(
+    validation: Mapping[str, Any],
+    *,
+    limit: int = 6,
+) -> list[dict[str, str]]:
+    errors = validation.get("errors")
+    if not isinstance(errors, list):
+        return []
+    bounded: list[dict[str, str]] = []
+    for error in errors[:limit]:
+        if not isinstance(error, Mapping):
+            continue
+        bounded.append(
+            {
+                "path": str(error.get("path") or "")[:180],
+                "code": str(error.get("code") or "")[:120],
+                "message": _output_summary(error.get("message"), limit=220),
+            }
+        )
+    return bounded
+
+
+def _missing_required_fields(validation_errors: Sequence[Mapping[str, Any]]) -> list[str]:
+    missing: list[str] = []
+    for error in validation_errors:
+        if error.get("code") != "missing_required_field":
+            continue
+        path = str(error.get("path") or "")
+        if "." in path:
+            missing.append(path.rsplit(".", 1)[-1])
+    return list(dict.fromkeys(missing))
+
+
+def _last_tool_or_command_kind(child_summary: Mapping[str, Any]) -> str | None:
+    if child_summary.get("last_command"):
+        return "command"
+    if child_summary.get("last_tool_name"):
+        return "tool"
+    if child_summary.get("last_tool_call_id"):
+        return "tool_call"
+    return None
+
+
+def _last_tool_or_command_preview(child_summary: Mapping[str, Any]) -> str | None:
+    for key in ("last_command", "last_tool_name", "last_tool_call_id"):
+        preview = _bounded_preview(child_summary.get(key))
+        if preview:
+            return preview
+    return None
+
+
+def _probe_facts(probe: Mapping[str, Any]) -> list[dict[str, Any]]:
+    facts = [
+        {"field": "task_id", "value": probe.get("task_id")},
+        {"field": "attempt", "value": probe.get("attempt")},
+        {"field": "timeout", "value": probe.get("timeout")},
+        {"field": "shard_exists", "value": probe.get("shard_exists")},
+        {"field": "shard_parent_valid", "value": probe.get("shard_parent_valid")},
+        {"field": "child_failure_code", "value": probe.get("child_failure_code")},
+    ]
+    return [fact for fact in facts if fact.get("value") is not None]
+
+
+def _probe_unknowns(
+    probe: Mapping[str, Any],
+    shard_state: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    unknowns: list[dict[str, str]] = []
+    for field, reason in _mapping_or_empty(shard_state.get("unobservable_reasons")).items():
+        if reason:
+            unknowns.append({"field": str(field), "reason": str(reason)})
+    if not probe.get("child_started_at"):
+        unknowns.append(
+            {
+                "field": "child_started_at",
+                "reason": "adapter_did_not_report_child_start_time",
+            }
+        )
+    if not probe.get("child_finished_at") and not probe.get("child_timed_out_at"):
+        unknowns.append(
+            {
+                "field": "child_finished_at",
+                "reason": "child_finish_or_timeout_time_unobservable",
+            }
+        )
+    unknowns.append(
+        {
+            "field": "root_cause",
+            "reason": (
+                "probe records parent-observed facts only; child-side timeout root "
+                "cause requires additional evidence"
+            ),
+        }
+    )
+    if probe.get("timeout") is True:
+        unknowns.extend(
+            [
+                {
+                    "field": "search_delay_root_cause",
+                    "reason": "not directly supported by probe fields",
+                },
+                {
+                    "field": "model_capacity_root_cause",
+                    "reason": "not directly supported by probe fields",
+                },
+                {
+                    "field": "runner_recovery_delay_root_cause",
+                    "reason": "not directly supported by probe fields",
+                },
+            ]
+        )
+    return unknowns
+
+
+def _probe_candidate_causes(probe: Mapping[str, Any]) -> list[dict[str, Any]]:
+    child_failure_code = str(probe.get("child_failure_code") or "")
+    timed_out = probe.get("timeout") is True
+    shard_exists = _probe_shard_exists(probe)
+    shard_parent_valid = probe.get("shard_parent_valid") is True
+    if timed_out and not shard_exists:
+        return [
+            {
+                "cause": "no_parent_observable_shard_before_timeout",
+                "basis": [
+                    "timeout",
+                    "child_timeout_at",
+                    "shard_exists_at_timeout",
+                    "last_validation_result",
+                ],
+                "confidence": "high",
+            }
+        ]
+    if timed_out and shard_exists and not shard_parent_valid:
+        return [
+            {
+                "cause": "shard_schema_invalid_at_timeout_probe",
+                "basis": [
+                    "timeout",
+                    "shard_exists_at_timeout",
+                    "shard_parent_valid",
+                    "last_validation_result.errors",
+                    "top_level_missing_fields",
+                ],
+                "confidence": "medium",
+            }
+        ]
+    if timed_out and shard_parent_valid:
+        return [
+            {
+                "cause": "timeout_after_parent_valid_shard",
+                "basis": [
+                    "timeout",
+                    "first_parent_valid_shard_at",
+                    "runner_recoverability",
+                ],
+                "confidence": "medium",
+            }
+        ]
+    if child_failure_code == CODEX_CHILD_SCHEMA_INVALID:
+        return [
+            {
+                "cause": "child_shard_schema_invalid",
+                "basis": [
+                    "child_failure_code",
+                    "shard_schema_version",
+                    "last_validation_result.errors",
+                ],
+                "confidence": "high",
+            }
+        ]
+    if child_failure_code == CODEX_CHILD_MISSING_SHARD:
+        return [
+            {
+                "cause": "missing_child_shard",
+                "basis": ["child_failure_code", "shard_exists"],
+                "confidence": "high",
+            }
+        ]
+    if child_failure_code:
+        return [
+            {
+                "cause": child_failure_code,
+                "basis": ["child_failure_code", "last_message_text_preview"],
+                "confidence": "medium",
+            }
+        ]
+    return []
+
+
+def _probe_shard_exists(probe: Mapping[str, Any]) -> bool:
+    if probe.get("shard_exists_at_timeout") is True:
+        return True
+    if probe.get("shard_exists_at_timeout") is False:
+        return False
+    return probe.get("shard_exists") is True
+
+
+def _finalize_child_attempt_probe_contract(probe: Mapping[str, Any]) -> dict[str, Any]:
+    updated = dict(probe)
+    updated["child_timeout_at"] = updated.get("child_timed_out_at")
+    updated["child_elapsed_seconds"] = updated.get("elapsed_seconds")
+    updated["shard_exists_at_timeout"] = (
+        updated.get("shard_exists") if updated.get("timeout") is True else None
+    )
+    updated["top_level_missing_fields"] = list(updated.get("missing_required_fields") or [])
+    updated["sidecar_status"] = copy.deepcopy(updated.get("sidecars") or {})
+    updated["runner_recoverability"] = _probe_runner_recoverability(updated)
+    updated["last_child_event"] = _probe_last_child_event(updated)
+    updated["last_tool_or_command_call"] = _probe_last_tool_or_command_call(updated)
+    updated["last_child_message_preview"] = updated.get("last_message_text_preview")
+    primary_cause = _primary_probe_candidate_cause(updated)
+    updated["candidate_cause"] = primary_cause.get("cause") if primary_cause else None
+    updated["candidate_cause_confidence"] = (
+        primary_cause.get("confidence") if primary_cause else None
+    )
+    updated["candidate_cause_basis"] = (
+        list(primary_cause.get("basis") or []) if primary_cause else []
+    )
+    updated["unobservable_reasons"] = _probe_unobservable_reasons(updated)
+    return updated
+
+
+def _primary_probe_candidate_cause(probe: Mapping[str, Any]) -> dict[str, Any]:
+    candidates = probe.get("candidate_causes")
+    if not isinstance(candidates, list):
+        return {}
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return {}
+
+
+def _probe_runner_recoverability(probe: Mapping[str, Any]) -> dict[str, Any]:
+    if probe.get("runner_recoverable_valid_shard") is True:
+        return {
+            "state": "recoverable_valid_shard",
+            "recoverable": True,
+            "basis": ["first_parent_valid_shard_at", "last_validation_result"],
+        }
+    if probe.get("shard_parent_valid") is False:
+        return {
+            "state": "not_recoverable_parent_invalid_shard",
+            "recoverable": False,
+            "basis": ["shard_parent_valid", "last_validation_result"],
+        }
+    return {
+        "state": "unknown",
+        "recoverable": None,
+        "basis": ["shard_parent_valid"],
+    }
+
+
+def _probe_last_child_event(probe: Mapping[str, Any]) -> dict[str, Any] | None:
+    event_type = probe.get("last_child_event_type")
+    if not event_type:
+        return None
+    return {
+        "event_type": event_type,
+        "message_preview": probe.get("last_message_text_preview"),
+    }
+
+
+def _probe_last_tool_or_command_call(probe: Mapping[str, Any]) -> dict[str, Any] | None:
+    kind = probe.get("last_tool_or_command_kind")
+    preview = probe.get("last_tool_or_command_preview")
+    if not kind and not preview:
+        return None
+    return {
+        "kind": kind,
+        "preview": preview,
+    }
+
+
+def _probe_unobservable_reasons(probe: Mapping[str, Any]) -> dict[str, str]:
+    reasons: dict[str, str] = {}
+    for item in probe.get("unknowns") or []:
+        if not isinstance(item, Mapping):
+            continue
+        field = item.get("field")
+        reason = item.get("reason")
+        if isinstance(field, str) and field and isinstance(reason, str) and reason:
+            reasons.setdefault(field, reason)
+    if probe.get("child_timeout_at") is None:
+        if probe.get("timeout") is True:
+            reasons.setdefault("child_timeout_at", "adapter_did_not_report_child_timeout_time")
+        else:
+            reasons.setdefault("child_timeout_at", "child_did_not_timeout")
+    if probe.get("child_elapsed_seconds") is None:
+        reasons.setdefault("child_elapsed_seconds", "adapter_did_not_report_child_elapsed_time")
+    if probe.get("shard_exists_at_timeout") is None:
+        reasons.setdefault("shard_exists_at_timeout", "child_did_not_timeout")
+    if probe.get("last_child_event") is None:
+        reasons.setdefault("last_child_event", "no_child_json_event_observed")
+    if probe.get("last_tool_or_command_call") is None:
+        reasons.setdefault("last_tool_or_command_call", "no_tool_or_command_call_observed")
+    if probe.get("last_child_message_preview") is None:
+        reasons.setdefault("last_child_message_preview", "no_child_message_observed")
+    if probe.get("candidate_cause_confidence") is None:
+        reasons.setdefault("candidate_cause_confidence", "no_candidate_cause_supported_by_probe")
+    return reasons
+
+
+def _with_probe_failure_code(
+    probe: Mapping[str, Any],
+    child_failure_code: str,
+) -> dict[str, Any]:
+    updated = dict(probe)
+    updated["child_failure_code"] = child_failure_code
+    updated["candidate_causes"] = _probe_candidate_causes(updated)
+    updated["facts"] = _probe_facts(updated)
+    return _finalize_child_attempt_probe_contract(updated)
+
+
+def _update_attempt_probe_failure_code(
+    attempt_record: dict[str, Any],
+    child_failure_code: str,
+) -> None:
+    probe = attempt_record.get("attempt_probe")
+    if not isinstance(probe, Mapping):
+        return
+    attempt_record["attempt_probe"] = _with_probe_failure_code(
+        probe,
+        child_failure_code,
+    )
+
+
+def _update_attempt_probe_validation(
+    attempt_record: dict[str, Any],
+    *,
+    validation: Mapping[str, Any],
+    child_failure_code: Any,
+) -> None:
+    probe = attempt_record.get("attempt_probe")
+    if not isinstance(probe, Mapping):
+        return
+    updated = dict(probe)
+    validation_errors = _bounded_validation_errors(validation)
+    valid = bool(validation.get("valid"))
+    validation_at = _utc_now()
+    updated["last_validation_attempt_at"] = validation_at
+    if valid and not updated.get("first_parent_valid_shard_at"):
+        updated["first_parent_valid_shard_at"] = validation_at
+    updated["last_validation_result"] = {
+        "state": "valid" if valid else "invalid",
+        "valid": valid,
+        "error_count": len(validation.get("errors", []))
+        if isinstance(validation.get("errors"), list)
+        else 0,
+        "errors": validation_errors,
+    }
+    updated["validation_error_count"] = updated["last_validation_result"]["error_count"]
+    updated["validation_errors"] = validation_errors
+    updated["missing_required_fields"] = _missing_required_fields(validation_errors)
+    updated["shard_parent_valid"] = valid
+    if isinstance(child_failure_code, str) and child_failure_code:
+        updated["child_failure_code"] = child_failure_code
+    updated["candidate_causes"] = _probe_candidate_causes(updated)
+    updated["facts"] = _probe_facts(updated)
+    attempt_record["attempt_probe"] = _finalize_child_attempt_probe_contract(updated)
+
+
+def _mapping_or_empty(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _classify_child_failure_code(
@@ -2983,9 +3702,22 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "and do not set hidden_codex_api_call or codex_native_api_call. "
             "Do not use fixture, manual, user-provided-only, or post-hoc provider_mode values. "
         )
+    # Child shard contract: the parent accepts only Evidence Schema v0 envelopes
+    # validated by evidence_schema.validate_artifacts; legacy shard-specific
+    # schema_version values are intentionally rejected.
+    required_top_level_fields = ", ".join(
+        f"`{field}`" for field in EVIDENCE_SCHEMA_V0_REQUIRED_TOP_LEVEL_FIELDS
+    )
     return (
         "Run this bounded research shard task and write only schema-valid "
         f"evidence to {shard_path}. "
+        "The child `evidence_shard.json` contract is an Evidence Schema v0 JSON envelope, "
+        f"not a legacy shard-specific payload: set `schema_version` exactly `{EVIDENCE_SCHEMA_VERSION}` "
+        f"and include required top-level fields {required_top_level_fields}. "
+        f"Set top-level `run_id` exactly `{run_dir.name}`, `mode` exactly `codex-plugin`, "
+        "`search_provider` exactly `codex-native`, and `vlm_provider` exactly `codex-interactive` "
+        "unless the input evidence specifies another allowed VLM provider. "
+        "Do not write `schema_version: \"codex-deepresearch.evidence-shard.v0\"`. "
         "First create the shard directory if needed and write a minimal valid `evidence_shard.json` "
         f"to {shard_path} before any optional sidecars; keep replacing it with richer valid evidence as you proceed. "
         "If you use inline scripts for local JSON or file manipulation, invoke them with `python3`, not `python`. "
@@ -2993,7 +3725,6 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         "for Korean queries, translate/summarize English source findings into Korean user-facing prose. "
         "Only direct quote_spans.quote values should remain verbatim in the source language. "
         "Prioritize a compact shard with decision-ready claims and do not read repository docs or skills unless the schema is otherwise impossible to satisfy. "
-        "Use `vlm_provider` exactly `codex-interactive` unless the input evidence specifies another allowed value. "
         f"{release_instruction}"
         f"{visual_instruction}"
         "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
@@ -3104,6 +3835,12 @@ def _write_codex_exec_child_diagnostics(
     timeout_seconds: float | None = None,
     returncode: int | None = None,
     os_error: str | None = None,
+    child_started_at: str | None = None,
+    child_finished_at: str | None = None,
+    child_timed_out_at: str | None = None,
+    elapsed_seconds: float | None = None,
+    child_thread_id: str | None = None,
+    output_shard_path: Path | str | None = None,
 ) -> dict[str, Any]:
     stdout_text = _coerce_output_text(stdout)
     stderr_text = _coerce_output_text(stderr)
@@ -3121,6 +3858,12 @@ def _write_codex_exec_child_diagnostics(
         timeout_seconds=timeout_seconds,
         returncode=returncode,
         os_error=os_error,
+        child_started_at=child_started_at,
+        child_finished_at=child_finished_at,
+        child_timed_out_at=child_timed_out_at,
+        elapsed_seconds=elapsed_seconds,
+        child_thread_id=child_thread_id,
+        output_shard_path=output_shard_path,
     )
     _write_json(artifacts["last_child_event_path"], summary)
     legacy_artifacts = _codex_exec_legacy_child_artifact_paths(
@@ -3155,6 +3898,12 @@ def _last_child_event_summary(
     timeout_seconds: float | None,
     returncode: int | None,
     os_error: str | None,
+    child_started_at: str | None,
+    child_finished_at: str | None,
+    child_timed_out_at: str | None,
+    elapsed_seconds: float | None,
+    child_thread_id: str | None,
+    output_shard_path: Path | str | None,
 ) -> dict[str, Any]:
     last_event = events[-1] if events else {}
     command_event, last_command = _last_extracted_value(events, _extract_command)
@@ -3169,6 +3918,12 @@ def _last_child_event_summary(
         "artifacts": _stringify_paths(artifacts),
         "total_json_events": len(events),
         "parse_errors": parse_errors,
+        "child_started_at": child_started_at,
+        "child_finished_at": child_finished_at,
+        "child_timed_out_at": child_timed_out_at,
+        "elapsed_seconds": elapsed_seconds,
+        "child_thread_id": child_thread_id,
+        "output_shard_path": str(output_shard_path) if output_shard_path is not None else None,
         "last_event_type": _extract_event_type(last_event),
         "last_item_type": _extract_item_type(last_event),
         "last_command": _bounded_preview(last_command),
@@ -3330,7 +4085,23 @@ def _first_mapping_value(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any
 def _bounded_preview(value: Any, *, limit: int = 300) -> str | None:
     if value is None:
         return None
-    return _output_summary(value, limit=limit)
+    return _redact_child_probe_secret_text(_output_summary(value, limit=limit))
+
+
+def _redact_child_probe_secret_text(value: str) -> str:
+    redacted = CHILD_PROBE_BEARER_PATTERN.sub(
+        f"Bearer {REDACTED_CHILD_PROBE_SECRET}",
+        value,
+    )
+    redacted = CHILD_PROBE_SECRET_FLAG_PATTERN.sub(
+        lambda match: f"{match.group(1)}={REDACTED_CHILD_PROBE_SECRET}",
+        redacted,
+    )
+    redacted = CHILD_PROBE_SECRET_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group(1)}={REDACTED_CHILD_PROBE_SECRET}",
+        redacted,
+    )
+    return redacted
 
 
 def _with_child_event_artifacts(
@@ -3424,6 +4195,30 @@ def _append_timeout_after_valid_shard_context(
         "missing_expected_sidecar_paths="
         f"{json.dumps(context.get('missing_expected_sidecar_paths') or [], sort_keys=True)}"
     )
+
+
+def _elapsed_seconds(started_monotonic: float) -> float:
+    return round(max(0.0, time.monotonic() - started_monotonic), 3)
+
+
+def _number_or_none(value: Any) -> float | int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return round(value, 3)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(parsed, 3)
+
+
+def _string_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _output_summary(value: Any, *, limit: int = 700) -> str:
@@ -3761,6 +4556,9 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
     release_validation = task.get("release_search_handoff_validation")
     if isinstance(release_validation, Mapping):
         record["release_search_handoff_validation"] = copy.deepcopy(release_validation)
+    validation = task.get("validation")
+    if isinstance(validation, Mapping):
+        record["validation"] = copy.deepcopy(validation)
     _add_attempt_diagnostics(record, task)
     return record
 
@@ -3983,12 +4781,20 @@ def _merge_diagnostics(
     failed_tasks: Sequence[Mapping[str, Any]],
     blocked_tasks: Sequence[Mapping[str, Any]],
     rejected_shards: Sequence[Mapping[str, Any]],
+    discarded_tasks: Sequence[Mapping[str, Any]],
     retry_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     retry_summary = retry_summary if isinstance(retry_summary, Mapping) else {}
+    shard_counts = _shard_count_diagnostics(
+        accepted_shards=accepted_shards,
+        failed_tasks=failed_tasks,
+        blocked_tasks=blocked_tasks,
+        rejected_shards=rejected_shards,
+        discarded_tasks=discarded_tasks,
+    )
     if accepted_shards:
         accepted_warnings = _accepted_shard_warnings(accepted_shards)
-        diagnostics: dict[str, Any] = {}
+        diagnostics: dict[str, Any] = {"shard_counts": shard_counts}
         if accepted_warnings:
             diagnostics.update({
                 "accepted_shard_warning_count": len(accepted_warnings),
@@ -4022,6 +4828,7 @@ def _merge_diagnostics(
     if failed_tasks:
         first = failed_tasks[0]
         diagnostics = {
+            "shard_counts": shard_counts,
             "actionable_cause": "no evidence shards were accepted because child tasks failed",
             "first_failure_category": first.get("failure_category"),
             "first_child_failure_code": first.get("child_failure_code"),
@@ -4038,6 +4845,7 @@ def _merge_diagnostics(
     if blocked_tasks:
         first = blocked_tasks[0]
         return {
+            "shard_counts": shard_counts,
             "actionable_cause": "no evidence shards were accepted because child tasks were blocked",
             "first_blocked_task_id": first.get("task_id"),
             "first_blocked_reason": first.get("reason"),
@@ -4050,11 +4858,32 @@ def _merge_diagnostics(
     if rejected_shards:
         first = rejected_shards[0]
         return {
+            "shard_counts": shard_counts,
             "actionable_cause": "no evidence shards were accepted because shard validation rejected the output",
             "first_rejected_task_id": first.get("task_id"),
             "first_rejected_reason": first.get("reason"),
         }
-    return {"actionable_cause": "no evidence shards were accepted"}
+    return {
+        "shard_counts": shard_counts,
+        "actionable_cause": "no evidence shards were accepted",
+    }
+
+
+def _shard_count_diagnostics(
+    *,
+    accepted_shards: Sequence[Mapping[str, Any]],
+    failed_tasks: Sequence[Mapping[str, Any]],
+    blocked_tasks: Sequence[Mapping[str, Any]],
+    rejected_shards: Sequence[Mapping[str, Any]],
+    discarded_tasks: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    return {
+        "accepted_shards": len(accepted_shards),
+        "rejected_shards": len(rejected_shards),
+        "failed_tasks": len(failed_tasks),
+        "discarded_tasks": len(discarded_tasks),
+        "blocked_tasks": len(blocked_tasks),
+    }
 
 
 def _accepted_shard_warnings(
