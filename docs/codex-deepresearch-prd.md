@@ -543,6 +543,16 @@ Parallel status matrix:
 - JSON result envelopes set `ok=false`, `status` to the matrix failure or blocked status, `parallel_degraded=false`, `needs_serial_handoff=true`, and include `diagnostics.actionable_cause`.
 - No serial source fetching, report synthesis, or fallback evidence generation may run after the failure in the same command.
 
+2026-07-03 installed-plugin real-use failure finding:
+
+- A user-run `$deep-research` session for `아트패스라는 서비스에 대해서 조사해서 알려줘` created a real run directory at `research-runs/dr_20260703T050739` and launched six Codex child tasks. The run produced child event logs, `research_tasks.json`, `parallel_orchestration_status.json`, `merge_status.json`, and `run_status.json`, but did not produce `report.md`.
+- The conclusively explained failures are:
+  - Schema mismatch: the runner validated child outputs with Evidence Schema v0 (`schema_version: "0.1.0"` plus required fields such as `run_id`, `mode`, `search_provider`, and `vlm_provider`), while two child tasks wrote a different shard-shaped payload such as `schema_version: "codex-deepresearch.evidence-shard.v0"`. Those tasks were correctly rejected as invalid by the current validator, but the contract between child prompt wording and parent validation was inconsistent.
+  - Partial success did not reach synthesis: `merge_status.json` and `parallel_orchestration_status.json` recorded one accepted shard, but `degraded_serial_handoff_required` was not a synthesis-eligible status in the invocation router. The full-runner therefore stopped before guardrails, verification, and report synthesis.
+  - Final status wording was inaccurate: `run_status.json` reported a blocked diagnostic saying the run produced no accepted shards even though the merge artifact showed one accepted shard. Final user-visible diagnostics must be computed from the actual merge counts rather than fixed strings.
+- Timeout was observed for two child tasks, but the root cause of why those child tasks spent the time and failed to produce valid shard envelopes is not conclusively explained by the available logs. Product documentation and issues must not present that timeout root cause as fact until supported by artifacts, code, or a targeted reproduction.
+- Required Product v1 contract: child output shape, parent validator expectations, merge semantics, status transition semantics, and final user-visible diagnostics must agree. If accepted shards are greater than zero and quality gates allow synthesis, the run must continue through guardrails, verification, and synthesis as a partial result instead of reporting a generic blocked state. If evidence is insufficient for synthesis, the blocked or failed status must explicitly report the accepted, rejected, failed, discarded, and missing counts.
+
 Codex child timeout and capacity handling:
 
 - Child execution diagnostics must distinguish `timeout=true` from model-capacity or other retryable child failures. Raw child stderr/stdout, JSON event fragments, last child message, timeout setting, elapsed seconds, and attempt count must be preserved in `run_trace.jsonl` or a referenced raw diagnostic artifact.
@@ -2113,6 +2123,7 @@ Tasks:
 11. supported + auto/human accepted evidence를 memory/playbook/skill/PRD로 승격하는 workflow를 만든다.
 12. install, quickstart, config, troubleshooting, examples 문서를 완성한다.
 13. plugin release checklist와 changelog 프로세스를 만든다.
+14. real-use child shard schema contract, partial-degraded synthesis transition, and final status diagnostics를 정렬한다. Acceptance requires a reproduced real or fixture-equivalent run where accepted shard count is greater than zero, invalid shard envelopes are rejected with explicit schema diagnostics, partial evidence can synthesize when evidence gates pass, and `run_status.json` never says "no accepted shards" when accepted shards exist.
 
 Deliverables:
 
