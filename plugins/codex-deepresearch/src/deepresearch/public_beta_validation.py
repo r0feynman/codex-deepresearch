@@ -90,6 +90,7 @@ INCLUDED_FAILURE_STATUSES = {
     "partial_auto_visual",
     "budget_pruned_visual",
     "failed_parallel_no_accepted_shards",
+    "failed_release_handoff_invalid",
     "failed_validation",
     "failed_synthesis",
 }
@@ -1702,6 +1703,8 @@ def _failure_category(
     if terminal_status == "failed_validation":
         return "artifact_handoff_failure"
     if terminal_status == "failed_parallel_no_accepted_shards":
+        return "artifact_handoff_failure"
+    if terminal_status == "failed_release_handoff_invalid":
         return "artifact_handoff_failure"
     if terminal_status == "partial_auto_visual":
         if _provider_has_vlm_gap(visual_provider_status or {}):

@@ -78,6 +78,48 @@ class FakeBrowserScreenshotTransport:
         )
 
 
+class MissingDependencyBrowserScreenshotTransport:
+    name = "playwright"
+    provider_mode = "real"
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def availability(self) -> tuple[bool, str | None]:
+        return False, "missing_browser_dependency"
+
+    def availability_diagnostics(self) -> dict:
+        return {
+            "transport": self.name,
+            "reason": "missing_browser_dependency",
+            "check": "chromium_launch",
+            "install_guidance": [
+                "python3 -m playwright install chromium",
+                "python3 -m playwright install-deps chromium",
+            ],
+        }
+
+    def capture(
+        self,
+        *,
+        url: str,
+        output_path: Path,
+        viewport: dict,
+        full_page: bool,
+        timeout_ms: int,
+    ) -> BrowserScreenshotCapture:
+        self.calls.append(
+            {
+                "url": url,
+                "output_path": output_path,
+                "viewport": dict(viewport),
+                "full_page": full_page,
+                "timeout_ms": timeout_ms,
+            }
+        )
+        raise AssertionError("capture should not run when browser dependency preflight fails")
+
+
 class ScriptedBraveImageTransport:
     def __init__(self, outcomes: list[_BraveImageSearchResponse | BaseException]) -> None:
         self.outcomes = list(outcomes)
@@ -1655,6 +1697,55 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertEqual(browser_provider["invocations"], 1)
         self.assertEqual(browser_provider["artifacts_fetched"], 1)
         self.assertEqual(browser_provider["vlm_images_analyzed"], 0)
+
+    def test_mixed_real_providers_keep_missing_browser_dependency_as_diagnostic(self) -> None:
+        prepared = prepare_run(
+            question="Find image and screenshot evidence with one unavailable real provider",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        brave_transport = FakeBraveImageTransport(count=3)
+        browser_transport = MissingDependencyBrowserScreenshotTransport()
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["brave-image-search", "browser-screenshot"],
+            screenshot_modes=["first_viewport"],
+            real_image_search_transport=brave_transport,
+            real_image_search_config={
+                "brave_api_key": "test-secret-token",
+                "brave_allow_result_storage": True,
+                "brave_image_count": 3,
+            },
+            browser_transport=browser_transport,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        self.assertEqual(len(brave_transport.calls), 1)
+        self.assertEqual(browser_transport.calls, [])
+        self.assertEqual(result["candidate_records"], 3)
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual({candidate["provider"] for candidate in candidates}, {"brave-image-search"})
+
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertTrue(provider_status["ok"])
+        self.assertEqual(provider_status["status"], "real_image_search_candidates_collected")
+        browser_provider = [
+            provider
+            for provider in provider_status["providers"]
+            if provider["provider"] == "browser-screenshot"
+        ][0]
+        self.assertFalse(browser_provider["available"])
+        self.assertEqual(browser_provider["blocked_reason"], "missing_browser_dependency")
+        self.assertEqual(browser_provider["invocations"], 0)
+        self.assertEqual(
+            browser_provider["diagnostics"]["install_guidance"],
+            [
+                "python3 -m playwright install chromium",
+                "python3 -m playwright install-deps chromium",
+            ],
+        )
 
     def test_text_only_route_does_not_call_real_image_search_provider(self) -> None:
         prepared = prepare_run(
