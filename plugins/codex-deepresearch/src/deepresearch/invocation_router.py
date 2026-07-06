@@ -28,6 +28,7 @@ from .search_handoff import (
     prepare_run,
     release_validation_identity_from_payload,
 )
+from .semantic_planner import BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
@@ -283,6 +284,42 @@ def run_skill_invocation(
         )
 
     run_dir = Path(prepared["run_dir"])
+    if prepared.get("status") == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+        status = _base_run_status(
+            invocation=normalized_invocation,
+            question=question,
+            selected_mode="blocked",
+            run_dir=run_dir,
+            status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+            ok=False,
+            terminal=True,
+            provenance={
+                "type": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+                "adapter": adapter_name,
+                "fixture_only": False,
+                "manual_handoff": False,
+                "real_child_execution": False,
+                "real_use_e2e_eligible": False,
+            },
+            diagnostics={
+                "actionable_cause": prepared.get("diagnostics", {}).get(
+                    "semantic_planning",
+                    "Codex-native semantic planner is unavailable.",
+                )
+            },
+            artifacts=_artifact_paths(run_dir, prepared.get("artifacts")),
+        )
+        if isinstance(prepared.get("semantic_planning"), Mapping):
+            status["semantic_planning"] = dict(prepared["semantic_planning"])
+            status["planner_mode"] = prepared.get("planner_mode")
+            status["semantic_release_eligible"] = prepared.get(
+                "semantic_release_eligible"
+            )
+            status["semantic_planning_status"] = prepared.get(
+                "semantic_planning_status"
+            )
+        return _write_run_status(run_dir, status)
+
     _write_run_status(
         run_dir,
         _base_run_status(

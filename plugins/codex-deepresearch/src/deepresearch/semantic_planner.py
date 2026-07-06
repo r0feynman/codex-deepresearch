@@ -326,7 +326,13 @@ def plan_semantic_angles(
 
     if explicit_angles is not None:
         return manual_angle_planner(question=question, explicit_angles=explicit_angles)
-    return heuristic_template_planner(question=question)
+    return blocked_semantic_planner_plan(
+        question=question,
+        reason=(
+            "Codex-native semantic planner is not implemented yet; refusing to "
+            "materialize heuristic template tasks as semantic decomposition."
+        ),
+    )
 
 
 def classify_question(question: str) -> str:

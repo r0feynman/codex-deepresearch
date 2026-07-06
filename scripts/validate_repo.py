@@ -195,6 +195,8 @@ def run_parallel_orchestration_validation(runner: Path) -> None:
                 runs_dir,
                 "--route",
                 "text_only",
+                "--angle",
+                "primary source discovery",
             ],
             cwd=ROOT,
             check=False,

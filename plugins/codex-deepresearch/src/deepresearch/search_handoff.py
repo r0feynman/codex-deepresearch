@@ -30,6 +30,7 @@ from .modality_router import route_angles
 from .public_beta_validation import public_beta_prompt_hash
 from .run_state import begin_stage, skipped_stage_status
 from .semantic_planner import (
+    BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_PLANNER_SCHEMA_VERSION,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
@@ -129,6 +130,14 @@ def prepare_run(
             route=route,
         ),
     )
+    if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+        return _prepare_blocked_semantic_planner_run(
+            normalized_question=normalized_question,
+            config=config,
+            semantic_plan=semantic_plan,
+            runs_dir=Path(runs_dir),
+            release_identity=release_identity,
+        )
     decisions = []
     for semantic_angle in semantic_plan.angles:
         route_override = route
@@ -308,7 +317,16 @@ def prepare_run(
         created_at=now,
     )
     status["artifacts"].update(semantic_integrity_artifacts)
-    write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
+    semantic_validation = write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
+    semantic_planning = _prepare_semantic_planning_summary(
+        semantic_plan=semantic_plan,
+        validation=semantic_validation,
+    )
+    status["semantic_planning"] = semantic_planning
+    if semantic_planning["semantic_release_eligible"] is not True:
+        status["diagnostics"] = {
+            "semantic_planning": semantic_planning["user_visible_diagnostic"],
+        }
 
     validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
     if not validation.valid:
@@ -362,7 +380,181 @@ def prepare_run(
             **semantic_integrity_artifacts,
         },
         "budget_estimate": status["budget_estimate"],
+        "planner_mode": semantic_plan.planner_mode,
+        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_planning_status": semantic_plan.status,
+        "semantic_planning": semantic_planning,
+        **({"diagnostics": dict(status["diagnostics"])} if "diagnostics" in status else {}),
         **release_identity,
+    }
+
+
+def _prepare_blocked_semantic_planner_run(
+    *,
+    normalized_question: str,
+    config: Any,
+    semantic_plan: Any,
+    runs_dir: Path,
+    release_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    now = _utc_now()
+    run_dir = _create_unique_run_dir(runs_dir, now)
+    run_id = run_dir.name
+    begin_stage(run_dir, "planning", run_id=run_id, started_at=now)
+
+    budget = _budget_to_evidence(config.budget_preset, config.budget)
+    evidence = {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "created_at": now,
+        "question": normalized_question,
+        "mode": config.mode,
+        "search_provider": config.search_provider,
+        "vlm_provider": config.vlm_provider,
+        "routing": [],
+        "semantic_planner": {
+            "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+            "question_class": semantic_plan.question_class,
+            "broad_question": semantic_plan.broad_question,
+            "source": semantic_plan.source,
+            "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
+            "planner_mode": semantic_plan.planner_mode,
+            "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+            "status": semantic_plan.status,
+            "diagnostics": dict(semantic_plan.diagnostics or {}),
+        },
+        "semantic_angles": [],
+        "search_tasks": [],
+        "budget": budget,
+        "sources": [],
+        "images": [],
+        "claims": [],
+        "handoff": {
+            "schema_version": HANDOFF_SCHEMA_VERSION,
+            "status": semantic_plan.status,
+            "search_results_path": None,
+            "visual_observations_path": None,
+        },
+    }
+    apply_release_validation_identity(evidence, release_identity)
+
+    status = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "run_id": run_id,
+        "status": semantic_plan.status,
+        "semantic_planning_status": semantic_plan.status,
+        "planner_mode": semantic_plan.planner_mode,
+        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "created_at": now,
+        "question": normalized_question,
+        "mode": config.mode,
+        "search_provider": config.search_provider,
+        "vlm_provider": config.vlm_provider,
+        "next_step": (
+            "Implement the Codex-native semantic planner adapter or provide explicit "
+            "manual angles; heuristic template fallback is release-ineligible."
+        ),
+        "artifacts": {
+            "evidence": str(run_dir / "evidence.json"),
+            "status": str(run_dir / "status.json"),
+            "semantic_planner_validation": str(
+                run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+            ),
+        },
+    }
+    apply_release_validation_identity(status, release_identity)
+
+    _write_json(run_dir / "evidence.json", evidence)
+    semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+        run_dir=run_dir,
+        question=normalized_question,
+        plan=semantic_plan,
+        routing=[],
+        search_tasks=[],
+        created_at=now,
+    )
+    status["artifacts"].update(semantic_integrity_artifacts)
+    semantic_validation = write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
+    semantic_planning = _prepare_semantic_planning_summary(
+        semantic_plan=semantic_plan,
+        validation=semantic_validation,
+    )
+    status["semantic_planning"] = semantic_planning
+    status["diagnostics"] = {
+        "semantic_planning": semantic_planning["user_visible_diagnostic"],
+    }
+
+    validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
+    status["validation"] = validation.to_dict()
+    if not validation.valid:
+        status["status"] = "failed_validation"
+
+    record_stage_trace(
+        run_dir,
+        stage="planning",
+        agent_role="planner",
+        status_payload=status,
+        prompt_summary="Create a Codex-native semantic plan for the research question.",
+        tool_call_summary=(
+            "Semantic planner unavailable; refused to materialize heuristic template tasks."
+        ),
+        event_type="semantic_planner_blocked",
+        timestamp=now,
+    )
+    _write_json(run_dir / "status.json", status)
+
+    artifacts = {
+        "evidence": str(run_dir / "evidence.json"),
+        "status": str(run_dir / "status.json"),
+        "run_trace": str(run_dir / "run_trace.jsonl"),
+        "run_steps": str(run_dir / "run_steps.json"),
+        "semantic_planner_validation": str(
+            run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+        ),
+        **semantic_integrity_artifacts,
+    }
+    return {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "status": status["status"],
+        "artifacts": artifacts,
+        "planner_mode": semantic_plan.planner_mode,
+        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_planning_status": semantic_plan.status,
+        "semantic_planning": semantic_planning,
+        "diagnostics": dict(status["diagnostics"]),
+        **release_identity,
+    }
+
+
+def _prepare_semantic_planning_summary(
+    *,
+    semantic_plan: Any,
+    validation: Mapping[str, Any],
+) -> dict[str, Any]:
+    diagnostics = (
+        dict(semantic_plan.diagnostics)
+        if isinstance(getattr(semantic_plan, "diagnostics", None), Mapping)
+        else {}
+    )
+    failures = validation.get("failures")
+    failure_codes = [
+        str(failure.get("code"))
+        for failure in failures
+        if isinstance(failure, Mapping) and failure.get("code")
+    ] if isinstance(failures, list) else []
+    return {
+        "schema_version": "codex-deepresearch.semantic-planning-summary.v0",
+        "status": str(getattr(semantic_plan, "status", "unknown") or "unknown"),
+        "planner_mode": str(getattr(semantic_plan, "planner_mode", "unknown") or "unknown"),
+        "semantic_release_eligible": bool(
+            getattr(semantic_plan, "semantic_release_eligible", False)
+        ),
+        "validation_ok": validation.get("ok"),
+        "failure_codes": failure_codes,
+        "fallback_kind": diagnostics.get("fallback_kind"),
+        "user_visible_diagnostic": diagnostics.get("user_visible_diagnostic"),
     }
 
 

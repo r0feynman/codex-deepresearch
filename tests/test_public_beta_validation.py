@@ -193,6 +193,137 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(metric["denominator_completed_non_blocked"], 1)
         self.assertEqual(metric["pass_rate"], 0.0)
 
+    def test_blocked_semantic_planner_counts_as_release_failure_not_excluded(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-blocked-semantic-planner"
+        blocked_run = self.write_text_run(
+            runs_dir / "blocked-semantic-planner",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="blocked_semantic_planner_unavailable",
+            ok=False,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": blocked_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("semantic planner denominator failure", run["failure_detail"])
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["blocked"], 9)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+
+    def test_fixture_completion_counts_as_semantic_release_failure_not_excluded(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-fixture-semantic-failure"
+        fixture_run = self.write_text_run(
+            runs_dir / "fixture-completion",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_fixture",
+            ok=True,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": fixture_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("fixture-only completion", run["failure_detail"])
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["blocked"], 9)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+
+    def test_release_ineligible_completed_parallel_text_run_fails_public_beta(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-semantic-release-ineligible"
+        fallback_run = self.write_text_run(
+            runs_dir / "heuristic-fallback",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_parallel",
+            ok=True,
+            semantic_planning="heuristic_fallback",
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": fallback_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["terminal_status"], "completed_parallel")
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("semantic planner release gate failed", run["failure_detail"])
+        checks = run["semantic_release_checks"]
+        self.assertFalse(checks["valid"])
+        failure_checks = {failure["check"] for failure in checks["failures"]}
+        self.assertIn("semantic_planner_mode", failure_checks)
+        self.assertIn("semantic_release_eligible", failure_checks)
+        self.assertIn("semantic_planner_validation_ok", failure_checks)
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["passed"], 0)
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+
+    def test_codex_semantic_text_run_with_required_artifacts_can_pass(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "codex-semantic",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed", result)
+        checks = result["semantic_release_checks"]
+        self.assertTrue(checks["valid"], checks)
+        self.assertEqual(checks["planner_modes"]["run_status"], "codex_semantic")
+        self.assertTrue(checks["semantic_release_eligible"]["run_status"])
+        self.assertTrue(checks["validation_ok"])
+        for artifact_name in checks["required_artifacts"]:
+            self.assertIn(artifact_name, result["status_artifacts"])
+
     def test_partial_parallel_reliability_counts_passing_text_and_visual_runs(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
@@ -1382,31 +1513,52 @@ class PublicBetaValidationTests(unittest.TestCase):
         status: str,
         ok: bool = True,
         created_at: str | None = None,
+        semantic_planning: str = "eligible",
     ) -> Path:
         run_dir.mkdir(parents=True)
         terminal = True
         timestamp = created_at or self.now()
+        semantic_release_statuses = {
+            "completed_parallel",
+            "completed_partial_parallel",
+            "completed_serial_handoff",
+        }
+        semantic_metadata = self.semantic_planning_metadata(
+            semantic_planning,
+            enabled=status in semantic_release_statuses,
+        )
+        run_status_payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_dir.name,
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "original_question": prompt["prompt"],
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "question": prompt["prompt"],
+            "status": status,
+            "ok": ok,
+            "terminal": terminal,
+            "created_at": timestamp,
+            "completed_at": timestamp,
+            "selected_mode": "full-runner",
+            "search_provider": "codex-native",
+            "adapter": "codex-exec",
+        }
+        if semantic_metadata:
+            run_status_payload.update(
+                {
+                    "planner_mode": semantic_metadata["planner_mode"],
+                    "semantic_release_eligible": semantic_metadata[
+                        "semantic_release_eligible"
+                    ],
+                    "semantic_planning": semantic_metadata["summary"],
+                }
+            )
         self.write_json(
             run_dir / "run_status.json",
-            {
-                "schema_version": "codex-deepresearch.run-status.v0",
-                "run_id": run_dir.name,
-                "prompt_id": prompt["id"],
-                "prompt_hash": self.prompt_hash(prompt["prompt"]),
-                "suite_id": suite_id,
-                "original_question": prompt["prompt"],
-                "execution_mode": "codex-plugin",
-                "runner_mode": "full-runner",
-                "question": prompt["prompt"],
-                "status": status,
-                "ok": ok,
-                "terminal": terminal,
-                "created_at": timestamp,
-                "completed_at": timestamp,
-                "selected_mode": "full-runner",
-                "search_provider": "codex-native",
-                "adapter": "codex-exec",
-            },
+            run_status_payload,
         )
         self.write_json(
             run_dir / "search_tasks.json",
@@ -1435,22 +1587,37 @@ class PublicBetaValidationTests(unittest.TestCase):
             [self.codex_native_search_result(prompt, suite_id=suite_id)],
         )
         if status.startswith("completed"):
+            evidence_payload = {
+                "schema_version": "0.1.0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
+                "question": prompt["prompt"],
+                "created_at": timestamp,
+                "mode": "codex-plugin",
+                "search_provider": "codex-native",
+            }
+            if semantic_metadata:
+                evidence_payload["semantic_planner"] = {
+                    "schema_version": "codex-deepresearch.semantic-planner.v0",
+                    "question_class": "general",
+                    "broad_question": False,
+                    "source": semantic_metadata["source"],
+                    "expected_evidence_needs": ["primary_source"],
+                    "planner_mode": semantic_metadata["planner_mode"],
+                    "semantic_release_eligible": semantic_metadata[
+                        "semantic_release_eligible"
+                    ],
+                    "status": semantic_metadata["summary"]["status"],
+                    "diagnostics": dict(semantic_metadata["diagnostics"]),
+                }
             self.write_json(
                 run_dir / "evidence.json",
-                {
-                    "schema_version": "0.1.0",
-                    "run_id": run_dir.name,
-                    "prompt_id": prompt["id"],
-                    "prompt_hash": self.prompt_hash(prompt["prompt"]),
-                    "suite_id": suite_id,
-                    "original_question": prompt["prompt"],
-                    "execution_mode": "codex-plugin",
-                    "runner_mode": "full-runner",
-                    "question": prompt["prompt"],
-                    "created_at": timestamp,
-                    "mode": "codex-plugin",
-                    "search_provider": "codex-native",
-                },
+                evidence_payload,
             )
             self.write_json(
                 run_dir / "report_status.json",
@@ -1470,7 +1637,194 @@ class PublicBetaValidationTests(unittest.TestCase):
                 },
             )
             (run_dir / "report.md").write_text("# Public-safe report\n", encoding="utf-8")
+            if semantic_metadata:
+                self.write_semantic_release_artifacts(
+                    run_dir,
+                    prompt=prompt,
+                    suite_id=suite_id,
+                    timestamp=timestamp,
+                    metadata=semantic_metadata,
+                )
         return run_dir
+
+    def semantic_planning_metadata(
+        self,
+        mode: str,
+        *,
+        enabled: bool,
+    ) -> dict[str, Any] | None:
+        if not enabled or mode == "missing":
+            return None
+        if mode == "eligible":
+            planner_mode = "codex_semantic"
+            eligible = True
+            status = "accepted_codex_semantic"
+            source = "codex_semantic"
+            diagnostics: dict[str, Any] = {}
+            failures: list[dict[str, Any]] = []
+            blockers: list[dict[str, Any]] = []
+            score: float | None = 9.4
+            verdict = "passed"
+        elif mode == "heuristic_fallback":
+            planner_mode = "heuristic_template_fallback"
+            eligible = False
+            status = "prepared_heuristic_template_fallback"
+            source = "heuristic_template_planner"
+            diagnostics = {
+                "semantic_release_eligible": False,
+                "planner_mode": planner_mode,
+                "fallback_kind": "keyword/template fallback planner",
+                "user_visible_diagnostic": (
+                    "True semantic decomposition did not run; this path is useful "
+                    "only as a release-ineligible fallback and cannot satisfy "
+                    "semantic planner gates."
+                ),
+            }
+            failures = [
+                {"code": "semantic_release_ineligible"},
+                {"code": "release_ineligible_planner_mode"},
+            ]
+            blockers = [
+                {
+                    "code": "release_ineligible_planner_mode",
+                    "planner_mode": planner_mode,
+                }
+            ]
+            score = None
+            verdict = "release_ineligible"
+        else:
+            raise AssertionError(f"unknown semantic_planning fixture mode: {mode}")
+        return {
+            "planner_mode": planner_mode,
+            "semantic_release_eligible": eligible,
+            "source": source,
+            "diagnostics": diagnostics,
+            "failures": failures,
+            "blockers": blockers,
+            "semantic_fit_score": score,
+            "final_verdict": verdict,
+            "summary": {
+                "schema_version": "codex-deepresearch.semantic-planning-summary.v0",
+                "status": status,
+                "planner_mode": planner_mode,
+                "semantic_release_eligible": eligible,
+                "validation_ok": not failures,
+                "user_visible_diagnostic": diagnostics.get("user_visible_diagnostic"),
+            },
+        }
+
+    def write_semantic_release_artifacts(
+        self,
+        run_dir: Path,
+        *,
+        prompt: dict[str, Any],
+        suite_id: str,
+        timestamp: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        base = {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "run_id": run_dir.name,
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "original_question": prompt["prompt"],
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "created_at": timestamp,
+            "planner_mode": metadata["planner_mode"],
+            "semantic_release_eligible": metadata["semantic_release_eligible"],
+        }
+        semantic_plan = {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "question_class": "general",
+            "broad_question": False,
+            "source": metadata["source"],
+            "expected_evidence_needs": ["primary_source"],
+            "planner_mode": metadata["planner_mode"],
+            "semantic_release_eligible": metadata["semantic_release_eligible"],
+            "status": metadata["summary"]["status"],
+            "diagnostics": dict(metadata["diagnostics"]),
+            "angles": [
+                {
+                    "angle_id": "angle_001",
+                    "title": "Primary source discovery",
+                    "research_question": prompt["prompt"],
+                    "question_context": prompt["prompt"],
+                    "route": prompt["route"],
+                    "evidence_need": "primary_source",
+                    "expected_artifacts": ["source list", "supporting quotes"],
+                    "success_criteria": ["Claims remain tied to source spans."],
+                    "report_section": "Primary Sources",
+                }
+            ],
+        }
+        self.write_json(
+            run_dir / "semantic_expectation_oracle.json",
+            {
+                **base,
+                "artifact_type": "semantic_expectation_oracle",
+                "oracle_requirement_map": [
+                    {
+                        "requirement_id": "req_001",
+                        "description": "Answer the prompt from a primary source.",
+                        "covered_by_angle_ids": ["angle_001"],
+                    }
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                **base,
+                "artifact_type": "semantic_plan",
+                "semantic_plan": semantic_plan,
+                "angles": semantic_plan["angles"],
+                "requirement_coverage_map": [
+                    {
+                        "requirement_id": "req_001",
+                        "angle_id": "angle_001",
+                        "coverage_status": "covered",
+                    }
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan_review.json",
+            {
+                **base,
+                "artifact_type": "semantic_plan_review",
+                "semantic_fit_score": metadata["semantic_fit_score"],
+                "blockers": list(metadata["blockers"]),
+                "warnings": [],
+                "reviewer_independence": {
+                    "independent": metadata["semantic_release_eligible"],
+                    "status": (
+                        "passed"
+                        if metadata["semantic_release_eligible"]
+                        else "release_ineligible"
+                    ),
+                },
+                "substitute_implementation_check": {
+                    "passed": metadata["semantic_release_eligible"],
+                    "checked": True,
+                },
+                "final_verdict": metadata["final_verdict"],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_planner_validation.json",
+            {
+                **base,
+                "fixture_id": run_dir.name,
+                "question_class": "general",
+                "broad_question": False,
+                "angle_count": 1,
+                "task_count": 1,
+                "failures": list(metadata["failures"]),
+                "ok": not metadata["failures"],
+            },
+        )
 
     def write_visual_run(
         self,
@@ -1491,27 +1845,42 @@ class PublicBetaValidationTests(unittest.TestCase):
             if prompt["route"] == "visual_required"
         )
         timestamp = self.now()
+        semantic_metadata = self.semantic_planning_metadata(
+            "eligible",
+            enabled=run_status == "completed_auto_visual",
+        )
+        run_status_payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_dir.name,
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "original_question": prompt["prompt"],
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "question": prompt["prompt"],
+            "status": run_status,
+            "ok": run_status == "completed_auto_visual",
+            "terminal": True,
+            "created_at": timestamp,
+            "completed_at": timestamp,
+            "selected_mode": "full-runner",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+        }
+        if semantic_metadata:
+            run_status_payload.update(
+                {
+                    "planner_mode": semantic_metadata["planner_mode"],
+                    "semantic_release_eligible": semantic_metadata[
+                        "semantic_release_eligible"
+                    ],
+                    "semantic_planning": semantic_metadata["summary"],
+                }
+            )
         self.write_json(
             run_dir / "run_status.json",
-            {
-                "schema_version": "codex-deepresearch.run-status.v0",
-                "run_id": run_dir.name,
-                "prompt_id": prompt["id"],
-                "prompt_hash": self.prompt_hash(prompt["prompt"]),
-                "suite_id": suite_id,
-                "original_question": prompt["prompt"],
-                "execution_mode": "codex-plugin",
-                "runner_mode": "full-runner",
-                "question": prompt["prompt"],
-                "status": run_status,
-                "ok": run_status == "completed_auto_visual",
-                "terminal": True,
-                "created_at": timestamp,
-                "completed_at": timestamp,
-                "selected_mode": "full-runner",
-                "search_provider": "codex-native",
-                "vlm_provider": "codex-interactive",
-            },
+            run_status_payload,
         )
         self.write_json(
             run_dir / "search_tasks.json",
@@ -1588,9 +1957,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "candidate_id": candidates[0]["candidate_id"] if candidates else "cand_001",
             "fetch_id": fetches[0]["fetch_id"] if fetches else "fetch_001",
         }
-        self.write_json(
-            run_dir / "evidence.json",
-            {
+        evidence_payload = {
                 "schema_version": "0.1.0",
                 "run_id": run_dir.name,
                 "prompt_id": prompt["id"],
@@ -1619,8 +1986,30 @@ class PublicBetaValidationTests(unittest.TestCase):
                 ]
                 if release_grade
                 else [],
-            },
-        )
+            }
+        if semantic_metadata:
+            evidence_payload["semantic_planner"] = {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "question_class": "visual_style",
+                "broad_question": True,
+                "source": semantic_metadata["source"],
+                "expected_evidence_needs": ["visual_observation"],
+                "planner_mode": semantic_metadata["planner_mode"],
+                "semantic_release_eligible": semantic_metadata[
+                    "semantic_release_eligible"
+                ],
+                "status": semantic_metadata["summary"]["status"],
+                "diagnostics": dict(semantic_metadata["diagnostics"]),
+            }
+        self.write_json(run_dir / "evidence.json", evidence_payload)
+        if semantic_metadata:
+            self.write_semantic_release_artifacts(
+                run_dir,
+                prompt=prompt,
+                suite_id=suite_id,
+                timestamp=timestamp,
+                metadata=semantic_metadata,
+            )
         self.write_json(
             run_dir / "report_status.json",
             {

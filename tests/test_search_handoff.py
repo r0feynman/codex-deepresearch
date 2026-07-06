@@ -14,7 +14,15 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import ingest_run, prepare_run, validate_artifacts
+from deepresearch import ingest_run, prepare_run as prepare_search_handoff_run, validate_artifacts
+
+
+TEST_MANUAL_ANGLES = ("primary source discovery",)
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", list(TEST_MANUAL_ANGLES))
+    return prepare_search_handoff_run(*args, **kwargs)
 
 
 class SearchHandoffTests(unittest.TestCase):
@@ -127,6 +135,37 @@ class SearchHandoffTests(unittest.TestCase):
                 self.assertEqual(payload["execution_mode"], "codex-plugin")
                 self.assertEqual(payload["runner_mode"], "full-runner")
                 self.assertIn("created_at", payload)
+
+    def test_prepare_exposes_release_ineligible_semantic_diagnostics(self) -> None:
+        result = prepare_run(
+            question="Compare public sources for an example search question.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+        )
+        run_dir = Path(result["run_dir"])
+        status = self.load_json(run_dir / "status.json")
+
+        for payload in (result, status):
+            with self.subTest(payload=payload["status"]):
+                self.assertEqual(payload["planner_mode"], "manual_angles")
+                self.assertFalse(payload["semantic_release_eligible"])
+                self.assertEqual(
+                    payload["semantic_planning"]["planner_mode"],
+                    "manual_angles",
+                )
+                self.assertFalse(
+                    payload["semantic_planning"]["semantic_release_eligible"]
+                )
+                self.assertFalse(payload["semantic_planning"]["validation_ok"])
+                self.assertIn(
+                    "release-ineligible fallback",
+                    payload["semantic_planning"]["user_visible_diagnostic"],
+                )
+                self.assertIn("semantic_planning", payload["diagnostics"])
+                self.assertIn(
+                    "release-ineligible fallback",
+                    payload["diagnostics"]["semantic_planning"],
+                )
 
     def test_prepare_records_modality_routes_for_planner_angles(self) -> None:
         result = prepare_run(
@@ -363,6 +402,8 @@ class SearchHandoffTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "example search question",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
             ],

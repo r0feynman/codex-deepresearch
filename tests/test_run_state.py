@@ -29,7 +29,7 @@ from deepresearch import (  # noqa: E402
     ingest_vision_observations,
     inspect_run_state,
     pause_run,
-    prepare_run,
+    prepare_run as prepare_search_handoff_run,
     read_trace_records,
     resume_run,
     run_control_path,
@@ -39,6 +39,14 @@ from deepresearch import (  # noqa: E402
     verify_claims,
 )
 from deepresearch.trace import record_stage_trace  # noqa: E402
+
+
+TEST_MANUAL_ANGLES = ("primary source discovery",)
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", list(TEST_MANUAL_ANGLES))
+    return prepare_search_handoff_run(*args, **kwargs)
 
 
 fetch_claims_module = importlib.import_module("deepresearch.fetch_claims")

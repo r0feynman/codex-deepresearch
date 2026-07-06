@@ -1464,6 +1464,7 @@ class PageImageExtractionTests(unittest.TestCase):
             question="Text-only page should not fetch images",
             runs_dir=self.temp_runs_dir(),
             route="text_only",
+            angles=["text-only source extraction"],
         )
         run_dir = Path(prepared["run_dir"])
         (run_dir / "sources").mkdir(exist_ok=True)

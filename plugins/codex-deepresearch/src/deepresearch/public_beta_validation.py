@@ -76,6 +76,22 @@ PASS_TERMINAL_STATUSES = {
     "completed_serial_handoff",
     "completed_auto_visual",
 }
+SEMANTIC_RELEASE_TERMINAL_STATUSES = {
+    "completed_parallel",
+    "completed_partial_parallel",
+    "completed_serial_handoff",
+}
+SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES = {
+    "blocked_semantic_planner_unavailable",
+    "completed_fixture",
+    "completed_manual_planner_fallback",
+}
+SEMANTIC_RELEASE_REQUIRED_ARTIFACTS = (
+    "semantic_expectation_oracle",
+    "semantic_plan",
+    "semantic_plan_review",
+    "semantic_planner_validation",
+)
 BLOCKED_TERMINAL_STATUSES = {
     "blocked_preflight",
     "blocked_semantic_planner_unavailable",
@@ -605,6 +621,13 @@ def evaluate_public_beta_prompt_run(
         run_status=run_status if isinstance(run_status, Mapping) else {},
         evidence=evidence if isinstance(evidence, Mapping) else {},
     )
+    semantic_release_checks: dict[str, Any] | None = None
+    if _requires_semantic_release_gate(prompt, terminal_status):
+        semantic_release_checks = _semantic_release_checks(
+            loaded_artifacts=loaded,
+            run_status=run_status if isinstance(run_status, Mapping) else {},
+            evidence=evidence if isinstance(evidence, Mapping) else {},
+        )
 
     provider_provenance = _provider_provenance(
         prompt=prompt,
@@ -680,6 +703,17 @@ def evaluate_public_beta_prompt_run(
         )
     if (
         status == "passed"
+        and semantic_release_checks is not None
+        and not semantic_release_checks["valid"]
+    ):
+        status = "failed"
+        classification = "included_failure"
+        failure_category = "artifact_handoff_failure"
+        detail = "semantic planner release gate failed: " + "; ".join(
+            failure["detail"] for failure in semantic_release_checks["failures"]
+        )
+    if (
+        status == "passed"
         and visual_release_checks is not None
         and not visual_release_checks["valid"]
     ):
@@ -725,6 +759,8 @@ def evaluate_public_beta_prompt_run(
         "public_safe": prompt.get("public_safe") is True,
         "raw_run_bundle_copied": False,
     }
+    if semantic_release_checks is not None:
+        result["semantic_release_checks"] = semantic_release_checks
     if visual_release_checks is not None:
         result["visual_release_checks"] = visual_release_checks
     return result
@@ -1668,6 +1704,10 @@ def _artifact_paths(run_dir: Path, *, route: str) -> dict[str, Path]:
         "report_status": run_dir / "report_status.json",
         "parallel_status": run_dir / "parallel_orchestration_status.json",
         "run_trace": run_dir / "run_trace.jsonl",
+        "semantic_expectation_oracle": run_dir / "semantic_expectation_oracle.json",
+        "semantic_plan": run_dir / "semantic_plan.json",
+        "semantic_plan_review": run_dir / "semantic_plan_review.json",
+        "semantic_planner_validation": run_dir / "semantic_planner_validation.json",
     }
     if route in VISUAL_ROUTES:
         artifacts.update(
@@ -1690,6 +1730,8 @@ def _required_status_artifacts(
     required = ["run_status"]
     if terminal_status in PASS_TERMINAL_STATUSES:
         required.extend(["evidence", "search_tasks", "search_results", "report", "report_status"])
+    if _requires_semantic_release_gate(prompt, terminal_status):
+        required.extend(SEMANTIC_RELEASE_REQUIRED_ARTIFACTS)
     if prompt.get("route") in VISUAL_ROUTES:
         required.append("visual_provider_status")
     if terminal_status == "completed_auto_visual":
@@ -1705,6 +1747,219 @@ def _required_status_artifacts(
     return required
 
 
+def _requires_semantic_release_gate(
+    prompt: Mapping[str, Any],
+    terminal_status: str,
+) -> bool:
+    if prompt.get("route") in VISUAL_ROUTES:
+        return terminal_status in (
+            SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES | {"completed_auto_visual"}
+        )
+    return terminal_status in (
+        SEMANTIC_RELEASE_TERMINAL_STATUSES
+        | SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES
+    )
+
+
+def _semantic_release_checks(
+    *,
+    loaded_artifacts: Mapping[str, Any],
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    failures: list[dict[str, Any]] = []
+    required_payloads: dict[str, Mapping[str, Any]] = {}
+    for name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
+        payload = loaded_artifacts.get(name)
+        if isinstance(payload, Mapping):
+            required_payloads[name] = payload
+        else:
+            failures.append(
+                {
+                    "check": "required_semantic_artifact_present",
+                    "artifact": name,
+                    "detail": f"{name}.json is missing or invalid",
+                }
+            )
+
+    planner_sources = _semantic_planner_mode_sources(
+        run_status=run_status,
+        evidence=evidence,
+        artifacts=required_payloads,
+    )
+    if not planner_sources:
+        failures.append(
+            {
+                "check": "semantic_planner_mode",
+                "detail": "planner_mode is missing from semantic release artifacts",
+            }
+        )
+    for source, planner_mode in sorted(planner_sources.items()):
+        if planner_mode != "codex_semantic":
+            failures.append(
+                {
+                    "check": "semantic_planner_mode",
+                    "source": source,
+                    "planner_mode": planner_mode,
+                    "detail": f"{source}.planner_mode is {planner_mode}, expected codex_semantic",
+                }
+            )
+
+    eligible_sources = _semantic_release_eligible_sources(
+        run_status=run_status,
+        evidence=evidence,
+        artifacts=required_payloads,
+    )
+    if not eligible_sources:
+        failures.append(
+            {
+                "check": "semantic_release_eligible",
+                "detail": "semantic_release_eligible is missing from semantic release artifacts",
+            }
+        )
+    for source, eligible in sorted(eligible_sources.items()):
+        if eligible is not True:
+            failures.append(
+                {
+                    "check": "semantic_release_eligible",
+                    "source": source,
+                    "semantic_release_eligible": eligible,
+                    "detail": f"{source}.semantic_release_eligible is not true",
+                }
+            )
+
+    validation = required_payloads.get("semantic_planner_validation")
+    if isinstance(validation, Mapping) and validation.get("ok") is not True:
+        failures.append(
+            {
+                "check": "semantic_planner_validation_ok",
+                "detail": "semantic_planner_validation.ok is not true",
+            }
+        )
+
+    review = required_payloads.get("semantic_plan_review")
+    if isinstance(review, Mapping):
+        score = _float_or_none(review.get("semantic_fit_score"))
+        if score is not None and score < 9.0:
+            failures.append(
+                {
+                    "check": "semantic_fit_score",
+                    "semantic_fit_score": score,
+                    "detail": "semantic_plan_review.semantic_fit_score is below 9.0",
+                }
+            )
+        blockers = review.get("blockers")
+        if isinstance(blockers, list) and blockers:
+            failures.append(
+                {
+                    "check": "semantic_review_blockers",
+                    "blocker_count": len(blockers),
+                    "detail": "semantic_plan_review.blockers is not empty",
+                }
+            )
+        substitute = review.get("substitute_implementation_check")
+        if isinstance(substitute, Mapping) and substitute.get("passed") is not True:
+            failures.append(
+                {
+                    "check": "substitute_implementation_check",
+                    "detail": "semantic_plan_review.substitute_implementation_check.passed is not true",
+                }
+            )
+        independence = review.get("reviewer_independence")
+        if isinstance(independence, Mapping) and independence.get("independent") is not True:
+            failures.append(
+                {
+                    "check": "reviewer_independence",
+                    "detail": "semantic_plan_review.reviewer_independence.independent is not true",
+                }
+            )
+
+    return {
+        "schema_version": "codex-deepresearch.semantic-release-checks.v0",
+        "valid": not failures,
+        "required_artifacts": list(SEMANTIC_RELEASE_REQUIRED_ARTIFACTS),
+        "present_artifacts": sorted(required_payloads),
+        "planner_modes": planner_sources,
+        "semantic_release_eligible": eligible_sources,
+        "validation_ok": validation.get("ok") if isinstance(validation, Mapping) else None,
+        "semantic_fit_score": review.get("semantic_fit_score") if isinstance(review, Mapping) else None,
+        "failures": failures,
+    }
+
+
+def _semantic_planner_mode_sources(
+    *,
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    _add_string_source(sources, "run_status", run_status.get("planner_mode"))
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        _add_string_source(
+            sources,
+            "evidence.semantic_planner",
+            semantic_planner.get("planner_mode"),
+        )
+    for name, payload in artifacts.items():
+        _add_string_source(sources, name, payload.get("planner_mode"))
+        nested = payload.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            _add_string_source(
+                sources,
+                f"{name}.semantic_plan",
+                nested.get("planner_mode"),
+            )
+    return sources
+
+
+def _semantic_release_eligible_sources(
+    *,
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    sources: dict[str, Any] = {}
+    _add_bool_source(sources, "run_status", run_status.get("semantic_release_eligible"))
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        _add_bool_source(
+            sources,
+            "evidence.semantic_planner",
+            semantic_planner.get("semantic_release_eligible"),
+        )
+    for name, payload in artifacts.items():
+        _add_bool_source(sources, name, payload.get("semantic_release_eligible"))
+        nested = payload.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            _add_bool_source(
+                sources,
+                f"{name}.semantic_plan",
+                nested.get("semantic_release_eligible"),
+            )
+    return sources
+
+
+def _add_string_source(sources: dict[str, str], source: str, value: Any) -> None:
+    if isinstance(value, str) and value.strip():
+        sources[source] = value.strip()
+
+
+def _add_bool_source(sources: dict[str, Any], source: str, value: Any) -> None:
+    if isinstance(value, bool):
+        sources[source] = value
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _metric_classification(
     prompt: Mapping[str, Any],
     terminal_status: str,
@@ -1713,6 +1968,11 @@ def _metric_classification(
     ok = run_status.get("ok") is True
     terminal = run_status.get("terminal") is True
     route = prompt.get("route")
+    if (
+        _requires_semantic_release_gate(prompt, terminal_status)
+        and terminal_status in SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES
+    ):
+        return "included_failure", "failed"
     if route in VISUAL_ROUTES and terminal_status in PASS_TERMINAL_STATUSES:
         if terminal_status == "completed_auto_visual" and ok and terminal:
             return "success", "passed"
@@ -1781,17 +2041,26 @@ def _failure_detail(
 ) -> str | None:
     if status == "passed":
         return None
+    if terminal_status == "completed_manual_planner_fallback":
+        return (
+            "manual planner fallback completed a useful run but cannot satisfy "
+            "semantic planner release metrics"
+        )
+    if terminal_status == "blocked_semantic_planner_unavailable":
+        return (
+            "Codex-native semantic planner was unavailable; this release-counted "
+            "run remains a semantic planner denominator failure"
+        )
+    if terminal_status == "completed_fixture":
+        return (
+            "fixture-only completion cannot satisfy semantic planner release metrics"
+        )
     if missing_artifacts:
         return "missing required status artifact(s): " + ", ".join(missing_artifacts)
     if status == "excluded":
         return (
             f"{terminal_status} is valid for fixture validation but excluded from "
             "real-use Public Beta release metrics"
-        )
-    if terminal_status == "completed_manual_planner_fallback":
-        return (
-            "manual planner fallback completed a useful run but cannot satisfy "
-            "semantic planner release metrics"
         )
     return f"terminal status {terminal_status} did not pass the Public Beta metric gate"
 

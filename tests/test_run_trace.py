@@ -103,6 +103,7 @@ class RunTraceTests(unittest.TestCase):
         result = prepare_run(
             question="example search question",
             runs_dir=self.temp_runs_dir(),
+            angles=["primary source discovery"],
         )
         run_dir = Path(result["run_dir"])
         trace_path = run_dir / "run_trace.jsonl"
@@ -128,6 +129,7 @@ class RunTraceTests(unittest.TestCase):
             question="example search question",
             runs_dir=self.temp_runs_dir(),
             route="text_only",
+            angles=["primary source discovery"],
         )
         run_dir = Path(prepared["run_dir"])
         self.write_search_results(run_dir, [self.base_search_result()])
@@ -197,6 +199,7 @@ class RunTraceTests(unittest.TestCase):
         prepared = prepare_run(
             question="example search question",
             runs_dir=self.temp_runs_dir(),
+            angles=["primary source discovery"],
         )
         run_dir = Path(prepared["run_dir"])
 
@@ -256,6 +259,7 @@ class RunTraceTests(unittest.TestCase):
                     question=f"invalid JSON trace {question_suffix}",
                     runs_dir=self.temp_runs_dir(),
                     route="visual_required" if stage == "ingest_vision" else "text_only",
+                    angles=["primary source discovery"],
                 )
                 run_dir = Path(prepared["run_dir"])
                 (run_dir / corrupt_file).write_text("{not valid json\n", encoding="utf-8")
