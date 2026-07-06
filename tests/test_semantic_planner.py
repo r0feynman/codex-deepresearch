@@ -114,6 +114,10 @@ class SemanticPlannerTests(unittest.TestCase):
     def load_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def write_json(self, path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     def read_jsonl(self, path: Path) -> list[dict]:
         return [
             json.loads(line)
@@ -212,6 +216,63 @@ class SemanticPlannerTests(unittest.TestCase):
             computed_validation,
             planner_mode=PLANNER_MODE_MANUAL_ANGLES,
         )
+
+    def test_codex_semantic_validation_rejects_non_finite_fit_score(self) -> None:
+        question = "How does the public transit fare cap affect downtown commuters?"
+        cases = (
+            ("nan", float("nan")),
+            ("positive-infinity", float("inf")),
+            ("negative-infinity", float("-inf")),
+        )
+        for case_name, score in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.temp_runs_dir() / case_name
+                self.write_json(
+                    run_dir / "semantic_plan_review.json",
+                    {
+                        "semantic_fit_score": score,
+                        "blockers": [],
+                        "substitute_implementation_check": {"passed": True},
+                    },
+                )
+                evidence = {
+                    "run_id": case_name,
+                    "question": question,
+                    "semantic_planner": {
+                        "question_class": "general",
+                        "broad_question": False,
+                        "planner_mode": "codex_semantic",
+                        "semantic_release_eligible": True,
+                        "expected_evidence_needs": ["primary_source"],
+                    },
+                    "semantic_angles": [
+                        {
+                            "angle_id": "angle_001",
+                            "title": "Fare cap commuter impact",
+                            "research_question": (
+                                "How does the public transit fare cap affect downtown commuters?"
+                            ),
+                            "question_context": question,
+                            "route": "text_only",
+                            "evidence_need": "primary_source",
+                            "expected_artifacts": ["official source list"],
+                            "success_criteria": ["Tie commuter impact claims to source spans."],
+                            "report_section": "Commuter Impact",
+                        }
+                    ],
+                }
+
+                validation = semantic_planner_validation(
+                    run_dir=run_dir,
+                    evidence=evidence,
+                    tasks=[],
+                )
+
+                self.assertFalse(validation["ok"], validation)
+                self.assertEqual(validation["planner_mode"], "codex_semantic")
+                self.assertTrue(validation["semantic_release_eligible"])
+                codes = {failure["code"] for failure in validation["failures"]}
+                self.assertIn("semantic_fit_score_missing_or_non_finite", codes)
 
     def test_required_broad_question_classes_create_semantic_angles_and_tasks(self) -> None:
         for fixture in SEMANTIC_FIXTURES:

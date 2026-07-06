@@ -106,6 +106,32 @@ SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES = (
     "evidence.semantic_planner",
     "semantic_plan.semantic_plan",
 )
+SEMANTIC_MIN_RELEASE_ANGLES = 2
+GENERIC_SEMANTIC_ANGLE_TEXTS = {
+    "primary source discovery",
+    "find authoritative sources that directly answer the research question",
+}
+GENERIC_SEMANTIC_TOKENS = {
+    "and",
+    "answer",
+    "authoritative",
+    "directly",
+    "discovery",
+    "evidence",
+    "find",
+    "for",
+    "from",
+    "official",
+    "primary",
+    "public",
+    "question",
+    "research",
+    "source",
+    "sources",
+    "that",
+    "the",
+    "with",
+}
 BLOCKED_TERMINAL_STATUSES = {
     "blocked_preflight",
     "blocked_semantic_planner_unavailable",
@@ -2024,6 +2050,66 @@ def _semantic_artifact_integrity_failures(
             invalid=not _non_empty_string(payload.get("session_id_unavailable_reason")),
         )
 
+    plan_angle_ids: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    if isinstance(plan, Mapping):
+        semantic_plan = plan.get("semantic_plan")
+        original_question = _semantic_original_question(plan, semantic_plan)
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="semantic_plan",
+            invalid=not isinstance(semantic_plan, Mapping) or not semantic_plan,
+        )
+        nested_angle_ids: set[str] = set()
+        if isinstance(semantic_plan, Mapping):
+            nested_angles = semantic_plan.get("angles")
+            nested_angles_valid = _valid_semantic_angles(
+                nested_angles,
+                original_question=original_question,
+            )
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name="semantic_plan",
+                field="semantic_plan.angles",
+                invalid=not nested_angles_valid,
+            )
+            if nested_angles_valid:
+                nested_angle_ids = _semantic_angle_ids(nested_angles)
+        top_level_angles = plan.get("angles")
+        top_level_angles_valid = _valid_semantic_angles(
+            top_level_angles,
+            original_question=original_question,
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="angles",
+            invalid=not top_level_angles_valid,
+        )
+        if top_level_angles_valid:
+            plan_angle_ids = _semantic_angle_ids(top_level_angles)
+        if (
+            top_level_angles_valid
+            and nested_angle_ids
+            and nested_angle_ids != plan_angle_ids
+        ):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name="semantic_plan",
+                field="semantic_plan.angles",
+                invalid=True,
+            )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="requirement_coverage_map",
+            invalid=not _valid_requirement_coverage_map(
+                plan.get("requirement_coverage_map"),
+                plan_angle_ids=plan_angle_ids,
+            ),
+        )
+
     oracle = artifacts.get("semantic_expectation_oracle")
     if isinstance(oracle, Mapping):
         _append_semantic_artifact_failure_if(
@@ -2031,38 +2117,8 @@ def _semantic_artifact_integrity_failures(
             artifact_name="semantic_expectation_oracle",
             field="oracle_requirement_map",
             invalid=not _valid_oracle_requirement_map(
-                oracle.get("oracle_requirement_map")
-            ),
-        )
-
-    plan = artifacts.get("semantic_plan")
-    if isinstance(plan, Mapping):
-        semantic_plan = plan.get("semantic_plan")
-        _append_semantic_artifact_failure_if(
-            failures,
-            artifact_name="semantic_plan",
-            field="semantic_plan",
-            invalid=not isinstance(semantic_plan, Mapping) or not semantic_plan,
-        )
-        if isinstance(semantic_plan, Mapping):
-            _append_semantic_artifact_failure_if(
-                failures,
-                artifact_name="semantic_plan",
-                field="semantic_plan.angles",
-                invalid=not _valid_semantic_angles(semantic_plan.get("angles")),
-            )
-        _append_semantic_artifact_failure_if(
-            failures,
-            artifact_name="semantic_plan",
-            field="angles",
-            invalid=not _valid_semantic_angles(plan.get("angles")),
-        )
-        _append_semantic_artifact_failure_if(
-            failures,
-            artifact_name="semantic_plan",
-            field="requirement_coverage_map",
-            invalid=not _valid_requirement_coverage_map(
-                plan.get("requirement_coverage_map")
+                oracle.get("oracle_requirement_map"),
+                plan_angle_ids=plan_angle_ids,
             ),
         )
 
@@ -2124,11 +2180,41 @@ def _valid_semantic_template_use(value: Any) -> bool:
     )
 
 
-def _valid_oracle_requirement_map(value: Any) -> bool:
+def _semantic_original_question(*payloads: Any) -> str:
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        scope = payload.get("question_scope")
+        if isinstance(scope, Mapping) and _non_empty_string(scope.get("original_question")):
+            return str(scope["original_question"]).strip()
+        for field in ("original_question", "question"):
+            if _non_empty_string(payload.get(field)):
+                return str(payload[field]).strip()
+    return ""
+
+
+def _valid_oracle_requirement_map(
+    value: Any,
+    *,
+    plan_angle_ids: set[str],
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or len(value) < SEMANTIC_MIN_RELEASE_ANGLES
+        or not plan_angle_ids
+    ):
+        return False
+    covered_angle_ids: set[str] = set()
+    for requirement in value:
+        if not _valid_oracle_requirement(requirement):
+            return False
+        covered_angle_ids.update(
+            str(angle_id).strip()
+            for angle_id in requirement.get("covered_by_angle_ids", [])
+            if _non_empty_string(angle_id)
+        )
     return (
-        isinstance(value, list)
-        and bool(value)
-        and all(_valid_oracle_requirement(requirement) for requirement in value)
+        covered_angle_ids == plan_angle_ids
     )
 
 
@@ -2145,28 +2231,87 @@ def _valid_oracle_requirement(value: Any) -> bool:
     )
 
 
-def _valid_semantic_angles(value: Any) -> bool:
+def _valid_semantic_angles(value: Any, *, original_question: str) -> bool:
+    original_tokens = _semantic_meaningful_tokens(original_question)
     return (
         isinstance(value, list)
-        and bool(value)
-        and all(_valid_semantic_angle(angle) for angle in value)
+        and len(value) >= SEMANTIC_MIN_RELEASE_ANGLES
+        and bool(original_tokens)
+        and all(
+            _valid_semantic_angle(
+                angle,
+                original_question=original_question,
+                original_tokens=original_tokens,
+            )
+            for angle in value
+        )
     )
 
 
-def _valid_semantic_angle(value: Any) -> bool:
+def _valid_semantic_angle(
+    value: Any,
+    *,
+    original_question: str,
+    original_tokens: set[str],
+) -> bool:
     if not isinstance(value, Mapping):
         return False
-    return _non_empty_string(value.get("angle_id")) and (
-        _non_empty_string(value.get("title"))
-        or _non_empty_string(value.get("research_question"))
+    required_string_fields = (
+        "angle_id",
+        "title",
+        "research_question",
+        "question_context",
+        "evidence_need",
+        "report_section",
+    )
+    if not all(_non_empty_string(value.get(field)) for field in required_string_fields):
+        return False
+    if not _non_empty_string_list(value.get("expected_artifacts")):
+        return False
+    if not _non_empty_string_list(value.get("success_criteria")):
+        return False
+
+    title = str(value["title"]).strip()
+    research_question = str(value["research_question"]).strip()
+    question_context = str(value["question_context"]).strip()
+    if _generic_or_original_semantic_text(title, original_question):
+        return False
+    if _generic_or_original_semantic_text(research_question, original_question):
+        return False
+    if _generic_or_original_semantic_text(question_context, original_question):
+        return False
+
+    angle_tokens = _semantic_meaningful_tokens(f"{title} {research_question}")
+    return bool(angle_tokens & original_tokens)
+
+
+def _generic_or_original_semantic_text(text: str, original_question: str) -> bool:
+    normalized = _normalized_semantic_text(text)
+    if normalized in GENERIC_SEMANTIC_ANGLE_TEXTS:
+        return True
+    return bool(original_question) and normalized == _normalized_semantic_text(
+        original_question
     )
 
 
-def _valid_requirement_coverage_map(value: Any) -> bool:
+def _valid_requirement_coverage_map(
+    value: Any,
+    *,
+    plan_angle_ids: set[str],
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or len(value) < SEMANTIC_MIN_RELEASE_ANGLES
+        or not plan_angle_ids
+    ):
+        return False
+    covered_angle_ids: set[str] = set()
+    for coverage in value:
+        if not _valid_requirement_coverage(coverage):
+            return False
+        covered_angle_ids.add(str(coverage["angle_id"]).strip())
     return (
-        isinstance(value, list)
-        and bool(value)
-        and all(_valid_requirement_coverage(coverage) for coverage in value)
+        covered_angle_ids == plan_angle_ids
     )
 
 
@@ -2177,6 +2322,30 @@ def _valid_requirement_coverage(value: Any) -> bool:
         _non_empty_string(value.get("requirement_id"))
         and _non_empty_string(value.get("angle_id"))
         and _non_empty_string(value.get("coverage_status"))
+    )
+
+
+def _semantic_angle_ids(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {
+        str(angle["angle_id"]).strip()
+        for angle in value
+        if isinstance(angle, Mapping) and _non_empty_string(angle.get("angle_id"))
+    }
+
+
+def _semantic_meaningful_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
+        if len(token) > 2 and token not in GENERIC_SEMANTIC_TOKENS
+    }
+
+
+def _normalized_semantic_text(text: str) -> str:
+    return " ".join(
+        re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
     )
 
 

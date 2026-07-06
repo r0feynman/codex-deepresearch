@@ -626,6 +626,202 @@ class PublicBetaValidationTests(unittest.TestCase):
                     field=expected_field,
                 )
 
+    def test_codex_semantic_text_run_rejects_generic_one_angle_plan(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "generic-one-angle",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        generic_angle = {
+            "angle_id": "angle_001",
+            "title": "Primary source discovery",
+            "research_question": (
+                "Find authoritative sources that directly answer the research question"
+            ),
+            "question_context": "Generic source discovery context.",
+            "route": "text_only",
+            "evidence_need": "primary_source",
+            "expected_artifacts": ["source list"],
+            "success_criteria": ["Find one source."],
+            "report_section": "Primary Sources",
+        }
+        plan = self.read_json(run_dir / "semantic_plan.json")
+        plan["angles"] = [generic_angle]
+        plan["semantic_plan"]["angles"] = [dict(generic_angle)]
+        plan["requirement_coverage_map"] = [
+            {
+                "requirement_id": "req_001",
+                "angle_id": "angle_001",
+                "coverage_status": "covered",
+            }
+        ]
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+        oracle["oracle_requirement_map"] = [
+            {
+                "requirement_id": "req_001",
+                "description": "Answer the prompt from a primary source.",
+                "covered_by_angle_ids": ["angle_001"],
+            }
+        ]
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assert_semantic_artifact_integrity_failure(
+            result,
+            artifact="semantic_plan",
+            field="angles",
+        )
+
+    def test_codex_semantic_text_run_rejects_generic_angle_text_with_valid_count_and_coverage(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("generic-title", "title", "Primary source discovery"),
+            (
+                "generic-research-question",
+                "research_question",
+                "Find authoritative sources that directly answer the research question",
+            ),
+        )
+        evidence_needs = ("primary_source", "comparative_analysis")
+        for case_name, generic_field, generic_value in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                angles = []
+                for index, evidence_need in enumerate(evidence_needs, start=1):
+                    angle = {
+                        "angle_id": f"angle_{index:03d}",
+                        "title": f"deterministic release validation evidence angle {index}",
+                        "research_question": (
+                            "Which deterministic software release validation "
+                            f"tradeoffs are source-backed for angle {index}?"
+                        ),
+                        "question_context": (
+                            "Scope deterministic release validation evidence for "
+                            f"public beta prompt {prompt['id']} angle {index}."
+                        ),
+                        "route": "text_only",
+                        "evidence_need": evidence_need,
+                        "expected_artifacts": ["source list", "supporting quotes"],
+                        "success_criteria": ["Claims remain tied to source spans."],
+                        "report_section": f"Validation Angle {index}",
+                    }
+                    angle[generic_field] = generic_value
+                    angles.append(angle)
+                plan = self.read_json(run_dir / "semantic_plan.json")
+                plan["angles"] = angles
+                plan["semantic_plan"]["angles"] = [dict(angle) for angle in angles]
+                plan["requirement_coverage_map"] = [
+                    {
+                        "requirement_id": f"req_{index:03d}",
+                        "angle_id": angle["angle_id"],
+                        "coverage_status": "covered",
+                    }
+                    for index, angle in enumerate(angles, start=1)
+                ]
+                self.write_json(run_dir / "semantic_plan.json", plan)
+                oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+                oracle["oracle_requirement_map"] = [
+                    {
+                        "requirement_id": f"req_{index:03d}",
+                        "description": f"Resolve angle {index} for the prompt.",
+                        "covered_by_angle_ids": [angle["angle_id"]],
+                    }
+                    for index, angle in enumerate(angles, start=1)
+                ]
+                self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact="semantic_plan",
+                    field="angles",
+                )
+
+    def test_codex_semantic_text_run_requires_oracle_and_coverage_angle_match(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            (
+                "oracle-partial-coverage",
+                "oracle-partial",
+                "semantic_expectation_oracle",
+                "oracle_requirement_map",
+            ),
+            (
+                "requirement-coverage-partial",
+                "coverage-partial",
+                "semantic_plan",
+                "requirement_coverage_map",
+            ),
+            (
+                "requirement-coverage-mismatch",
+                "coverage-mismatch",
+                "semantic_plan",
+                "requirement_coverage_map",
+            ),
+        )
+        for case_name, mutation, expected_artifact, expected_field in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                if mutation == "oracle-partial":
+                    oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+                    oracle["oracle_requirement_map"] = oracle["oracle_requirement_map"][:2]
+                    self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+                else:
+                    plan = self.read_json(run_dir / "semantic_plan.json")
+                    if mutation == "coverage-partial":
+                        plan["requirement_coverage_map"] = plan[
+                            "requirement_coverage_map"
+                        ][:2]
+                    elif mutation == "coverage-mismatch":
+                        plan["requirement_coverage_map"][0]["angle_id"] = "angle_unknown"
+                    else:
+                        raise AssertionError(f"unhandled coverage mutation: {case_name}")
+                    self.write_json(run_dir / "semantic_plan.json", plan)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact=expected_artifact,
+                    field=expected_field,
+                )
+
     def test_semantic_release_failure_paths_remain_included_failures(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
@@ -2054,25 +2250,81 @@ class PublicBetaValidationTests(unittest.TestCase):
         timestamp: str,
         metadata: dict[str, Any],
     ) -> None:
+        generic_terms = {
+            "and",
+            "across",
+            "cite",
+            "compare",
+            "for",
+            "guidance",
+            "public",
+            "research",
+            "the",
+        }
+        prompt_terms: list[str] = []
+        for raw_token in prompt["prompt"].replace("-", " ").replace("/", " ").split():
+            token = raw_token.strip(".,:;!?()[]{}\"'").lower()
+            if len(token) <= 2 or token in generic_terms or token in prompt_terms:
+                continue
+            prompt_terms.append(token)
+        subject = " ".join(prompt_terms[:4]) or "public beta validation"
         angles = [
             {
                 "angle_id": "angle_001",
-                "title": "Primary source discovery",
-                "research_question": prompt["prompt"],
-                "question_context": prompt["prompt"],
+                "title": f"{subject} source evidence map",
+                "research_question": (
+                    f"Which primary sources define {subject} evidence-quality tradeoffs?"
+                ),
+                "question_context": (
+                    f"Scope prompt terms: {subject}; public beta prompt {prompt['id']}."
+                ),
                 "route": prompt["route"],
                 "evidence_need": "primary_source",
                 "expected_artifacts": ["source list", "supporting quotes"],
                 "success_criteria": ["Claims remain tied to source spans."],
                 "report_section": "Primary Sources",
-            }
+            },
+            {
+                "angle_id": "angle_002",
+                "title": f"{subject} comparison criteria",
+                "research_question": (
+                    f"How do {subject} approaches differ in validation criteria?"
+                ),
+                "question_context": (
+                    f"Compare public evidence for {subject} without using fixtures."
+                ),
+                "route": prompt["route"],
+                "evidence_need": "comparative_analysis",
+                "expected_artifacts": ["comparison matrix", "difference notes"],
+                "success_criteria": ["Comparisons cite distinct source-backed criteria."],
+                "report_section": "Comparison",
+            },
+            {
+                "angle_id": "angle_003",
+                "title": f"{subject} caveats and limits",
+                "research_question": (
+                    f"What caveats limit claims about {subject} release readiness?"
+                ),
+                "question_context": (
+                    f"Identify caveats that affect the {subject} evidence record."
+                ),
+                "route": prompt["route"],
+                "evidence_need": "risk_or_guardrail",
+                "expected_artifacts": ["risk register", "guardrail checklist"],
+                "success_criteria": ["Caveats are explicit and source-linked."],
+                "report_section": "Caveats",
+            },
         ]
         semantic_plan = {
             "schema_version": "codex-deepresearch.semantic-planner.v0",
             "question_class": "general",
             "broad_question": False,
             "source": metadata["source"],
-            "expected_evidence_needs": ["primary_source"],
+            "expected_evidence_needs": [
+                "primary_source",
+                "comparative_analysis",
+                "risk_or_guardrail",
+            ],
             "planner_mode": metadata["planner_mode"],
             "semantic_release_eligible": metadata["semantic_release_eligible"],
             "status": metadata["summary"]["status"],
@@ -2171,10 +2423,11 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "artifact_type": "semantic_expectation_oracle",
                 "oracle_requirement_map": [
                     {
-                        "requirement_id": "req_001",
-                        "description": "Answer the prompt from a primary source.",
-                        "covered_by_angle_ids": ["angle_001"],
+                        "requirement_id": f"req_{index:03d}",
+                        "description": f"Resolve {angle['title']} for the prompt.",
+                        "covered_by_angle_ids": [angle["angle_id"]],
                     }
+                    for index, angle in enumerate(angles, start=1)
                 ],
             },
         )
@@ -2187,10 +2440,11 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "angles": angles,
                 "requirement_coverage_map": [
                     {
-                        "requirement_id": "req_001",
-                        "angle_id": "angle_001",
+                        "requirement_id": f"req_{index:03d}",
+                        "angle_id": angle["angle_id"],
                         "coverage_status": "covered",
                     }
+                    for index, angle in enumerate(angles, start=1)
                 ],
             },
         )
@@ -2224,8 +2478,8 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "fixture_id": run_dir.name,
                 "question_class": "general",
                 "broad_question": False,
-                "angle_count": 1,
-                "task_count": 1,
+                "angle_count": len(angles),
+                "task_count": len(angles),
                 "failures": list(metadata["failures"]),
                 "ok": not metadata["failures"],
             },

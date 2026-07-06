@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 from collections import Counter
@@ -1870,8 +1871,16 @@ def _semantic_release_status(
         try:
             numeric_score = float(semantic_fit_score)
         except (TypeError, ValueError):
-            numeric_score = -1.0
-        if numeric_score < SEMANTIC_FIT_SCORE_THRESHOLD:
+            numeric_score = None
+        if numeric_score is None or not math.isfinite(numeric_score):
+            failures.append(
+                {
+                    "code": "semantic_fit_score_missing_or_non_finite",
+                    "semantic_fit_score": semantic_fit_score,
+                    "threshold": SEMANTIC_FIT_SCORE_THRESHOLD,
+                }
+            )
+        elif numeric_score < SEMANTIC_FIT_SCORE_THRESHOLD:
             failures.append(
                 {
                     "code": "semantic_fit_score_below_threshold",
