@@ -159,6 +159,40 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(metric["denominator_completed_non_blocked"], 2)
         self.assertEqual(metric["pass_rate"], 0.5)
 
+    def test_manual_planner_fallback_counts_as_release_failure_not_pass(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-manual-planner-fallback"
+        manual_run = self.write_text_run(
+            runs_dir / "manual-fallback",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_manual_planner_fallback",
+            ok=True,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": manual_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("cannot satisfy semantic planner", run["failure_detail"])
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["passed"], 0)
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["blocked"], 9)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+        self.assertEqual(metric["pass_rate"], 0.0)
+
     def test_partial_parallel_reliability_counts_passing_text_and_visual_runs(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}

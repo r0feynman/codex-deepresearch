@@ -30,9 +30,11 @@ from .modality_router import route_angles
 from .public_beta_validation import public_beta_prompt_hash
 from .run_state import begin_stage, skipped_stage_status
 from .semantic_planner import (
+    PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_PLANNER_SCHEMA_VERSION,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
     plan_semantic_angles,
+    write_semantic_integrity_artifacts,
     write_semantic_planner_validation,
 )
 from .trace import record_stage_trace
@@ -130,7 +132,7 @@ def prepare_run(
     decisions = []
     for semantic_angle in semantic_plan.angles:
         route_override = route
-        if route_override is None and semantic_plan.source != "explicit":
+        if route_override is None and semantic_plan.planner_mode != PLANNER_MODE_MANUAL_ANGLES:
             route_override = semantic_angle.route
         decisions.extend(
             route_angles(
@@ -215,6 +217,10 @@ def prepare_run(
             "broad_question": semantic_plan.broad_question,
             "source": semantic_plan.source,
             "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
+            "planner_mode": semantic_plan.planner_mode,
+            "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+            "status": semantic_plan.status,
+            "diagnostics": dict(semantic_plan.diagnostics or {}),
         },
         "semantic_angles": [
             _semantic_angle_evidence_record(route_record)
@@ -259,6 +265,9 @@ def prepare_run(
         "schema_version": HANDOFF_SCHEMA_VERSION,
         "run_id": run_id,
         "status": "awaiting_search_results",
+        "semantic_planning_status": semantic_plan.status,
+        "planner_mode": semantic_plan.planner_mode,
+        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
         "created_at": now,
         "question": normalized_question,
         "mode": config.mode,
@@ -290,6 +299,15 @@ def prepare_run(
     _write_json(run_dir / "visual_tasks.json", visual_tasks_artifact)
     (run_dir / "visual_observations.jsonl").write_text("", encoding="utf-8")
     write_budget_estimate(run_dir, budget_estimate)
+    semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+        run_dir=run_dir,
+        question=normalized_question,
+        plan=semantic_plan,
+        routing=routing,
+        search_tasks=search_tasks,
+        created_at=now,
+    )
+    status["artifacts"].update(semantic_integrity_artifacts)
     write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
 
     validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
@@ -341,6 +359,7 @@ def prepare_run(
             "semantic_planner_validation": str(
                 run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
             ),
+            **semantic_integrity_artifacts,
         },
         "budget_estimate": status["budget_estimate"],
         **release_identity,

@@ -414,10 +414,28 @@ class InvocationRouterTests(unittest.TestCase):
         )
         self.assertFalse(result["fallback"]["parallel_degraded"])
         self.assertFalse(result["fallback"]["needs_serial_handoff"])
+        self.assertEqual(result["planner_mode"], "heuristic_template_fallback")
+        self.assertFalse(result["semantic_release_eligible"])
+        self.assertEqual(
+            result["semantic_planning"]["review_verdict"],
+            "release_ineligible",
+        )
+        self.assertFalse(result["semantic_planning"]["validation_ok"])
+        self.assertIn("semantic_planning", result["diagnostics"])
 
         persisted = self.read_json(Path(result["artifacts"]["run_status"]))
         self.assertEqual(persisted["status"], "completed_fixture")
         self.assertEqual(persisted["provenance"]["type"], "fixture")
+        self.assertEqual(persisted["planner_mode"], "heuristic_template_fallback")
+        self.assertFalse(persisted["semantic_release_eligible"])
+        self.assertFalse(persisted["semantic_planning"]["validation_ok"])
+        self.assertEqual(
+            persisted["semantic_planning"]["review_verdict"],
+            "release_ineligible",
+        )
+        self.assertIn("semantic_planning", persisted["diagnostics"])
+        self.assertIn("semantic_plan", persisted["artifact_handoff"]["artifact_paths"])
+        self.assertIn("semantic_planning", persisted["artifact_handoff"])
         self.assertIn("report_status", persisted["artifact_handoff"]["artifact_paths"])
 
     def test_full_runner_forwards_codex_exec_timeout_override(self) -> None:

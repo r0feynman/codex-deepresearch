@@ -57,6 +57,8 @@ _COMPLETED_STAGE_STATUSES = {
     "completed_parallel",
     "completed_partial_parallel",
     "completed_serial_handoff",
+    "completed_manual_planner_fallback",
+    "prepared_manual_fallback",
     "ingested",
     "ingested_with_rejections",
     "manual_sources_ingested",

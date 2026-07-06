@@ -16,6 +16,11 @@ from deepresearch.report_generation import synthesize_report  # noqa: E402
 from deepresearch.search_handoff import prepare_run  # noqa: E402
 from deepresearch.semantic_planner import (  # noqa: E402
     ALLOWED_EVIDENCE_NEEDS,
+    PLANNER_MODE_FIXTURE,
+    PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+    PLANNER_MODE_MANUAL_ANGLES,
+    SEMANTIC_FIT_SCORE_THRESHOLD,
+    heuristic_template_planner,
     semantic_planner_validation,
 )
 
@@ -122,6 +127,42 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         return Path(result["run_dir"])
 
+    def assert_release_ineligible_semantic_validation(
+        self,
+        validation: dict,
+        *,
+        planner_mode: str,
+    ) -> None:
+        self.assertFalse(validation["ok"])
+        self.assertEqual(validation["planner_mode"], planner_mode)
+        self.assertFalse(validation["semantic_release_eligible"])
+        codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("semantic_release_ineligible", codes)
+        self.assertIn("release_ineligible_planner_mode", codes)
+
+    def assert_integrity_artifacts(
+        self,
+        run_dir: Path,
+        *,
+        planner_mode: str,
+    ) -> None:
+        for filename in (
+            "semantic_expectation_oracle.json",
+            "semantic_plan.json",
+            "semantic_plan_review.json",
+            "semantic_plan_delta.json",
+            "semantic_materialization_diff.json",
+            "semantic_planner_raw/planner_request.json",
+            "semantic_planner_raw/planner_response.json",
+        ):
+            self.assertTrue((run_dir / filename).is_file(), filename)
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+        self.assertEqual(review["planner_mode"], planner_mode)
+        self.assertFalse(review["semantic_release_eligible"])
+        self.assertNotEqual(review.get("semantic_fit_score"), SEMANTIC_FIT_SCORE_THRESHOLD)
+        self.assertEqual(review["final_verdict"], "release_ineligible")
+        self.assertFalse(review["substitute_implementation_check"]["passed"])
+
     def test_required_broad_question_classes_create_semantic_angles_and_tasks(self) -> None:
         for fixture in SEMANTIC_FIXTURES:
             with self.subTest(fixture=fixture["fixture_id"]):
@@ -129,13 +170,29 @@ class SemanticPlannerTests(unittest.TestCase):
                 evidence = self.load_json(run_dir / "evidence.json")
                 validation = self.load_json(run_dir / "semantic_planner_validation.json")
 
-                self.assertTrue(validation["ok"], validation["failures"])
+                self.assert_release_ineligible_semantic_validation(
+                    validation,
+                    planner_mode=PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+                )
+                self.assert_integrity_artifacts(
+                    run_dir,
+                    planner_mode=PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+                )
                 real_smoke = validation["real_codex_exec_smoke"]
                 self.assertIn(real_smoke["status"], {"completed", "skipped"})
                 if real_smoke["status"] == "skipped":
                     self.assertIn("skip_category", real_smoke)
                     self.assertIn("reason", real_smoke)
                 self.assertEqual(evidence["semantic_planner"]["question_class"], fixture["question_class"])
+                self.assertEqual(
+                    evidence["semantic_planner"]["source"],
+                    "heuristic_template_planner",
+                )
+                self.assertEqual(
+                    evidence["semantic_planner"]["planner_mode"],
+                    PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+                )
+                self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
                 self.assertTrue(evidence["semantic_planner"]["broad_question"])
                 self.assertEqual(validation["question_class"], fixture["question_class"])
                 self.assertGreaterEqual(validation["angle_count"], 5)
@@ -191,7 +248,10 @@ class SemanticPlannerTests(unittest.TestCase):
                             self.assertTrue(task[field], field)
 
                 planned_validation = self.load_json(run_dir / "semantic_planner_validation.json")
-                self.assertTrue(planned_validation["ok"], planned_validation["failures"])
+                self.assert_release_ineligible_semantic_validation(
+                    planned_validation,
+                    planner_mode=PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+                )
                 self.assertLessEqual(planned_validation["near_duplicate_ratio"], 0.20)
                 self.assertLessEqual(planned_validation["generic_lens_ratio"], 0.30)
 
@@ -205,7 +265,10 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(len(tasks), len(self.load_json(run_dir / "research_tasks.json")["tasks"]))
         self.assertGreaterEqual(len({task["angle_id"] for task in tasks}), 5)
         validation = self.load_json(run_dir / "semantic_planner_validation.json")
-        self.assertTrue(validation["ok"], validation["failures"])
+        self.assert_release_ineligible_semantic_validation(
+            validation,
+            planner_mode=PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+        )
         self.assertLessEqual(validation["near_duplicate_ratio"], 0.20)
         self.assertLessEqual(validation["generic_lens_ratio"], 0.30)
 
@@ -232,7 +295,10 @@ class SemanticPlannerTests(unittest.TestCase):
         validation = self.load_json(run_dir / "semantic_planner_validation.json")
         self.assertEqual(merge_status["status"], "completed")
         self.assertEqual(report_status["status"], "completed")
-        self.assertTrue(validation["ok"], validation["failures"])
+        self.assert_release_ineligible_semantic_validation(
+            validation,
+            planner_mode=PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+        )
         self.assertGreaterEqual(
             len([count for count in validation["report_angle_claim_counts"].values() if count > 0]),
             3,
@@ -364,7 +430,14 @@ class SemanticPlannerTests(unittest.TestCase):
         run_dir = Path(result["run_dir"])
         evidence = self.load_json(run_dir / "evidence.json")
 
-        self.assertEqual(evidence["semantic_planner"]["source"], "explicit")
+        self.assertEqual(evidence["semantic_planner"]["source"], "manual_angles")
+        self.assertEqual(evidence["semantic_planner"]["planner_mode"], PLANNER_MODE_MANUAL_ANGLES)
+        self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assert_release_ineligible_semantic_validation(
+            validation,
+            planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+        )
         self.assertEqual(
             [angle["title"] for angle in evidence["semantic_angles"]],
             [
@@ -378,7 +451,7 @@ class SemanticPlannerTests(unittest.TestCase):
             ["text_only", "visual_required", "visual_optional"],
         )
 
-    def test_route_override_preserves_semantic_fanout_and_overrides_routes(self) -> None:
+    def test_route_override_preserves_heuristic_fanout_and_overrides_routes(self) -> None:
         result = prepare_run(
             question=SEMANTIC_FIXTURES[0]["question"],
             runs_dir=self.temp_runs_dir(),
@@ -387,7 +460,12 @@ class SemanticPlannerTests(unittest.TestCase):
         run_dir = Path(result["run_dir"])
         evidence = self.load_json(run_dir / "evidence.json")
 
-        self.assertEqual(evidence["semantic_planner"]["source"], "semantic")
+        self.assertEqual(evidence["semantic_planner"]["source"], "heuristic_template_planner")
+        self.assertEqual(
+            evidence["semantic_planner"]["planner_mode"],
+            PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+        )
+        self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
         self.assertEqual(evidence["semantic_planner"]["question_class"], "technical_api")
         self.assertGreaterEqual(len(evidence["semantic_angles"]), 5)
         self.assertLessEqual(len(evidence["semantic_angles"]), 8)
@@ -412,7 +490,12 @@ class SemanticPlannerTests(unittest.TestCase):
                 )
                 evidence = self.load_json(Path(result["run_dir"]) / "evidence.json")
 
-                self.assertEqual(evidence["semantic_planner"]["source"], "explicit")
+                self.assertEqual(evidence["semantic_planner"]["source"], "manual_angles")
+                self.assertEqual(
+                    evidence["semantic_planner"]["planner_mode"],
+                    PLANNER_MODE_MANUAL_ANGLES,
+                )
+                self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
                 self.assertEqual(len(evidence["semantic_angles"]), 1)
                 self.assertEqual(len(evidence["routing"]), 1)
                 self.assertEqual(evidence["semantic_angles"][0]["route"], route)
@@ -424,7 +507,10 @@ class SemanticPlannerTests(unittest.TestCase):
                 )
                 self.assertEqual(len(planned["tasks"]), 1)
                 self.assertFalse(validation["broad_question"])
-                self.assertTrue(validation["ok"], validation["failures"])
+                self.assert_release_ineligible_semantic_validation(
+                    validation,
+                    planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+                )
 
     def test_visual_evidence_terms_win_over_implementation_wording(self) -> None:
         result = prepare_run(
@@ -436,6 +522,46 @@ class SemanticPlannerTests(unittest.TestCase):
 
         self.assertEqual(evidence["semantic_planner"]["question_class"], "visual_style")
         self.assertIn("visual_required", routes)
+
+    def test_fixture_planner_mode_cannot_pass_semantic_validation(self) -> None:
+        run_dir = self.temp_runs_dir()
+        question = "Fixture-only planner should never count as semantic."
+        plan = heuristic_template_planner(
+            question=question,
+            planner_mode=PLANNER_MODE_FIXTURE,
+        )
+        evidence = {
+            "run_id": "fixture-release-ineligible",
+            "question": question,
+            "semantic_planner": plan.to_dict(),
+            "semantic_angles": [angle.to_dict() for angle in plan.angles],
+        }
+
+        validation = semantic_planner_validation(run_dir=run_dir, evidence=evidence, tasks=[])
+
+        self.assert_release_ineligible_semantic_validation(
+            validation,
+            planner_mode=PLANNER_MODE_FIXTURE,
+        )
+
+    def test_historical_ev_prompt_default_runner_cannot_claim_semantic_success(self) -> None:
+        result = prepare_run(
+            question="전기차 배터리 화재 안전 테스트 이미지와 규제 근거를 조사해줘",
+            runs_dir=self.temp_runs_dir(),
+        )
+        run_dir = Path(result["run_dir"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+
+        self.assertNotEqual(evidence["semantic_planner"]["planner_mode"], "codex_semantic")
+        self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
+        self.assert_release_ineligible_semantic_validation(
+            validation,
+            planner_mode=PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+        )
+        self.assertFalse(review["substitute_implementation_check"]["passed"])
+        self.assertNotEqual(review.get("semantic_fit_score"), SEMANTIC_FIT_SCORE_THRESHOLD)
 
 
 if __name__ == "__main__":

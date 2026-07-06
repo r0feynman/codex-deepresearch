@@ -78,6 +78,7 @@ PASS_TERMINAL_STATUSES = {
 }
 BLOCKED_TERMINAL_STATUSES = {
     "blocked_preflight",
+    "blocked_semantic_planner_unavailable",
     "blocked_missing_search_handoff",
     "blocked_parallel_execution",
     "blocked_missing_visual_provider",
@@ -89,6 +90,7 @@ BLOCKED_TERMINAL_STATUSES = {
 INCLUDED_FAILURE_STATUSES = {
     "partial_auto_visual",
     "budget_pruned_visual",
+    "completed_manual_planner_fallback",
     "failed_parallel_no_accepted_shards",
     "failed_release_handoff_invalid",
     "failed_validation",
@@ -1739,6 +1741,7 @@ def _failure_category(
             return "report_linkage_failure"
         return "artifact_handoff_failure"
     if terminal_status in {
+        "blocked_semantic_planner_unavailable",
         "blocked_missing_visual_provider",
         "blocked_preflight",
         "blocked_parallel_execution",
@@ -1746,6 +1749,8 @@ def _failure_category(
     }:
         return "provider_failure"
     if terminal_status == "blocked_missing_search_handoff":
+        return "artifact_handoff_failure"
+    if terminal_status == "completed_manual_planner_fallback":
         return "artifact_handoff_failure"
     if terminal_status == "blocked_missing_vlm_provider":
         return "vlm_failure"
@@ -1782,6 +1787,11 @@ def _failure_detail(
         return (
             f"{terminal_status} is valid for fixture validation but excluded from "
             "real-use Public Beta release metrics"
+        )
+    if terminal_status == "completed_manual_planner_fallback":
+        return (
+            "manual planner fallback completed a useful run but cannot satisfy "
+            "semantic planner release metrics"
         )
     return f"terminal status {terminal_status} did not pass the Public Beta metric gate"
 

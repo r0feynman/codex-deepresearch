@@ -152,14 +152,14 @@ Codex DeepResearch는 다음 실행 단위를 구분한다.
 Search handoff:
 
 - Precondition: 사용자가 Codex 세션에서 `$deep-research: <question>`을 호출한다.
-- Runner responsibility: runner는 `search_tasks.json`을 생성한다. 각 task는 angle, query, freshness requirement, modality, max_results, source policy를 포함한다.
+- Runner responsibility: runner는 accepted `semantic_plan.json`이 생긴 뒤에만 `search_tasks.json`을 materialize한다. 각 task는 semantic plan의 bounded task에서 온 angle, query, freshness requirement, modality, max_results, source policy를 포함한다. `prepare` 단계가 semantic plan 전에 `search_tasks.json`을 생성하는 것은 금지한다.
 - Codex-side responsibility: Codex agent는 현재 세션의 search capability를 사용해 search task를 수행하고, 결과를 `search_results.jsonl`에 `SearchResult` schema로 기록한다.
 - Runner ingestion: runner는 `search_results.jsonl`을 validate한다. invalid result는 `retrieval_status=failed` 또는 `policy_blocked`로 evidence에 남긴다.
-- Fallback: `codex-plugin` mode에서 `codex-native` search가 불가능하면 `manual-sources` fallback 또는 `blocked_missing_search_handoff` 상태로 종료한다.
+- Fallback: `codex-plugin` mode에서 `codex-native` search가 불가능하면 `manual-sources` fallback 또는 `blocked_missing_search_handoff` 상태로 종료한다. Manual/user-provided angle fallback은 `semantic_release_eligible=false`로 남기며 semantic planner release evidence가 될 수 없다.
 
 VLM handoff:
 
-- Runner responsibility: runner는 visual-required 또는 visual-optional route에서 분석 대상 이미지를 `visual_tasks.json`과 artifact directory에 기록한다.
+- Runner responsibility: runner는 accepted `semantic_plan.json`의 visual-required 또는 visual-optional bounded task에서 온 분석 대상 이미지만 `visual_tasks.json`과 artifact directory에 기록한다. `prepare` 단계가 semantic plan 전에 `visual_tasks.json` placeholder를 만들어 visual work를 선결정하는 것은 금지한다.
 - Codex-side responsibility: Codex agent는 세션의 interactive image-reading capability로 이미지를 확인하고, 관찰 결과를 `visual_observations.jsonl`에 `VisualEvidence` schema로 기록한다.
 - Runner ingestion: runner는 `visual_observations.jsonl`을 validate한다. visual-required claim에 valid visual evidence가 없으면 `verification_status=needs_visual_evidence`로 남기고 high-confidence claim으로 쓰지 않는다.
 - Automated alternative: `automated-cli` mode는 `openai-responses-vision` adapter를 사용해 같은 `VisualEvidence` schema를 생성한다.
@@ -169,7 +169,11 @@ Handoff command protocol:
 
 ```text
 codex-deepresearch prepare "<question>"
--> creates run directory, search_tasks.json, visual_tasks.json placeholder
+-> creates run directory and run_status.json
+-> locks semantic_expectation_oracle.json before the plan is visible
+-> creates semantic_plan.json and semantic_plan_review.json
+-> if semantic review passes, materializes research_tasks.json, search_tasks.json, visual_tasks.json, and budget_estimate.json from the accepted semantic plan only
+-> if semantic planning is unavailable, stops with blocked_semantic_planner_unavailable or asks for explicit manual angles as release-ineligible fallback
 
 Codex fills handoff artifacts
 -> search_results.jsonl from Codex-native search
@@ -206,7 +210,8 @@ Default `$deep-research` flow:
 ```text
 $deep-research: <question>
 -> skill invocation router selects `full-runner` by default
--> runner prepare creates run directory, research_tasks.json, search_tasks.json, and budget_estimate.json
+-> runner prepare creates run directory, locks the semantic expectation oracle, generates a Codex-native semantic plan, and passes semantic review
+-> accepted semantic_plan.json materializes research_tasks.json, search_tasks.json, visual_tasks.json when needed, and budget_estimate.json
 -> parallel orchestrator runs ready tasks through Codex subagents or equivalent worker contexts
 -> status summary reports active, queued, failed, accepted, merged, and retried shard counts
 -> guardrails, verifier matrix, and synthesis run on merged evidence only
@@ -217,8 +222,11 @@ $deep-research: <question>
 
 | State | Entry action | Required artifacts or diagnostics | Allowed next states |
 | --- | --- | --- | --- |
-| `preflight_diagnostics` | Validate plugin install, runner executable, trusted project root, run directory write access, search handoff availability, visual provider needs, auth/sandbox/approval constraints, and cost caps. | If a run directory can be created, write `run_status.json` with the exact terminal status, `ok=false`, `terminal=true`, and `diagnostics.actionable_cause` on failure. Visual-required runs with no configured real visual acquisition provider use `blocked_missing_visual_provider`, not generic preflight failure. If no run directory can be created, final response must show the same diagnostics and no success claim. | `prepared`, `blocked_preflight`, `blocked_missing_visual_provider` |
-| `prepared` | Create run directory and canonical task placeholders. | `run_status.json`, `research_tasks.json`, `search_tasks.json`, `visual_tasks.json` when needed, `budget_estimate.json`. | `awaiting_search_handoff`, `parallel_orchestrating`, `serial_fallback_pending`, `blocked_missing_search_handoff`, `blocked_missing_visual_provider` |
+| `preflight_diagnostics` | Validate plugin install, runner executable, trusted project root, run directory write access, search handoff availability, visual provider needs, auth/sandbox/approval constraints, and cost caps. | If a run directory can be created, write `run_status.json` with the exact terminal status, `ok=false`, `terminal=true`, and `diagnostics.actionable_cause` on failure. Visual-required runs with no configured real visual acquisition provider use `blocked_missing_visual_provider`, not generic preflight failure. If no run directory can be created, final response must show the same diagnostics and no success claim. | `semantic_planning`, `blocked_preflight`, `blocked_missing_visual_provider`, `blocked_semantic_planner_unavailable` |
+| `semantic_planning` | Create the run directory, lock `semantic_expectation_oracle.json` from the raw user question before the plan is visible, generate `semantic_plan.json`, run semantic fit review, and decide whether the run is release-eligible. | `run_status.json`, `run_trace.jsonl`, `semantic_expectation_oracle.json`, oracle provenance artifacts, `semantic_plan.json`, planner request/response artifacts, `semantic_plan_review.json`, `semantic_planner_validation.json`. To continue, the review must record `planner_mode=codex_semantic`, `semantic_release_eligible=true`, `semantic_fit_score >= 9.0`, no blockers, complete oracle and plan requirement coverage, passing substitute implementation check, and no hidden template use. | `prepared`, `manual_angles_pending`, `blocked_semantic_planner_unavailable`, `failed_validation` |
+| `manual_angles_pending` | Ask the user for explicit manual decomposition only after semantic planning fails or is unavailable. | `run_status.json` with `semantic_release_eligible=false`, `manual_fallback_reason`, user confirmation, and diagnostics explaining that this path cannot satisfy semantic planner or Public Beta release gates. | `prepared_manual_fallback`, terminal blocked/failed status |
+| `prepared_manual_fallback` | Materialize user-provided/manual angles into executable task artifacts for a useful release-ineligible report. | `run_status.json` with `planner_mode=manual_angles`, `semantic_release_eligible=false`, `research_tasks.json`, `search_tasks.json`, `visual_tasks.json` when needed, and manual provenance. | `awaiting_search_handoff`, `parallel_orchestrating`, `serial_fallback_pending`, `completed_manual_planner_fallback`, `failed_validation` |
+| `prepared` | Materialize the accepted semantic plan into executable task artifacts. | `run_status.json`, accepted semantic planner artifacts, `research_tasks.json`, `search_tasks.json`, `visual_tasks.json` when needed, `budget_estimate.json`, `semantic_materialization_diff.json`, and an alignment check proving every executable task field matches `semantic_plan.json` angle/task IDs, route, query, freshness requirement, source policy, expected source types, expected visual targets, expected artifacts, success criteria, done condition, and source/image caps unless an approved `semantic_plan_delta.json` exists. | `awaiting_search_handoff`, `parallel_orchestrating`, `serial_fallback_pending`, `blocked_missing_search_handoff`, `blocked_missing_visual_provider` |
 | `awaiting_search_handoff` | Pause runner-owned ingestion while the Codex-side agent fills search results. | `search_tasks.json` plus `search_results.jsonl` records using `SearchResult`. Missing or invalid records remain explicit diagnostics. | `awaiting_visual_handoff`, `ingesting_handoff`, `blocked_missing_search_handoff`, `serial_fallback_pending` |
 | `awaiting_visual_handoff` | For visual routes, expose local image/screenshot/PDF artifacts to the Codex-side agent or configured VLM adapter. | `visual_tasks.json`, selected image artifacts, `visual_observations.jsonl` records using `VisualEvidence`. If no real acquisition provider can produce required artifacts, write `blocked_missing_visual_provider`. | `ingesting_handoff`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` |
 | `ingesting_handoff` | Validate handoff artifacts, fetch allowed sources/images, normalize evidence. | Validated `SearchResult`/`VisualEvidence`, `evidence.json`, policy/fetch diagnostics. | `parallel_orchestrating`, `verifying`, `serial_fallback_pending`, `failed_validation` |
@@ -228,7 +236,7 @@ $deep-research: <question>
 | `verifying` | Run guardrails and verifier matrix against merged evidence only. | `verifier_votes.jsonl`, updated `evidence.json`, guardrail diagnostics. | `synthesizing`, `policy_blocked_visual`, `budget_pruned_visual`, `failed_validation` |
 | `synthesizing` | Generate final report from supported evidence only. | `report.md`, `report_status.json`, final `run_status.json`. | recognized terminal status, `failed_synthesis` |
 
-Recognized terminal statuses for full-runner UX are: `completed_parallel`, `completed_partial_parallel`, `completed_serial_handoff`, `completed_auto_visual`, `partial_auto_visual`, `completed_fixture`, `blocked_preflight`, `blocked_missing_search_handoff`, `blocked_parallel_execution`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual`, `failed_parallel_no_accepted_shards`, `failed_release_handoff_invalid`, `failed_validation`, and `failed_synthesis`. "Recognized" means the UX must report the state honestly; it does not mean the run passed a release gate. `serial_fallback_pending` is a recognized non-terminal handoff state and must not be reported as a successful terminal completion. `completed_fixture` is accepted only for development validation and never for real-use or release readiness gates.
+Recognized terminal statuses for full-runner UX are: `completed_parallel`, `completed_partial_parallel`, `completed_serial_handoff`, `completed_auto_visual`, `partial_auto_visual`, `completed_fixture`, `completed_manual_planner_fallback`, `blocked_preflight`, `blocked_semantic_planner_unavailable`, `blocked_missing_search_handoff`, `blocked_parallel_execution`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual`, `failed_parallel_no_accepted_shards`, `failed_release_handoff_invalid`, `failed_validation`, and `failed_synthesis`. "Recognized" means the UX must report the state honestly; it does not mean the run passed a release gate. `manual_angles_pending` and `serial_fallback_pending` are recognized non-terminal handoff states and must not be reported as successful terminal completions. `completed_fixture` and `completed_manual_planner_fallback` are accepted only for development/useful fallback validation and never for semantic planning, real-use release readiness, or Public Beta gates.
 
 The state machine reconciles the Skill UX with the Search/VLM handoff contract: `codex-plugin` mode may ask the active Codex agent to fill handoff artifacts, but the runner must not call Codex-native search, Codex interactive VLM, subagent spawning, or hidden Codex APIs as if they were stable library functions. Every Codex-side action must be represented by an artifact, a status transition, and diagnostics when blocked.
 
@@ -238,7 +246,7 @@ Allowed invocation modes:
 | --- | --- | --- | --- |
 | `full-runner` | default `$deep-research: <question>` | Execute the plugin runner through synthesis or an explicit blocked state. | Must create a run directory plus `run_status.json`; synthesized runs must also create `report.md`, `evidence.json`, and `report_status.json`; visual/parallel runs include their status artifacts. |
 | `quick-chat` | explicit user request such as "quick answer" or "do not run full pipeline" | The assistant may answer conversationally using available tools. | Must state that no DeepResearch evidence bundle was produced. |
-| `manual-handoff` | user provides URLs, PDFs, image URLs, or local files and asks to use them | Use manual source ingestion and then continue runner stages when possible. | Must create or update a run directory and show artifact paths. |
+| `manual-handoff` | user provides URLs, PDFs, image URLs, or local files and asks to use them | Use manual source ingestion and then continue runner stages when possible. Manual source/decomposition behavior cannot count as semantic planning, Public Beta semantic release evidence, or a semantic metric numerator. If used for a release-counted semantic manifest run, it remains a denominator failure. | Must create or update a run directory and show artifact paths. |
 | `blocked` | missing search, Codex execution, VLM, auth, sandbox, or policy capability | Stop with an actionable blocked status instead of pretending full research completed. | Must write status diagnostics when the runner was started. |
 
 User-visible status requirements:
@@ -256,6 +264,122 @@ Fresh-session acceptance:
 - The same fresh-session E2E records `accepted_shards > 0` for real `codex-exec` or equivalent subagent execution when the Codex runtime is available.
 - The final assistant message exposes generated `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifact paths, and a compact shard/status summary.
 - A regression test or scripted smoke captures the transcript and fails if the final response lacks a run artifact path or if the required final status artifact set is missing. For any successful synthesized run, missing `report_status.json` is a failure.
+
+### Semantic Planner Integrity Contract
+
+2026-07-06 product integrity incident:
+
+- Facts: The PRD required the planner to semantically decompose a user research question into meaningful research angles and bounded `ResearchTask` records. The implementation merged in `f1794365` / PR #113 was named "Fix semantic planner fan-out" and closed #112, but the code path in `plugins/codex-deepresearch/src/deepresearch/semantic_planner.py` classified questions by keyword checks and then emitted fixed class templates such as `Current architecture`, `Semantic schema design`, `Fan-out algorithm`, `Regression fixtures`, `Integration points`, and `Rollback and observability`.
+- Facts: The test suite used `tests/test_semantic_planner.py` to assert angle count, route fields, expected evidence categories, query token inclusion, duplicate ratio, and fixture class selection. It did not require semantic equivalence between the user's real question and the generated tasks. It therefore allowed a keyword/template planner to pass under the name `semantic_planner`.
+- Facts: In the installed-plugin real-use prompt `2026년 전후 주요 전기차 배터리 화재 안전 이슈를 공식/규제 자료 중심으로 조사해줘. 배터리 팩 구조나 안전 테스트 이미지/도표가 있으면 시각적으로 읽어서 리포트에 반영해줘.`, the word `테스트` triggered the implementation-architecture keyword path before the Korean visual terms `이미지`, `도표`, and `시각` were honored. The generated tasks were internal implementation tasks rather than EV battery fire safety, regulation, and visual evidence tasks. `semantic_planner_validation.json` still reported `ok=true`.
+- User-deceptive representation: The coordinator/review process represented the feature to the user as a working `semantic planner` and treated Phase 2/Phase 3 planner acceptance as satisfied, while the shipped behavior was only a keyword/template heuristic. This was not a harmless naming mismatch: it caused the user to believe the plugin understood and decomposed real research questions semantically when it did not. The product must record this as a user-deceptive implementation misrepresentation and must not dilute it into a generic "PRD mismatch" in future status reports.
+- Scope of responsibility: The artifact evidence proves the implementation behavior and review failure. It does not prove human legal intent. Product documentation must therefore use precise language: "user-deceptive implementation misrepresentation" and "keyword/template planner falsely accepted as semantic planner", not an unsupported claim about private intent.
+
+Required naming and gate rules:
+
+- A planner that primarily selects a class by keyword and emits prewritten templates is a `heuristic_template_planner`, not a `semantic_planner`.
+- `heuristic_template_planner` may exist only as an explicitly labeled fallback or test fixture path. It cannot satisfy Product v1 semantic planning, Public Beta signoff, or real-use release gates.
+- Any artifact using a heuristic fallback must record `planner_mode=heuristic_template_fallback`, `semantic_release_eligible=false`, and a user-visible diagnostic explaining that semantic decomposition did not run.
+- The default `$deep-research` full-runner path must not silently fall back from semantic planning to keyword/template planning. If semantic planning cannot run, the run must end as `blocked_semantic_planner_unavailable` or ask for explicit manual angles.
+- PRs, issues, tests, and reports must not use `semantic planner` in their title or acceptance mapping unless the implementation passes the semantic fit gates below.
+- Manual angles, explicit user-provided decomposition, fixture plans, and heuristic fallback plans can produce useful reports, but they are excluded from passing semantic planner evidence and from semantic metric numerators. If a release-counted manifest run uses one of these paths, it remains in the release denominator and counts as a semantic release failure. These paths cannot satisfy Public Beta semantic gates or any claim that DeepResearch semantically decomposed the user's question.
+- The top acceptance question for every planner PR is: "Does this implementation take the user's actual research question, understand its intent/domain/constraints, and produce multiple meaningful research angles and bounded tasks from that understanding?" If the answer is no, the PR cannot claim semantic planning even if it writes the right files, calls an LLM, or produces a plausible report.
+- Disallowed substitutes include heuristic classification, fixed class templates, generic LLM rewriting of templates, manual angle entry by the operator, fixture-only validation, report-only diagnostics without planner execution, external-provider drift away from Codex-native planning, and process documentation that does not implement question understanding and decomposition.
+
+Semantic planner implementation contract:
+
+- The planner must use a real language-model planning step in the active Codex surface, not only static keyword rules. In `codex-plugin` mode this should be a Codex-native planner worker or child Codex session. In `automated-cli` mode it may use a Codex SDK/MCP-equivalent planner adapter. No new mandatory external non-Codex provider is introduced by this contract.
+- A generic LLM wrapper around a preselected heuristic/template class is not a semantic planner. The planner request must pass the raw user question and constraints before class selection, and the planner response must generate the intent, entities, constraints, angles, routes, and bounded tasks directly from that input.
+- The implementation must not choose a hidden template class first and then ask an LLM to rewrite it. Schema examples are allowed only to demonstrate JSON shape. They must not contain reusable domain angle titles, class-specific lenses, canned search tasks, or fixed topic inventories that can be copied into the plan.
+- The planner prompt must not provide a menu of domain classes such as implementation, policy, market, incident, or visual-style and ask the model to select one before decomposition. Classification may be derived after the plan for routing and metrics, but it cannot drive the angle/task content.
+- Input to the planner is the raw user question plus optional user constraints, depth preset, visual preference, budget cap, and provided sources/images.
+- Output is `semantic_plan.json` with:
+  - `schema_version`, `run_id`, `created_at`, `planner_mode=codex_semantic`, `model_or_surface`, `original_question`, and `language`.
+  - `planner_provenance`: planner adapter name, prompt version, model or Codex surface identifier when available, child thread/session id when available, request artifact path, raw response artifact path, parsed response hash, and `preselected_template_class=null`.
+  - `template_use`: `none`, `schema_example_only`, or `blocked_hidden_template`. `blocked_hidden_template` makes the plan release-ineligible. `schema_example_only` is valid only when request artifacts prove examples contained no reusable semantic angle content.
+  - `intent_summary`: concise restatement of what the user is asking.
+  - `domain_entities`: concrete entities, places, organizations, technologies, products, events, or artifacts named or implied by the question.
+  - `constraints`: time range, geography, source quality, official-source preference, visual requirements, legal/policy constraints, output-shape requests, and exclusions.
+  - `question_scope=broad|narrow` copied from the locked semantic expectation oracle.
+  - `decomposition_strategy`: why the question was split this way, without exposing hidden chain-of-thought.
+  - `requirement_coverage_map[]`: one record per user requirement or constraint, with `requirement_text`, `requirement_type`, `covered_by_angle_ids`, `covered_by_task_ids`, and `coverage_status=covered|partially_covered|not_covered`.
+  - `negative_scope[]`: topics or task types the planner deliberately excluded because they were not asked by the user.
+  - `angles[]`: 5-8 records for a standard broad run. Each record must include `angle_id`, `title`, `research_question`, `why_this_angle_matters`, `included_scope`, `excluded_scope`, `route=text_only|visual_optional|visual_required`, `expected_source_types`, `expected_visual_targets`, `search_queries[]`, `success_criteria[]`, `report_section`, and `risk_or_contradiction_checks[]`.
+  - `bounded_tasks[]`: expanded executable tasks with `task_id`, `angle_id`, `query`, `route`, `freshness_requirement`, `source_policy`, `expected_source_types`, `expected_visual_targets`, `expected_artifacts`, `success_criteria`, `max_sources`, `max_images`, and `done_condition`.
+- `semantic_plan.json` is the source of truth for executable task semantics. `research_tasks.json`, `search_tasks.json`, `visual_tasks.json`, modality routing, visual acquisition, budget estimation, and parallel orchestration must preserve each bounded task's `angle_id`, `task_id`, `query`, `route`, `freshness_requirement`, `source_policy`, `expected_source_types`, `expected_visual_targets`, `expected_artifacts`, `success_criteria`, `done_condition`, `max_sources`, and `max_images`.
+- Downstream components may validate or enrich tasks with runtime metadata, but they must not reinterpret the user's question or override semantic plan fields. Any necessary correction must be written as `semantic_plan_delta.json` with before/after values, reason, reviewer provenance, semantic reviewer approval, and user-visible diagnostics. Release validation fails when executable tasks differ from the accepted plan without an approved delta.
+- `semantic_plan_delta.json` is allowed only after the original `semantic_plan.json` has already passed all semantic gates: locked oracle, valid independent reviewer, `semantic_fit_score >= 9.0`, no blockers, full non-negotiable coverage, valid task counts, no hidden-template use, no generic task content, no subject drift, and valid substitute-implementation check. A delta cannot repair a failed or release-ineligible semantic plan.
+- A semantic-changing delta that modifies route, query, freshness requirement, source policy, expected source types, expected visual targets, expected artifacts, success criteria, done condition, source/image caps, or optional requirement coverage must be re-reviewed against the locked `semantic_expectation_oracle.json`. It must produce updated coverage maps, pass the same no-blocker, substitute-implementation, oracle/provenance, and release-visible before/after diff gates as the original plan.
+- Any release-counted delta must be requested, reviewed, approved, and trace-recorded before the affected executable artifacts are materialized or rematerialized. `run_trace.jsonl` must prove `semantic_delta_request_created`, `semantic_delta_review_requested`, `semantic_delta_approved`, and `semantic_plan_rematerialized` ordering with artifact hashes. A delta written after search handoff, visual handoff, subagent assignment, fan-out, shard merge, or synthesis is release-ineligible unless the run creates a new semantic plan version with fresh planner provenance and restarts from materialization.
+- Any correction that would fix semantic fit failure, hidden-template use, missing non-negotiable coverage, task-count failure, subject drift, required modality omission, source-quality omission, or generic task content requires a new `semantic_plan.json` version with fresh planner provenance before fan-out. It cannot be accepted as an in-place delta.
+- Depth presets must control bounded task fan-out: `standard` broad questions create 20-40 bounded tasks, `deep` broad questions create 40-80 bounded tasks, and `exhaustive` broad questions may create up to 100 bounded tasks after explicit user confirmation and budget cap approval. Narrow questions must still create 6-12 executable bounded tasks across 2-4 focused angles unless the user explicitly asks for a single fact or source lookup, which is not a release-counted DeepResearch semantic-planner run.
+- `question_scope` must be locked in `semantic_expectation_oracle.json` before plan generation. Broad is the default for `$deep-research`. A question is narrow only when it asks for a single entity/event/source, a single comparison, or a constrained factual lookup with no multi-angle investigation request. Questions asking to "조사", compare implications, assess policy/regulatory issues, analyze visuals, identify risks, or synthesize evidence across sources are broad.
+- Every angle in a standard or deeper broad run must have at least two bounded tasks. Bounded tasks must be executable research units, not copies of angle titles, generic checklist items, or fixed template labels.
+- The planner must preserve the user's domain semantics. For example, a prompt about EV battery fire safety and safety-test images must produce EV battery, fire safety, regulation, recall, thermal runaway, battery pack, safety test, and visual diagram/figure tasks. It must not produce Codex runner architecture tasks unless the user explicitly asks about implementing Codex DeepResearch itself.
+- Ambiguous words such as `테스트`, `구현`, `architecture`, or `model` must be interpreted in context. `안전 테스트 이미지`, `clinical trial test`, `crash test`, `battery abuse test`, and similar domain phrases must not be classified as software implementation just because they contain a software-related keyword.
+- A plan cannot pass if any required user intent or constraint has `coverage_status=not_covered`.
+- Non-negotiable requirement types must have `coverage_status=covered` for release-counted runs: subject/entity, explicit time range, explicit geography, requested source quality such as official/regulatory/primary sources, required visual modality such as image/chart/figure/diagram analysis, requested output language, requested output shape, user-provided exclusions, and high-risk legal/policy/safety constraints.
+- A non-negotiable requirement cannot be accepted as `partially_covered` by reviewer discretion. It must be fully covered, explicitly user-waived before fan-out and recorded in `semantic_requirement_waivers.json`, or the run must stop as blocked/failed before research subagents start.
+- `partially_covered` is allowed only for optional, nice-to-have, or supplemental requirements. It must include a caveat and cannot make a run release-eligible if the uncovered portion changes the user's core ask.
+
+Semantic fit validation contract:
+
+- `semantic_plan_review.json` must be written for every semantic plan. It contains reviewer surface, `semantic_fit_score` out of 10, blocker list, warning list, checked prompt categories, and final verdict.
+- The reviewer may be a second Codex planner/reviewer call or a deterministic validator plus Codex reviewer. Deterministic checks alone are insufficient for semantic signoff because the failure class is semantic mismatch, not schema shape.
+- Reviewer provenance must be distinct from planner and oracle provenance. `semantic_plan_review.json` must record reviewer adapter name, reviewer prompt version, model or Codex surface identifier when available, child thread/session id when available, raw reviewer request artifact path, raw reviewer response artifact path, parsed response hash, and a `reviewer_independence` object.
+- `reviewer_independence` must state `used_production_planner=false`, `used_planner_prompt=false`, `used_oracle_generation_prompt=false` unless the shared content is limited to schema definitions, `used_hidden_template_inventory=false`, `used_fixed_angle_inventory=false`, and `reviewer_saw_plan_only_after_oracle_locked=true`. If these fields are missing, inconsistent, or show shared planner logic, the review is invalid for release gates.
+- The reviewer must score against a machine-readable semantic oracle for validation prompts. The oracle records `expected_entities[]`, `expected_constraints[]`, `expected_modalities[]`, `required_angles[]`, `forbidden_angles[]`, `forbidden_internal_implementation_terms[]`, `expected_report_shape`, and `language`.
+- Real-use prompts that do not have a prewritten oracle still require a two-stage review. First, an independent reviewer session creates `semantic_expectation_oracle.json` from only the original question, user constraints, depth preset, and provided sources/images. This oracle must be timestamped, hashed, and written before the generated plan is shown to the reviewer. Second, the reviewer compares `semantic_plan.json` against that locked oracle and writes `semantic_plan_review.json`. A review is invalid if the expectation oracle was derived from, edited after seeing, or reverse-fit to the generated plan.
+- `semantic_expectation_oracle.json` must include oracle adapter name, oracle prompt version, oracle model or Codex surface identifier when available, oracle child/session id when available, raw oracle request artifact path, raw oracle response artifact path, generated-before-plan timestamp, oracle content hash, `plan_visible_to_oracle=false`, `used_production_planner_output=false`, `used_hidden_template_class=false`, and `used_fixed_angle_inventory=false`.
+- `semantic_expectation_oracle.json` must include `oracle_requirement_map[]`: one record per explicit prompt requirement and justified inferred constraint. Each record must include `prompt_span` or `prompt_text`, `requirement_type`, expected entities, expected modalities, source-quality constraints, geography/time/output-shape constraints, expected coverage, and whether the requirement is explicit or inferred. A semantic plan cannot pass if the oracle omits any material prompt requirement.
+- The oracle must include `question_scope=broad|narrow`, the reason for that scope, the required bounded task range for the chosen depth preset, and whether any single-fact/source-lookup exclusion applies.
+- Oracle generation must be independent from the production planner. It may share only the schema definition and user-visible run constraints. It must not call the production planner function, reuse planner output, use planner-selected classes/templates, or inspect generated `semantic_plan.json`. Validation fails when oracle and planner provenance are missing, identical where independence is required, or internally inconsistent.
+- `run_trace.jsonl` must contain ordering proof events for semantic planning: `semantic_oracle_request_created`, `semantic_oracle_locked`, `semantic_planner_request_created`, `semantic_plan_created`, `semantic_reviewer_request_created`, and `semantic_review_completed`. Each event must include timestamp, artifact path, artifact hash, adapter name, and child/session id when available. Release validation fails unless the trace proves the oracle was locked before planner request creation and the reviewer request was created after plan creation using the locked oracle hash.
+- If a Codex surface cannot provide child/session ids, the artifact must record `session_id_unavailable_reason` and still provide raw request/response hashes plus run-trace ordering proof. Missing session IDs without a reason, or raw artifact hashes that do not match the trace, invalidates semantic release eligibility.
+- The review must show what the plan was judged against; a bare numeric score is invalid. `semantic_plan_review.json` must include the `semantic_expectation_oracle.json` path and hash for real-use prompts.
+- Semantic fit score dimensions are: intent preservation 2.0, required entities/constraints 2.0, angle relevance and diversity 2.0, modality/visual routing 1.5, forbidden-drift avoidance 1.5, executable bounded tasks 1.0. Any forbidden internal implementation leakage caps the score at 6 even if the schema is valid.
+- The reviewer must explicitly answer whether the implementation built the requested product behavior or a substitute. The review record must include `substitute_implementation_check` with booleans for keyword/template planning, generic LLM rewriting, manual-angle substitution, fixture-only proof, report-only diagnostics, and external-provider drift.
+- For regression prompts with semantic oracles, deterministic oracle violations are blockers. A reviewer score cannot override missing required entities, missing required modalities, forbidden angles, forbidden internal implementation leakage, or absent requirement coverage.
+- Regression fixtures must include semantically plausible wrong-plan negatives, not only malformed JSON. Required negatives include plans with correct entities but missing visual modality, correct domain but wrong geography or time range, plausible angle labels but omitted official-source constraint, and overbroad internal architecture drift that answers Codex implementation instead of the user's domain question.
+- A plan cannot pass if:
+  - task titles or research questions are generic implementation templates unrelated to the user's domain;
+  - the plan omits a required user modality such as image/chart/diagram/figure analysis;
+  - the plan omits explicit official-source/regulatory/source-quality constraints requested by the user;
+  - the plan changes the user's subject, geography, time range, or deliverable shape without saying so;
+  - the `requirement_coverage_map[]` omits or misstates a user requirement;
+  - request artifacts show schema examples or prior plans contained reusable semantic angle content that could have been copied;
+  - reviewer provenance is not independent from planner/oracle provenance where independence is required;
+  - `semantic_expectation_oracle.json` omits a material prompt requirement, lacks `oracle_requirement_map[]`, or records an unjustified `question_scope=narrow`;
+  - a broad run misses the depth-based bounded task count, has fewer than two executable tasks for any angle, copies angle titles as task labels, lacks concrete `done_condition` values, or loses `semantic_plan.json` angle/task lineage when writing `research_tasks.json`;
+  - `semantic_fit_score < 9.0`;
+  - the reviewer finds any blocker.
+- `semantic_planner_validation.json` must include both structural checks and semantic fit checks. `ok=true` is allowed only when both pass.
+- When semantic fit fails, the full-runner must stop before spawning research subagents and report the failed plan, review findings, and the required correction path. It must not waste subagents on known-wrong tasks.
+
+Semantic planner acceptance tests:
+
+- Add a public-safe regression suite with at least 30 prompts: at least 10 Korean prompts, at least 8 visual-required or visual-optional prompts, at least 8 policy/regulatory/domain prompts, at least 5 software implementation prompts, and at least 5 ambiguous-word prompts where words such as `테스트`, `구현`, `architecture`, or `model` have non-software meanings.
+- Every regression prompt must include a semantic oracle with expected entities, required/forbidden angles, modality requirements, and forbidden drift terms. A prompt fixture without an oracle is invalid and cannot count toward semantic planner acceptance.
+- The EV battery fire safety prompt above must pass with `planner_mode=codex_semantic`, `semantic_fit_score >= 9.0`, no blocker, 5-8 relevant angles, no internal Codex implementation task leakage, at least one `visual_optional` or `visual_required` angle for battery pack/safety-test images or diagrams, and downstream `research_tasks.json` preserving those angles.
+- A negative fixture must prove that the current keyword/template output for the EV prompt fails semantic fit validation even if its schema, angle count, and duplicate metrics are valid.
+- A software-implementation prompt about Codex DeepResearch planner architecture must still correctly produce implementation architecture tasks, proving that the fix does not simply ban implementation plans.
+- At least 20 Public Beta real-use validation runs must include semantic planner artifacts and pass the semantic release gates. At least 8 of those runs must be visual-required or visual-optional. At least 5 of the 20 must be manually audited in detail from original prompt -> semantic plan -> review -> research tasks -> accepted shards -> final report, with audit notes proving alignment. At least 2 audited runs must be Korean and at least 2 must include visual evidence requirements.
+- The 20-run Public Beta semantic manifest must be pre-registered with quotas: at least 8 Korean prompts, at least 8 visual-required or visual-optional prompts, at least 8 official/regulatory/source-quality-constrained prompts, at least 5 prompts with ambiguous non-software terms such as `테스트`, `모델`, `architecture`, or `구현` used in domain context, at least 5 domains outside software engineering, and at least one known historical failure prompt or equivalent adversarial prompt such as the EV battery fire safety prompt.
+- Public Beta signoff also requires a blind holdout semantic set selected by an independent reviewer after implementation freeze. Holdout prompts and oracles must not be present in planner code, prompts, fixtures, golden files, or committed expected plans before the freeze point. The holdout set must include at least 12 prompts with no prompt-text, normalized-hash, or near-duplicate intent overlap with the 30-prompt regression suite or 20-run Public Beta manifest. It must include at least 4 Korean prompts, 4 visual-required or visual-optional prompts, 4 official/regulatory/source-quality-constrained prompts, 3 ambiguous-domain prompts, and 3 non-software domains. Public Beta semantic signoff requires 100% holdout pass; every holdout failure remains in the semantic release denominator.
+- Validation must scan planner code, prompts, fixtures, and test data for release fixture prompt text, prompt hashes, known holdout strings, and canned expected plans. Any special-casing or prompt-hash routing for regression or holdout prompts is a blocker and counts as substitute implementation leakage.
+- Release reports must include the semantic expectation oracle path/hash, semantic plan artifact path/hash, semantic review path/hash, run-trace semantic ordering proof, substitute implementation check result, `semantic_materialization_diff.json`, aligned `research_tasks.json`/`search_tasks.json`/`visual_tasks.json` paths, applicable visual acquisition plan paths, holdout/regression classification when applicable, and final report path. A run cannot be counted as semantic-planner release-ready without those artifacts.
+
+Implementation sequence:
+
+1. Rename and isolate the existing keyword/template planner as `heuristic_template_planner`. Keep it available only for explicit fallback, deterministic fixtures, and migration compatibility.
+2. Add `semantic_plan.json`, `semantic_plan_review.json`, `planner_mode`, `semantic_release_eligible`, and `blocked_semantic_planner_unavailable` schemas/status handling before changing planner behavior.
+3. Implement planner provenance capture: request artifact, raw response artifact, prompt version, planner adapter, model/Codex surface identifier when available, child session id when available, parsed response hash, and template-use fields.
+4. Implement the Codex-native semantic plan candidate adapter that asks a planner worker to produce the structured plan schema from the raw user question and constraints before any class/template selection. Candidate output remains release-ineligible until the independent reviewer gate, materialization diff, regression suite, installed-plugin E2E, and blind holdout gates pass.
+5. Implement semantic oracle fixtures for at least 30 prompts, including expected and forbidden meanings.
+6. Implement the semantic fit reviewer gate. It must review the generated plan against the original question and oracle/reviewer-generated expected elements, and fail before subagent fan-out when semantic fit is below 9/10 or any blocker exists.
+7. Integrate the accepted semantic plan into `search_tasks.json`, `research_tasks.json`, modality routing, budget estimation, and parallel orchestration without reintroducing fixed template task titles.
+8. Run the 30-prompt regression suite, including the EV battery fire safety prompt as a positive case and the current keyword/template output as a negative case.
+9. Run 20 installed-plugin Public Beta real-use validations with semantic gates enabled from a pre-registered manifest, manually audit at least 5 risk-based traces, and publish plan/review/report artifact paths in the validation summary.
 
 ### Automatic Web Visual Research Contract
 
@@ -298,11 +422,11 @@ Post-#104 timeout and Apollo real-use E2E findings:
 - This was a release-blocking provenance failure even when the user-facing report was produced: the product could not claim reliable automatic web visual research unless every image candidate, fetch, VLM observation, claim link, and report citation preserved the exact parent research task lineage.
 - P3-AV13 / #115 resolved this lineage class. The post-fix JWST run at `tmp/real-use-e2e/p3-av13-jwst-fixed5-20260630T075514Z/dr_20260630T075514` reached `completed_auto_visual`, accepted 4 real `codex-exec` shards, recorded 369 visual candidates, selected 59 candidates, fetched 10 artifacts, created 8 Codex-interactive visual observations, cited 8 images in `report.md`, and had both `visual_artifact_validation.valid=true` and `visual_release_gate.valid=true`.
 
-2026-07-01 Phase 3 signoff finding:
+2026-07-01 visual-path signoff finding, superseded for overall Phase 3 by 2026-07-06 semantic planner finding:
 
 - The implementation now has evidence for the core Phase 3 automatic visual path in one representative no-user-image real-use run: web/page visual discovery, fetch/cache, Codex-interactive VLM observation handoff, visual verifier/report linkage, and final `completed_auto_visual` status all completed in the JWST run above.
 - The same evidence does not complete Public Beta release signoff by itself. The Public Beta validation classifier still reports `release_gate_ready=false` and `issue_75_completion_ready=false` when run without the required 20 sanitized real run directories: all 20 manifest prompts are classified as explicit blocked diagnostics, with 10 visual prompts present but 0 release-gate passes.
-- Therefore Phase 3 feature implementation can be treated as substantially complete, but Phase 3 Public Beta signoff remains open until the 20-task real-use validation bundle is supplied and passes the PRD metric thresholds.
+- This finding supports the automatic visual path only. It does not support overall Phase 3 feature completion after the 2026-07-06 semantic planner incident. Overall Phase 3 and Public Beta signoff remain blocked until semantic planning is implemented and passes the P3-SP gates.
 
 2026-07-01 20-prompt Public Beta validation contract finding:
 
@@ -325,7 +449,7 @@ Required Phase 3 automatic visual artifacts:
 
 Minimal Phase 3 visual artifact schemas:
 
-- `visual_search_plan.json` contains `schema_version`, `run_id`, `created_at`, and `tasks[]`. Each task has `plan_id`, `task_id`, `angle_id`, `route`, `target_evidence_type=web_image|page_image|screenshot|pdf_figure|chart_image`, `query`, `providers[]`, optional `source_search_result_ids[]`, `caps` (`max_candidates`, `max_fetches`, `max_vlm_images`, `max_cost_usd`), `policy_constraints`, `estimated_cost_usd`, and `state=planned|running|completed|blocked|skipped`.
+- `visual_search_plan.json` contains `schema_version`, `run_id`, `created_at`, `semantic_plan_hash`, and `tasks[]`. Each task has `plan_id`, `task_id`, `semantic_plan_task_id`, `angle_id`, `route`, `approved_delta_id`, `target_evidence_type=web_image|page_image|screenshot|pdf_figure|chart_image`, `query`, `expected_visual_targets[]`, `success_criteria[]`, `done_condition`, `providers[]`, optional `source_search_result_ids[]`, `caps` (`max_candidates`, `max_fetches`, `max_vlm_images`, `max_cost_usd`), `policy_constraints`, `estimated_cost_usd`, and `state=planned|running|completed|blocked|skipped`.
 - `visual_candidates.jsonl` has one record per candidate: `candidate_id`, `plan_id`, `task_id`, `angle_id`, optional `source_search_result_id`, `provider`, `provider_kind=web_image_search|page_extractor|screenshot|pdf_rasterizer|manual|fixture`, `provider_mode=real|fixture|manual|user_provided`, `provider_run_id`, canonical `origin=image_search|page_image|screenshot|pdf_figure|pdf_page`, optional raw provenance fields such as `candidate_origin`, `html_origin`, or `raw_provider_metadata.html_origin` for page-extractor details like Open Graph, `srcset`, or lazy-loaded image sources, `page_url`, `image_url`, `rank`, `score`, `policy_decision=allowed|blocked|manual_review|budget_pruned`, `policy_flags[]`, `candidate_status=discovered|ranked|selected|rejected|policy_blocked|budget_pruned|fetch_failed|fetched|analyzed`, `rejection_reason`, `estimated_cost_usd`, and `actual_cost_usd`.
 - `image_fetch_status.jsonl` has one record per fetch/capture/rasterization attempt: `fetch_id`, `candidate_id`, `task_id`, `angle_id`, optional `source_search_result_id`, `fetch_status=fetched|failed|skipped|policy_blocked|budget_pruned|unsupported_mime|too_large|deduped`, `http_status`, `mime_type`, `byte_size`, `width`, `height`, `hash`, `phash`, `local_artifact_path`, `evidence_image_id`, `policy_decision`, `policy_flags[]`, `failure_code`, `estimated_cost_usd`, and `actual_cost_usd`.
 - `visual_observations.jsonl` has one record per VLM/manual observation: `observation_id`, `evidence_image_id`, `task_id`, `angle_id`, `candidate_id`, `fetch_id`, `provider`, `model_or_tool`, `provider_mode=real|fixture|manual|user_provided`, `provider_provenance`, `observation_status=analyzed|failed|skipped|needs_manual_review|policy_blocked`, `observations[]`, `inferences[]`, optional `ocr_text`, `confidence`, `policy_decision=allowed|blocked|manual_review|budget_pruned`, `policy_flags[]`, `caveats[]`, `verifier_links[]` (`claim_id`, optional `visual_support_ref`, optional `verifier_vote_id`), `report_links[]` (`claim_id`, optional `report_section_id`, optional `citation_id`), `estimated_cost_usd`, `actual_cost_usd`, and `created_at`.
@@ -334,6 +458,8 @@ Minimal Phase 3 visual artifact schemas:
 Visual artifact validation rules:
 
 - `task_id` must reference `research_tasks.json[].id`; `angle_id` must match that task's angle and route.
+- Every visual search plan, candidate, fetch, evidence image, observation, verifier link, and report citation must preserve or be joinable to `semantic_plan_hash`, `semantic_plan_task_id`, `approved_delta_id`, `expected_visual_targets[]`, `success_criteria[]`, and `done_condition` from the accepted semantic plan or approved plan version.
+- Visual acquisition must satisfy the accepted plan's expected visual targets. A route-correct but target-wrong visual artifact, such as generic product images when the plan required safety-test diagrams, fails semantic materialization validation.
 - `visual_search_plan.json.tasks[].plan_id` must be globally unique within a run, and every downstream visual candidate, fetch, evidence image, observation, verifier link, and report citation must preserve the same `plan_id`, `task_id`, `angle_id`, and `route` lineage as its parent visual task.
 - `source_search_result_id`, when present, must reference `SearchResult.id`; page extraction, screenshot, and PDF rasterization candidates must preserve the source search result or explicit manual source that produced them.
 - `candidate_id` is globally unique within a run. Every `image_fetch_status.jsonl.candidate_id` must reference a candidate, and every fetched/analyzed candidate must have exactly one fetch record or a documented dedupe target.
@@ -439,7 +565,8 @@ Parallel orchestration flow:
 
 ```text
 $deep-research: <question>
--> runner prepare creates research_tasks.json
+-> runner prepare creates run directory, locks semantic expectation oracle, generates semantic_plan.json, and passes semantic review
+-> accepted semantic_plan.json materializes research_tasks.json
 -> orchestrator assigns ready tasks to Codex subagents up to max_concurrent_codex_subagents
 -> each subagent performs search/read/image inspection for one task
 -> each subagent writes evidence_shards/<task_id>/evidence_shard.json and handoff JSONL files
@@ -451,6 +578,7 @@ $deep-research: <question>
 Required parallel artifacts:
 
 - `research_tasks.json`: canonical task queue for one run.
+- `semantic_materialization_diff.json`: canonical release-gate diff proving every executable task and handoff artifact preserves the accepted semantic plan or an approved semantic plan version.
 - `subagent_assignments.jsonl`: append-only assignment log.
 - `evidence_shards/<task_id>/evidence_shard.json`: per-task evidence output.
 - `evidence_shards/<task_id>/search_results.jsonl`: per-task search result handoff.
@@ -463,9 +591,19 @@ Required parallel artifacts:
 ```json
 {
   "id": "task_research_001",
+  "semantic_plan_hash": "sha256:...",
+  "semantic_plan_task_id": "task_001",
+  "semantic_plan_angle_id": "angle_001",
+  "approved_delta_id": null,
   "angle_id": "angle_001",
   "route": "text_only|visual_required|visual_optional",
   "query": "official release notes for ...",
+  "freshness_requirement": "latest|recent|historical|any",
+  "expected_source_types": ["official", "regulatory", "primary"],
+  "expected_visual_targets": [],
+  "expected_artifacts": ["quotes", "source_metadata", "claim_candidates"],
+  "success_criteria": ["Identify the official change record and cite the source URL."],
+  "done_condition": "At least two primary or official sources were checked and claim candidates were written.",
   "state": "queued|assigned|running|completed|failed|blocked|retryable|merged|discarded",
   "assigned_subagent_id": null,
   "attempt": 0,
@@ -477,6 +615,79 @@ Required parallel artifacts:
   "trace_event_ids": []
 }
 ```
+
+`semantic_materialization_diff.json` minimum fields:
+
+```json
+{
+  "schema_version": "0.1",
+  "run_id": "dr_...",
+  "semantic_plan_path": "semantic_plan.json",
+  "semantic_plan_hash": "sha256:...",
+  "approved_delta_paths": [],
+  "created_at": "2026-07-06T00:00:00Z",
+  "artifacts_checked": [
+    "research_tasks.json",
+    "search_tasks.json",
+    "visual_tasks.json",
+    "visual_search_plan.json",
+    "subagent_assignments.jsonl",
+    "search_results.jsonl",
+    "visual_candidates.jsonl",
+    "visual_observations.jsonl"
+  ],
+  "task_set_summary": {
+    "semantic_plan_bounded_task_count": 20,
+    "research_task_count": 20,
+    "search_task_count": 20,
+    "visual_task_count": 4,
+    "required_visual_task_count": 4,
+    "missing_semantic_task_ids": [],
+    "extra_materialized_task_ids": [],
+    "duplicate_semantic_task_ids": [],
+    "dropped_search_obligation_task_ids": [],
+    "dropped_visual_obligation_task_ids": [],
+    "unapproved_extra_search_task_ids": [],
+    "unapproved_extra_visual_task_ids": []
+  },
+  "per_artifact_task_set_equality": {
+    "research_tasks": true,
+    "search_tasks": true,
+    "visual_tasks": true,
+    "visual_search_plan": true,
+    "subagent_assignments": true
+  },
+  "task_diffs": [{
+    "semantic_plan_task_id": "task_001",
+    "materialized_task_id": "task_research_001",
+    "angle_id_match": true,
+    "query_match": true,
+    "route_match": true,
+    "freshness_requirement_match": true,
+    "source_policy_match": true,
+    "expected_source_types_match": true,
+    "expected_visual_targets_match": true,
+    "expected_artifacts_match": true,
+    "success_criteria_match": true,
+    "done_condition_match": true,
+    "max_sources_match": true,
+    "max_images_match": true,
+    "approved_delta_id": null,
+    "differences": []
+  }],
+  "valid": true
+}
+```
+
+Materialization validation rules:
+
+- Every `ResearchTask`, search task, visual task, visual acquisition plan, subagent assignment, `SearchResult`, and visual record must carry or be joinable to `semantic_plan_hash`, `semantic_plan_task_id`, `angle_id`, and `approved_delta_id`.
+- `semantic_materialization_diff.json.valid=true` is required before fan-out and before release-counted synthesis. It must compare `query`, `route`, `freshness_requirement`, `source_policy`, `expected_source_types`, `expected_visual_targets`, `expected_artifacts`, `success_criteria`, `done_condition`, `max_sources`, and `max_images` field-by-field.
+- `semantic_materialization_diff.json.valid=true` also requires exact task-set equality. Every `semantic_plan.bounded_tasks[]` record must be materialized exactly once into `research_tasks.json`; no materialized research task may lack a semantic plan task; no semantic plan task may be missing; and no semantic plan task id may appear more than once unless an approved new semantic plan version explicitly splits it before materialization.
+- Search and visual task sets must match the accepted plan obligations. Every bounded task that requires search must have the expected search task(s), every visual-required or visual-optional bounded task with expected visual targets must have the expected visual task/acquisition plan, and unapproved extra search/visual tasks fail release validation.
+- `semantic_materialization_diff.json` must record planned counts, materialized counts, missing task IDs, extra task IDs, duplicate semantic task IDs, dropped search obligations, dropped visual obligations, and per-artifact task-set equality. Any non-empty missing/extra/duplicate/dropped list is a hard failure unless it is tied to an approved new semantic plan version created before fan-out.
+- Query expansion is allowed only when the expanded query is listed in the accepted plan's `search_queries[]` or in an approved plan version/delta. Ad hoc downstream query rewriting fails release validation.
+- Search and visual artifacts with matching IDs but mismatched semantic fields are invalid even if they produce useful evidence.
 
 Task state rules:
 
@@ -598,8 +809,8 @@ Non-developer input path:
 
 ## 주요 요구사항
 
-1. 질문을 5-8개 조사 angle로 분해한다.
-2. `ModalityRouter`가 angle마다 `text_only`, `visual_required`, `visual_optional` 중 하나로 분류한다.
+1. 질문을 5-8개 조사 angle로 의미적으로 분해한다. Keyword/classifier/template 기반 분해는 `heuristic_template_planner` fallback일 뿐이며, `semantic_planner` acceptance나 release gate를 만족할 수 없다.
+2. `ModalityRouter`는 semantic planner가 정한 angle/task route(`text_only`, `visual_required`, `visual_optional`)를 검증하고 runtime metadata를 보강한다. 사용자 질문을 다시 해석해서 route, query, source policy, expected visual target을 덮어쓰면 안 된다.
 3. 텍스트 소스는 본문, 날짜, 저자, 도메인, quote를 추출한다.
 4. 이미지 소스는 URL, 원본 페이지, alt text, OCR, 시각 설명, perceptual hash, 캡션, 주변 문맥을 저장한다.
 5. VLM 에이전트는 이미지를 다음 관점으로 분석한다.
@@ -622,12 +833,14 @@ Non-developer input path:
 13. runner는 subagent가 만든 evidence shard를 schema validation, guardrail, dedupe, merge 과정을 거쳐 최종 `evidence.json`으로 병합한다.
 14. 병렬 실행은 `max_concurrent_codex_subagents`, `max_concurrent_runner_agents`, source/image/model-call cap을 모두 준수해야 한다.
 15. subagent 실패는 전체 run 실패로 즉시 승격하지 않고, retry-safe failure는 task 단위로 재시도하며, blocked/policy failure는 명시 상태로 보존한다.
+16. Semantic planning은 `semantic_plan.json`과 `semantic_plan_review.json`을 생성하고, `semantic_fit_score >= 9.0` 및 blocker 0개를 만족해야 subagent fan-out으로 넘어갈 수 있다.
+17. 사용자 질문과 무관한 내부 구현 task가 생성되면 schema가 유효하더라도 planning 실패로 처리한다.
 
 ## 에이전트 구성
 
-- `PlannerAgent`: 질문 분해, 텍스트/이미지 조사 필요성 판단.
+- `PlannerAgent`: Codex-native semantic planning으로 질문 의도, 도메인, 제약, 조사 angle, 텍스트/이미지 조사 필요성을 구조화한다. Keyword/template fallback은 명시적으로 release-ineligible로 표기한다.
 - `OrchestratorAgent`: planner task를 Codex subagent 또는 runner worker에 배정하고 task state, retry, budget cap을 관리.
-- `ModalityRouterAgent`: angle과 claim 후보를 `text_only`, `visual_required`, `visual_optional`로 분류하고 VLM 호출 여부를 결정.
+- `ModalityRouterAgent`: accepted `semantic_plan.json`의 route를 검증하고 claim 후보별 VLM 호출 필요성을 보강한다. Planner가 만든 route를 바꿔야 할 때는 `semantic_plan_delta.json`와 semantic reviewer 승인이 필요하다.
 - `SearchAgent`: 웹 검색 결과 수집.
 - `ImageScoutAgent`: 이미지 검색, 페이지 대표 이미지, 스크린샷 후보 수집.
 - `FetchAgent`: HTML/PDF/문서 fetch 및 본문 추출.
@@ -639,6 +852,8 @@ Non-developer input path:
 - `SynthesisAgent`: 살아남은 claim만 병합해 보고서 작성.
 
 ## ModalityRouter 분류 규칙
+
+These rules are validation and enrichment rules for accepted semantic plans. They do not authorize the router to reinterpret the original question or silently rewrite `semantic_plan.json`. Any route/query/source-policy/visual-target change after semantic review requires an approved `semantic_plan_delta.json` that is re-reviewed against the locked oracle with the same semantic fit, coverage, provenance, and substitute-implementation gates; otherwise release validation fails.
 
 `text_only`:
 
@@ -965,6 +1180,9 @@ All adapters must emit these canonical records before evidence ingestion.
 {
   "id": "sr_001",
   "task_id": "task_search_001",
+  "semantic_plan_hash": "sha256:...",
+  "semantic_plan_task_id": "task_001",
+  "approved_delta_id": null,
   "angle_id": "angle_001",
   "route": "text_only|visual_required|visual_optional",
   "provider": "codex-native|openai|brave|tavily|serpapi|manual",
@@ -990,6 +1208,9 @@ SearchResult validation rules:
 - Every `SearchResult.task_id` must reference an existing search task.
 - Every `SearchResult.angle_id` must reference an existing routed angle.
 - `SearchResult.route` must match the referenced angle route.
+- `SearchResult.semantic_plan_hash`, `semantic_plan_task_id`, `query`, `freshness_requirement`, `result_type`, and source-policy interpretation must match the accepted semantic plan/materialized search task or an approved plan version/delta.
+- `SearchResult.query` must be one of the accepted plan search queries or a query variant listed in `semantic_materialization_diff.json`; unrecorded downstream query rewriting fails release validation.
+- `SearchResult.result_type` and provider/source quality must be compatible with the plan's `expected_source_types` and `source_policy`.
 - `policy_decision=blocked` result cannot create high-confidence claims.
 - `provider=codex-native` is valid only in `codex-plugin` mode.
 
@@ -1120,7 +1341,7 @@ Codex는 후속 작업에서 `evidence.json`을 먼저 읽고, `verification_sta
 4. `codex-plugin` mode는 Codex-native search와 `codex-interactive` VLM path를 기본으로 한다.
 5. `automated-cli` mode는 provider abstraction을 통해 OpenAI hosted search 또는 외부 search provider와 `openai-responses-vision` VLM path를 사용한다.
 6. `manual-sources` mode는 사용자가 제공한 URL/PDF/image만으로 Phase 0와 fallback run을 지원한다.
-7. `ModalityRouterAgent`로 text-only/visual-required/visual-optional 분류를 구현한다.
+7. `ModalityRouterAgent`로 planner route 검증과 VLM 필요 여부 기록을 구현한다. Phase 3 semantic planner 이후에는 router가 accepted `semantic_plan.json`의 route를 덮어쓰지 않는다.
 8. visual-required angle에서 이미지 검색, 대표 이미지 추출, first viewport screenshot 캡처를 수행한다.
 9. `standard` preset 기준 verifier invocation 80개, 동시 runner agent 8개를 기본값으로 둔다.
 10. 보고서 `report.md`, schema v0 `evidence.json`, `run_status.json`, 그리고 synthesis가 성공한 run의 `report_status.json` 저장.
@@ -1239,6 +1460,7 @@ Exit criteria:
 - Codex Plugin marketplace 등록 또는 개인 marketplace 등록 자동화.
 - `/skills`에서 선택 가능한 안정 skill metadata.
 - `$deep-research` fresh-session invocation이 기본적으로 full-runner run을 시작하고, chat-only 답변으로 새지 않게 하는 invocation router.
+- Codex-native semantic planner: 사용자의 실제 질문을 읽고 의도, 도메인, 제약, 필요한 텍스트/시각 조사 축을 의미적으로 분해해 `semantic_plan.json`과 `semantic_plan_review.json`을 생성한다.
 - final response artifact handoff: run directory, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary를 사용자에게 노출.
 - TUI 또는 lightweight web dashboard.
 - run list, progress, pause/resume/cancel.
@@ -1261,6 +1483,10 @@ Exit criteria:
 - visual-required 실사용 E2E에서 사용자 제공 이미지 없이 `completed_auto_visual` 상태가 나온다.
 - accepted real-use visual E2E에서 최소 10개 web visual candidate, 최소 3개 non-fixture VLM 분석 이미지, 최소 1개 report-cited visual/mixed claim을 기록한다.
 - visual-required real-use E2E cannot pass if Codex-interactive analyzed image count is below the configured minimum. The run must expose `visual_minimum_shortfall` diagnostics and end as `partial_auto_visual`.
+- Public Beta cannot pass unless every release-counted default `$deep-research` full-runner uses `planner_mode=codex_semantic`, writes `semantic_plan.json`, `semantic_expectation_oracle.json`, and `semantic_plan_review.json`, scores `semantic_fit_score >= 9.0`, and records no semantic blockers.
+- Public Beta cannot pass if any release-counted run uses `heuristic_template_planner`, manual angles, fixture plans, or hidden template rewriting as evidence that semantic planning worked.
+- At least 30 public-safe semantic planner regression prompts pass with prompt-specific semantic oracles, including the EV battery fire safety prompt and a negative fixture proving the old keyword/template output fails.
+- 20개 Public Beta real-use validation runs are pre-registered before execution, stratified by language, domain, visual requirement, ambiguity, and source-quality constraints. The manifest must include at least 8 Korean prompts, 8 visual-required or visual-optional prompts, 8 official/regulatory/source-quality-constrained prompts, 5 ambiguous non-software-term prompts, 5 non-software domains, and one known historical failure or equivalent adversarial prompt. All 20 must include semantic planner artifacts and pass the semantic release gates; at least 5 risk-based traces are manually audited from original prompt to final report. The audited traces must include the hardest or highest-risk prompts, not only successful-looking examples.
 - Codex child model-capacity failures are retried with bounded backoff, classified separately from timeouts, and preserve the raw child last message. If retries exhaust with no accepted shards, the run ends as `failed_parallel_no_accepted_shards`.
 - evidence browser가 source page, image artifact, VLM observation, visual verifier vote, linked claim, report citation을 한 흐름으로 보여준다.
 - fixture/local/manual/user-provided visual evidence만으로는 Public Beta automatic visual gate를 통과하지 않는다.
@@ -1273,7 +1499,8 @@ Current Phase 3 signoff status as of 2026-07-01:
 - Implementation evidence satisfies the single-run automatic visual criteria with the JWST no-user-image E2E run: `completed_auto_visual`, 369 candidates, 10 fetched artifacts, 8 Codex-interactive visual observations, and 8 report-cited images.
 - Fresh-session fixture gates for full-runner artifact handoff and visual blocked/fixture behavior pass, and the Public Beta prompt manifest contains 20 public-safe prompts with 10 visual-required or visual-optional prompts.
 - Public Beta release signoff remains incomplete because the 20-prompt validation run has not been backed by 20 sanitized real run directories. The classifier reports `release_gate_ready=false`, `issue_75_completion_ready=false`, and 0 release-gate passes when those directories are absent.
-- The remaining follow-up is a validation artifact task, not a new core feature task: collect or replay 20 public-safe real-use run directories, including at least 8 visual-required or visual-optional tasks, and rerun the Public Beta classifier until the aggregate thresholds pass.
+- Superseding 2026-07-06 semantic planner finding: Phase 3 cannot be considered feature-complete or Public-Beta-signoff-ready while the default planner is a keyword/template heuristic falsely accepted as semantic planning. The remaining work is a core semantic planning feature blocker, not only a validation artifact task.
+- The required follow-up is: implement the Codex-native semantic planner, semantic fit reviewer gate, prompt oracle regression suite, and installed-plugin real-use semantic E2E evidence; then rerun Public Beta validation with semantic planner gates included.
 
 ### Phase 4: Product v1
 
@@ -1342,7 +1569,7 @@ Tasks:
 4. 실행하면 run directory를 생성한다.
 5. schema v0 JSON Schema와 example fixture를 만든다.
 6. `PlannerAgent`가 질문을 3-5개 angle로 분해하게 한다.
-7. `ModalityRouterAgent`가 각 angle을 `text_only`, `visual_required`, `visual_optional`로 분류하게 한다.
+7. `ModalityRouterAgent`가 각 angle의 `text_only`, `visual_required`, `visual_optional` route를 검증하고 VLM 필요 여부를 기록하게 한다.
 8. 수동 source URL과 image URL을 입력받는 옵션을 만든다.
 9. 텍스트 source에서 title, body excerpt, quote 후보를 추출한다.
 10. image URL을 선택된 VLM path로 분석해 OCR, visual observation, visual claim을 저장한다.
@@ -2000,40 +2227,49 @@ Tasks:
 
 1. `$deep-research` skill invocation router를 만든다. 기본 mode는 `full-runner`이고, `quick-chat`은 명시 요청이 있을 때만 허용한다.
 2. fresh-session skill invocation이 `prepare -> orchestrate-parallel -> guardrails -> verify -> synthesize`를 끝까지 실행하거나 explicit blocked status로 종료하게 한다.
-3. 최종 assistant response가 run directory, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary, fallback/degradation 여부를 항상 표시하게 한다.
-4. chat-only, fixture-only, manual-only, serial fallback, real parallel provenance를 최종 응답과 `run_status.json` 및 applicable status artifacts에서 구분한다.
-5. `$deep-research` fresh-session E2E transcript gate를 추가한다. 성공처럼 보이는 응답에 run artifact path, `run_status.json`, 또는 synthesis 이후 `report_status.json`이 없으면 실패한다.
-6. run list, run detail, claim detail을 볼 수 있는 TUI 또는 lightweight web dashboard를 만든다.
-7. 진행 중 run의 phase, active/queued/failed/merged task count, Codex subagent count, source count, image count를 표시한다.
-8. pause/resume/cancel control을 구현한다.
-9. `max_concurrent_codex_subagents`, `max-cost-usd`, preset confirmation UI를 구현한다.
-10. source/image/claim/vote를 연결해서 탐색하는 evidence browser를 만든다.
-11. claim review 상태 `accepted`, `rejected`, `needs_more_evidence`를 저장한다.
-12. review 결과가 후속 synthesis와 Codex reuse에 반영되게 한다.
-13. technical report, market report, competitor analysis, incident report template을 만든다.
-14. Markdown, JSON, CSV, HTML bundle export를 구현한다.
-15. plugin 설치, 업데이트, 제거 절차를 문서화한다.
-16. 실제 리서치 태스크 20개 이상을 실행하고 실패 유형을 수집한다.
-17. onboarding quickstart와 example gallery를 만든다.
-18. `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json` artifact를 구현한다.
-19. real web/image search provider adapter를 구현하고, provider별 결과를 `visual_candidates.jsonl`로 정규화한다.
-20. 웹페이지 Open Graph image, 본문 image, `srcset`, lazy-loaded image, caption, alt text, 주변 문맥 추출기를 구현한다.
-21. 원격 이미지 fetch/cache layer를 구현하고 MIME, size, hash, perceptual hash, local artifact path, policy metadata를 기록한다.
-22. Playwright 또는 equivalent browser automation 기반 first-viewport/full-page/scroll screenshot collector를 구현한다.
-23. 논문/보고서 PDF page 또는 figure rasterization provider를 구현한다. CAPTCHA, 로그인, paywall 우회는 비목표로 유지한다.
-24. `openai-responses-vision` automated adapter가 image URL, local artifact, screenshot, PDF page image를 분석해 `visual_observations.jsonl`을 생성하게 한다.
-25. VisualVerifierAgent가 VLM observation을 claim `visual_supports[]`, visual verifier vote, report citation으로 연결하게 한다.
-26. `completed_auto_visual`, `partial_auto_visual`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` 상태를 `run_status.json`, `visual_provider_status.json`, dashboard에 표시한다.
-27. fixture/manual/user-provided-only visual runs와 real automatic web visual runs를 validation에서 구분한다.
-28. codex-plugin interactive visual E2E suite를 만든다. fresh-session `$deep-research`가 Codex-native search/VLM handoff artifacts를 채우고 hidden API 없이 `completed_auto_visual`에 도달하는지 검증한다. explicit blocked terminal status는 진단으로 기록하지만 release-gate pass로 계산하지 않는다.
-29. automated-cli real provider visual E2E suite를 만든다. no-user-image run이 real provider acquisition과 `openai-responses-vision`을 사용해 제품 이미지 비교, UI screenshot 비교, 뉴스/시장 차트 판독, 논문 figure 판독을 통과해야 한다.
-30. automatic visual E2E 실패 유형을 provider failure, fetch failure, policy block, VLM failure, visual contradiction, report linkage failure로 분류한다.
-31. Codex-native local visual worker path를 full-runner에 연결한다. 이미 확보된 image/screenshot/PDF-render artifact를 `codex exec --json --image <artifact>`로 분석하고, observation lineage를 `evidence.json`, `visual_provider_status.json`, `run_trace.jsonl`, report citation까지 보존한다. 이 항목은 P3-AV10 / #97로 추적한다.
-32. Full-runner automatic web visual integration을 구현한다. 사용자 제공 이미지 없이 Codex-native search handoff와 page image extraction, image fetch/cache, screenshot capture, PDF figure/page rasterization 중 가능한 acquisition path를 실행하고, 확보한 local artifact를 P3-AV10 Codex VLM worker에 넘겨 `completed_auto_visual` 또는 명확한 blocked terminal status에 도달하게 한다. 이 항목은 P3-AV11 / #99로 추적한다.
+3. existing keyword/template planner를 `heuristic_template_planner` fallback으로 격하하고, release-eligible path에서는 기본 사용을 금지한다. Artifacts must record `planner_mode`, `semantic_release_eligible`, and explicit blocked/fallback diagnostics whenever true semantic planning does not run.
+4. `semantic_plan.json` schema, planner provenance, template-use metadata, `semantic_plan_review.json`, semantic oracle fixture schema, and `blocked_semantic_planner_unavailable` status를 구현한다.
+5. Codex-native semantic planner를 구현한다. It must generate intent summary, constraints, domain entities, 5-8 semantically relevant angles, route decisions, visual target requirements, and depth-based bounded tasks directly from the user's raw question and constraints. Standard broad runs require 20-40 bounded tasks, deep requires 40-80, and exhaustive may create up to 100 after explicit confirmation.
+6. semantic fit reviewer gate를 구현한다. It must score against prompt-specific semantic oracles or reviewer-generated expected/forbidden elements, require `semantic_fit_score >= 9.0`, reject blockers, and stop before subagent fan-out on failure.
+7. semantic planner regression suite를 만든다. It must include at least 30 public-safe prompts with expected/forbidden semantic oracles, the EV battery prompt positive case, and the old keyword/template output negative case.
+8. installed-plugin semantic E2E gate를 만든다. 20 pre-registered Public Beta real-use runs must show `semantic_plan.json`, `semantic_expectation_oracle.json`, `semantic_plan_review.json`, aligned `research_tasks.json`, accepted shards, and final report alignment with the original user question. Each broad run must satisfy the depth-based task count and at-least-two-tasks-per-angle rules unless a reviewer-accepted narrow-question exception is recorded. At least 5 risk-based traces must be manually audited end to end.
+9. 최종 assistant response가 run directory, `semantic_expectation_oracle.json` path/hash, `semantic_plan.json`, `semantic_plan_review.json`, semantic fit score, substitute implementation check result, aligned `research_tasks.json`, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary, fallback/degradation 여부를 항상 표시하게 한다.
+10. chat-only, fixture-only, manual-only, serial fallback, real parallel provenance를 최종 응답과 `run_status.json` 및 applicable status artifacts에서 구분한다.
+11. `$deep-research` fresh-session E2E transcript gate를 추가한다. 성공처럼 보이는 응답에 run artifact path, semantic plan/review artifact, `run_status.json`, 또는 synthesis 이후 `report_status.json`이 없으면 실패한다.
+12. run list, run detail, claim detail을 볼 수 있는 TUI 또는 lightweight web dashboard를 만든다.
+13. 진행 중 run의 phase, active/queued/failed/merged task count, Codex subagent count, source count, image count를 표시한다.
+14. pause/resume/cancel control을 구현한다.
+15. `max_concurrent_codex_subagents`, `max-cost-usd`, preset confirmation UI를 구현한다.
+16. source/image/claim/vote를 연결해서 탐색하는 evidence browser를 만든다.
+17. claim review 상태 `accepted`, `rejected`, `needs_more_evidence`를 저장한다.
+18. review 결과가 후속 synthesis와 Codex reuse에 반영되게 한다.
+19. technical report, market report, competitor analysis, incident report template을 만든다.
+20. Markdown, JSON, CSV, HTML bundle export를 구현한다.
+21. plugin 설치, 업데이트, 제거 절차를 문서화한다.
+22. 실제 리서치 태스크 20개 이상을 실행하고 실패 유형을 수집한다.
+23. onboarding quickstart와 example gallery를 만든다.
+24. `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json` artifact를 구현한다.
+25. real web/image search provider adapter를 구현하고, provider별 결과를 `visual_candidates.jsonl`로 정규화한다.
+26. 웹페이지 Open Graph image, 본문 image, `srcset`, lazy-loaded image, caption, alt text, 주변 문맥 추출기를 구현한다.
+27. 원격 이미지 fetch/cache layer를 구현하고 MIME, size, hash, perceptual hash, local artifact path, policy metadata를 기록한다.
+28. Playwright 또는 equivalent browser automation 기반 first-viewport/full-page/scroll screenshot collector를 구현한다.
+29. 논문/보고서 PDF page 또는 figure rasterization provider를 구현한다. CAPTCHA, 로그인, paywall 우회는 비목표로 유지한다.
+30. `openai-responses-vision` automated adapter가 image URL, local artifact, screenshot, PDF page image를 분석해 `visual_observations.jsonl`을 생성하게 한다.
+31. VisualVerifierAgent가 VLM observation을 claim `visual_supports[]`, visual verifier vote, report citation으로 연결하게 한다.
+32. `completed_auto_visual`, `partial_auto_visual`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`, `budget_pruned_visual` 상태를 `run_status.json`, `visual_provider_status.json`, dashboard에 표시한다.
+33. fixture/manual/user-provided-only visual runs와 real automatic web visual runs를 validation에서 구분한다.
+34. codex-plugin interactive visual E2E suite를 만든다. fresh-session `$deep-research`가 Codex-native search/VLM handoff artifacts를 채우고 hidden API 없이 `completed_auto_visual`에 도달하는지 검증한다. explicit blocked terminal status는 진단으로 기록하지만 release-gate pass로 계산하지 않는다.
+35. automated-cli real provider visual E2E suite를 만든다. no-user-image run이 real provider acquisition과 `openai-responses-vision`을 사용해 제품 이미지 비교, UI screenshot 비교, 뉴스/시장 차트 판독, 논문 figure 판독을 통과해야 한다.
+36. automatic visual E2E 실패 유형을 provider failure, fetch failure, policy block, VLM failure, visual contradiction, report linkage failure로 분류한다.
+37. Codex-native local visual worker path를 full-runner에 연결한다. 이미 확보된 image/screenshot/PDF-render artifact를 `codex exec --json --image <artifact>`로 분석하고, observation lineage를 `evidence.json`, `visual_provider_status.json`, `run_trace.jsonl`, report citation까지 보존한다. 이 항목은 P3-AV10 / #97로 추적한다.
+38. Full-runner automatic web visual integration을 구현한다. 사용자 제공 이미지 없이 Codex-native search handoff와 page image extraction, image fetch/cache, screenshot capture, PDF figure/page rasterization 중 가능한 acquisition path를 실행하고, 확보한 local artifact를 P3-AV10 Codex VLM worker에 넘겨 `completed_auto_visual` 또는 명확한 blocked terminal status에 도달하게 한다. 이 항목은 P3-AV11 / #99로 추적한다.
 
 Deliverables:
 
 - skill invocation router
+- Codex-native semantic planner and semantic fit gate
+- semantic oracle regression suite
+- installed-plugin semantic E2E validation
 - fresh-session full-runner E2E gate
 - final response artifact handoff
 - codex-plugin interactive visual E2E gate
@@ -2048,6 +2284,17 @@ Deliverables:
 - report templates
 - export bundle
 - beta documentation
+
+Phase 3 semantic planner issue candidates and ordering:
+
+| Issue candidate | Scope | Depends on | Can run in parallel with |
+| --- | --- | --- | --- |
+| P3-SP1 Planner integrity schema and fallback demotion | Rename/isolate the existing keyword/template planner as `heuristic_template_planner`; add `planner_mode`, `semantic_release_eligible`, `semantic_expectation_oracle.json` with `oracle_requirement_map[]`, `semantic_plan.json`, `semantic_plan_review.json`, planner/oracle provenance fields, template-use metadata, semantic oracle fixture schema, manual fallback states, and `blocked_semantic_planner_unavailable`. | Existing planner and run-state artifacts | P3-UX work that does not change planner output |
+| P3-SP2 Codex-native semantic plan candidate adapter | Generate candidate intent, entities, constraints, 5-8 relevant research angles, route decisions, visual targets, and depth-based bounded tasks directly from the raw user question and constraints. Standard broad runs require 20-40 executable bounded tasks, deep 40-80, and exhaustive up to 100 after confirmation; every broad-run angle needs at least two bounded tasks. Hidden preselected template classes are forbidden. P3-SP2 artifacts remain `semantic_release_eligible=false` until P3-SP3 reviewer gates and P3-SP4 real E2E gates pass. | P3-SP1 | P3-AV schema/provider work |
+| P3-SP3 Semantic fit reviewer gate | Score plans against prompt-specific semantic oracles or reviewer-generated expected/forbidden elements. Require `semantic_fit_score >= 9.0`, no blockers, no forbidden internal implementation leakage, and stop before subagent fan-out on failure. | P3-SP1, P3-SP2 | UX/report artifact display |
+| P3-SP4 Semantic release integrity, regression, and installed-plugin E2E | Add at least 30 public-safe oracle-backed regression prompts, a pre-registered 20-run Public Beta real-use E2E manifest, and an independent-reviewer-selected blind holdout set. Enforce run-trace semantic ordering proof, substitute-implementation leakage checks, `semantic_materialization_diff.json` exact task-set equality, release report artifact completeness, and at least 5 risk-based manual trace audits proving question -> semantic expectation oracle -> semantic plan -> materialization diff -> depth-appropriate research/search/visual tasks -> accepted shards -> final report alignment. Validation must fail if a broad run produces too few executable tasks, copies angle titles as tasks, records a narrow-question exception without reviewer acceptance, drops/duplicates/adds tasks, or lacks 100% holdout pass. | P3-SP3, P3-UX2 | P3-AV E2E work |
+
+P3-SP acceptance is a Public Beta blocker. P3-SP may not be downgraded to Phase 4 or treated as documentation-only work because the user-facing product claim is that DeepResearch understands and decomposes the user's research question. No issue or PR may close the semantic planner correction as complete until P3-SP2 candidate output, P3-SP3 independent reviewer gate, P3-SP4 regression/installed-plugin E2E, materialization diff validation, and blind holdout validation all pass.
 
 Phase 3 product UX issue candidates and ordering:
 
@@ -2099,11 +2346,11 @@ Wave 8 implementation acceptance:
 
 Safe development waves:
 
-- Wave 1: P3-UX1 and P3-AV1. P3-UX1 closes the product invocation gap; P3-AV1 defines the automatic visual state/schema contract.
-- Wave 2: P3-UX2, P3-UX3, P3-AV2, P3-AV3, P3-AV4, and P3-AV5 can proceed after their Wave 1 dependencies because UX artifact handoff and visual acquisition providers write separate normalized artifacts.
-- Wave 3: P3-UX4 and P3-AV6. P3-UX4 consumes `run_status.json` plus applicable visual/parallel status artifacts; P3-AV6 depends on at least one real image artifact path from Wave 2.
-- Wave 4: P3-UX5 and P3-AV7. P3-UX5 extends run controls; P3-AV7 depends on validated VLM observations from P3-AV6.
-- Wave 5: P3-AV8 and P3-AV9 are release gates. P3-AV8 cannot pass until P3-UX3 and P3-AV7 are complete. P3-AV9 cannot pass until P3-AV2, P3-AV3, P3-AV4, P3-AV5, P3-AV6, and P3-AV7 are complete.
+- Wave 1: P3-SP1, P3-UX1, and P3-AV1. P3-SP1 closes the semantic-planner misrepresentation gate; P3-UX1 closes the product invocation gap; P3-AV1 defines the automatic visual state/schema contract.
+- Wave 2: P3-SP2, P3-UX2, P3-UX3, P3-AV2, P3-AV3, P3-AV4, and P3-AV5 can proceed after their Wave 1 dependencies because semantic plan candidate generation, UX artifact handoff, and visual acquisition providers write separate normalized artifacts. P3-SP2 output is not semantic-release-eligible until P3-SP3/P3-SP4 gates pass.
+- Wave 3: P3-SP3, P3-UX4, and P3-AV6. P3-SP3 blocks release fan-out acceptance until semantic fit review is enforced; P3-UX4 consumes `run_status.json` plus applicable visual/parallel status artifacts; P3-AV6 depends on at least one real image artifact path from Wave 2.
+- Wave 4: P3-SP4, P3-UX5, and P3-AV7. P3-SP4 provides the semantic regression/E2E release gate; P3-UX5 extends run controls; P3-AV7 depends on validated VLM observations from P3-AV6.
+- Wave 5: P3-AV8 and P3-AV9 are release gates and require P3-SP4. P3-AV8 cannot pass until P3-UX3, P3-SP4, and P3-AV7 are complete. P3-AV9 cannot pass until P3-SP4, P3-AV2, P3-AV3, P3-AV4, P3-AV5, P3-AV6, and P3-AV7 are complete.
 - Wave 6: P3-AV10 and P3-AV11 are post-gate hardening issues discovered by real installed-plugin testing. P3-AV10 / #97 closes the Codex-native local artifact VLM worker gap. P3-AV11 / #99 is the next safe implementation wave and cannot be accepted until it proves the complete no-user-image web discovery -> local artifact acquisition -> Codex VLM -> visual verifier -> report citation path in the default full-runner UX.
 - Wave 7: P3-RUN1 / #106 and P3-AV12 / #105 are post-P3-AV11 real-use hardening issues. They may proceed in parallel because P3-RUN1 owns child execution retry/backoff while P3-AV12 owns visual fetch/VLM minimum stability. Final visual-minimum acceptance requires both model-capacity and visual-minimum failure classifications to be stable.
 - Wave 8: P3-AV13 / #115 is a post-Wave-7 lineage hardening issue. It is accepted only when multi-angle visual artifacts keep unique IDs and correct `task_id`, `angle_id`, and `route` lineage through candidate, fetch, observation, verifier, and report citation records; the JWST post-fix run satisfies this single-run positive gate.
@@ -2194,6 +2441,7 @@ Deliverables:
 | 스크린샷 수집 | No | Basic | Provider beta | Yes | Yes | Yes |
 | 자동 웹 이미지 조사 E2E | No | No | Partial | Yes | Stable | Team-managed |
 | PDF/논문 figure 자동 판독 | No | No | Prototype | Basic | Yes | Yes |
+| Planner mode / question decomposition | No | Heuristic template, not semantic | Heuristic fallback only | Codex semantic + review gate | Stable semantic | Team-managed |
 | ModalityRouter | Basic | Yes | Yes | Yes | Yes | Policy-aware |
 | Agent budget | Manual | Presets | Cost estimator | User controls | Policy controls | Team controls |
 | Evidence 저장 | Schema v0 JSON/MD | Schema v0 JSON/MD | Versioned draft | Browsable | Versioned stable | Shared |
@@ -2210,6 +2458,12 @@ Deliverables:
 - plugin manifest `.codex-plugin/plugin.json`이 validation을 통과한다.
 - personal marketplace metadata가 존재하고 install/update/remove 절차가 문서화되어 있다.
 - `$deep-research: smoke test`가 Codex 세션에서 run directory, `report.md`, `evidence.json`, `run_status.json`, 그리고 synthesis가 성공한 run의 `report_status.json`을 생성한다.
+- Release-counted `$deep-research` runs must write `semantic_plan.json`, `semantic_expectation_oracle.json`, and `semantic_plan_review.json` with `planner_mode=codex_semantic`, `semantic_release_eligible=true`, `semantic_fit_score >= 9.0`, no blockers, no forbidden internal implementation leakage, complete `oracle_requirement_map[]`, complete `requirement_coverage_map[]`, locked `question_scope`, depth-appropriate bounded task count, planner request/response artifact paths, oracle raw request/response artifact paths, reviewer raw request/response artifact paths, locked expectation oracle hash, reviewer response hash, valid `reviewer_independence`, valid oracle/planner/reviewer provenance separation, and a passing `substitute_implementation_check`. Missing, shared, inconsistent, or reverse-fit oracle/reviewer provenance invalidates the release gate.
+- Release-counted `$deep-research` runs must include `run_trace.jsonl` semantic ordering events proving `semantic_oracle_locked` happened before `semantic_planner_request_created`, and `semantic_reviewer_request_created` happened after `semantic_plan_created` using the locked oracle hash. Self-attested booleans without trace-backed artifact hashes are not enough.
+- Release-counted task materialization must diff `semantic_plan.json` against `research_tasks.json`, `search_tasks.json`, `visual_tasks.json`, visual acquisition plans, visual provider status, and parallel assignments. The diff must prove exact task-set equality, no missing/extra/duplicate semantic task IDs, no dropped search/visual obligations, and preservation of `task_id`, `angle_id`, `query`, `route`, `freshness_requirement`, `source_policy`, expected source types, expected visual targets, expected artifacts, source/image caps, success criteria, and done condition unless an approved semantic plan version was created before fan-out.
+- Release-counted `semantic_plan_delta.json` usage must be trace-proven before rematerialization and before any affected search handoff, visual handoff, subagent assignment, or fan-out. Post-handoff/post-fan-out deltas are release-ineligible unless the run restarts from a new semantic plan version.
+- Release-counted semantic planner evidence cannot come from `heuristic_template_planner`, manual angles, fixture plans, hidden template rewriting, or generic report-only diagnostics.
+- Release-counted semantic planner evidence must prove that the actual user question drove the generated angles and bounded tasks. A good final report without a valid semantic plan/review/provenance chain does not satisfy this gate.
 - `codex-plugin` mode의 search handoff와 VLM handoff artifact가 schema validation을 통과한다.
 - `verification_status`, `review_status`, `promotion_status`가 모든 claim에 존재한다.
 - `SearchResult`, `VisualEvidence`, `VerifierVote` adapter records가 schema v0에 맞게 validate된다.
@@ -2356,10 +2610,12 @@ Public Beta automatic visual policy:
 Metric denominators:
 
 - Product-Level Acceptance Criteria는 release gate다. gate 항목은 해당 release에서 100% 통과해야 한다.
+- Semantic planner release gates are stricter than operational SLOs: every release-counted Public Beta and Product v1 default `$deep-research` run must pass semantic planner eligibility, requirement coverage, substitute implementation, and provenance gates. Percentage targets below are not allowed to dilute those gates.
+- Semantic planner release metrics use the full pre-registered release-counted manifest as the denominator. `blocked_semantic_planner_unavailable`, semantic review failure, manual-angle fallback, heuristic fallback, hidden-template detection, and release-ineligible semantic artifacts count as semantic release failures, not excluded blocked runs.
 - 아래 phase metric은 `policy_blocked`, `needs_manual_review`, `blocked_missing_search_handoff`, `blocked_missing_visual_provider`, `blocked_missing_vlm_provider`, `policy_blocked_visual`로 정상 차단된 run을 제외한 completed non-blocked runs 기준이다.
 - blocked run은 실패가 아니라 별도 `blocked_*` 상태로 집계하지만, Public Beta에서 필수 provider/scenario gate를 검증하는 run이 `blocked_*`로 끝나면 해당 release gate는 미충족이다.
 - `partial_auto_visual`과 non-exempt `budget_pruned_visual`은 automatic visual E2E denominator에 포함하고 numerator에서는 제외한다.
-- `completed_fixture`는 fixture-only metric에는 사용할 수 있지만 real-use, codex-plugin interactive, automated-cli real provider, Public Beta release denominator와 numerator에서 제외한다.
+- `completed_fixture`는 fixture-only/non-release operational metric에는 사용할 수 있지만 real-use, codex-plugin interactive, automated-cli real provider numerator에서는 제외한다. Semantic planner release metrics are stricter: any pre-registered release-counted semantic run that ends as `completed_fixture` or uses fixture/manual/heuristic behavior remains in the semantic denominator and counts as a failure, never as a pass.
 
 Metric status classification:
 
@@ -2385,6 +2641,15 @@ Metric status classification:
 | automatic web visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
 | codex-plugin interactive visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
 | automated-cli real provider visual E2E pass rate | n/a | n/a | 70% | 90% | 95% |
+| semantic planner release-eligible pass rate | n/a | n/a | 0% until implemented | 100% release gate | 100% release gate |
+| semantic fit blocker leakage | n/a | n/a | 0 | 0 | 0 |
+| heuristic/template planner counted as semantic | 0 | 0 | 0 | 0 | 0 |
+| semantic requirement coverage completeness | n/a | n/a | 0% until implemented | 100% release gate | 100% release gate |
+| substitute implementation leakage | 0 | 0 | 0 | 0 | 0 |
+| planner provenance completeness | n/a | n/a | 0% until implemented | 100% release gate | 100% release gate |
+| semantic oracle/reviewer provenance completeness | n/a | n/a | 0% until implemented | 100% release gate | 100% release gate |
+| semantic run-trace ordering proof completeness | n/a | n/a | 0% until implemented | 100% release gate | 100% release gate |
+| semantic materialization alignment pass rate | n/a | n/a | 0% until implemented | 100% release gate | 100% release gate |
 | visual minimum satisfaction rate | n/a | n/a | 90% | 95% | 98% |
 | codex child capacity diagnostic classification coverage | n/a | n/a | 100% | 100% | 100% |
 | codex child capacity retry policy compliance | n/a | n/a | 95% | 99% | 99% |
@@ -2407,8 +2672,17 @@ Metric definitions:
 - `codex child capacity diagnostic classification coverage`: percentage of Codex child model-capacity failures that preserve raw child diagnostics, set `child_failure_code=codex_child_model_capacity`, and record `timeout=false`.
 - `codex child capacity retry policy compliance`: percentage of retry-eligible capacity failures that follow configured bounded backoff, attempt limits, timeout limits, and terminal-status rules.
 - `real visual provider provenance coverage`: percentage of image/screenshot/PDF visual artifacts with provider, origin, source page, local artifact, hash, policy state, VLM path, and real-vs-fixture provenance recorded.
-- `visual artifact lineage validation pass rate`: percentage of non-blocked visual-required real-use runs where every visual plan, candidate, fetch, evidence image, VLM observation, verifier link, and report citation has unique IDs and task/angle/route lineage matching `research_tasks.json`. Public Beta target is 99%.
+- `visual artifact lineage validation pass rate`: percentage of non-blocked visual-required real-use runs where every visual plan, candidate, fetch, evidence image, VLM observation, verifier link, and report citation has unique IDs and task/angle/route lineage matching both the accepted `semantic_plan.json` and materialized `research_tasks.json`/`visual_tasks.json`. Public Beta target is 99%.
 - `user-requested report shape adherence`: percentage of sampled real-use reports scoring `>=9/10` on the report quality gate.
+- `semantic planner release-eligible pass rate`: percentage of all pre-registered release-counted runs with `planner_mode=codex_semantic`, `semantic_release_eligible=true`, `semantic_expectation_oracle.json`, `semantic_plan.json`, `semantic_plan_review.json`, oracle/planner/reviewer raw request and response artifacts, complete and independent oracle/planner/reviewer provenance, valid `reviewer_independence`, complete oracle requirement map, complete plan requirement coverage, locked question scope, depth-appropriate bounded task count, `semantic_fit_score >= 9.0`, no reviewer blockers, no forbidden internal implementation leakage, passing substitute implementation check, `semantic_materialization_diff.json.valid=true`, exact task-set equality, and downstream `research_tasks.json`, `search_tasks.json`, `visual_tasks.json`, visual acquisition plans, visual provider status, and parallel assignments aligned field-by-field to the accepted semantic plan or approved semantic plan version. Semantic blocked/fallback/release-ineligible runs remain in this denominator and count as failures.
+- `semantic fit blocker leakage`: count of runs where semantic fit review found a blocker but the runner still spawned research subagents or reported semantic planning success.
+- `heuristic/template planner counted as semantic`: count of fixture, manual, explicit-angle, or `heuristic_template_planner` runs counted as semantic planner passing evidence or numerator. The required value is always 0. Release-counted manifest runs that use these paths remain denominator failures rather than disappearing from semantic release metrics.
+- `semantic requirement coverage completeness`: percentage of release-counted semantic runs where every user requirement and constraint from the original prompt appears first in `oracle_requirement_map[]`, then in `requirement_coverage_map[]`, and is covered by at least one angle and one bounded task. Non-negotiable requirements must be fully covered, user-waived before fan-out, or terminal blocked/failed; optional supplemental requirements may have an accepted partial-coverage caveat only when it does not change the user's core ask.
+- `substitute implementation leakage`: count of release-counted runs that pass while using keyword/template planning, generic LLM rewriting, manual-angle substitution, fixture-only proof, report-only diagnostics, or external-provider drift instead of actual semantic question decomposition. The required value is always 0.
+- `planner provenance completeness`: percentage of release-counted semantic runs with planner adapter, prompt version, model/Codex surface identifier when available, child session id when available, request artifact path, raw response artifact path, parsed response hash, and template-use metadata present and internally consistent.
+- `semantic oracle/reviewer provenance completeness`: percentage of release-counted semantic runs with oracle and reviewer adapter names, prompt versions, model/Codex surface identifiers when available, child/session ids when available, raw request artifact paths, raw response artifact paths, content/response hashes, generated-before-plan timestamp for the oracle, `plan_visible_to_oracle=false`, valid `reviewer_independence`, and no shared planner/oracle/reviewer logic where independence is required. Missing or shared provenance invalidates the run for release gates.
+- `semantic run-trace ordering proof completeness`: percentage of release-counted semantic runs whose `run_trace.jsonl` proves oracle request, oracle lock, planner request, plan creation, reviewer request, and review completion order with matching artifact hashes. Missing, reordered, or hash-inconsistent events invalidate the run for release gates.
+- `semantic materialization alignment pass rate`: percentage of release-counted semantic runs with `semantic_materialization_diff.json.valid=true`, exact bounded-task set equality, no missing/extra/duplicate semantic task IDs, no dropped search/visual obligations, field-by-field alignment from accepted semantic plan or approved plan version into `research_tasks.json`, `search_tasks.json`, `visual_tasks.json`, visual acquisition plans, `SearchResult`, visual records, and subagent assignments, including query, route, freshness requirement, source policy, expected source types, expected visual targets, expected artifacts, success criteria, done condition, and source/image caps, and no unapproved downstream query/route/source-policy/visual-target rewrite.
 - `fresh-session skill full-runner artifact handoff pass rate`: percentage of fresh Codex session `$deep-research` E2E runs where the final response includes a run artifact path, `report.md`, `evidence.json`, `run_status.json`, `report_status.json` after synthesis, status/shard summary, and the backing files exist after the response.
 
 ## 구현 순서
@@ -2416,20 +2690,26 @@ Metric definitions:
 1. Codex Plugin 구조와 `$deep-research` Skill UX를 확정하고, 기본 invocation mode를 `full-runner`로 고정한다.
 2. schema v0 JSON Schema, fixture, validation command를 만든다.
 3. plugin 내부 runner와 개발용 CLI wrapper를 만든다.
-4. `Planner -> ModalityRouter -> Search -> Fetch -> Extract -> Verify -> Synthesize` 파이프라인을 runner에 구현한다.
-5. `codex-plugin`, `automated-cli`, `manual-sources` 실행 모드를 분리한다.
-6. search provider mode를 skill용 Codex-native workflow와 CLI용 provider abstraction으로 분리한다.
-7. VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리한다.
-8. Agent budget preset과 pruning을 구현한다.
-9. run trace, run step state machine, cache key를 구현한다.
-10. Automated runner adapter를 통해 `codex exec --json` 또는 Codex SDK/MCP server 기반 Codex subagent 병렬 orchestration, evidence shard, merge/dedupe를 구현한다.
-11. `$deep-research` fresh-session E2E가 full-runner artifact handoff를 통과하게 한다.
-12. Phase 3 automatic web visual research artifacts와 provider diagnostics를 구현한다.
-13. real web/image search provider, page image extractor, screenshot collector, PDF figure rasterizer, image fetch/cache를 구현한다.
-14. `openai-responses-vision` automated adapter와 visual verifier/report linkage를 구현한다.
-15. 시각 evidence appendix를 생성한다.
-16. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
-17. 웹 UI/워크플로우 대시보드에서 subagent 진행 상태, automatic visual status, visual provider provenance, cost cap을 제어한다.
+4. Existing keyword/template planner를 `heuristic_template_planner`로 분리하고, default/release-counted path에서 semantic planner로 둔갑하지 못하게 `planner_mode`와 `semantic_release_eligible=false`를 기록한다.
+5. `semantic_expectation_oracle.json`, `semantic_plan.json`, `semantic_plan_review.json`, `semantic_plan_delta.json`, oracle/planner/reviewer provenance, `reviewer_independence`, `substitute_implementation_check`, and `blocked_semantic_planner_unavailable` schemas/statuses를 구현한다.
+6. Codex-native semantic plan candidate adapter를 구현한다. Raw user question and constraints must drive intent, entities, constraints, angles, routes, bounded tasks, and visual requirements before any class or routing label is derived. Candidate artifacts remain `semantic_release_eligible=false` until independent review and E2E gates pass.
+7. Independent semantic oracle and reviewer gate를 구현한다. Release-counted plans must pass locked-oracle review, `semantic_fit_score >= 9.0`, no blockers, full non-negotiable requirement coverage, and substitute-implementation rejection before task materialization.
+8. Accepted `semantic_plan.json`에서만 `research_tasks.json`, `search_tasks.json`, `visual_tasks.json`, visual acquisition plans, budget estimates, and parallel assignments를 materialize하고, `semantic_materialization_diff.json` field-by-field alignment validator를 구현한다.
+9. `codex-plugin`, `automated-cli`, `manual-sources` 실행 모드를 분리한다.
+10. search provider mode를 skill용 Codex-native workflow와 CLI용 provider abstraction으로 분리한다.
+11. VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리한다.
+12. `Planner/SemanticReview -> TaskMaterializer -> ModalityRouteValidation -> Search -> Fetch -> Extract -> Verify -> Synthesize` 파이프라인을 runner에 구현한다.
+13. Agent budget preset과 pruning을 구현한다.
+14. run trace, run step state machine, cache key를 구현한다.
+15. Automated runner adapter를 통해 `codex exec --json` 또는 Codex SDK/MCP server 기반 Codex subagent 병렬 orchestration, evidence shard, merge/dedupe를 구현한다.
+16. Semantic regression suite, blind holdout validation, and installed-plugin semantic E2E를 만든다. Public Beta release-counted runs must include oracle-backed prompts, independent-reviewer-selected holdout prompts after implementation freeze, and real-use prompts that prove user-question semantic decomposition before fan-out.
+17. `$deep-research` fresh-session E2E가 full-runner artifact handoff를 통과하게 한다.
+18. Phase 3 automatic web visual research artifacts와 provider diagnostics를 구현한다.
+19. real web/image search provider, page image extractor, screenshot collector, PDF figure rasterizer, image fetch/cache를 구현한다.
+20. `openai-responses-vision` automated adapter와 visual verifier/report linkage를 구현한다.
+21. 시각 evidence appendix를 생성한다.
+22. 개인 marketplace 등록과 plugin install/update 절차를 문서화한다.
+23. 웹 UI/워크플로우 대시보드에서 subagent 진행 상태, automatic visual status, visual provider provenance, cost cap을 제어한다.
 
 ## 참고 근거
 
@@ -2445,6 +2725,12 @@ Metric definitions:
 ## 자체 검토
 
 문제점: 처음 초안은 딥리서치 파이프라인만 있고, 비개발자 입력 경로와 지식 승격 경로가 약했다. 또한 Codex에서 내장 명령처럼 쓰는 배포 표면, subagent 상한, VLM 필요 여부 분류가 명시되어 있지 않았다. 이후 검토에서 MVP가 user-provided image에 의존하면 딥리서치라고 보기 어렵다는 문제가 추가로 확인됐다. 추가 리뷰에서는 문서가 "최종 제품은 Codex Plugin"이라는 방향보다 "독립 CLI 프로그램을 만든 뒤 plugin으로 포장"하는 것처럼 읽히고, Codex interactive VLM/search와 자동 CLI API 호출이 섞여 있다는 문제가 확인됐다. 2026-06-23 PRD 진화 검토에서는 Claude Code deep-research식 병렬 subagent 조사 경험이 예산표에 암시되어 있을 뿐, planner fan-out, subagent assignment, evidence shard, merge/dedupe, 100-agent high fan-out cap이 구현 계약으로 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 실사용 E2E에서는 Phase 2 artifact는 생성되지만, real `codex-exec` shard가 accepted 되지 않고, visual evidence가 final report에 쓰이지 않으며, report synthesis가 사용자 질문 형식을 따르지 않는 문제가 확인됐다. 2026-06-24 추가 PRD 리뷰에서는 Phase 3가 dashboard/evidence review 중심으로 정의되어 있어, 사용자가 원하는 "웹 조사 중 이미지/차트/논문 figure를 자동 발견하고 VLM으로 판독하는" end-to-end 자동 웹 이미지 조사가 구현 범위와 gate에 충분히 명시되어 있지 않다는 문제가 확인됐다. 2026-06-24 skill UX 리뷰에서는 새 Codex 세션의 `$deep-research` invocation이 full runner를 끝까지 실행하지 않고 일반 대화형 답변으로 새어 나갈 수 있어, 개발 검증용 runner 결과와 실제 사용자 체감이 달라지는 문제가 확인됐다. 2026-06-29 PR #104 이후 Apollo public-image 실사용 E2E에서는 timeout hardening 자체는 동작했지만, 한 run은 2개 이미지만 Codex-interactive로 분석되어 3개 visual minimum을 충족하지 못했고, 다른 run은 `Selected model is at capacity. Please try a different model.` 메시지와 함께 child가 실패했음이 확인됐다. 2026-06-30 JWST text-plus-visual 실사용 E2E에서는 real `codex-exec` shard, 자동 이미지 후보 수집, Codex-interactive VLM 분석, report citation이 모두 작동했지만, visual artifact lineage가 잘못 기록되어 `duplicate_id`, `angle_mismatch`, `route_mismatch` 검증 오류가 발생했고 최종 상태가 `partial_auto_visual`로 남는 문제가 확인됐다.
+
+2026-07-06 semantic planner integrity incident: The coordinator/review process accepted and represented a keyword/template planner as a `semantic_planner`. This deceived the user about the actual capability: the product appeared to have semantic question understanding and decomposition, while the implementation selected broad classes by keyword and emitted fixed templates. The EV battery fire safety prompt proved the harm: a domain phrase containing `안전 테스트 이미지/도표` was misread as software implementation, generated internal Codex architecture tasks, and still passed `semantic_planner_validation.ok=true`. This PRD now records that behavior as a user-deceptive implementation misrepresentation, not a neutral PRD mismatch.
+
+2026-07-06 semantic planner adversarial PRD review: A follow-up reviewer found that the initial integrity contract still allowed weak acceptance through percentage-based semantic metrics, reviewer expectations reverse-fit after seeing a plan, under-specified bounded task fan-out, cherry-picked "representative" audits, and a release matrix row that called heuristic decomposition semantic. The PRD now requires 100% semantic release gates for release-counted runs, locked `semantic_expectation_oracle.json` before plan review, depth-based 20-100 bounded task fan-out, pre-registered 20-run Public Beta manifests, risk-based trace audits, and explicit "heuristic template, not semantic" naming.
+
+2026-07-06 second semantic planner adversarial PRD review: A further review found that the state machine still lacked a first-class semantic planning state, expectation oracles could omit user requirements, narrow-question exceptions were under-specified, manual fallback lacked explicit release-ineligible states, bounded-task violations were not hard blockers, and Public Beta manifest quotas were too loose. The PRD now adds `semantic_planning`, `manual_angles_pending`, and `prepared_manual_fallback` states; requires `oracle_requirement_map[]`; locks `question_scope`; defines broad/narrow task-count rules; makes task-count, task-executability, done-condition, and lineage failures semantic blockers; and adds Public Beta manifest quotas for Korean, visual, official/regulatory, ambiguous-term, non-software, and historical-failure prompts.
 
 수정: 최종 배포 단위를 Codex Plugin으로 명시하고, CLI는 plugin 내부 runner의 개발/테스트/자동화용 wrapper로 재정의했다. 실행 모드를 `codex-plugin`, `automated-cli`, `manual-sources`로 분리했고, VLM path를 `codex-interactive`, `openai-responses-vision`, `manual-visual-review`로 분리했다. Search provider도 plugin용 Codex-native workflow와 CLI용 provider abstraction으로 나누었다. 또한 `schema_version`, source retrieval metadata, image artifact path, VLM observation/inference 분리, quote span, verifier vote metadata를 포함하는 Evidence Schema v0를 PRD의 핵심 계약으로 확정했다. 이번 진화에서는 Parallel Codex Subagent Orchestration Contract를 추가해 `research_tasks.json`, `subagent_assignments.jsonl`, evidence shard, `merge_status.json`, task state, degradation behavior, `max_concurrent_codex_subagents`, `exhaustive` 100-subagent confirmation rule을 구현 가능한 요구사항으로 명시했다. 2026-06-23 추가 검증에서는 Codex CLI가 `spawn_agent`, `wait`, `close_agent` JSON events로 2개 subagent를 생성하고 결과를 회수하는 smoke test를 통과했으므로, M18의 첫 구현 방식을 automated runner adapter로 확정했다. 2026-06-24 수정에서는 real-use E2E finding을 PRD에 추가하고, M19-M24 hardening tickets로 trusted `codex-exec` context, parallel status semantics, visual evidence linkage, user-shaped report synthesis, run-step stability, fixture-vs-real E2E distinction을 공식 Phase 2 후속 범위로 편입했다. 이번 Phase 3 진화에서는 Automatic Web Visual Research Contract를 추가하고, `visual_search_plan.json`, `visual_candidates.jsonl`, `image_fetch_status.jsonl`, `visual_provider_status.json`, real provider provenance, `completed_auto_visual` 상태, `openai-responses-vision` automated adapter, browser screenshot, PDF figure rasterization, visual E2E gate를 Phase 3 범위와 WBS에 명시했다. 또한 Skill Invocation Full-Runner UX Contract를 추가해 `$deep-research` 기본 mode를 `full-runner`로 고정하고, `quick-chat`은 명시 요청 때만 허용하며, 최종 응답이 run directory, `report.md`, `evidence.json`, `run_status.json`, synthesized-run `report_status.json`, applicable visual/parallel status artifacts, shard summary를 노출해야 한다는 fresh-session E2E gate를 Phase 3 P3-UX 이슈로 분리했다. PR #56 후속 검토에서는 codex-plugin full-runner state machine, final status artifact set(`run_status.json`, synthesized-run `report_status.json`, visual/parallel status files), Phase 3 visual artifact field rules, codex-plugin interactive visual E2E와 automated-cli real provider E2E 분리, Public Beta provider/scenario gates, automatic visual ok/terminal/metric classification을 추가해 implementation contract를 더 좁혔다. 추가 후속 검토에서는 `blocked_missing_visual_provider` 전이를 preflight/prepared/visual handoff에서 명시하고, `visual_observations.jsonl` record schema를 추가했다. 2026-06-26 후속 정리에서는 #97 / P3-AV10이 이미 확보된 local visual artifact를 Codex-native VLM worker로 읽는 필요조건일 뿐 complete automatic web visual research가 아님을 명시하고, #99 / P3-AV11을 다음 safe wave로 추가해 full-runner가 web discovery -> local artifact acquisition -> Codex VLM -> visual verifier -> report citation을 한 run에서 완성해야 한다는 acceptance를 추가했다. 2026-06-29 후속 정리에서는 #105 / P3-AV12와 #106 / P3-RUN1을 Wave 7으로 추가해 visual minimum shortfall은 `partial_auto_visual`과 `visual_minimum_shortfall` diagnostics로, Codex child model capacity는 `codex_child_model_capacity`와 bounded retry/backoff로 처리하도록 계약을 좁혔다. 2026-06-30 후속 정리에서는 multi-angle visual run의 `plan_id`, `task_id`, `angle_id`, `route` lineage 보존과 validation 실패 분류를 P3-AV13 범위로 추가했다.
 
