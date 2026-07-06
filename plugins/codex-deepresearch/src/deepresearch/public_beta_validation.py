@@ -92,6 +92,19 @@ SEMANTIC_RELEASE_REQUIRED_ARTIFACTS = (
     "semantic_plan_review",
     "semantic_planner_validation",
 )
+SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES = (
+    "run_status",
+    "evidence.semantic_planner",
+    "semantic_expectation_oracle",
+    "semantic_plan",
+    "semantic_plan.semantic_plan",
+    "semantic_plan_review",
+    "semantic_planner_validation",
+)
+SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES = (
+    "evidence.semantic_planner",
+    "semantic_plan.semantic_plan",
+)
 BLOCKED_TERMINAL_STATUSES = {
     "blocked_preflight",
     "blocked_semantic_planner_unavailable",
@@ -1787,10 +1800,16 @@ def _semantic_release_checks(
         evidence=evidence,
         artifacts=required_payloads,
     )
-    if not planner_sources:
+    missing_planner_sources = [
+        source
+        for source in SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES
+        if source not in planner_sources
+    ]
+    if missing_planner_sources:
         failures.append(
             {
                 "check": "semantic_planner_mode",
+                "missing_sources": missing_planner_sources,
                 "detail": "planner_mode is missing from semantic release artifacts",
             }
         )
@@ -1810,10 +1829,16 @@ def _semantic_release_checks(
         evidence=evidence,
         artifacts=required_payloads,
     )
-    if not eligible_sources:
+    missing_eligible_sources = [
+        source
+        for source in SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES
+        if source not in eligible_sources
+    ]
+    if missing_eligible_sources:
         failures.append(
             {
                 "check": "semantic_release_eligible",
+                "missing_sources": missing_eligible_sources,
                 "detail": "semantic_release_eligible is missing from semantic release artifacts",
             }
         )
@@ -1828,8 +1853,36 @@ def _semantic_release_checks(
                 }
             )
 
+    codex_source_sources = _semantic_codex_source_sources(
+        evidence=evidence,
+        artifacts=required_payloads,
+    )
+    missing_codex_source_sources = [
+        source
+        for source in SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES
+        if source not in codex_source_sources
+    ]
+    if missing_codex_source_sources:
+        failures.append(
+            {
+                "check": "semantic_codex_source",
+                "missing_sources": missing_codex_source_sources,
+                "detail": "codex_semantic source provenance is missing from semantic release artifacts",
+            }
+        )
+    for source, codex_source in sorted(codex_source_sources.items()):
+        if codex_source != "codex_semantic":
+            failures.append(
+                {
+                    "check": "semantic_codex_source",
+                    "source": source,
+                    "semantic_source": codex_source,
+                    "detail": f"{source}.source is {codex_source}, expected codex_semantic",
+                }
+            )
+
     validation = required_payloads.get("semantic_planner_validation")
-    if isinstance(validation, Mapping) and validation.get("ok") is not True:
+    if not isinstance(validation, Mapping) or validation.get("ok") is not True:
         failures.append(
             {
                 "check": "semantic_planner_validation_ok",
@@ -1839,8 +1892,16 @@ def _semantic_release_checks(
 
     review = required_payloads.get("semantic_plan_review")
     if isinstance(review, Mapping):
-        score = _float_or_none(review.get("semantic_fit_score"))
-        if score is not None and score < 9.0:
+        score = _numeric_or_none(review.get("semantic_fit_score"))
+        if score is None:
+            failures.append(
+                {
+                    "check": "semantic_fit_score",
+                    "semantic_fit_score": review.get("semantic_fit_score"),
+                    "detail": "semantic_plan_review.semantic_fit_score is missing or non-numeric",
+                }
+            )
+        elif score < 9.0:
             failures.append(
                 {
                     "check": "semantic_fit_score",
@@ -1849,7 +1910,14 @@ def _semantic_release_checks(
                 }
             )
         blockers = review.get("blockers")
-        if isinstance(blockers, list) and blockers:
+        if not isinstance(blockers, list):
+            failures.append(
+                {
+                    "check": "semantic_review_blockers",
+                    "detail": "semantic_plan_review.blockers must be a list",
+                }
+            )
+        elif blockers:
             failures.append(
                 {
                     "check": "semantic_review_blockers",
@@ -1858,7 +1926,7 @@ def _semantic_release_checks(
                 }
             )
         substitute = review.get("substitute_implementation_check")
-        if isinstance(substitute, Mapping) and substitute.get("passed") is not True:
+        if not isinstance(substitute, Mapping) or substitute.get("passed") is not True:
             failures.append(
                 {
                     "check": "substitute_implementation_check",
@@ -1866,7 +1934,7 @@ def _semantic_release_checks(
                 }
             )
         independence = review.get("reviewer_independence")
-        if isinstance(independence, Mapping) and independence.get("independent") is not True:
+        if not isinstance(independence, Mapping) or independence.get("independent") is not True:
             failures.append(
                 {
                     "check": "reviewer_independence",
@@ -1881,6 +1949,7 @@ def _semantic_release_checks(
         "present_artifacts": sorted(required_payloads),
         "planner_modes": planner_sources,
         "semantic_release_eligible": eligible_sources,
+        "semantic_codex_sources": codex_source_sources,
         "validation_ok": validation.get("ok") if isinstance(validation, Mapping) else None,
         "semantic_fit_score": review.get("semantic_fit_score") if isinstance(review, Mapping) else None,
         "failures": failures,
@@ -1941,6 +2010,31 @@ def _semantic_release_eligible_sources(
     return sources
 
 
+def _semantic_codex_source_sources(
+    *,
+    evidence: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        _add_string_source(
+            sources,
+            "evidence.semantic_planner",
+            semantic_planner.get("source"),
+        )
+    semantic_plan = artifacts.get("semantic_plan")
+    if isinstance(semantic_plan, Mapping):
+        nested = semantic_plan.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            _add_string_source(
+                sources,
+                "semantic_plan.semantic_plan",
+                nested.get("source"),
+            )
+    return sources
+
+
 def _add_string_source(sources: dict[str, str], source: str, value: Any) -> None:
     if isinstance(value, str) and value.strip():
         sources[source] = value.strip()
@@ -1951,13 +2045,12 @@ def _add_bool_source(sources: dict[str, Any], source: str, value: Any) -> None:
         sources[source] = value
 
 
-def _float_or_none(value: Any) -> float | None:
+def _numeric_or_none(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, (int, float)):
         return float(value)
-    except (TypeError, ValueError):
-        return None
+    return None
 
 
 def _metric_classification(

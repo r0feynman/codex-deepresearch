@@ -641,7 +641,7 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertIn("manual_ingest_status", result["artifacts"])
         self.assertTrue(result["manual_handoff"]["ok"])
 
-    def test_visual_required_without_provider_blocks_with_visual_status_artifact(self) -> None:
+    def test_visual_required_without_angles_blocks_before_visual_provider_preflight(self) -> None:
         with (
             mock.patch("deepresearch.invocation_router.shutil.which", return_value=None),
             mock.patch("deepresearch.invocation_router.run_parallel_orchestration") as parallel_mock,
@@ -655,41 +655,29 @@ class InvocationRouterTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["terminal"])
-        self.assertEqual(result["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(result["selected_mode"], "blocked")
         self.assertIn("actionable_cause", result["diagnostics"])
-        self.assertIn("codex exec is not available on PATH", result["diagnostics"]["actionable_cause"])
+        self.assertIn("True semantic decomposition did not run", result["diagnostics"]["actionable_cause"])
         self.assertIn("run_status", result["artifacts"])
-        self.assertIn("visual_provider_status", result["artifacts"])
+        self.assertNotIn("visual_provider_status", result["artifacts"])
+        self.assertNotIn("search_tasks", result["artifacts"])
+        self.assertNotIn("visual_tasks", result["artifacts"])
+        self.assertNotIn("parallel_orchestration_status", result["artifacts"])
         parallel_mock.assert_not_called()
 
         run_status = self.read_json(Path(result["artifacts"]["run_status"]))
         self.assertFalse(run_status["ok"])
         self.assertTrue(run_status["terminal"])
-        self.assertEqual(run_status["status"], "blocked_missing_vlm_provider")
+        self.assertEqual(run_status["status"], "blocked_semantic_planner_unavailable")
         self.assertEqual(
             run_status["diagnostics"]["actionable_cause"],
             result["diagnostics"]["actionable_cause"],
         )
-        self.assertNotIn("failure_code", run_status["diagnostics"])
-
-        visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
-        self.assertFalse(visual_provider_status["ok"])
-        self.assertTrue(visual_provider_status["terminal"])
-        self.assertEqual(visual_provider_status["status"], "blocked_missing_vlm_provider")
-        self.assertEqual(
-            visual_provider_status["diagnostics"]["actionable_cause"],
-            result["diagnostics"]["actionable_cause"],
-        )
-        self.assertNotIn("failure_code", visual_provider_status["diagnostics"])
-        self.assertTrue(visual_provider_status["providers"][0]["configured"])
-        self.assertFalse(visual_provider_status["providers"][0]["available"])
-        self.assertEqual(visual_provider_status["providers"][0]["blocked_reason"], "codex_exec_unavailable")
 
         trace = self.read_jsonl(Path(result["artifacts"]["run_trace"]))
-        self.assertEqual(trace[-1]["event_type"], "visual_provider_preflight")
-        self.assertEqual(trace[-1]["status"], "blocked_missing_vlm_provider")
-        self.assertEqual(trace[-1]["provider"], "codex-interactive")
-        self.assertEqual(trace[-1]["adapter"], "codex-exec")
+        self.assertEqual(trace[-1]["event_type"], "semantic_planner_blocked")
+        self.assertEqual(trace[-1]["status"], "blocked_semantic_planner_unavailable")
 
     def test_visual_required_with_codex_worker_available_reaches_parallel_handoff(self) -> None:
         runs_dir = self.temp_runs_dir()
@@ -742,6 +730,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect product screenshots for evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
@@ -1135,6 +1124,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
@@ -1372,6 +1362,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public images for lineage",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="quick",
                 min_tasks=3,
                 max_tasks=3,
@@ -1664,6 +1655,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
@@ -1857,6 +1849,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots and chart images for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="quick",
                 max_images=12,
                 min_tasks=1,
@@ -2103,6 +2096,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: find and cite at least ten public Apollo 11 images",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="standard",
                 max_images=12,
                 min_tasks=1,
@@ -2285,6 +2279,7 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect public product screenshots for visual evidence",
                 runs_dir=runs_dir,
                 route="visual_required",
+                angles=["primary source discovery"],
                 budget_preset="quick",
                 min_tasks=1,
                 max_tasks=1,
@@ -2564,6 +2559,7 @@ class InvocationRouterTests(unittest.TestCase):
             runs_dir=self.temp_runs_dir(),
             adapter_name="fixture",
             route="visual_required",
+            angles=["primary source discovery"],
             budget_preset="quick",
             min_tasks=1,
             max_tasks=1,

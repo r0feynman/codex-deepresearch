@@ -487,7 +487,7 @@ class SemanticPlannerTests(unittest.TestCase):
             for token in SEMANTIC_FIXTURES[0]["critical_query_tokens"]:
                 self.assertIn(token.lower(), lowered_query)
 
-    def test_visual_route_override_without_angles_uses_legacy_single_route(self) -> None:
+    def test_visual_route_override_without_angles_blocks_before_task_materialization(self) -> None:
         for route in ("visual_required", "visual_optional"):
             with self.subTest(route=route):
                 result = prepare_run(
@@ -496,28 +496,31 @@ class SemanticPlannerTests(unittest.TestCase):
                     route=route,
                     budget_preset="quick",
                 )
-                evidence = self.load_json(Path(result["run_dir"]) / "evidence.json")
+                run_dir = Path(result["run_dir"])
+                evidence = self.load_json(run_dir / "evidence.json")
 
-                self.assertEqual(evidence["semantic_planner"]["source"], "manual_angles")
+                self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+                self.assertEqual(
+                    evidence["semantic_planner"]["source"],
+                    "blocked_semantic_planner_unavailable",
+                )
                 self.assertEqual(
                     evidence["semantic_planner"]["planner_mode"],
-                    PLANNER_MODE_MANUAL_ANGLES,
+                    PLANNER_MODE_BLOCKED,
                 )
                 self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
-                self.assertEqual(len(evidence["semantic_angles"]), 1)
-                self.assertEqual(len(evidence["routing"]), 1)
-                self.assertEqual(evidence["semantic_angles"][0]["route"], route)
-                self.assertEqual(evidence["routing"][0]["modality"], route)
+                self.assertEqual(evidence["semantic_planner"]["status"], "blocked_semantic_planner_unavailable")
+                self.assertEqual(evidence["semantic_angles"], [])
+                self.assertEqual(evidence["routing"], [])
+                self.assertFalse((run_dir / "search_tasks.json").exists())
+                self.assertFalse((run_dir / "visual_tasks.json").exists())
+                self.assertFalse((run_dir / "research_tasks.json").exists())
+                self.assertFalse((run_dir / "parallel_orchestration_status.json").exists())
 
-                planned = plan_research_tasks(run=Path(result["run_dir"]), min_tasks=1)
-                validation = self.load_json(
-                    Path(result["run_dir"]) / "semantic_planner_validation.json"
-                )
-                self.assertEqual(len(planned["tasks"]), 1)
-                self.assertFalse(validation["broad_question"])
+                validation = self.load_json(run_dir / "semantic_planner_validation.json")
                 self.assert_release_ineligible_semantic_validation(
                     validation,
-                    planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+                    planner_mode=PLANNER_MODE_BLOCKED,
                 )
 
     def test_visual_evidence_terms_win_over_implementation_wording(self) -> None:

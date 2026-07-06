@@ -320,6 +320,8 @@ class BudgetEstimatorTests(unittest.TestCase):
                 str(runs_dir),
                 "--route",
                 "visual_required",
+                "--angle",
+                "primary source discovery",
                 "--max-images",
                 "0",
             ],

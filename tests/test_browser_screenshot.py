@@ -20,6 +20,13 @@ from deepresearch.browser_screenshot import (  # noqa: E402
     PlaywrightBrowserTransport,
 )
 
+prepare_search_handoff_run = prepare_run
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", ["primary source discovery"])
+    return prepare_search_handoff_run(*args, **kwargs)
+
 
 class FakeBrowserTransport:
     name = "fake-browser"

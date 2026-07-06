@@ -324,6 +324,165 @@ class PublicBetaValidationTests(unittest.TestCase):
         for artifact_name in checks["required_artifacts"]:
             self.assertIn(artifact_name, result["status_artifacts"])
 
+    def test_codex_semantic_text_run_requires_complete_review_evidence(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("missing-score", "pop", "semantic_fit_score", "semantic_fit_score"),
+            ("string-score", "set", "semantic_fit_score", "semantic_fit_score"),
+            ("low-score", "low", "semantic_fit_score", "semantic_fit_score"),
+            ("missing-blockers", "pop", "blockers", "semantic_review_blockers"),
+            ("invalid-blockers", "set", "blockers", "semantic_review_blockers"),
+            ("nonempty-blockers", "nonempty", "blockers", "semantic_review_blockers"),
+            (
+                "missing-reviewer-independence",
+                "pop",
+                "reviewer_independence",
+                "reviewer_independence",
+            ),
+            (
+                "failed-reviewer-independence",
+                "failed",
+                "reviewer_independence",
+                "reviewer_independence",
+            ),
+            (
+                "missing-substitute-check",
+                "pop",
+                "substitute_implementation_check",
+                "substitute_implementation_check",
+            ),
+            (
+                "failed-substitute-check",
+                "failed",
+                "substitute_implementation_check",
+                "substitute_implementation_check",
+            ),
+        )
+        for case_name, action, field, expected_check in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                review = self.read_json(run_dir / "semantic_plan_review.json")
+                if action == "pop":
+                    review.pop(field, None)
+                elif action == "set" and field == "semantic_fit_score":
+                    review[field] = "9.4"
+                elif action == "low":
+                    review[field] = 8.99
+                elif action == "set" and field == "blockers":
+                    review[field] = {"count": 0}
+                elif action == "nonempty":
+                    review[field] = [{"code": "semantic_gap"}]
+                elif action == "failed" and field == "reviewer_independence":
+                    review[field] = {"independent": False, "status": "shared"}
+                elif action == "failed" and field == "substitute_implementation_check":
+                    review[field] = {"passed": False, "checked": True}
+                else:
+                    raise AssertionError(f"unhandled review mutation: {case_name}")
+                self.write_json(run_dir / "semantic_plan_review.json", review)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["metric_classification"], "included_failure")
+                failure_checks = {
+                    failure["check"]
+                    for failure in result["semantic_release_checks"]["failures"]
+                }
+                self.assertIn(expected_check, failure_checks)
+
+    def test_codex_semantic_text_run_requires_codex_semantic_source_provenance(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("missing-evidence-source", "evidence", None, "evidence.semantic_planner"),
+            ("raw-plan-source", "semantic_plan", "raw_fixture", "semantic_plan.semantic_plan"),
+        )
+        for case_name, artifact, source_value, expected_source in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_parallel",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                if artifact == "evidence":
+                    evidence = self.read_json(run_dir / "evidence.json")
+                    evidence["semantic_planner"].pop("source", None)
+                    self.write_json(run_dir / "evidence.json", evidence)
+                elif artifact == "semantic_plan":
+                    semantic_plan = self.read_json(run_dir / "semantic_plan.json")
+                    semantic_plan["semantic_plan"]["source"] = source_value
+                    self.write_json(run_dir / "semantic_plan.json", semantic_plan)
+                else:
+                    raise AssertionError(f"unhandled provenance mutation: {case_name}")
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed", result)
+                failures = result["semantic_release_checks"]["failures"]
+                source_failures = [
+                    failure
+                    for failure in failures
+                    if failure["check"] == "semantic_codex_source"
+                ]
+                self.assertTrue(source_failures, failures)
+                self.assertTrue(
+                    any(
+                        failure.get("source") == expected_source
+                        or expected_source in failure.get("missing_sources", [])
+                        for failure in source_failures
+                    ),
+                    source_failures,
+                )
+
+    def test_semantic_release_failure_paths_remain_included_failures(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("heuristic", "completed_parallel", True, "heuristic_fallback"),
+            ("manual", "completed_manual_planner_fallback", True, "missing"),
+            ("fixture", "completed_fixture", True, "missing"),
+            ("blocked", "blocked_semantic_planner_unavailable", False, "missing"),
+        )
+        for case_name, status, ok, semantic_planning in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status=status,
+                    ok=ok,
+                    semantic_planning=semantic_planning,
+                )
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["metric_classification"], "included_failure")
+                self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+
     def test_partial_parallel_reliability_counts_passing_text_and_visual_runs(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}

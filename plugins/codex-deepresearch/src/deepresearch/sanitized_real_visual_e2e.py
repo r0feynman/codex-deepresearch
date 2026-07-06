@@ -341,6 +341,7 @@ def _prepare_replay_run(
         question=question,
         runs_dir=suite_dir / "runs",
         route="visual_required",
+        angles=["primary source discovery"],
         budget_preset="standard",
         vlm_provider=CODEX_INTERACTIVE_PROVIDER,
         max_results=max(8, candidate_count),

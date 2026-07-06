@@ -18,6 +18,13 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ingest_manual_sources, prepare_run, validate_artifacts
 
+prepare_search_handoff_run = prepare_run
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", ["primary source discovery"])
+    return prepare_search_handoff_run(*args, **kwargs)
+
 
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="

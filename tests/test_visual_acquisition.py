@@ -27,6 +27,13 @@ from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
 from deepresearch.visual_acquisition import _BraveImageSearchResponse  # noqa: E402
 from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
 
+prepare_search_handoff_run = prepare_run
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", ["primary source discovery"])
+    return prepare_search_handoff_run(*args, **kwargs)
+
 
 class FakeBraveImageTransport:
     def __init__(self, *, count: int = 12) -> None:

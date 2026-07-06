@@ -931,6 +931,8 @@ def main() -> None:
                 vision_runs_dir,
                 "--route",
                 "visual_required",
+                "--angle",
+                "primary source discovery",
             ],
             cwd=ROOT,
             check=False,

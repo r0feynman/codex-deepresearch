@@ -1002,11 +1002,7 @@ def _effective_explicit_angles_for_route(
     angles: Sequence[str] | None,
     route: str | None,
 ) -> Sequence[str] | None:
-    if angles is not None:
-        return angles
-    if route in {"visual_required", "visual_optional"}:
-        return ["primary source discovery"]
-    return None
+    return angles
 
 
 def _semantic_angle_evidence_record(route_record: Mapping[str, Any]) -> dict[str, Any]:
