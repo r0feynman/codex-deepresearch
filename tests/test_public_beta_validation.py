@@ -159,6 +159,144 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(metric["denominator_completed_non_blocked"], 2)
         self.assertEqual(metric["pass_rate"], 0.5)
 
+    def test_partial_parallel_reliability_counts_passing_text_and_visual_runs(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-partial-reliability"
+        prompt_runs = self.write_all_passing_prompt_runs(
+            manifest,
+            runs_dir=runs_dir,
+            suite_id=suite_id,
+        )
+        for prompt in manifest["prompts"]:
+            run_dir = prompt_runs[prompt["id"]]
+            if prompt["route"] in {"visual_required", "visual_optional"}:
+                self.write_parallel_status(run_dir, status="completed_parallel", planned=5, accepted=5)
+        text_partial = prompt_runs["pb-text-003"]
+        text_status = self.read_json(text_partial / "run_status.json")
+        text_status["status"] = "completed_partial_parallel"
+        self.write_json(text_partial / "run_status.json", text_status)
+        self.write_parallel_status(
+            text_partial,
+            status="completed_partial_parallel",
+            planned=6,
+            accepted=5,
+            failed=1,
+        )
+        self.write_parallel_status(
+            prompt_runs["pb-visual-010"],
+            status="completed_partial_parallel",
+            planned=5,
+            accepted=4,
+            failed=1,
+        )
+
+        payload = run_public_beta_validation(
+            runs_dir=self.temp_dir(),
+            suite_id=suite_id,
+            clean=True,
+            prompt_runs=prompt_runs,
+        )
+
+        self.assertEqual(payload["status"], "passed")
+        reliability = payload["reliability"]["partial_parallel"]
+        self.assertEqual(reliability["partial_parallel_runs"], 2)
+        self.assertEqual(reliability["completed_real_parallel_stage_runs"], 20)
+        self.assertEqual(reliability["partial_parallel_rate"], 0.1)
+        self.assertTrue(reliability["enforcement_active"])
+        self.assertEqual(reliability["threshold_status"], "warning")
+        runs = {run["id"]: run for run in payload["runs"]}
+        self.assertEqual(
+            runs["pb-text-003"]["partial_parallel_summary"]["reason_category"],
+            "failed_tasks",
+        )
+        self.assertTrue(
+            runs["pb-text-003"]["partial_parallel_summary"]["final_artifact_gate_passed"]
+        )
+        self.assertEqual(
+            runs["pb-visual-010"]["partial_parallel_summary"]["accepted_shard_count"],
+            4,
+        )
+        summary_text = Path(payload["artifacts"]["summary"]).read_text(encoding="utf-8")
+        self.assertIn("Partial parallel rate: 10.0% (2 / 20)", summary_text)
+        self.assertIn("Threshold status: warning; enforcement_active=true", summary_text)
+
+    def test_partial_parallel_regression_band_fails_when_denominator_is_enforced(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-partial-regression"
+        prompt_runs = self.write_all_passing_prompt_runs(
+            manifest,
+            runs_dir=runs_dir,
+            suite_id=suite_id,
+        )
+        for prompt in manifest["prompts"]:
+            run_dir = prompt_runs[prompt["id"]]
+            if prompt["route"] in {"visual_required", "visual_optional"}:
+                self.write_parallel_status(run_dir, status="completed_parallel", planned=5, accepted=5)
+        for prompt_id in ("pb-text-003", "pb-text-004", "pb-visual-010"):
+            run_dir = prompt_runs[prompt_id]
+            if prompt_id.startswith("pb-text"):
+                run_status = self.read_json(run_dir / "run_status.json")
+                run_status["status"] = "completed_partial_parallel"
+                self.write_json(run_dir / "run_status.json", run_status)
+            self.write_parallel_status(
+                run_dir,
+                status="completed_partial_parallel",
+                planned=5,
+                accepted=4,
+                failed=1,
+            )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs=prompt_runs,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        reliability = payload["reliability"]["partial_parallel"]
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(reliability["partial_parallel_runs"], 3)
+        self.assertEqual(reliability["completed_real_parallel_stage_runs"], 20)
+        self.assertEqual(reliability["threshold_status"], "regression_failure")
+        self.assertTrue(reliability["release_gate_blocking"])
+        self.assertTrue(
+            any("partial-parallel reliability regression" in gap for gap in payload["remaining_gaps"]),
+            payload["remaining_gaps"],
+        )
+
+    def test_non_passing_partial_parallel_keeps_artifact_gate_failure(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-003"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "partial-missing-report",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_partial_parallel",
+        )
+        self.write_parallel_status(
+            run_dir,
+            status="completed_partial_parallel",
+            planned=6,
+            accepted=5,
+            failed=1,
+        )
+        (run_dir / "report.md").unlink()
+
+        result = evaluate_public_beta_prompt_run(prompt, run_dir)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_category"], "artifact_handoff_failure")
+        self.assertFalse(result["partial_parallel_summary"]["final_artifact_gate_passed"])
+        self.assertEqual(
+            result["partial_parallel_summary"]["reason_category"],
+            "failed_tasks",
+        )
+
     def test_visual_prompt_requires_completed_auto_visual_to_pass(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = next(
@@ -1595,6 +1733,94 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         (run_dir / "report.md").write_text(report, encoding="utf-8")
         return run_dir
+
+    def write_parallel_status(
+        self,
+        run_dir: Path,
+        *,
+        status: str,
+        planned: int,
+        accepted: int,
+        failed: int = 0,
+        blocked: int = 0,
+        rejected: int = 0,
+        discarded: int = 0,
+    ) -> None:
+        partial = status == "completed_partial_parallel" or accepted < planned or any(
+            count > 0 for count in (failed, blocked, rejected, discarded)
+        )
+        reason = "none"
+        if partial:
+            if accepted == 0:
+                reason = "no_accepted_shards"
+            elif failed:
+                reason = "failed_tasks"
+            elif blocked:
+                reason = "blocked_tasks"
+            elif rejected:
+                reason = "rejected_shards"
+            elif discarded:
+                reason = "discarded_tasks"
+            else:
+                reason = "omitted_tasks"
+        failure_counts = {
+            "failed_tasks": failed,
+            "blocked_tasks": blocked,
+            "rejected_shards": rejected,
+            "discarded_tasks": discarded,
+            "by_category": {"invalid_shard": failed} if failed else {},
+        }
+        summary = {
+            "partial": partial,
+            "reason_category": reason,
+            "planned_task_count": planned,
+            "accepted_shard_count": accepted,
+            "omitted_task_count": max(0, planned - accepted),
+            "failed_task_count": failed,
+            "blocked_task_count": blocked,
+            "rejected_shard_count": rejected,
+            "discarded_task_count": discarded,
+            "retried_task_count": 0,
+            "retry_exhausted_task_count": 0,
+            "parallel_degraded": False,
+            "failure_category_counts": failure_counts["by_category"],
+        }
+        payload = {
+            "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+            "run_id": run_dir.name,
+            "status": status,
+            "ok": True,
+            "parallel_degraded": False,
+            "adapter": "codex-exec",
+            "planned_task_count": planned,
+            "runnable_task_count": planned,
+            "accepted_shard_count": accepted,
+            "failure_counts": failure_counts,
+            "retry_summary": {"retry_count": 0, "retry_exhausted_count": 0},
+            "partial_parallel_summary": summary,
+            "partial_reason_category": reason,
+            "evidence_source": {
+                "type": "real_child_execution",
+                "adapter": "codex-exec",
+                "accepted_shards": accepted,
+                "real_child_execution": True,
+                "fixture_only": False,
+                "manual_handoff": False,
+                "attempted_real_child_execution": True,
+            },
+        }
+        self.write_json(run_dir / "parallel_orchestration_status.json", payload)
+        self.write_json(
+            run_dir / "merge_status.json",
+            {
+                **payload,
+                "status": "completed",
+                "accepted_shards": [
+                    {"task_id": f"task_research_{index:03d}"}
+                    for index in range(1, accepted + 1)
+                ],
+            },
+        )
 
     def write_all_passing_prompt_runs(
         self,

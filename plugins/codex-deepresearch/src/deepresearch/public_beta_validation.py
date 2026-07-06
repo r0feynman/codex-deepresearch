@@ -113,6 +113,10 @@ GATE_THRESHOLDS = {
     "automated_cli_real_provider_visual_e2e": 0.90,
     "automatic_web_visual_e2e": 0.90,
 }
+PARTIAL_PARALLEL_TARGET_RATE = 0.05
+PARTIAL_PARALLEL_WARNING_RATE = 0.10
+PARTIAL_PARALLEL_MIN_ENFORCEMENT_DENOMINATOR = 20
+PARTIAL_PARALLEL_HISTORY_SUITE_COUNT = 3
 CODEX_NATIVE_COMPLETION_GATE_IDS = {
     "fresh_session_full_runner_artifact_handoff",
     "codex_plugin_interactive_visual_e2e",
@@ -352,6 +356,12 @@ def run_public_beta_validation(
     )
     outcome_counts = _outcome_counts(evaluated_runs)
     classification_counts = _classification_counts(evaluated_runs)
+    reliability = _reliability_summary(
+        root_runs_dir=root_runs_dir,
+        current_suite_id=suite_id,
+        current_generated_at=generated_at,
+        current_runs=evaluated_runs,
+    )
     prompt_release_gate_ready = all(
         prompt_metrics[metric_id].get("release_gate_ready") is True
         for metric_id in required_gate_ids
@@ -375,10 +385,14 @@ def run_public_beta_validation(
         for key, value in acceptance.items()
         if key != "summary_artifact_public_safe"
     }
+    reliability_regression = (
+        reliability.get("partial_parallel", {}).get("release_gate_blocking") is True
+    )
     status = (
         "failed"
         if outcome_counts["failed"] > 0
         or (external_gates_required and external_gate_failed)
+        or reliability_regression
         else "passed"
         if release_gate_ready and all(pre_summary_acceptance.values())
         else "blocked"
@@ -450,6 +464,7 @@ def run_public_beta_validation(
         "outcome_counts": outcome_counts,
         "classification_counts": classification_counts,
         "failure_category_counts": _failure_category_counts(evaluated_runs),
+        "reliability": reliability,
         "prompt_metrics": prompt_metrics,
         "external_gate_results": external_gate_results,
         "acceptance": acceptance,
@@ -460,6 +475,7 @@ def run_public_beta_validation(
             external_gate_results=external_gate_results,
             required_gate_ids=required_gate_ids,
             external_gates_required=external_gates_required,
+            reliability=reliability,
         ),
         "artifacts": {
             "results": str(results_path.resolve()),
@@ -550,6 +566,7 @@ def evaluate_public_beta_prompt_run(
     run_status = loaded.get("run_status")
     visual_provider_status = loaded.get("visual_provider_status")
     report_status = loaded.get("report_status")
+    parallel_status = loaded.get("parallel_status")
     evidence = loaded.get("evidence")
     report_text = _read_optional_text(artifacts["report"])
     terminal_status = _terminal_status(run_status)
@@ -696,6 +713,11 @@ def evaluate_public_beta_prompt_run(
         "supplied_run_binding": run_binding,
         "status_consistency_failures": status_consistency_failures,
         "codex_native_handoff_checks": codex_native_checks,
+        "partial_parallel_summary": _run_partial_parallel_summary(
+            run_status if isinstance(run_status, Mapping) else {},
+            parallel_status if isinstance(parallel_status, Mapping) else {},
+            final_artifact_gate_passed=status == "passed",
+        ),
         "failure_category": failure_category,
         "failure_detail": detail,
         "public_safe": prompt.get("public_safe") is True,
@@ -1424,6 +1446,7 @@ def _remaining_gaps(
     external_gate_results: Mapping[str, Mapping[str, Any]],
     required_gate_ids: set[str],
     external_gates_required: bool,
+    reliability: Mapping[str, Any],
 ) -> list[str]:
     gaps: list[str] = []
     blocked = [run for run in evaluated_runs if run.get("status") == "blocked"]
@@ -1475,6 +1498,17 @@ def _remaining_gaps(
             "External gate result artifacts failed strict validation for: "
             + " | ".join(details)
             + "."
+        )
+    partial = reliability.get("partial_parallel")
+    if isinstance(partial, Mapping) and partial.get("release_gate_blocking") is True:
+        rate = partial.get("partial_parallel_rate")
+        rate_label = "unknown" if rate is None else f"{rate:.1%}"
+        gaps.append(
+            "Product v1 partial-parallel reliability regression: "
+            f"rate={rate_label}, "
+            f"partial_parallel_runs={partial.get('partial_parallel_runs')}, "
+            "completed_real_parallel_stage_runs="
+            f"{partial.get('completed_real_parallel_stage_runs')}."
         )
     if not gaps:
         gaps.append("No remaining release-gate gaps were detected.")
@@ -1534,6 +1568,25 @@ def _render_summary(results: Mapping[str, Any]) -> str:
             f"- Failed non-blocked: {results['outcome_counts']['failed']}",
             f"- Blocked: {results['outcome_counts']['blocked']}",
             f"- Excluded: {results['outcome_counts']['excluded']}",
+            "",
+            "## Product v1 Reliability",
+            "",
+        ]
+    )
+    partial = results.get("reliability", {}).get("partial_parallel", {})
+    rate = partial.get("partial_parallel_rate")
+    rate_label = "n/a" if rate is None else f"{rate:.1%}"
+    lines.extend(
+        [
+            "- Partial parallel rate: "
+            f"{rate_label} ({partial.get('partial_parallel_runs', 0)} / "
+            f"{partial.get('completed_real_parallel_stage_runs', 0)})",
+            "- Formula: partial_parallel_runs / completed_real_parallel_stage_runs",
+            "- Bands: target <= 5%; warning > 5% and <= 10%; "
+            "regression/failure > 10%",
+            f"- Window suites: {', '.join(partial.get('window', {}).get('suite_ids', [])) or '<none>'}",
+            f"- Threshold status: {partial.get('threshold_status') or '<unknown>'}; "
+            f"enforcement_active={str(partial.get('enforcement_active')).lower()}",
             "",
             "## Remaining Gaps",
             "",
@@ -2384,6 +2437,337 @@ def _provider_provenance(
             "codex_interactive_handoff",
         ),
     }
+
+
+def _reliability_summary(
+    *,
+    root_runs_dir: Path,
+    current_suite_id: str,
+    current_generated_at: str,
+    current_runs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    current_suite = _partial_parallel_suite_summary(
+        suite_id=current_suite_id,
+        generated_at=current_generated_at,
+        runs=current_runs,
+    )
+    previous_suites = _load_previous_partial_parallel_suite_summaries(
+        root_runs_dir=root_runs_dir,
+        current_suite_id=current_suite_id,
+    )
+    suites = _latest_partial_parallel_suites([*previous_suites, current_suite])
+    denominator = sum(
+        _count(suite.get("completed_real_parallel_stage_runs")) for suite in suites
+    )
+    partial_runs = sum(_count(suite.get("partial_parallel_runs")) for suite in suites)
+    rate = (partial_runs / denominator) if denominator else None
+    enforcement_active = denominator >= PARTIAL_PARALLEL_MIN_ENFORCEMENT_DENOMINATOR
+    band = _partial_parallel_rate_band(rate)
+    return {
+        "partial_parallel": {
+            "formula": "partial_parallel_runs / completed_real_parallel_stage_runs",
+            "window": {
+                "latest_public_safe_suite_count": PARTIAL_PARALLEL_HISTORY_SUITE_COUNT,
+                "suite_ids": [str(suite.get("suite_id") or "") for suite in suites],
+                "suites": suites,
+            },
+            "partial_parallel_runs": partial_runs,
+            "completed_real_parallel_stage_runs": denominator,
+            "partial_parallel_rate": rate,
+            "target_rate": PARTIAL_PARALLEL_TARGET_RATE,
+            "warning_rate": PARTIAL_PARALLEL_WARNING_RATE,
+            "bands": {
+                "target": "<= 5%",
+                "warning": "> 5% and <= 10%",
+                "regression_failure": "> 10%",
+            },
+            "band": band,
+            "enforcement_min_denominator": PARTIAL_PARALLEL_MIN_ENFORCEMENT_DENOMINATOR,
+            "enforcement_active": enforcement_active,
+            "threshold_status": band if enforcement_active else "insufficient_denominator",
+            "release_gate_blocking": enforcement_active and band == "regression_failure",
+        }
+    }
+
+
+def _partial_parallel_suite_summary(
+    *,
+    suite_id: str,
+    generated_at: str,
+    runs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    denominator_runs = [run for run in runs if _completed_real_parallel_stage_run(run)]
+    partial_runs = [run for run in denominator_runs if _run_partial_parallel(run)]
+    denominator = len(denominator_runs)
+    partial_count = len(partial_runs)
+    return {
+        "suite_id": suite_id,
+        "generated_at": generated_at,
+        "public_safe": True,
+        "partial_parallel_runs": partial_count,
+        "completed_real_parallel_stage_runs": denominator,
+        "partial_parallel_rate": (partial_count / denominator) if denominator else None,
+        "partial_prompt_ids": [str(run.get("id") or "") for run in partial_runs],
+    }
+
+
+def _load_previous_partial_parallel_suite_summaries(
+    *,
+    root_runs_dir: Path,
+    current_suite_id: str,
+) -> list[dict[str, Any]]:
+    suites: list[dict[str, Any]] = []
+    if not root_runs_dir.exists():
+        return suites
+    for child in root_runs_dir.iterdir():
+        if not child.is_dir() or child.name == current_suite_id:
+            continue
+        path = child / PUBLIC_BETA_VALIDATION_RESULTS_FILENAME
+        payload = _read_optional_json(path)
+        if not isinstance(payload, Mapping) or payload.get("public_safe") is not True:
+            continue
+        existing = _existing_partial_parallel_suite_summary(payload)
+        if existing is not None:
+            suites.append(existing)
+            continue
+        runs = payload.get("runs")
+        if isinstance(runs, list):
+            suites.append(
+                _partial_parallel_suite_summary(
+                    suite_id=str(payload.get("suite_id") or child.name),
+                    generated_at=str(payload.get("generated_at") or ""),
+                    runs=[run for run in runs if isinstance(run, Mapping)],
+                )
+            )
+    return suites
+
+
+def _existing_partial_parallel_suite_summary(
+    payload: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    reliability = payload.get("reliability")
+    if not isinstance(reliability, Mapping):
+        return None
+    partial = reliability.get("partial_parallel")
+    if not isinstance(partial, Mapping):
+        return None
+    window = partial.get("window")
+    if not isinstance(window, Mapping):
+        return None
+    suites = window.get("suites")
+    if not isinstance(suites, list):
+        return None
+    suite_id = str(payload.get("suite_id") or "")
+    for suite in suites:
+        if isinstance(suite, Mapping) and str(suite.get("suite_id") or "") == suite_id:
+            return {
+                "suite_id": suite_id,
+                "generated_at": str(suite.get("generated_at") or payload.get("generated_at") or ""),
+                "public_safe": True,
+                "partial_parallel_runs": _count(suite.get("partial_parallel_runs")),
+                "completed_real_parallel_stage_runs": _count(
+                    suite.get("completed_real_parallel_stage_runs")
+                ),
+                "partial_parallel_rate": suite.get("partial_parallel_rate"),
+                "partial_prompt_ids": list(suite.get("partial_prompt_ids") or []),
+            }
+    return None
+
+
+def _latest_partial_parallel_suites(
+    suites: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for suite in suites:
+        suite_id = str(suite.get("suite_id") or "")
+        if suite_id:
+            deduped[suite_id] = dict(suite)
+    return sorted(
+        deduped.values(),
+        key=lambda suite: str(suite.get("generated_at") or ""),
+        reverse=True,
+    )[:PARTIAL_PARALLEL_HISTORY_SUITE_COUNT]
+
+
+def _run_partial_parallel_summary(
+    run_status: Mapping[str, Any],
+    parallel_status: Mapping[str, Any],
+    *,
+    final_artifact_gate_passed: bool,
+) -> dict[str, Any]:
+    source = _as_mapping(parallel_status.get("partial_parallel_summary"))
+    failure_counts = _as_mapping(parallel_status.get("failure_counts"))
+    retry_summary = _as_mapping(parallel_status.get("retry_summary"))
+    evidence_source = _as_mapping(parallel_status.get("evidence_source"))
+    planned = _first_count(
+        source.get("planned_task_count"),
+        parallel_status.get("planned_task_count"),
+    )
+    accepted = _first_count(
+        source.get("accepted_shard_count"),
+        parallel_status.get("accepted_shard_count"),
+        evidence_source.get("accepted_shards"),
+    )
+    omitted = _first_count(source.get("omitted_task_count"))
+    if omitted is None:
+        omitted = max(0, (planned or 0) - (accepted or 0)) if planned is not None else 0
+    failed = _first_count(source.get("failed_task_count"), failure_counts.get("failed_tasks")) or 0
+    blocked = _first_count(source.get("blocked_task_count"), failure_counts.get("blocked_tasks")) or 0
+    rejected = _first_count(source.get("rejected_shard_count"), failure_counts.get("rejected_shards")) or 0
+    discarded = _first_count(source.get("discarded_task_count"), failure_counts.get("discarded_tasks")) or 0
+    retried = _first_count(source.get("retried_task_count"), retry_summary.get("retry_count")) or 0
+    retry_exhausted = _first_count(
+        source.get("retry_exhausted_task_count"),
+        retry_summary.get("retry_exhausted_count"),
+    ) or 0
+    partial = source.get("partial")
+    if not isinstance(partial, bool):
+        partial = (
+            str(parallel_status.get("status") or run_status.get("status") or "")
+            == "completed_partial_parallel"
+            or ((accepted or 0) > 0 and omitted > 0)
+            or any(count > 0 for count in (failed, blocked, rejected, discarded))
+            or bool(parallel_status.get("parallel_degraded"))
+        )
+    reason = str(
+        source.get("reason_category")
+        or parallel_status.get("partial_reason_category")
+        or ""
+    )
+    if not reason:
+        reason = _partial_reason_category_from_counts(
+            partial=partial,
+            accepted=accepted or 0,
+            failed=failed,
+            blocked=blocked,
+            rejected=rejected,
+            discarded=discarded,
+            retry_exhausted=retry_exhausted,
+            omitted=omitted,
+            parallel_degraded=bool(parallel_status.get("parallel_degraded")),
+        )
+    return {
+        "partial": partial,
+        "reason_category": reason,
+        "completed_real_parallel_stage": _completed_real_parallel_stage_from_artifacts(
+            run_status=run_status,
+            parallel_status=parallel_status,
+        ),
+        "parallel_stage_status": str(
+            parallel_status.get("status") or run_status.get("status") or "unknown"
+        ),
+        "planned_task_count": planned or 0,
+        "accepted_shard_count": accepted or 0,
+        "omitted_task_count": omitted,
+        "failed_task_count": failed,
+        "blocked_task_count": blocked,
+        "rejected_shard_count": rejected,
+        "discarded_task_count": discarded,
+        "retried_task_count": retried,
+        "retry_exhausted_task_count": retry_exhausted,
+        "final_artifact_gate_passed": final_artifact_gate_passed,
+    }
+
+
+def _completed_real_parallel_stage_run(run: Mapping[str, Any]) -> bool:
+    summary = run.get("partial_parallel_summary")
+    return isinstance(summary, Mapping) and summary.get("completed_real_parallel_stage") is True
+
+
+def _run_partial_parallel(run: Mapping[str, Any]) -> bool:
+    summary = run.get("partial_parallel_summary")
+    return isinstance(summary, Mapping) and summary.get("partial") is True
+
+
+def _completed_real_parallel_stage_from_artifacts(
+    *,
+    run_status: Mapping[str, Any],
+    parallel_status: Mapping[str, Any],
+) -> bool:
+    stage_status = str(parallel_status.get("status") or run_status.get("status") or "")
+    if stage_status not in {"completed_parallel", "completed_partial_parallel"}:
+        return False
+    evidence_source = _as_mapping(parallel_status.get("evidence_source"))
+    adapter = str(
+        parallel_status.get("adapter")
+        or evidence_source.get("adapter")
+        or run_status.get("adapter")
+        or ""
+    )
+    selected_mode = str(run_status.get("selected_mode") or "")
+    if selected_mode in {"quick-chat", "manual-handoff"} or adapter == "fixture":
+        return False
+    return (
+        evidence_source.get("real_child_execution") is True
+        or str(evidence_source.get("type") or "") == "real_child_execution"
+        or adapter == "codex-exec"
+    )
+
+
+def _partial_parallel_rate_band(rate: float | None) -> str:
+    if rate is None:
+        return "insufficient_denominator"
+    if rate <= PARTIAL_PARALLEL_TARGET_RATE:
+        return "target"
+    if rate <= PARTIAL_PARALLEL_WARNING_RATE:
+        return "warning"
+    return "regression_failure"
+
+
+def _partial_reason_category_from_counts(
+    *,
+    partial: bool,
+    accepted: int,
+    failed: int,
+    blocked: int,
+    rejected: int,
+    discarded: int,
+    retry_exhausted: int,
+    omitted: int,
+    parallel_degraded: bool,
+) -> str:
+    if not partial:
+        return "none"
+    if accepted == 0:
+        return "no_accepted_shards"
+    if retry_exhausted > 0:
+        return "retry_exhausted"
+    if failed > 0:
+        return "failed_tasks"
+    if blocked > 0:
+        return "blocked_tasks"
+    if rejected > 0:
+        return "rejected_shards"
+    if discarded > 0:
+        return "discarded_tasks"
+    if parallel_degraded:
+        return "parallel_degraded"
+    if omitted > 0:
+        return "omitted_tasks"
+    return "partial_unknown"
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _first_count(*values: Any) -> int | None:
+    for value in values:
+        if value is None:
+            continue
+        return _count(value)
+    return None
+
+
+def _count(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _outcome_counts(runs: Sequence[Mapping[str, Any]]) -> dict[str, int]:

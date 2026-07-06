@@ -660,6 +660,69 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(records[0]["task_id"], "task_search_001")
         self.assertEqual(records[0]["retrieval_status"], "fetched")
 
+    def test_passing_partial_parallel_exposes_stable_reason_summary(self) -> None:
+        run_dir = self.prepare()
+
+        class PartialCodexAdapter:
+            name = "codex-exec"
+
+            def run_task(inner_self, task, *, run_dir, max_threads):
+                task_id = str(task["id"])
+                if task_id.endswith("002"):
+                    return type("Result", (), {
+                        "task_id": task_id,
+                        "status": "failed",
+                        "child_thread_id": f"codex-{task_id}",
+                        "events": (),
+                        "shard_path": None,
+                        "failure_category": "invalid_shard",
+                        "message": "synthetic public-safe invalid shard",
+                    })()
+                shard_path = run_dir / task["output_shard_path"]
+                shard_path.parent.mkdir(parents=True, exist_ok=True)
+                self.write_json(shard_path, self.shard(run_dir, task))
+                return type("Result", (), {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "child_thread_id": f"codex-{task_id}",
+                    "events": (),
+                    "shard_path": str(shard_path),
+                    "failure_category": None,
+                    "message": None,
+                })()
+
+        with mock.patch(
+            "deepresearch.parallel_orchestrator._adapter",
+            return_value=PartialCodexAdapter(),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                min_tasks=2,
+                max_tasks=2,
+                allow_degraded=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "completed_partial_parallel")
+        self.assertFalse(result["needs_serial_handoff"])
+        summary = result["partial_parallel_summary"]
+        self.assertTrue(summary["partial"])
+        self.assertEqual(summary["reason_category"], "failed_tasks")
+        self.assertEqual(summary["accepted_shard_count"], 1)
+        self.assertEqual(summary["omitted_task_count"], 1)
+        self.assertEqual(summary["failed_task_count"], 1)
+        self.assertEqual(result["partial_reason_category"], "failed_tasks")
+        merge = self.load_json(run_dir / "merge_status.json")
+        self.assertEqual(
+            merge["partial_parallel_summary"]["reason_category"],
+            "failed_tasks",
+        )
+        self.assertNotEqual(
+            merge["partial_parallel_summary"]["reason_category"],
+            "no_accepted_shards",
+        )
+
     def test_codex_exec_adapter_runs_from_project_root_and_reports_trust_errors(self) -> None:
         run_dir = self.prepare()
         task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]

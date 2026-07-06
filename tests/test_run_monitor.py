@@ -315,6 +315,70 @@ class RunMonitorTests(unittest.TestCase):
         self.assertNotIn(outside_private_path, rendered)
         self.assertNotIn(relative_private_path, rendered)
 
+    def test_detail_shows_partial_parallel_reason_and_final_gate_pass(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        run_dir = self.make_run(runs_dir, "run-visual-partial-001")
+        self.write_json(
+            run_dir / "run_status.json",
+            {
+                "run_id": "run-visual-partial-001",
+                "status": "completed_auto_visual",
+                "ok": True,
+                "terminal": True,
+                "selected_mode": "full-runner",
+                "adapter": "codex-exec",
+            },
+        )
+        partial_summary = {
+            "partial": True,
+            "reason_category": "failed_tasks",
+            "planned_task_count": 5,
+            "accepted_shard_count": 4,
+            "omitted_task_count": 1,
+            "failed_task_count": 1,
+            "blocked_task_count": 0,
+            "rejected_shard_count": 0,
+            "discarded_task_count": 2,
+            "retried_task_count": 3,
+            "retry_exhausted_task_count": 1,
+        }
+        self.write_json(
+            run_dir / "parallel_orchestration_status.json",
+            {
+                "run_id": "run-visual-partial-001",
+                "status": "completed_partial_parallel",
+                "ok": True,
+                "adapter": "codex-exec",
+                "parallel_degraded": False,
+                "planned_task_count": 5,
+                "accepted_shard_count": 4,
+                "failure_counts": {"failed_tasks": 1},
+                "partial_parallel_summary": partial_summary,
+                "partial_reason_category": "failed_tasks",
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "adapter": "codex-exec",
+                    "accepted_shards": 4,
+                    "real_child_execution": True,
+                },
+            },
+        )
+
+        detail = inspect_run_monitor(run_dir)
+        rendered = render_run_detail(detail)
+
+        self.assertTrue(detail["partial_parallel"]["partial"])
+        self.assertEqual(detail["partial_parallel"]["reason_category"], "failed_tasks")
+        self.assertEqual(detail["partial_parallel"]["accepted_shard_count"], 4)
+        self.assertEqual(detail["partial_parallel"]["omitted_task_count"], 1)
+        self.assertTrue(detail["partial_parallel"]["final_artifact_gate_passed"])
+        self.assertIn("Partial parallel: partial=yes reason=failed_tasks", rendered)
+        self.assertIn("accepted=4 omitted=1 rejected=0 failed=1", rendered)
+        self.assertIn("blocked=0 discarded=2 retried=3 retry_exhausted=1", rendered)
+        self.assertIn("final_artifact_gate_passed=yes", rendered)
+        self.assertNotIn("no-report", rendered)
+        self.assertNotIn("no accepted shards", rendered.lower())
+
     def test_list_monitor_keeps_paths_run_relative_and_labels_fixture(self) -> None:
         runs_dir = self.temp_runs_dir()
         run_dir = self.make_run(runs_dir, "run-fixture-001")
