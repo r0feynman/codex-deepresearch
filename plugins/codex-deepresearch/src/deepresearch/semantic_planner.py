@@ -42,6 +42,17 @@ RELEASE_INELIGIBLE_PLANNER_MODES = {
     PLANNER_MODE_FIXTURE,
     PLANNER_MODE_BLOCKED,
 }
+SEMANTIC_COMMON_INTEGRITY_FIELDS = (
+    "question_scope",
+    "raw_request_path",
+    "raw_response_path",
+    "raw_request_hash",
+    "raw_response_hash",
+    "provenance",
+    "template_use",
+    "session_id",
+    "session_id_unavailable_reason",
+)
 
 ALLOWED_EVIDENCE_NEEDS = (
     "official_source",
@@ -733,6 +744,7 @@ def semantic_planner_validation(
             "report_status": str(run_path / "report_status.json"),
         },
     }
+    artifact.update(_semantic_common_integrity_fields(run_path))
     return artifact
 
 
@@ -1543,6 +1555,24 @@ def _read_optional_json(path: Path) -> dict[str, Any] | None:
     except (FileNotFoundError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _semantic_common_integrity_fields(run_path: Path) -> dict[str, Any]:
+    sources = [
+        payload
+        for payload in (
+            _read_optional_json(run_path / SEMANTIC_PLAN_FILENAME),
+            _read_optional_json(run_path / SEMANTIC_EXPECTATION_ORACLE_FILENAME),
+        )
+        if isinstance(payload, Mapping)
+    ]
+    integrity: dict[str, Any] = {}
+    for field in SEMANTIC_COMMON_INTEGRITY_FIELDS:
+        for payload in sources:
+            if field in payload:
+                integrity[field] = payload[field]
+                break
+    return integrity
 
 
 def _expected_needs_for_class(

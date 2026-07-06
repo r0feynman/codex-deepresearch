@@ -166,6 +166,53 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(review["final_verdict"], "release_ineligible")
         self.assertFalse(review["substitute_implementation_check"]["passed"])
 
+    def assert_validation_common_integrity_fields(self, validation: dict, source: dict) -> None:
+        common_fields = (
+            "question_scope",
+            "raw_request_path",
+            "raw_response_path",
+            "raw_request_hash",
+            "raw_response_hash",
+            "provenance",
+            "template_use",
+            "session_id",
+            "session_id_unavailable_reason",
+        )
+        for field in common_fields:
+            self.assertIn(field, validation)
+            self.assertEqual(validation[field], source[field])
+        self.assertRegex(validation["raw_request_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(validation["raw_response_hash"], r"^[0-9a-f]{64}$")
+
+    def test_prepared_run_validation_carries_semantic_integrity_fields(self) -> None:
+        run_dir = self.prepare_fixture(SEMANTIC_FIXTURES[0])
+        evidence = self.load_json(run_dir / "evidence.json")
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")
+        persisted_validation = self.load_json(run_dir / "semantic_planner_validation.json")
+
+        self.assert_validation_common_integrity_fields(
+            persisted_validation,
+            semantic_plan,
+        )
+        self.assert_release_ineligible_semantic_validation(
+            persisted_validation,
+            planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+        )
+
+        computed_validation = semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=[],
+        )
+        self.assert_validation_common_integrity_fields(
+            computed_validation,
+            semantic_plan,
+        )
+        self.assert_release_ineligible_semantic_validation(
+            computed_validation,
+            planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+        )
+
     def test_required_broad_question_classes_create_semantic_angles_and_tasks(self) -> None:
         for fixture in SEMANTIC_FIXTURES:
             with self.subTest(fixture=fixture["fixture_id"]):

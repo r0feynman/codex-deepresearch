@@ -1943,6 +1943,12 @@ def _semantic_release_checks(
                 }
             )
 
+    if _claims_eligible_codex_semantic(
+        planner_sources=planner_sources,
+        eligible_sources=eligible_sources,
+    ):
+        failures.extend(_semantic_artifact_integrity_failures(required_payloads))
+
     return {
         "schema_version": "codex-deepresearch.semantic-release-checks.v0",
         "valid": not failures,
@@ -1955,6 +1961,242 @@ def _semantic_release_checks(
         "semantic_fit_score": review.get("semantic_fit_score") if isinstance(review, Mapping) else None,
         "failures": failures,
     }
+
+
+def _claims_eligible_codex_semantic(
+    *,
+    planner_sources: Mapping[str, str],
+    eligible_sources: Mapping[str, Any],
+) -> bool:
+    return (
+        any(
+            planner_mode == "codex_semantic"
+            for planner_mode in planner_sources.values()
+        )
+        and any(eligible is True for eligible in eligible_sources.values())
+    )
+
+
+def _semantic_artifact_integrity_failures(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for artifact_name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
+        payload = artifacts.get(artifact_name)
+        if not isinstance(payload, Mapping):
+            continue
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="question_scope",
+            invalid=not _valid_semantic_question_scope(payload.get("question_scope")),
+        )
+        for field in ("raw_request_path", "raw_response_path"):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name=artifact_name,
+                field=field,
+                invalid=not _non_empty_string(payload.get(field)),
+            )
+        for field in ("raw_request_hash", "raw_response_hash"):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name=artifact_name,
+                field=field,
+                invalid=not _sha256_hex_string(payload.get(field)),
+            )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="provenance",
+            invalid=not _valid_semantic_provenance(payload.get("provenance")),
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="template_use",
+            invalid=not _valid_semantic_template_use(payload.get("template_use")),
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="session_id_unavailable_reason",
+            invalid=not _non_empty_string(payload.get("session_id_unavailable_reason")),
+        )
+
+    oracle = artifacts.get("semantic_expectation_oracle")
+    if isinstance(oracle, Mapping):
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_expectation_oracle",
+            field="oracle_requirement_map",
+            invalid=not _valid_oracle_requirement_map(
+                oracle.get("oracle_requirement_map")
+            ),
+        )
+
+    plan = artifacts.get("semantic_plan")
+    if isinstance(plan, Mapping):
+        semantic_plan = plan.get("semantic_plan")
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="semantic_plan",
+            invalid=not isinstance(semantic_plan, Mapping) or not semantic_plan,
+        )
+        if isinstance(semantic_plan, Mapping):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name="semantic_plan",
+                field="semantic_plan.angles",
+                invalid=not _valid_semantic_angles(semantic_plan.get("angles")),
+            )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="angles",
+            invalid=not _valid_semantic_angles(plan.get("angles")),
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="requirement_coverage_map",
+            invalid=not _valid_requirement_coverage_map(
+                plan.get("requirement_coverage_map")
+            ),
+        )
+
+    return failures
+
+
+def _append_semantic_artifact_failure_if(
+    failures: list[dict[str, Any]],
+    *,
+    artifact_name: str,
+    field: str,
+    invalid: bool,
+) -> None:
+    if not invalid:
+        return
+    failures.append(
+        {
+            "check": "semantic_artifact_integrity",
+            "artifact": artifact_name,
+            "field": field,
+            "detail": f"{artifact_name}.{field} is missing or shallow",
+        }
+    )
+
+
+def _valid_semantic_question_scope(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    angle_count = value.get("angle_count")
+    return (
+        _non_empty_string(value.get("original_question"))
+        and _sha256_hex_string(value.get("question_hash"))
+        and _non_empty_string(value.get("question_class"))
+        and _non_empty_string(value.get("planner_mode"))
+        and isinstance(angle_count, int)
+        and not isinstance(angle_count, bool)
+        and angle_count > 0
+    )
+
+
+def _valid_semantic_provenance(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and _non_empty_string(value.get("planner_mode"))
+        and _non_empty_string(value.get("planner_source"))
+        and value.get("raw_request_required") is True
+        and value.get("raw_response_required") is True
+        and _non_empty_string(value.get("session_id_unavailable_reason"))
+        and isinstance(value.get("semantic_release_eligible"), bool)
+    )
+
+
+def _valid_semantic_template_use(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and isinstance(value.get("uses_preselected_template"), bool)
+        and isinstance(value.get("template_release_eligible"), bool)
+        and isinstance(value.get("template_angle_titles"), list)
+    )
+
+
+def _valid_oracle_requirement_map(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_valid_oracle_requirement(requirement) for requirement in value)
+    )
+
+
+def _valid_oracle_requirement(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        _non_empty_string(value.get("requirement_id"))
+        and (
+            _non_empty_string(value.get("text"))
+            or _non_empty_string(value.get("description"))
+        )
+        and _non_empty_string_list(value.get("covered_by_angle_ids"))
+    )
+
+
+def _valid_semantic_angles(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_valid_semantic_angle(angle) for angle in value)
+    )
+
+
+def _valid_semantic_angle(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return _non_empty_string(value.get("angle_id")) and (
+        _non_empty_string(value.get("title"))
+        or _non_empty_string(value.get("research_question"))
+    )
+
+
+def _valid_requirement_coverage_map(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_valid_requirement_coverage(coverage) for coverage in value)
+    )
+
+
+def _valid_requirement_coverage(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        _non_empty_string(value.get("requirement_id"))
+        and _non_empty_string(value.get("angle_id"))
+        and _non_empty_string(value.get("coverage_status"))
+    )
+
+
+def _non_empty_string_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_non_empty_string(item) for item in value)
+    )
+
+
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sha256_hex_string(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()) is not None
+    )
 
 
 def _semantic_planner_mode_sources(
