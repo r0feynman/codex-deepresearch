@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -2049,7 +2050,8 @@ def _numeric_or_none(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
     return None
 
 

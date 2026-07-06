@@ -331,6 +331,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             ("missing-score", "pop", "semantic_fit_score", "semantic_fit_score"),
             ("string-score", "set", "semantic_fit_score", "semantic_fit_score"),
             ("low-score", "low", "semantic_fit_score", "semantic_fit_score"),
+            ("nan-score", "nan", "semantic_fit_score", "semantic_fit_score"),
+            ("infinite-score", "inf", "semantic_fit_score", "semantic_fit_score"),
+            ("negative-infinite-score", "-inf", "semantic_fit_score", "semantic_fit_score"),
             ("missing-blockers", "pop", "blockers", "semantic_review_blockers"),
             ("invalid-blockers", "set", "blockers", "semantic_review_blockers"),
             ("nonempty-blockers", "nonempty", "blockers", "semantic_review_blockers"),
@@ -376,6 +379,12 @@ class PublicBetaValidationTests(unittest.TestCase):
                     review[field] = "9.4"
                 elif action == "low":
                     review[field] = 8.99
+                elif action == "nan":
+                    review[field] = float("nan")
+                elif action == "inf":
+                    review[field] = float("inf")
+                elif action == "-inf":
+                    review[field] = float("-inf")
                 elif action == "set" and field == "blockers":
                     review[field] = {"count": 0}
                 elif action == "nonempty":
