@@ -109,6 +109,7 @@ SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES = (
 SEMANTIC_MIN_RELEASE_ANGLES = 2
 SEMANTIC_MIN_ANGLE_OVERLAP_TOKENS = 2
 SEMANTIC_MIN_ANGLE_UNIQUE_TOKENS = 4
+SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD = 0.85
 GENERIC_SEMANTIC_ANGLE_TEXTS = {
     "primary source discovery",
     "find authoritative sources that directly answer the research question",
@@ -2250,19 +2251,29 @@ def _valid_oracle_requirement(value: Any) -> bool:
 
 def _valid_semantic_angles(value: Any, *, original_question: str) -> bool:
     original_tokens = _semantic_meaningful_tokens(original_question)
-    return (
-        isinstance(value, list)
-        and len(value) >= SEMANTIC_MIN_RELEASE_ANGLES
-        and bool(original_tokens)
-        and all(
-            _valid_semantic_angle(
-                angle,
-                original_question=original_question,
-                original_tokens=original_tokens,
-            )
-            for angle in value
+    if (
+        not isinstance(value, list)
+        or len(value) < SEMANTIC_MIN_RELEASE_ANGLES
+        or not original_tokens
+    ):
+        return False
+    angle_ids = [
+        str(angle.get("angle_id")).strip()
+        for angle in value
+        if isinstance(angle, Mapping) and _non_empty_string(angle.get("angle_id"))
+    ]
+    if len(angle_ids) != len(value) or len(set(angle_ids)) != len(value):
+        return False
+    if not all(
+        _valid_semantic_angle(
+            angle,
+            original_question=original_question,
+            original_tokens=original_tokens,
         )
-    )
+        for angle in value
+    ):
+        return False
+    return not _has_duplicate_semantic_angle_content(value)
 
 
 def _valid_semantic_angle(
@@ -2326,6 +2337,45 @@ def _semantic_placeholder_text(text: str) -> bool:
     return any(
         re.search(pattern, normalized)
         for pattern in GENERIC_SEMANTIC_PLACEHOLDER_PATTERNS
+    )
+
+
+def _has_duplicate_semantic_angle_content(angles: Sequence[Any]) -> bool:
+    token_sets = [
+        _semantic_angle_content_tokens(angle)
+        for angle in angles
+        if isinstance(angle, Mapping)
+    ]
+    signatures: set[tuple[str, ...]] = set()
+    for index, left_tokens in enumerate(token_sets):
+        signature = tuple(sorted(left_tokens))
+        if signature in signatures:
+            return True
+        signatures.add(signature)
+        for right_tokens in token_sets[index + 1:]:
+            if _near_duplicate_semantic_token_sets(left_tokens, right_tokens):
+                return True
+    return False
+
+
+def _semantic_angle_content_tokens(angle: Mapping[str, Any]) -> set[str]:
+    return set(
+        _semantic_meaningful_token_list(
+            f"{angle.get('title') or ''} {angle.get('research_question') or ''}"
+        )
+    )
+
+
+def _near_duplicate_semantic_token_sets(left: set[str], right: set[str]) -> bool:
+    if not left or not right:
+        return False
+    intersection = len(left & right)
+    union = len(left | right)
+    jaccard = intersection / union if union else 0.0
+    containment = intersection / min(len(left), len(right))
+    return (
+        jaccard >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+        or containment >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
     )
 
 

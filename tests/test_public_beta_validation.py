@@ -828,6 +828,73 @@ class PublicBetaValidationTests(unittest.TestCase):
             field="angles",
         )
 
+    def test_codex_semantic_text_run_rejects_duplicate_token_rich_angles(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "duplicate-token-rich-angles",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        evidence_needs = ("primary_source", "comparative_analysis")
+        angles = [
+            {
+                "angle_id": f"angle_{index:03d}",
+                "title": "deterministic software release validation tradeoffs",
+                "research_question": (
+                    "Which deterministic software release validation criteria "
+                    "shape evidence tradeoffs?"
+                ),
+                "question_context": (
+                    "Evaluate deterministic software release validation evidence "
+                    f"for public beta prompt {prompt['id']}."
+                ),
+                "route": "text_only",
+                "evidence_need": evidence_need,
+                "expected_artifacts": ["source list", "supporting quotes"],
+                "success_criteria": ["Claims remain tied to source spans."],
+                "report_section": f"Release Validation {index}",
+            }
+            for index, evidence_need in enumerate(evidence_needs, start=1)
+        ]
+        plan = self.read_json(run_dir / "semantic_plan.json")
+        plan["angles"] = angles
+        plan["semantic_plan"]["angles"] = [dict(angle) for angle in angles]
+        plan["requirement_coverage_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "angle_id": angle["angle_id"],
+                "coverage_status": "covered",
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+        oracle["oracle_requirement_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "description": f"Resolve release validation angle {index}.",
+                "covered_by_angle_ids": [angle["angle_id"]],
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assert_semantic_artifact_integrity_failure(
+            result,
+            artifact="semantic_plan",
+            field="angles",
+        )
+
     def test_codex_semantic_text_run_requires_oracle_and_coverage_angle_match(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
