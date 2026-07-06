@@ -134,6 +134,11 @@ def inspect_run_monitor(run_dir: str | Path) -> dict[str, Any]:
             subagent_assignments,
             run_trace,
         ),
+        "partial_parallel": _partial_parallel_summary(
+            run_status,
+            parallel_status,
+            merge_status,
+        ),
         "child_attempt_probes": _child_attempt_probe_summary(
             research_tasks,
             parallel_status,
@@ -211,6 +216,7 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
     control = _mapping(payload.get("control"))
     mode = _mapping(payload.get("mode"))
     shards = _mapping(payload.get("shards"))
+    partial_parallel = _mapping(payload.get("partial_parallel"))
     child_attempt_probes = _mapping(payload.get("child_attempt_probes"))
     counts = _mapping(payload.get("evidence_counts"))
     budget = _mapping(payload.get("budget"))
@@ -238,6 +244,17 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
             f"retried={_int(shards.get('retried'))} "
             f"blocked={_int(shards.get('blocked'))} "
             f"planned={_display_optional_int(shards.get('planned'))}"
+        ),
+        (
+            "Partial parallel: "
+            f"partial={_display_bool(partial_parallel.get('partial'))} "
+            f"reason={partial_parallel.get('reason_category') or 'none'} "
+            f"accepted={_int(partial_parallel.get('accepted_shard_count'))} "
+            f"omitted={_int(partial_parallel.get('omitted_task_count'))} "
+            f"rejected={_int(partial_parallel.get('rejected_shard_count'))} "
+            f"failed={_int(partial_parallel.get('failed_task_count'))} "
+            f"blocked={_int(partial_parallel.get('blocked_task_count'))} "
+            f"final_artifact_gate_passed={_display_bool(partial_parallel.get('final_artifact_gate_passed'))}"
         ),
         (
             "Child probes: "
@@ -758,6 +775,131 @@ def _shard_summary(
     )
     counts["runnable"] = _first_int(parallel_status.get("runnable_task_count"))
     return counts
+
+
+def _partial_parallel_summary(
+    run_status: Mapping[str, Any],
+    parallel_status: Mapping[str, Any],
+    merge_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    source = _mapping(parallel_status.get("partial_parallel_summary")) or _mapping(
+        merge_status.get("partial_parallel_summary")
+    )
+    failure_counts = _mapping(parallel_status.get("failure_counts")) or _mapping(
+        merge_status.get("failure_counts")
+    )
+    retry_summary = _mapping(parallel_status.get("retry_summary")) or _mapping(
+        merge_status.get("retry_summary")
+    )
+    planned = _first_int(
+        source.get("planned_task_count"),
+        parallel_status.get("planned_task_count"),
+        merge_status.get("planned_task_count"),
+    ) or 0
+    accepted = _first_int(
+        source.get("accepted_shard_count"),
+        parallel_status.get("accepted_shard_count"),
+        merge_status.get("accepted_shard_count"),
+        len(_list(merge_status.get("accepted_shards")))
+        if _list(merge_status.get("accepted_shards"))
+        else None,
+        _mapping(parallel_status.get("evidence_source")).get("accepted_shards"),
+        _mapping(merge_status.get("evidence_source")).get("accepted_shards"),
+    ) or 0
+    omitted = _first_int(
+        source.get("omitted_task_count"),
+        max(0, planned - accepted) if planned else None,
+    ) or 0
+    failed = _first_int(source.get("failed_task_count"), failure_counts.get("failed_tasks")) or 0
+    blocked = _first_int(source.get("blocked_task_count"), failure_counts.get("blocked_tasks")) or 0
+    rejected = _first_int(source.get("rejected_shard_count"), failure_counts.get("rejected_shards")) or 0
+    discarded = _first_int(source.get("discarded_task_count"), failure_counts.get("discarded_tasks")) or 0
+    retried = _first_int(source.get("retried_task_count"), retry_summary.get("retry_count")) or 0
+    retry_exhausted = _first_int(
+        source.get("retry_exhausted_task_count"),
+        retry_summary.get("retry_exhausted_count"),
+    ) or 0
+    partial = _first_present_bool(source.get("partial"))
+    if partial is None:
+        status = str(parallel_status.get("status") or run_status.get("status") or "")
+        partial = (
+            status == "completed_partial_parallel"
+            or (accepted > 0 and omitted > 0)
+            or any(count > 0 for count in (failed, blocked, rejected, discarded))
+            or _bool(parallel_status.get("parallel_degraded"))
+            or _bool(merge_status.get("parallel_degraded"))
+        )
+    reason = str(
+        source.get("reason_category")
+        or parallel_status.get("partial_reason_category")
+        or merge_status.get("partial_reason_category")
+        or ""
+    )
+    if not reason:
+        reason = _partial_reason_from_counts(
+            partial=partial,
+            accepted=accepted,
+            failed=failed,
+            blocked=blocked,
+            rejected=rejected,
+            discarded=discarded,
+            retry_exhausted=retry_exhausted,
+            omitted=omitted,
+            parallel_degraded=_bool(parallel_status.get("parallel_degraded"))
+            or _bool(merge_status.get("parallel_degraded")),
+        )
+    final_gate = (
+        run_status.get("terminal") is True
+        and run_status.get("ok") is True
+        and str(run_status.get("status") or "").startswith("completed")
+    )
+    return {
+        "partial": partial,
+        "reason_category": reason,
+        "planned_task_count": planned,
+        "accepted_shard_count": accepted,
+        "omitted_task_count": omitted,
+        "failed_task_count": failed,
+        "blocked_task_count": blocked,
+        "rejected_shard_count": rejected,
+        "discarded_task_count": discarded,
+        "retried_task_count": retried,
+        "retry_exhausted_task_count": retry_exhausted,
+        "final_artifact_gate_passed": final_gate,
+    }
+
+
+def _partial_reason_from_counts(
+    *,
+    partial: bool,
+    accepted: int,
+    failed: int,
+    blocked: int,
+    rejected: int,
+    discarded: int,
+    retry_exhausted: int,
+    omitted: int,
+    parallel_degraded: bool,
+) -> str:
+    if not partial:
+        return "none"
+    if accepted == 0:
+        return "no_accepted_shards"
+    if retry_exhausted > 0:
+        return "retry_exhausted"
+    if failed > 0:
+        return "failed_tasks"
+    if blocked > 0:
+        return "blocked_tasks"
+    if rejected > 0:
+        return "rejected_shards"
+    if discarded > 0:
+        return "discarded_tasks"
+    if parallel_degraded:
+        return "parallel_degraded"
+    if omitted > 0:
+        return "omitted_tasks"
+    return "partial_unknown"
 
 
 def _child_attempt_probe_summary(

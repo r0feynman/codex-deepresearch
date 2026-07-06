@@ -1345,6 +1345,14 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         tasks,
         retry_policy=tasks_artifact.get("codex_exec_retry_policy"),
     )
+    partial_parallel_summary = _partial_parallel_summary(
+        status=None,
+        planned_task_count=len(tasks),
+        accepted_shard_count=len(accepted_shards),
+        failure_counts=failure_counts,
+        retry_summary=retry_summary,
+        parallel_degraded=bool(tasks_artifact.get("parallel_degraded")),
+    )
     merge_status = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
@@ -1360,6 +1368,8 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         "failed_tasks": failed_tasks,
         "failure_counts": failure_counts,
         "retry_summary": retry_summary,
+        "partial_parallel_summary": partial_parallel_summary,
+        "partial_reason_category": partial_parallel_summary["reason_category"],
         "codex_native_search_handoff": {
             "search_results_path": str(run_dir / "search_results.jsonl"),
             "records": len(child_search_handoff_records),
@@ -1757,6 +1767,12 @@ def _parallel_status(
         "runnable_task_count": runnable_task_count,
         "max_scheduled_concurrency": max_scheduled_concurrency,
         "accepted_shard_count": len(accepted_shards),
+        "partial_parallel_summary": _partial_parallel_summary_from_merge(
+            status=status,
+            planned_task_count=planned_task_count,
+            merge_status=merge_status,
+            parallel_degraded=parallel_degraded,
+        ),
         "needs_serial_handoff": needs_serial_handoff,
         "artifacts": {
             "parallel_orchestration_status": str(run_dir / "parallel_orchestration_status.json"),
@@ -1770,7 +1786,10 @@ def _parallel_status(
     if merge_status is not None:
         merge = dict(merge_status)
         merge.setdefault("evidence_source", evidence_source)
+        merge.setdefault("partial_parallel_summary", payload["partial_parallel_summary"])
+        merge.setdefault("partial_reason_category", payload["partial_parallel_summary"]["reason_category"])
         payload["merge"] = merge
+    payload["partial_reason_category"] = payload["partial_parallel_summary"]["reason_category"]
     if codex_exec_timeout_seconds is not None:
         payload["codex_exec_timeout_seconds"] = codex_exec_timeout_seconds
     if codex_exec_retry_policy is not None:
@@ -4856,6 +4875,150 @@ def _failure_counts(
         "discarded_tasks": len(discarded_tasks),
         "by_category": by_category,
     }
+
+
+def _partial_parallel_summary_from_merge(
+    *,
+    status: str | None,
+    planned_task_count: int,
+    merge_status: Mapping[str, Any] | None,
+    parallel_degraded: bool,
+) -> dict[str, Any]:
+    if not merge_status:
+        return _partial_parallel_summary(
+            status=status,
+            planned_task_count=planned_task_count,
+            accepted_shard_count=0,
+            failure_counts={},
+            retry_summary={},
+            parallel_degraded=parallel_degraded,
+        )
+    accepted_count = _accepted_shard_count(merge_status)
+    return _partial_parallel_summary(
+        status=status,
+        planned_task_count=planned_task_count,
+        accepted_shard_count=accepted_count,
+        failure_counts=_mapping_like(merge_status.get("failure_counts")),
+        retry_summary=_mapping_like(merge_status.get("retry_summary")),
+        parallel_degraded=parallel_degraded
+        or bool(merge_status.get("parallel_degraded")),
+    )
+
+
+def _partial_parallel_summary(
+    *,
+    status: str | None,
+    planned_task_count: int,
+    accepted_shard_count: int,
+    failure_counts: Mapping[str, Any],
+    retry_summary: Mapping[str, Any],
+    parallel_degraded: bool,
+) -> dict[str, Any]:
+    failed_count = _safe_int(failure_counts.get("failed_tasks"))
+    blocked_count = _safe_int(failure_counts.get("blocked_tasks"))
+    rejected_count = _safe_int(failure_counts.get("rejected_shards"))
+    discarded_count = _safe_int(failure_counts.get("discarded_tasks"))
+    retried_count = _safe_int(retry_summary.get("retry_count"))
+    retry_exhausted_count = _safe_int(retry_summary.get("retry_exhausted_count"))
+    omitted_count = max(0, planned_task_count - accepted_shard_count)
+    partial = (
+        status == "completed_partial_parallel"
+        or (accepted_shard_count > 0 and omitted_count > 0)
+        or failed_count > 0
+        or blocked_count > 0
+        or rejected_count > 0
+        or discarded_count > 0
+        or parallel_degraded
+    )
+    reason_category = _partial_reason_category(
+        partial=partial,
+        accepted_shard_count=accepted_shard_count,
+        failed_count=failed_count,
+        blocked_count=blocked_count,
+        rejected_count=rejected_count,
+        discarded_count=discarded_count,
+        retry_exhausted_count=retry_exhausted_count,
+        omitted_count=omitted_count,
+        parallel_degraded=parallel_degraded,
+    )
+    return {
+        "partial": partial,
+        "reason_category": reason_category,
+        "planned_task_count": planned_task_count,
+        "accepted_shard_count": accepted_shard_count,
+        "omitted_task_count": omitted_count,
+        "failed_task_count": failed_count,
+        "blocked_task_count": blocked_count,
+        "rejected_shard_count": rejected_count,
+        "discarded_task_count": discarded_count,
+        "retried_task_count": retried_count,
+        "retry_exhausted_task_count": retry_exhausted_count,
+        "parallel_degraded": parallel_degraded,
+        "failure_category_counts": dict(failure_counts.get("by_category", {}))
+        if isinstance(failure_counts.get("by_category"), Mapping)
+        else {},
+    }
+
+
+def _partial_reason_category(
+    *,
+    partial: bool,
+    accepted_shard_count: int,
+    failed_count: int,
+    blocked_count: int,
+    rejected_count: int,
+    discarded_count: int,
+    retry_exhausted_count: int,
+    omitted_count: int,
+    parallel_degraded: bool,
+) -> str:
+    if not partial:
+        return "none"
+    if accepted_shard_count == 0:
+        return "no_accepted_shards"
+    if retry_exhausted_count > 0:
+        return "retry_exhausted"
+    if failed_count > 0:
+        return "failed_tasks"
+    if blocked_count > 0:
+        return "blocked_tasks"
+    if rejected_count > 0:
+        return "rejected_shards"
+    if discarded_count > 0:
+        return "discarded_tasks"
+    if parallel_degraded:
+        return "parallel_degraded"
+    if omitted_count > 0:
+        return "omitted_tasks"
+    return "partial_unknown"
+
+
+def _accepted_shard_count(payload: Mapping[str, Any]) -> int:
+    explicit = payload.get("accepted_shard_count")
+    if isinstance(explicit, int):
+        return max(0, explicit)
+    accepted = payload.get("accepted_shards")
+    if isinstance(accepted, list):
+        return len(accepted)
+    evidence_source = payload.get("evidence_source")
+    if isinstance(evidence_source, Mapping):
+        return _safe_int(evidence_source.get("accepted_shards"))
+    return 0
+
+
+def _mapping_like(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _safe_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _merge_diagnostics(
