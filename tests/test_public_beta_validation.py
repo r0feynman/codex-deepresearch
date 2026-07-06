@@ -45,6 +45,26 @@ class PublicBetaValidationTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def assert_semantic_artifact_integrity_failure(
+        self,
+        result: dict[str, Any],
+        *,
+        artifact: str,
+        field: str,
+    ) -> None:
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(result["metric_classification"], "included_failure")
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertTrue(
+            any(
+                failure.get("check") == "semantic_artifact_integrity"
+                and failure.get("artifact") == artifact
+                and failure.get("field") == field
+                for failure in failures
+            ),
+            failures,
+        )
+
     def read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         return [
             json.loads(line)
@@ -158,6 +178,909 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(metric["blocked"], 8)
         self.assertEqual(metric["denominator_completed_non_blocked"], 2)
         self.assertEqual(metric["pass_rate"], 0.5)
+
+    def test_manual_planner_fallback_counts_as_release_failure_not_pass(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-manual-planner-fallback"
+        manual_run = self.write_text_run(
+            runs_dir / "manual-fallback",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_manual_planner_fallback",
+            ok=True,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": manual_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("cannot satisfy semantic planner", run["failure_detail"])
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["passed"], 0)
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["blocked"], 9)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+        self.assertEqual(metric["pass_rate"], 0.0)
+
+    def test_blocked_semantic_planner_counts_as_release_failure_not_excluded(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-blocked-semantic-planner"
+        blocked_run = self.write_text_run(
+            runs_dir / "blocked-semantic-planner",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="blocked_semantic_planner_unavailable",
+            ok=False,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": blocked_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("semantic planner denominator failure", run["failure_detail"])
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["blocked"], 9)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+
+    def test_fixture_completion_counts_as_semantic_release_failure_not_excluded(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-fixture-semantic-failure"
+        fixture_run = self.write_text_run(
+            runs_dir / "fixture-completion",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_fixture",
+            ok=True,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": fixture_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("fixture-only completion", run["failure_detail"])
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["blocked"], 9)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+
+    def test_release_ineligible_completed_parallel_text_run_fails_public_beta(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
+        runs_dir = self.temp_dir()
+        suite_id = "public-beta-semantic-release-ineligible"
+        fallback_run = self.write_text_run(
+            runs_dir / "heuristic-fallback",
+            prompt=prompts["pb-text-001"],
+            suite_id=suite_id,
+            status="completed_parallel",
+            ok=True,
+            semantic_planning="heuristic_fallback",
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs={"pb-text-001": fallback_run},
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        run = {item["id"]: item for item in payload["runs"]}["pb-text-001"]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["terminal_status"], "completed_parallel")
+        self.assertEqual(run["metric_classification"], "included_failure")
+        self.assertEqual(run["failure_category"], "artifact_handoff_failure")
+        self.assertIn("semantic planner release gate failed", run["failure_detail"])
+        checks = run["semantic_release_checks"]
+        self.assertFalse(checks["valid"])
+        failure_checks = {failure["check"] for failure in checks["failures"]}
+        self.assertIn("semantic_planner_mode", failure_checks)
+        self.assertIn("semantic_release_eligible", failure_checks)
+        self.assertIn("semantic_planner_validation_ok", failure_checks)
+        metric = payload["prompt_metrics"]["fresh_session_full_runner_artifact_handoff"]
+        self.assertEqual(metric["passed"], 0)
+        self.assertEqual(metric["failed_non_blocked"], 1)
+        self.assertEqual(metric["denominator_completed_non_blocked"], 1)
+
+    def test_codex_semantic_text_run_with_required_artifacts_can_pass(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "codex-semantic",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed", result)
+        checks = result["semantic_release_checks"]
+        self.assertTrue(checks["valid"], checks)
+        self.assertEqual(checks["planner_modes"]["run_status"], "codex_semantic")
+        self.assertTrue(checks["semantic_release_eligible"]["run_status"])
+        self.assertTrue(checks["validation_ok"])
+        for artifact_name in checks["required_artifacts"]:
+            self.assertIn(artifact_name, result["status_artifacts"])
+
+    def test_codex_semantic_text_run_requires_complete_review_evidence(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("missing-score", "pop", "semantic_fit_score", "semantic_fit_score"),
+            ("string-score", "set", "semantic_fit_score", "semantic_fit_score"),
+            ("low-score", "low", "semantic_fit_score", "semantic_fit_score"),
+            ("nan-score", "nan", "semantic_fit_score", "semantic_fit_score"),
+            ("infinite-score", "inf", "semantic_fit_score", "semantic_fit_score"),
+            ("negative-infinite-score", "-inf", "semantic_fit_score", "semantic_fit_score"),
+            ("missing-blockers", "pop", "blockers", "semantic_review_blockers"),
+            ("invalid-blockers", "set", "blockers", "semantic_review_blockers"),
+            ("nonempty-blockers", "nonempty", "blockers", "semantic_review_blockers"),
+            (
+                "missing-reviewer-independence",
+                "pop",
+                "reviewer_independence",
+                "reviewer_independence",
+            ),
+            (
+                "failed-reviewer-independence",
+                "failed",
+                "reviewer_independence",
+                "reviewer_independence",
+            ),
+            (
+                "missing-substitute-check",
+                "pop",
+                "substitute_implementation_check",
+                "substitute_implementation_check",
+            ),
+            (
+                "failed-substitute-check",
+                "failed",
+                "substitute_implementation_check",
+                "substitute_implementation_check",
+            ),
+        )
+        for case_name, action, field, expected_check in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                review = self.read_json(run_dir / "semantic_plan_review.json")
+                if action == "pop":
+                    review.pop(field, None)
+                elif action == "set" and field == "semantic_fit_score":
+                    review[field] = "9.4"
+                elif action == "low":
+                    review[field] = 8.99
+                elif action == "nan":
+                    review[field] = float("nan")
+                elif action == "inf":
+                    review[field] = float("inf")
+                elif action == "-inf":
+                    review[field] = float("-inf")
+                elif action == "set" and field == "blockers":
+                    review[field] = {"count": 0}
+                elif action == "nonempty":
+                    review[field] = [{"code": "semantic_gap"}]
+                elif action == "failed" and field == "reviewer_independence":
+                    review[field] = {"independent": False, "status": "shared"}
+                elif action == "failed" and field == "substitute_implementation_check":
+                    review[field] = {"passed": False, "checked": True}
+                else:
+                    raise AssertionError(f"unhandled review mutation: {case_name}")
+                self.write_json(run_dir / "semantic_plan_review.json", review)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["metric_classification"], "included_failure")
+                failure_checks = {
+                    failure["check"]
+                    for failure in result["semantic_release_checks"]["failures"]
+                }
+                self.assertIn(expected_check, failure_checks)
+
+    def test_codex_semantic_text_run_requires_codex_semantic_source_provenance(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("missing-evidence-source", "evidence", None, "evidence.semantic_planner"),
+            ("raw-plan-source", "semantic_plan", "raw_fixture", "semantic_plan.semantic_plan"),
+        )
+        for case_name, artifact, source_value, expected_source in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_parallel",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                if artifact == "evidence":
+                    evidence = self.read_json(run_dir / "evidence.json")
+                    evidence["semantic_planner"].pop("source", None)
+                    self.write_json(run_dir / "evidence.json", evidence)
+                elif artifact == "semantic_plan":
+                    semantic_plan = self.read_json(run_dir / "semantic_plan.json")
+                    semantic_plan["semantic_plan"]["source"] = source_value
+                    self.write_json(run_dir / "semantic_plan.json", semantic_plan)
+                else:
+                    raise AssertionError(f"unhandled provenance mutation: {case_name}")
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed", result)
+                failures = result["semantic_release_checks"]["failures"]
+                source_failures = [
+                    failure
+                    for failure in failures
+                    if failure["check"] == "semantic_codex_source"
+                ]
+                self.assertTrue(source_failures, failures)
+                self.assertTrue(
+                    any(
+                        failure.get("source") == expected_source
+                        or expected_source in failure.get("missing_sources", [])
+                        for failure in source_failures
+                    ),
+                    source_failures,
+                )
+
+    def test_codex_semantic_text_run_requires_oracle_requirement_map_integrity(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("missing-oracle-requirement-map", "pop"),
+            ("empty-oracle-requirement-map", "empty"),
+        )
+        for case_name, action in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+                if action == "pop":
+                    oracle.pop("oracle_requirement_map", None)
+                elif action == "empty":
+                    oracle["oracle_requirement_map"] = []
+                else:
+                    raise AssertionError(f"unhandled oracle mutation: {case_name}")
+                self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact="semantic_expectation_oracle",
+                    field="oracle_requirement_map",
+                )
+
+    def test_codex_semantic_text_run_requires_review_integrity_fields(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        fields = (
+            "question_scope",
+            "raw_request_path",
+            "raw_response_path",
+            "raw_request_hash",
+            "raw_response_hash",
+            "provenance",
+            "template_use",
+            "session_id_unavailable_reason",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / f"missing-review-{field}",
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                review = self.read_json(run_dir / "semantic_plan_review.json")
+                review.pop(field, None)
+                self.write_json(run_dir / "semantic_plan_review.json", review)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact="semantic_plan_review",
+                    field=field,
+                )
+
+    def test_codex_semantic_text_run_requires_plan_integrity_fields(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("missing-semantic-plan", "pop", "semantic_plan", "semantic_plan"),
+            ("missing-plan-angles", "pop", "angles", "angles"),
+            ("empty-plan-angles", "empty", "angles", "angles"),
+            (
+                "missing-nested-plan-angles",
+                "nested-pop",
+                "angles",
+                "semantic_plan.angles",
+            ),
+            (
+                "empty-nested-plan-angles",
+                "nested-empty",
+                "angles",
+                "semantic_plan.angles",
+            ),
+            (
+                "missing-requirement-coverage-map",
+                "pop",
+                "requirement_coverage_map",
+                "requirement_coverage_map",
+            ),
+            (
+                "empty-requirement-coverage-map",
+                "empty",
+                "requirement_coverage_map",
+                "requirement_coverage_map",
+            ),
+        )
+        for case_name, action, field, expected_field in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                plan = self.read_json(run_dir / "semantic_plan.json")
+                if action == "pop":
+                    plan.pop(field, None)
+                elif action == "empty":
+                    plan[field] = []
+                elif action == "nested-pop":
+                    plan["semantic_plan"].pop(field, None)
+                elif action == "nested-empty":
+                    plan["semantic_plan"][field] = []
+                else:
+                    raise AssertionError(f"unhandled plan mutation: {case_name}")
+                self.write_json(run_dir / "semantic_plan.json", plan)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact="semantic_plan",
+                    field=expected_field,
+                )
+
+    def test_codex_semantic_text_run_rejects_generic_one_angle_plan(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "generic-one-angle",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        generic_angle = {
+            "angle_id": "angle_001",
+            "title": "Primary source discovery",
+            "research_question": (
+                "Find authoritative sources that directly answer the research question"
+            ),
+            "question_context": "Generic source discovery context.",
+            "route": "text_only",
+            "evidence_need": "primary_source",
+            "expected_artifacts": ["source list"],
+            "success_criteria": ["Find one source."],
+            "report_section": "Primary Sources",
+        }
+        plan = self.read_json(run_dir / "semantic_plan.json")
+        plan["angles"] = [generic_angle]
+        plan["semantic_plan"]["angles"] = [dict(generic_angle)]
+        plan["requirement_coverage_map"] = [
+            {
+                "requirement_id": "req_001",
+                "angle_id": "angle_001",
+                "coverage_status": "covered",
+            }
+        ]
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+        oracle["oracle_requirement_map"] = [
+            {
+                "requirement_id": "req_001",
+                "description": "Answer the prompt from a primary source.",
+                "covered_by_angle_ids": ["angle_001"],
+            }
+        ]
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assert_semantic_artifact_integrity_failure(
+            result,
+            artifact="semantic_plan",
+            field="angles",
+        )
+
+    def test_codex_semantic_text_run_rejects_generic_angle_text_with_valid_count_and_coverage(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("generic-title", "title", "Primary source discovery"),
+            (
+                "generic-research-question",
+                "research_question",
+                "Find authoritative sources that directly answer the research question",
+            ),
+        )
+        evidence_needs = ("primary_source", "comparative_analysis")
+        for case_name, generic_field, generic_value in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                angles = []
+                for index, evidence_need in enumerate(evidence_needs, start=1):
+                    scope_label = evidence_need.replace("_", " ")
+                    angle = {
+                        "angle_id": f"angle_{index:03d}",
+                        "title": (
+                            f"deterministic release validation {scope_label} scope"
+                        ),
+                        "research_question": (
+                            "Which deterministic software release validation "
+                            f"tradeoffs require {scope_label} review?"
+                        ),
+                        "question_context": (
+                            "Scope deterministic release validation evidence for "
+                            f"public beta prompt {prompt['id']} and {scope_label}."
+                        ),
+                        "route": "text_only",
+                        "evidence_need": evidence_need,
+                        "expected_artifacts": ["source list", "supporting quotes"],
+                        "success_criteria": ["Claims remain tied to source spans."],
+                        "report_section": f"Validation Angle {index}",
+                    }
+                    angle[generic_field] = generic_value
+                    angles.append(angle)
+                plan = self.read_json(run_dir / "semantic_plan.json")
+                plan["angles"] = angles
+                plan["semantic_plan"]["angles"] = [dict(angle) for angle in angles]
+                plan["requirement_coverage_map"] = [
+                    {
+                        "requirement_id": f"req_{index:03d}",
+                        "angle_id": angle["angle_id"],
+                        "coverage_status": "covered",
+                    }
+                    for index, angle in enumerate(angles, start=1)
+                ]
+                self.write_json(run_dir / "semantic_plan.json", plan)
+                oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+                oracle["oracle_requirement_map"] = [
+                    {
+                        "requirement_id": f"req_{index:03d}",
+                        "description": f"Resolve angle {index} for the prompt.",
+                        "covered_by_angle_ids": [angle["angle_id"]],
+                    }
+                    for index, angle in enumerate(angles, start=1)
+                ]
+                self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact="semantic_plan",
+                    field="angles",
+                )
+
+    def test_codex_semantic_text_run_rejects_low_specificity_software_evidence_angles(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "low-specificity-software-evidence",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        evidence_needs = ("primary_source", "comparative_analysis")
+        angles = [
+            {
+                "angle_id": f"angle_{index:03d}",
+                "title": f"software evidence angle {index}",
+                "research_question": f"How does software evidence support angle {index}?",
+                "question_context": (
+                    "Low-specificity software evidence scope for public beta "
+                    f"prompt {prompt['id']}."
+                ),
+                "route": "text_only",
+                "evidence_need": evidence_need,
+                "expected_artifacts": ["source list", "supporting quotes"],
+                "success_criteria": ["Claims remain tied to source spans."],
+                "report_section": f"Software Evidence {index}",
+            }
+            for index, evidence_need in enumerate(evidence_needs, start=1)
+        ]
+        plan = self.read_json(run_dir / "semantic_plan.json")
+        plan["angles"] = angles
+        plan["semantic_plan"]["angles"] = [dict(angle) for angle in angles]
+        plan["requirement_coverage_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "angle_id": angle["angle_id"],
+                "coverage_status": "covered",
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+        oracle["oracle_requirement_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "description": f"Resolve software evidence angle {index}.",
+                "covered_by_angle_ids": [angle["angle_id"]],
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assert_semantic_artifact_integrity_failure(
+            result,
+            artifact="semantic_plan",
+            field="angles",
+        )
+
+    def test_codex_semantic_text_run_rejects_duplicate_token_rich_angles(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "duplicate-token-rich-angles",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        evidence_needs = ("primary_source", "comparative_analysis")
+        angles = [
+            {
+                "angle_id": f"angle_{index:03d}",
+                "title": "deterministic software release validation tradeoffs",
+                "research_question": (
+                    "Which deterministic software release validation criteria "
+                    "shape evidence tradeoffs?"
+                ),
+                "question_context": (
+                    "Evaluate deterministic software release validation evidence "
+                    f"for public beta prompt {prompt['id']}."
+                ),
+                "route": "text_only",
+                "evidence_need": evidence_need,
+                "expected_artifacts": ["source list", "supporting quotes"],
+                "success_criteria": ["Claims remain tied to source spans."],
+                "report_section": f"Release Validation {index}",
+            }
+            for index, evidence_need in enumerate(evidence_needs, start=1)
+        ]
+        plan = self.read_json(run_dir / "semantic_plan.json")
+        plan["angles"] = angles
+        plan["semantic_plan"]["angles"] = [dict(angle) for angle in angles]
+        plan["requirement_coverage_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "angle_id": angle["angle_id"],
+                "coverage_status": "covered",
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+        oracle["oracle_requirement_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "description": f"Resolve release validation angle {index}.",
+                "covered_by_angle_ids": [angle["angle_id"]],
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assert_semantic_artifact_integrity_failure(
+            result,
+            artifact="semantic_plan",
+            field="angles",
+        )
+
+    def test_codex_semantic_text_run_rejects_template_use_fallback_claims(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "template-use-fallback",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        artifact_files = (
+            "semantic_expectation_oracle.json",
+            "semantic_plan.json",
+            "semantic_plan_review.json",
+            "semantic_planner_validation.json",
+        )
+        for filename in artifact_files:
+            path = run_dir / filename
+            payload = self.read_json(path)
+            template_use = dict(payload["template_use"])
+            template_use["uses_preselected_template"] = True
+            template_use["template_source"] = "heuristic_template_planner"
+            template_use["template_angle_titles"] = ["Primary source discovery"]
+            payload["template_use"] = template_use
+            self.write_json(path, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        failures = result["semantic_release_checks"]["failures"]
+        template_failures = {
+            (failure.get("artifact"), failure.get("field"))
+            for failure in failures
+            if failure.get("check") == "semantic_artifact_integrity"
+        }
+        self.assertTrue(
+            {
+                ("semantic_expectation_oracle", "template_use"),
+                ("semantic_plan", "template_use"),
+                ("semantic_plan_review", "template_use"),
+                ("semantic_planner_validation", "template_use"),
+            }.issubset(template_failures),
+            failures,
+        )
+
+    def test_codex_semantic_text_run_rejects_heuristic_planner_provenance(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "heuristic-planner-provenance",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        artifact_files = (
+            "semantic_expectation_oracle.json",
+            "semantic_plan.json",
+            "semantic_plan_review.json",
+            "semantic_planner_validation.json",
+        )
+        for filename in artifact_files:
+            path = run_dir / filename
+            payload = self.read_json(path)
+            provenance = dict(payload["provenance"])
+            provenance["planner_source"] = "heuristic_template_planner"
+            payload["provenance"] = provenance
+            self.write_json(path, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        failures = result["semantic_release_checks"]["failures"]
+        provenance_failures = {
+            (failure.get("artifact"), failure.get("field"))
+            for failure in failures
+            if failure.get("check") == "semantic_artifact_integrity"
+        }
+        self.assertTrue(
+            {
+                ("semantic_expectation_oracle", "provenance"),
+                ("semantic_plan", "provenance"),
+                ("semantic_plan_review", "provenance"),
+                ("semantic_planner_validation", "provenance"),
+            }.issubset(provenance_failures),
+            failures,
+        )
+
+    def test_codex_semantic_text_run_requires_oracle_and_coverage_angle_match(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            (
+                "oracle-partial-coverage",
+                "oracle-partial",
+                "semantic_expectation_oracle",
+                "oracle_requirement_map",
+            ),
+            (
+                "requirement-coverage-partial",
+                "coverage-partial",
+                "semantic_plan",
+                "requirement_coverage_map",
+            ),
+            (
+                "requirement-coverage-mismatch",
+                "coverage-mismatch",
+                "semantic_plan",
+                "requirement_coverage_map",
+            ),
+        )
+        for case_name, mutation, expected_artifact, expected_field in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status="completed_serial_handoff",
+                    ok=True,
+                    semantic_planning="eligible",
+                )
+                if mutation == "oracle-partial":
+                    oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+                    oracle["oracle_requirement_map"] = oracle["oracle_requirement_map"][:2]
+                    self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+                else:
+                    plan = self.read_json(run_dir / "semantic_plan.json")
+                    if mutation == "coverage-partial":
+                        plan["requirement_coverage_map"] = plan[
+                            "requirement_coverage_map"
+                        ][:2]
+                    elif mutation == "coverage-mismatch":
+                        plan["requirement_coverage_map"][0]["angle_id"] = "angle_unknown"
+                    else:
+                        raise AssertionError(f"unhandled coverage mutation: {case_name}")
+                    self.write_json(run_dir / "semantic_plan.json", plan)
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assert_semantic_artifact_integrity_failure(
+                    result,
+                    artifact=expected_artifact,
+                    field=expected_field,
+                )
+
+    def test_semantic_release_failure_paths_remain_included_failures(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        cases = (
+            ("heuristic", "completed_parallel", True, "heuristic_fallback"),
+            ("manual", "completed_manual_planner_fallback", True, "missing"),
+            ("fixture", "completed_fixture", True, "missing"),
+            ("blocked", "blocked_semantic_planner_unavailable", False, "missing"),
+        )
+        for case_name, status, ok, semantic_planning in cases:
+            with self.subTest(case=case_name):
+                run_dir = self.write_text_run(
+                    self.temp_dir() / case_name,
+                    prompt=prompt,
+                    suite_id="public-beta-validation",
+                    status=status,
+                    ok=ok,
+                    semantic_planning=semantic_planning,
+                )
+
+                result = evaluate_public_beta_prompt_run(
+                    prompt,
+                    run_dir,
+                    suite_id="public-beta-validation",
+                )
+
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["metric_classification"], "included_failure")
+                self.assertEqual(result["failure_category"], "artifact_handoff_failure")
 
     def test_partial_parallel_reliability_counts_passing_text_and_visual_runs(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -1348,31 +2271,52 @@ class PublicBetaValidationTests(unittest.TestCase):
         status: str,
         ok: bool = True,
         created_at: str | None = None,
+        semantic_planning: str = "eligible",
     ) -> Path:
         run_dir.mkdir(parents=True)
         terminal = True
         timestamp = created_at or self.now()
+        semantic_release_statuses = {
+            "completed_parallel",
+            "completed_partial_parallel",
+            "completed_serial_handoff",
+        }
+        semantic_metadata = self.semantic_planning_metadata(
+            semantic_planning,
+            enabled=status in semantic_release_statuses,
+        )
+        run_status_payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_dir.name,
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "original_question": prompt["prompt"],
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "question": prompt["prompt"],
+            "status": status,
+            "ok": ok,
+            "terminal": terminal,
+            "created_at": timestamp,
+            "completed_at": timestamp,
+            "selected_mode": "full-runner",
+            "search_provider": "codex-native",
+            "adapter": "codex-exec",
+        }
+        if semantic_metadata:
+            run_status_payload.update(
+                {
+                    "planner_mode": semantic_metadata["planner_mode"],
+                    "semantic_release_eligible": semantic_metadata[
+                        "semantic_release_eligible"
+                    ],
+                    "semantic_planning": semantic_metadata["summary"],
+                }
+            )
         self.write_json(
             run_dir / "run_status.json",
-            {
-                "schema_version": "codex-deepresearch.run-status.v0",
-                "run_id": run_dir.name,
-                "prompt_id": prompt["id"],
-                "prompt_hash": self.prompt_hash(prompt["prompt"]),
-                "suite_id": suite_id,
-                "original_question": prompt["prompt"],
-                "execution_mode": "codex-plugin",
-                "runner_mode": "full-runner",
-                "question": prompt["prompt"],
-                "status": status,
-                "ok": ok,
-                "terminal": terminal,
-                "created_at": timestamp,
-                "completed_at": timestamp,
-                "selected_mode": "full-runner",
-                "search_provider": "codex-native",
-                "adapter": "codex-exec",
-            },
+            run_status_payload,
         )
         self.write_json(
             run_dir / "search_tasks.json",
@@ -1401,22 +2345,37 @@ class PublicBetaValidationTests(unittest.TestCase):
             [self.codex_native_search_result(prompt, suite_id=suite_id)],
         )
         if status.startswith("completed"):
+            evidence_payload = {
+                "schema_version": "0.1.0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
+                "question": prompt["prompt"],
+                "created_at": timestamp,
+                "mode": "codex-plugin",
+                "search_provider": "codex-native",
+            }
+            if semantic_metadata:
+                evidence_payload["semantic_planner"] = {
+                    "schema_version": "codex-deepresearch.semantic-planner.v0",
+                    "question_class": "general",
+                    "broad_question": False,
+                    "source": semantic_metadata["source"],
+                    "expected_evidence_needs": ["primary_source"],
+                    "planner_mode": semantic_metadata["planner_mode"],
+                    "semantic_release_eligible": semantic_metadata[
+                        "semantic_release_eligible"
+                    ],
+                    "status": semantic_metadata["summary"]["status"],
+                    "diagnostics": dict(semantic_metadata["diagnostics"]),
+                }
             self.write_json(
                 run_dir / "evidence.json",
-                {
-                    "schema_version": "0.1.0",
-                    "run_id": run_dir.name,
-                    "prompt_id": prompt["id"],
-                    "prompt_hash": self.prompt_hash(prompt["prompt"]),
-                    "suite_id": suite_id,
-                    "original_question": prompt["prompt"],
-                    "execution_mode": "codex-plugin",
-                    "runner_mode": "full-runner",
-                    "question": prompt["prompt"],
-                    "created_at": timestamp,
-                    "mode": "codex-plugin",
-                    "search_provider": "codex-native",
-                },
+                evidence_payload,
             )
             self.write_json(
                 run_dir / "report_status.json",
@@ -1436,7 +2395,328 @@ class PublicBetaValidationTests(unittest.TestCase):
                 },
             )
             (run_dir / "report.md").write_text("# Public-safe report\n", encoding="utf-8")
+            if semantic_metadata:
+                self.write_semantic_release_artifacts(
+                    run_dir,
+                    prompt=prompt,
+                    suite_id=suite_id,
+                    timestamp=timestamp,
+                    metadata=semantic_metadata,
+                )
         return run_dir
+
+    def semantic_planning_metadata(
+        self,
+        mode: str,
+        *,
+        enabled: bool,
+    ) -> dict[str, Any] | None:
+        if not enabled or mode == "missing":
+            return None
+        if mode == "eligible":
+            planner_mode = "codex_semantic"
+            eligible = True
+            status = "accepted_codex_semantic"
+            source = "codex_semantic"
+            diagnostics: dict[str, Any] = {}
+            failures: list[dict[str, Any]] = []
+            blockers: list[dict[str, Any]] = []
+            score: float | None = 9.4
+            verdict = "passed"
+        elif mode == "heuristic_fallback":
+            planner_mode = "heuristic_template_fallback"
+            eligible = False
+            status = "prepared_heuristic_template_fallback"
+            source = "heuristic_template_planner"
+            diagnostics = {
+                "semantic_release_eligible": False,
+                "planner_mode": planner_mode,
+                "fallback_kind": "keyword/template fallback planner",
+                "user_visible_diagnostic": (
+                    "True semantic decomposition did not run; this path is useful "
+                    "only as a release-ineligible fallback and cannot satisfy "
+                    "semantic planner gates."
+                ),
+            }
+            failures = [
+                {"code": "semantic_release_ineligible"},
+                {"code": "release_ineligible_planner_mode"},
+            ]
+            blockers = [
+                {
+                    "code": "release_ineligible_planner_mode",
+                    "planner_mode": planner_mode,
+                }
+            ]
+            score = None
+            verdict = "release_ineligible"
+        else:
+            raise AssertionError(f"unknown semantic_planning fixture mode: {mode}")
+        return {
+            "planner_mode": planner_mode,
+            "semantic_release_eligible": eligible,
+            "source": source,
+            "diagnostics": diagnostics,
+            "failures": failures,
+            "blockers": blockers,
+            "semantic_fit_score": score,
+            "final_verdict": verdict,
+            "summary": {
+                "schema_version": "codex-deepresearch.semantic-planning-summary.v0",
+                "status": status,
+                "planner_mode": planner_mode,
+                "semantic_release_eligible": eligible,
+                "validation_ok": not failures,
+                "user_visible_diagnostic": diagnostics.get("user_visible_diagnostic"),
+            },
+        }
+
+    def write_semantic_release_artifacts(
+        self,
+        run_dir: Path,
+        *,
+        prompt: dict[str, Any],
+        suite_id: str,
+        timestamp: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        generic_terms = {
+            "and",
+            "across",
+            "cite",
+            "compare",
+            "for",
+            "from",
+            "guidance",
+            "public",
+            "research",
+            "the",
+            "visual",
+            "evidence",
+        }
+        prompt_terms: list[str] = []
+        for raw_token in prompt["prompt"].replace("-", " ").replace("/", " ").split():
+            token = raw_token.strip(".,:;!?()[]{}\"'").lower()
+            if len(token) <= 2 or token in generic_terms or token in prompt_terms:
+                continue
+            prompt_terms.append(token)
+        subject = " ".join(prompt_terms[:4]) or "public beta validation"
+        angles = [
+            {
+                "angle_id": "angle_001",
+                "title": f"{subject} source evidence map",
+                "research_question": (
+                    f"Which primary sources define {subject} evidence-quality tradeoffs?"
+                ),
+                "question_context": (
+                    f"Scope prompt terms: {subject}; public beta prompt {prompt['id']}."
+                ),
+                "route": prompt["route"],
+                "evidence_need": "primary_source",
+                "expected_artifacts": ["source list", "supporting quotes"],
+                "success_criteria": ["Claims remain tied to source spans."],
+                "report_section": "Primary Sources",
+            },
+            {
+                "angle_id": "angle_002",
+                "title": f"{subject} comparison criteria",
+                "research_question": (
+                    f"How do {subject} approaches differ in validation criteria?"
+                ),
+                "question_context": (
+                    f"Compare public evidence for {subject} without using fixtures."
+                ),
+                "route": prompt["route"],
+                "evidence_need": "comparative_analysis",
+                "expected_artifacts": ["comparison matrix", "difference notes"],
+                "success_criteria": ["Comparisons cite distinct source-backed criteria."],
+                "report_section": "Comparison",
+            },
+            {
+                "angle_id": "angle_003",
+                "title": f"{subject} caveats and limits",
+                "research_question": (
+                    f"What caveats limit claims about {subject} release readiness?"
+                ),
+                "question_context": (
+                    f"Identify caveats that affect the {subject} evidence record."
+                ),
+                "route": prompt["route"],
+                "evidence_need": "risk_or_guardrail",
+                "expected_artifacts": ["risk register", "guardrail checklist"],
+                "success_criteria": ["Caveats are explicit and source-linked."],
+                "report_section": "Caveats",
+            },
+        ]
+        semantic_plan = {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "question_class": "general",
+            "broad_question": False,
+            "source": metadata["source"],
+            "expected_evidence_needs": [
+                "primary_source",
+                "comparative_analysis",
+                "risk_or_guardrail",
+            ],
+            "planner_mode": metadata["planner_mode"],
+            "semantic_release_eligible": metadata["semantic_release_eligible"],
+            "status": metadata["summary"]["status"],
+            "diagnostics": dict(metadata["diagnostics"]),
+            "angles": angles,
+        }
+        question_scope = {
+            "original_question": prompt["prompt"],
+            "question_hash": self.prompt_hash(prompt["prompt"]),
+            "question_class": "general",
+            "planner_mode": metadata["planner_mode"],
+            "angle_count": len(angles),
+        }
+        uses_template = metadata["planner_mode"] != "codex_semantic"
+        template_use = {
+            "uses_preselected_template": uses_template,
+            "template_source": metadata["source"] if uses_template else None,
+            "template_release_eligible": False,
+            "template_angle_titles": [
+                angle["title"] for angle in angles
+            ] if uses_template else [],
+        }
+        session_id_unavailable_reason = (
+            "Public beta test fixture records deterministic semantic artifacts "
+            "without a live Codex session id."
+        )
+        provenance = {
+            "planner_mode": metadata["planner_mode"],
+            "planner_source": metadata["source"],
+            "raw_request_required": True,
+            "raw_response_required": True,
+            "session_id": None,
+            "session_id_unavailable_reason": session_id_unavailable_reason,
+            "semantic_release_eligible": metadata["semantic_release_eligible"],
+        }
+        raw_dir = run_dir / "semantic_raw"
+        raw_request_path = raw_dir / "semantic_request.json"
+        raw_response_path = raw_dir / "semantic_response.json"
+        self.write_json(
+            raw_request_path,
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "artifact_type": "semantic_planner_raw_request",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "planner_mode": metadata["planner_mode"],
+                "semantic_release_eligible": metadata["semantic_release_eligible"],
+                "question": prompt["prompt"],
+                "question_scope": question_scope,
+                "template_use": template_use,
+                "provenance": provenance,
+            },
+        )
+        self.write_json(
+            raw_response_path,
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "artifact_type": "semantic_planner_raw_response",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "planner_mode": metadata["planner_mode"],
+                "semantic_release_eligible": metadata["semantic_release_eligible"],
+                "semantic_plan": semantic_plan,
+                "diagnostics": dict(metadata["diagnostics"]),
+                "provenance": provenance,
+            },
+        )
+        raw_request_hash = hashlib.sha256(raw_request_path.read_bytes()).hexdigest()
+        raw_response_hash = hashlib.sha256(raw_response_path.read_bytes()).hexdigest()
+        base = {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "run_id": run_dir.name,
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "original_question": prompt["prompt"],
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "created_at": timestamp,
+            "planner_mode": metadata["planner_mode"],
+            "semantic_release_eligible": metadata["semantic_release_eligible"],
+            "question_scope": question_scope,
+            "raw_request_path": str(raw_request_path),
+            "raw_response_path": str(raw_response_path),
+            "raw_request_hash": raw_request_hash,
+            "raw_response_hash": raw_response_hash,
+            "provenance": provenance,
+            "template_use": template_use,
+            "session_id": None,
+            "session_id_unavailable_reason": session_id_unavailable_reason,
+        }
+        self.write_json(
+            run_dir / "semantic_expectation_oracle.json",
+            {
+                **base,
+                "artifact_type": "semantic_expectation_oracle",
+                "oracle_requirement_map": [
+                    {
+                        "requirement_id": f"req_{index:03d}",
+                        "description": f"Resolve {angle['title']} for the prompt.",
+                        "covered_by_angle_ids": [angle["angle_id"]],
+                    }
+                    for index, angle in enumerate(angles, start=1)
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                **base,
+                "artifact_type": "semantic_plan",
+                "semantic_plan": semantic_plan,
+                "angles": angles,
+                "requirement_coverage_map": [
+                    {
+                        "requirement_id": f"req_{index:03d}",
+                        "angle_id": angle["angle_id"],
+                        "coverage_status": "covered",
+                    }
+                    for index, angle in enumerate(angles, start=1)
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan_review.json",
+            {
+                **base,
+                "artifact_type": "semantic_plan_review",
+                "semantic_fit_score": metadata["semantic_fit_score"],
+                "blockers": list(metadata["blockers"]),
+                "warnings": [],
+                "reviewer_independence": {
+                    "independent": metadata["semantic_release_eligible"],
+                    "status": (
+                        "passed"
+                        if metadata["semantic_release_eligible"]
+                        else "release_ineligible"
+                    ),
+                },
+                "substitute_implementation_check": {
+                    "passed": metadata["semantic_release_eligible"],
+                    "checked": True,
+                },
+                "final_verdict": metadata["final_verdict"],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_planner_validation.json",
+            {
+                **base,
+                "fixture_id": run_dir.name,
+                "question_class": "general",
+                "broad_question": False,
+                "angle_count": len(angles),
+                "task_count": len(angles),
+                "failures": list(metadata["failures"]),
+                "ok": not metadata["failures"],
+            },
+        )
 
     def write_visual_run(
         self,
@@ -1457,27 +2737,42 @@ class PublicBetaValidationTests(unittest.TestCase):
             if prompt["route"] == "visual_required"
         )
         timestamp = self.now()
+        semantic_metadata = self.semantic_planning_metadata(
+            "eligible",
+            enabled=run_status == "completed_auto_visual",
+        )
+        run_status_payload = {
+            "schema_version": "codex-deepresearch.run-status.v0",
+            "run_id": run_dir.name,
+            "prompt_id": prompt["id"],
+            "prompt_hash": self.prompt_hash(prompt["prompt"]),
+            "suite_id": suite_id,
+            "original_question": prompt["prompt"],
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "question": prompt["prompt"],
+            "status": run_status,
+            "ok": run_status == "completed_auto_visual",
+            "terminal": True,
+            "created_at": timestamp,
+            "completed_at": timestamp,
+            "selected_mode": "full-runner",
+            "search_provider": "codex-native",
+            "vlm_provider": "codex-interactive",
+        }
+        if semantic_metadata:
+            run_status_payload.update(
+                {
+                    "planner_mode": semantic_metadata["planner_mode"],
+                    "semantic_release_eligible": semantic_metadata[
+                        "semantic_release_eligible"
+                    ],
+                    "semantic_planning": semantic_metadata["summary"],
+                }
+            )
         self.write_json(
             run_dir / "run_status.json",
-            {
-                "schema_version": "codex-deepresearch.run-status.v0",
-                "run_id": run_dir.name,
-                "prompt_id": prompt["id"],
-                "prompt_hash": self.prompt_hash(prompt["prompt"]),
-                "suite_id": suite_id,
-                "original_question": prompt["prompt"],
-                "execution_mode": "codex-plugin",
-                "runner_mode": "full-runner",
-                "question": prompt["prompt"],
-                "status": run_status,
-                "ok": run_status == "completed_auto_visual",
-                "terminal": True,
-                "created_at": timestamp,
-                "completed_at": timestamp,
-                "selected_mode": "full-runner",
-                "search_provider": "codex-native",
-                "vlm_provider": "codex-interactive",
-            },
+            run_status_payload,
         )
         self.write_json(
             run_dir / "search_tasks.json",
@@ -1554,9 +2849,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "candidate_id": candidates[0]["candidate_id"] if candidates else "cand_001",
             "fetch_id": fetches[0]["fetch_id"] if fetches else "fetch_001",
         }
-        self.write_json(
-            run_dir / "evidence.json",
-            {
+        evidence_payload = {
                 "schema_version": "0.1.0",
                 "run_id": run_dir.name,
                 "prompt_id": prompt["id"],
@@ -1585,8 +2878,30 @@ class PublicBetaValidationTests(unittest.TestCase):
                 ]
                 if release_grade
                 else [],
-            },
-        )
+            }
+        if semantic_metadata:
+            evidence_payload["semantic_planner"] = {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "question_class": "visual_style",
+                "broad_question": True,
+                "source": semantic_metadata["source"],
+                "expected_evidence_needs": ["visual_observation"],
+                "planner_mode": semantic_metadata["planner_mode"],
+                "semantic_release_eligible": semantic_metadata[
+                    "semantic_release_eligible"
+                ],
+                "status": semantic_metadata["summary"]["status"],
+                "diagnostics": dict(semantic_metadata["diagnostics"]),
+            }
+        self.write_json(run_dir / "evidence.json", evidence_payload)
+        if semantic_metadata:
+            self.write_semantic_release_artifacts(
+                run_dir,
+                prompt=prompt,
+                suite_id=suite_id,
+                timestamp=timestamp,
+                metadata=semantic_metadata,
+            )
         self.write_json(
             run_dir / "report_status.json",
             {

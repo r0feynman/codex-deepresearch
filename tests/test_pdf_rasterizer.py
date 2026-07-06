@@ -25,6 +25,13 @@ from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E4
 from deepresearch import pdf_rasterizer  # noqa: E402
 from deepresearch import visual_acquisition  # noqa: E402
 
+prepare_search_handoff_run = prepare_run
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", ["primary source discovery"])
+    return prepare_search_handoff_run(*args, **kwargs)
+
 
 class PdfRasterizerTests(unittest.TestCase):
     def temp_runs_dir(self) -> Path:

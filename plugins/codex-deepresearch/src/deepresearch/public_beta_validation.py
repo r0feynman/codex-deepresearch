@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -76,8 +77,82 @@ PASS_TERMINAL_STATUSES = {
     "completed_serial_handoff",
     "completed_auto_visual",
 }
+SEMANTIC_RELEASE_TERMINAL_STATUSES = {
+    "completed_parallel",
+    "completed_partial_parallel",
+    "completed_serial_handoff",
+}
+SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES = {
+    "blocked_semantic_planner_unavailable",
+    "completed_fixture",
+    "completed_manual_planner_fallback",
+}
+SEMANTIC_RELEASE_REQUIRED_ARTIFACTS = (
+    "semantic_expectation_oracle",
+    "semantic_plan",
+    "semantic_plan_review",
+    "semantic_planner_validation",
+)
+SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES = (
+    "run_status",
+    "evidence.semantic_planner",
+    "semantic_expectation_oracle",
+    "semantic_plan",
+    "semantic_plan.semantic_plan",
+    "semantic_plan_review",
+    "semantic_planner_validation",
+)
+SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES = (
+    "evidence.semantic_planner",
+    "semantic_plan.semantic_plan",
+)
+SEMANTIC_MIN_RELEASE_ANGLES = 2
+SEMANTIC_MIN_ANGLE_OVERLAP_TOKENS = 2
+SEMANTIC_MIN_ANGLE_UNIQUE_TOKENS = 4
+SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD = 0.85
+GENERIC_SEMANTIC_ANGLE_TEXTS = {
+    "primary source discovery",
+    "find authoritative sources that directly answer the research question",
+}
+GENERIC_SEMANTIC_PLACEHOLDER_PATTERNS = (
+    r"\bangle\s*\d+\b",
+    r"\bangle_\d+\b",
+    r"\bevidence\s+angle\b",
+    r"\bsupport\s+angle\b",
+)
+GENERIC_SEMANTIC_TOKENS = {
+    "and",
+    "answer",
+    "authoritative",
+    "compare",
+    "directly",
+    "does",
+    "discovery",
+    "do",
+    "evidence",
+    "find",
+    "for",
+    "from",
+    "how",
+    "official",
+    "primary",
+    "public",
+    "question",
+    "research",
+    "source",
+    "sources",
+    "support",
+    "supports",
+    "supporting",
+    "that",
+    "the",
+    "what",
+    "with",
+    "which",
+}
 BLOCKED_TERMINAL_STATUSES = {
     "blocked_preflight",
+    "blocked_semantic_planner_unavailable",
     "blocked_missing_search_handoff",
     "blocked_parallel_execution",
     "blocked_missing_visual_provider",
@@ -89,6 +164,7 @@ BLOCKED_TERMINAL_STATUSES = {
 INCLUDED_FAILURE_STATUSES = {
     "partial_auto_visual",
     "budget_pruned_visual",
+    "completed_manual_planner_fallback",
     "failed_parallel_no_accepted_shards",
     "failed_release_handoff_invalid",
     "failed_validation",
@@ -603,6 +679,13 @@ def evaluate_public_beta_prompt_run(
         run_status=run_status if isinstance(run_status, Mapping) else {},
         evidence=evidence if isinstance(evidence, Mapping) else {},
     )
+    semantic_release_checks: dict[str, Any] | None = None
+    if _requires_semantic_release_gate(prompt, terminal_status):
+        semantic_release_checks = _semantic_release_checks(
+            loaded_artifacts=loaded,
+            run_status=run_status if isinstance(run_status, Mapping) else {},
+            evidence=evidence if isinstance(evidence, Mapping) else {},
+        )
 
     provider_provenance = _provider_provenance(
         prompt=prompt,
@@ -678,6 +761,17 @@ def evaluate_public_beta_prompt_run(
         )
     if (
         status == "passed"
+        and semantic_release_checks is not None
+        and not semantic_release_checks["valid"]
+    ):
+        status = "failed"
+        classification = "included_failure"
+        failure_category = "artifact_handoff_failure"
+        detail = "semantic planner release gate failed: " + "; ".join(
+            failure["detail"] for failure in semantic_release_checks["failures"]
+        )
+    if (
+        status == "passed"
         and visual_release_checks is not None
         and not visual_release_checks["valid"]
     ):
@@ -723,6 +817,8 @@ def evaluate_public_beta_prompt_run(
         "public_safe": prompt.get("public_safe") is True,
         "raw_run_bundle_copied": False,
     }
+    if semantic_release_checks is not None:
+        result["semantic_release_checks"] = semantic_release_checks
     if visual_release_checks is not None:
         result["visual_release_checks"] = visual_release_checks
     return result
@@ -1666,6 +1762,10 @@ def _artifact_paths(run_dir: Path, *, route: str) -> dict[str, Path]:
         "report_status": run_dir / "report_status.json",
         "parallel_status": run_dir / "parallel_orchestration_status.json",
         "run_trace": run_dir / "run_trace.jsonl",
+        "semantic_expectation_oracle": run_dir / "semantic_expectation_oracle.json",
+        "semantic_plan": run_dir / "semantic_plan.json",
+        "semantic_plan_review": run_dir / "semantic_plan_review.json",
+        "semantic_planner_validation": run_dir / "semantic_planner_validation.json",
     }
     if route in VISUAL_ROUTES:
         artifacts.update(
@@ -1688,6 +1788,8 @@ def _required_status_artifacts(
     required = ["run_status"]
     if terminal_status in PASS_TERMINAL_STATUSES:
         required.extend(["evidence", "search_tasks", "search_results", "report", "report_status"])
+    if _requires_semantic_release_gate(prompt, terminal_status):
+        required.extend(SEMANTIC_RELEASE_REQUIRED_ARTIFACTS)
     if prompt.get("route") in VISUAL_ROUTES:
         required.append("visual_provider_status")
     if terminal_status == "completed_auto_visual":
@@ -1703,6 +1805,769 @@ def _required_status_artifacts(
     return required
 
 
+def _requires_semantic_release_gate(
+    prompt: Mapping[str, Any],
+    terminal_status: str,
+) -> bool:
+    if prompt.get("route") in VISUAL_ROUTES:
+        return terminal_status in (
+            SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES | {"completed_auto_visual"}
+        )
+    return terminal_status in (
+        SEMANTIC_RELEASE_TERMINAL_STATUSES
+        | SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES
+    )
+
+
+def _semantic_release_checks(
+    *,
+    loaded_artifacts: Mapping[str, Any],
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    failures: list[dict[str, Any]] = []
+    required_payloads: dict[str, Mapping[str, Any]] = {}
+    for name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
+        payload = loaded_artifacts.get(name)
+        if isinstance(payload, Mapping):
+            required_payloads[name] = payload
+        else:
+            failures.append(
+                {
+                    "check": "required_semantic_artifact_present",
+                    "artifact": name,
+                    "detail": f"{name}.json is missing or invalid",
+                }
+            )
+
+    planner_sources = _semantic_planner_mode_sources(
+        run_status=run_status,
+        evidence=evidence,
+        artifacts=required_payloads,
+    )
+    missing_planner_sources = [
+        source
+        for source in SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES
+        if source not in planner_sources
+    ]
+    if missing_planner_sources:
+        failures.append(
+            {
+                "check": "semantic_planner_mode",
+                "missing_sources": missing_planner_sources,
+                "detail": "planner_mode is missing from semantic release artifacts",
+            }
+        )
+    for source, planner_mode in sorted(planner_sources.items()):
+        if planner_mode != "codex_semantic":
+            failures.append(
+                {
+                    "check": "semantic_planner_mode",
+                    "source": source,
+                    "planner_mode": planner_mode,
+                    "detail": f"{source}.planner_mode is {planner_mode}, expected codex_semantic",
+                }
+            )
+
+    eligible_sources = _semantic_release_eligible_sources(
+        run_status=run_status,
+        evidence=evidence,
+        artifacts=required_payloads,
+    )
+    missing_eligible_sources = [
+        source
+        for source in SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES
+        if source not in eligible_sources
+    ]
+    if missing_eligible_sources:
+        failures.append(
+            {
+                "check": "semantic_release_eligible",
+                "missing_sources": missing_eligible_sources,
+                "detail": "semantic_release_eligible is missing from semantic release artifacts",
+            }
+        )
+    for source, eligible in sorted(eligible_sources.items()):
+        if eligible is not True:
+            failures.append(
+                {
+                    "check": "semantic_release_eligible",
+                    "source": source,
+                    "semantic_release_eligible": eligible,
+                    "detail": f"{source}.semantic_release_eligible is not true",
+                }
+            )
+
+    codex_source_sources = _semantic_codex_source_sources(
+        evidence=evidence,
+        artifacts=required_payloads,
+    )
+    missing_codex_source_sources = [
+        source
+        for source in SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES
+        if source not in codex_source_sources
+    ]
+    if missing_codex_source_sources:
+        failures.append(
+            {
+                "check": "semantic_codex_source",
+                "missing_sources": missing_codex_source_sources,
+                "detail": "codex_semantic source provenance is missing from semantic release artifacts",
+            }
+        )
+    for source, codex_source in sorted(codex_source_sources.items()):
+        if codex_source != "codex_semantic":
+            failures.append(
+                {
+                    "check": "semantic_codex_source",
+                    "source": source,
+                    "semantic_source": codex_source,
+                    "detail": f"{source}.source is {codex_source}, expected codex_semantic",
+                }
+            )
+
+    validation = required_payloads.get("semantic_planner_validation")
+    if not isinstance(validation, Mapping) or validation.get("ok") is not True:
+        failures.append(
+            {
+                "check": "semantic_planner_validation_ok",
+                "detail": "semantic_planner_validation.ok is not true",
+            }
+        )
+
+    review = required_payloads.get("semantic_plan_review")
+    if isinstance(review, Mapping):
+        score = _numeric_or_none(review.get("semantic_fit_score"))
+        if score is None:
+            failures.append(
+                {
+                    "check": "semantic_fit_score",
+                    "semantic_fit_score": review.get("semantic_fit_score"),
+                    "detail": "semantic_plan_review.semantic_fit_score is missing or non-numeric",
+                }
+            )
+        elif score < 9.0:
+            failures.append(
+                {
+                    "check": "semantic_fit_score",
+                    "semantic_fit_score": score,
+                    "detail": "semantic_plan_review.semantic_fit_score is below 9.0",
+                }
+            )
+        blockers = review.get("blockers")
+        if not isinstance(blockers, list):
+            failures.append(
+                {
+                    "check": "semantic_review_blockers",
+                    "detail": "semantic_plan_review.blockers must be a list",
+                }
+            )
+        elif blockers:
+            failures.append(
+                {
+                    "check": "semantic_review_blockers",
+                    "blocker_count": len(blockers),
+                    "detail": "semantic_plan_review.blockers is not empty",
+                }
+            )
+        substitute = review.get("substitute_implementation_check")
+        if not isinstance(substitute, Mapping) or substitute.get("passed") is not True:
+            failures.append(
+                {
+                    "check": "substitute_implementation_check",
+                    "detail": "semantic_plan_review.substitute_implementation_check.passed is not true",
+                }
+            )
+        independence = review.get("reviewer_independence")
+        if not isinstance(independence, Mapping) or independence.get("independent") is not True:
+            failures.append(
+                {
+                    "check": "reviewer_independence",
+                    "detail": "semantic_plan_review.reviewer_independence.independent is not true",
+                }
+            )
+
+    if _claims_eligible_codex_semantic(
+        planner_sources=planner_sources,
+        eligible_sources=eligible_sources,
+    ):
+        failures.extend(_semantic_artifact_integrity_failures(required_payloads))
+
+    return {
+        "schema_version": "codex-deepresearch.semantic-release-checks.v0",
+        "valid": not failures,
+        "required_artifacts": list(SEMANTIC_RELEASE_REQUIRED_ARTIFACTS),
+        "present_artifacts": sorted(required_payloads),
+        "planner_modes": planner_sources,
+        "semantic_release_eligible": eligible_sources,
+        "semantic_codex_sources": codex_source_sources,
+        "validation_ok": validation.get("ok") if isinstance(validation, Mapping) else None,
+        "semantic_fit_score": review.get("semantic_fit_score") if isinstance(review, Mapping) else None,
+        "failures": failures,
+    }
+
+
+def _claims_eligible_codex_semantic(
+    *,
+    planner_sources: Mapping[str, str],
+    eligible_sources: Mapping[str, Any],
+) -> bool:
+    return (
+        any(
+            planner_mode == "codex_semantic"
+            for planner_mode in planner_sources.values()
+        )
+        and any(eligible is True for eligible in eligible_sources.values())
+    )
+
+
+def _semantic_artifact_integrity_failures(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for artifact_name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
+        payload = artifacts.get(artifact_name)
+        if not isinstance(payload, Mapping):
+            continue
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="question_scope",
+            invalid=not _valid_semantic_question_scope(payload.get("question_scope")),
+        )
+        for field in ("raw_request_path", "raw_response_path"):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name=artifact_name,
+                field=field,
+                invalid=not _non_empty_string(payload.get(field)),
+            )
+        for field in ("raw_request_hash", "raw_response_hash"):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name=artifact_name,
+                field=field,
+                invalid=not _sha256_hex_string(payload.get(field)),
+            )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="provenance",
+            invalid=not _valid_semantic_provenance(payload.get("provenance")),
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="template_use",
+            invalid=not _valid_semantic_template_use(payload.get("template_use")),
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name=artifact_name,
+            field="session_id_unavailable_reason",
+            invalid=not _non_empty_string(payload.get("session_id_unavailable_reason")),
+        )
+
+    plan_angle_ids: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    if isinstance(plan, Mapping):
+        semantic_plan = plan.get("semantic_plan")
+        original_question = _semantic_original_question(plan, semantic_plan)
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="semantic_plan",
+            invalid=not isinstance(semantic_plan, Mapping) or not semantic_plan,
+        )
+        nested_angle_ids: set[str] = set()
+        if isinstance(semantic_plan, Mapping):
+            nested_angles = semantic_plan.get("angles")
+            nested_angles_valid = _valid_semantic_angles(
+                nested_angles,
+                original_question=original_question,
+            )
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name="semantic_plan",
+                field="semantic_plan.angles",
+                invalid=not nested_angles_valid,
+            )
+            if nested_angles_valid:
+                nested_angle_ids = _semantic_angle_ids(nested_angles)
+        top_level_angles = plan.get("angles")
+        top_level_angles_valid = _valid_semantic_angles(
+            top_level_angles,
+            original_question=original_question,
+        )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="angles",
+            invalid=not top_level_angles_valid,
+        )
+        if top_level_angles_valid:
+            plan_angle_ids = _semantic_angle_ids(top_level_angles)
+        if (
+            top_level_angles_valid
+            and nested_angle_ids
+            and nested_angle_ids != plan_angle_ids
+        ):
+            _append_semantic_artifact_failure_if(
+                failures,
+                artifact_name="semantic_plan",
+                field="semantic_plan.angles",
+                invalid=True,
+            )
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_plan",
+            field="requirement_coverage_map",
+            invalid=not _valid_requirement_coverage_map(
+                plan.get("requirement_coverage_map"),
+                plan_angle_ids=plan_angle_ids,
+            ),
+        )
+
+    oracle = artifacts.get("semantic_expectation_oracle")
+    if isinstance(oracle, Mapping):
+        _append_semantic_artifact_failure_if(
+            failures,
+            artifact_name="semantic_expectation_oracle",
+            field="oracle_requirement_map",
+            invalid=not _valid_oracle_requirement_map(
+                oracle.get("oracle_requirement_map"),
+                plan_angle_ids=plan_angle_ids,
+            ),
+        )
+
+    return failures
+
+
+def _append_semantic_artifact_failure_if(
+    failures: list[dict[str, Any]],
+    *,
+    artifact_name: str,
+    field: str,
+    invalid: bool,
+) -> None:
+    if not invalid:
+        return
+    failures.append(
+        {
+            "check": "semantic_artifact_integrity",
+            "artifact": artifact_name,
+            "field": field,
+            "detail": f"{artifact_name}.{field} is missing or shallow",
+        }
+    )
+
+
+def _valid_semantic_question_scope(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    angle_count = value.get("angle_count")
+    return (
+        _non_empty_string(value.get("original_question"))
+        and _sha256_hex_string(value.get("question_hash"))
+        and _non_empty_string(value.get("question_class"))
+        and _non_empty_string(value.get("planner_mode"))
+        and isinstance(angle_count, int)
+        and not isinstance(angle_count, bool)
+        and angle_count > 0
+    )
+
+
+def _valid_semantic_provenance(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("planner_mode") == "codex_semantic"
+        and value.get("planner_source") == "codex_semantic"
+        and value.get("raw_request_required") is True
+        and value.get("raw_response_required") is True
+        and _non_empty_string(value.get("session_id_unavailable_reason"))
+        and value.get("semantic_release_eligible") is True
+    )
+
+
+def _valid_semantic_template_use(value: Any) -> bool:
+    template_source = value.get("template_source") if isinstance(value, Mapping) else None
+    return (
+        isinstance(value, Mapping)
+        and value.get("uses_preselected_template") is False
+        and value.get("template_release_eligible") is False
+        and value.get("template_angle_titles") == []
+        and (
+            template_source is None
+            or (isinstance(template_source, str) and not template_source.strip())
+        )
+    )
+
+
+def _semantic_original_question(*payloads: Any) -> str:
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        scope = payload.get("question_scope")
+        if isinstance(scope, Mapping) and _non_empty_string(scope.get("original_question")):
+            return str(scope["original_question"]).strip()
+        for field in ("original_question", "question"):
+            if _non_empty_string(payload.get(field)):
+                return str(payload[field]).strip()
+    return ""
+
+
+def _valid_oracle_requirement_map(
+    value: Any,
+    *,
+    plan_angle_ids: set[str],
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or len(value) < SEMANTIC_MIN_RELEASE_ANGLES
+        or not plan_angle_ids
+    ):
+        return False
+    covered_angle_ids: set[str] = set()
+    for requirement in value:
+        if not _valid_oracle_requirement(requirement):
+            return False
+        covered_angle_ids.update(
+            str(angle_id).strip()
+            for angle_id in requirement.get("covered_by_angle_ids", [])
+            if _non_empty_string(angle_id)
+        )
+    return (
+        covered_angle_ids == plan_angle_ids
+    )
+
+
+def _valid_oracle_requirement(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        _non_empty_string(value.get("requirement_id"))
+        and (
+            _non_empty_string(value.get("text"))
+            or _non_empty_string(value.get("description"))
+        )
+        and _non_empty_string_list(value.get("covered_by_angle_ids"))
+    )
+
+
+def _valid_semantic_angles(value: Any, *, original_question: str) -> bool:
+    original_tokens = _semantic_meaningful_tokens(original_question)
+    if (
+        not isinstance(value, list)
+        or len(value) < SEMANTIC_MIN_RELEASE_ANGLES
+        or not original_tokens
+    ):
+        return False
+    angle_ids = [
+        str(angle.get("angle_id")).strip()
+        for angle in value
+        if isinstance(angle, Mapping) and _non_empty_string(angle.get("angle_id"))
+    ]
+    if len(angle_ids) != len(value) or len(set(angle_ids)) != len(value):
+        return False
+    if not all(
+        _valid_semantic_angle(
+            angle,
+            original_question=original_question,
+            original_tokens=original_tokens,
+        )
+        for angle in value
+    ):
+        return False
+    return not _has_duplicate_semantic_angle_content(value)
+
+
+def _valid_semantic_angle(
+    value: Any,
+    *,
+    original_question: str,
+    original_tokens: set[str],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    required_string_fields = (
+        "angle_id",
+        "title",
+        "research_question",
+        "question_context",
+        "evidence_need",
+        "report_section",
+    )
+    if not all(_non_empty_string(value.get(field)) for field in required_string_fields):
+        return False
+    if not _non_empty_string_list(value.get("expected_artifacts")):
+        return False
+    if not _non_empty_string_list(value.get("success_criteria")):
+        return False
+
+    title = str(value["title"]).strip()
+    research_question = str(value["research_question"]).strip()
+    question_context = str(value["question_context"]).strip()
+    if _generic_or_original_semantic_text(title, original_question):
+        return False
+    if _generic_or_original_semantic_text(research_question, original_question):
+        return False
+    if _generic_or_original_semantic_text(question_context, original_question):
+        return False
+    combined_text = f"{title} {research_question}"
+    if _semantic_placeholder_text(combined_text):
+        return False
+
+    all_tokens = _semantic_token_list(combined_text)
+    meaningful_tokens = _semantic_meaningful_token_list(combined_text)
+    unique_meaningful_tokens = set(meaningful_tokens)
+    if len(unique_meaningful_tokens) < SEMANTIC_MIN_ANGLE_UNIQUE_TOKENS:
+        return False
+    if len(meaningful_tokens) * 2 < len(all_tokens):
+        return False
+    overlap_tokens = unique_meaningful_tokens & original_tokens
+    return len(overlap_tokens) >= SEMANTIC_MIN_ANGLE_OVERLAP_TOKENS
+
+
+def _generic_or_original_semantic_text(text: str, original_question: str) -> bool:
+    normalized = _normalized_semantic_text(text)
+    if normalized in GENERIC_SEMANTIC_ANGLE_TEXTS:
+        return True
+    return bool(original_question) and normalized == _normalized_semantic_text(
+        original_question
+    )
+
+
+def _semantic_placeholder_text(text: str) -> bool:
+    normalized = _normalized_semantic_text(text)
+    return any(
+        re.search(pattern, normalized)
+        for pattern in GENERIC_SEMANTIC_PLACEHOLDER_PATTERNS
+    )
+
+
+def _has_duplicate_semantic_angle_content(angles: Sequence[Any]) -> bool:
+    token_sets = [
+        _semantic_angle_content_tokens(angle)
+        for angle in angles
+        if isinstance(angle, Mapping)
+    ]
+    signatures: set[tuple[str, ...]] = set()
+    for index, left_tokens in enumerate(token_sets):
+        signature = tuple(sorted(left_tokens))
+        if signature in signatures:
+            return True
+        signatures.add(signature)
+        for right_tokens in token_sets[index + 1:]:
+            if _near_duplicate_semantic_token_sets(left_tokens, right_tokens):
+                return True
+    return False
+
+
+def _semantic_angle_content_tokens(angle: Mapping[str, Any]) -> set[str]:
+    return set(
+        _semantic_meaningful_token_list(
+            f"{angle.get('title') or ''} {angle.get('research_question') or ''}"
+        )
+    )
+
+
+def _near_duplicate_semantic_token_sets(left: set[str], right: set[str]) -> bool:
+    if not left or not right:
+        return False
+    intersection = len(left & right)
+    union = len(left | right)
+    jaccard = intersection / union if union else 0.0
+    containment = intersection / min(len(left), len(right))
+    return (
+        jaccard >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+        or containment >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+    )
+
+
+def _valid_requirement_coverage_map(
+    value: Any,
+    *,
+    plan_angle_ids: set[str],
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or len(value) < SEMANTIC_MIN_RELEASE_ANGLES
+        or not plan_angle_ids
+    ):
+        return False
+    covered_angle_ids: set[str] = set()
+    for coverage in value:
+        if not _valid_requirement_coverage(coverage):
+            return False
+        covered_angle_ids.add(str(coverage["angle_id"]).strip())
+    return (
+        covered_angle_ids == plan_angle_ids
+    )
+
+
+def _valid_requirement_coverage(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        _non_empty_string(value.get("requirement_id"))
+        and _non_empty_string(value.get("angle_id"))
+        and _non_empty_string(value.get("coverage_status"))
+    )
+
+
+def _semantic_angle_ids(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {
+        str(angle["angle_id"]).strip()
+        for angle in value
+        if isinstance(angle, Mapping) and _non_empty_string(angle.get("angle_id"))
+    }
+
+
+def _semantic_token_list(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
+        if len(token) > 2
+    ]
+
+
+def _semantic_meaningful_token_list(text: str) -> list[str]:
+    return [
+        token
+        for token in _semantic_token_list(text)
+        if token not in GENERIC_SEMANTIC_TOKENS
+    ]
+
+
+def _semantic_meaningful_tokens(text: str) -> set[str]:
+    return set(_semantic_meaningful_token_list(text))
+
+
+def _normalized_semantic_text(text: str) -> str:
+    return " ".join(
+        re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
+    )
+
+
+def _non_empty_string_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_non_empty_string(item) for item in value)
+    )
+
+
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sha256_hex_string(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()) is not None
+    )
+
+
+def _semantic_planner_mode_sources(
+    *,
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    _add_string_source(sources, "run_status", run_status.get("planner_mode"))
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        _add_string_source(
+            sources,
+            "evidence.semantic_planner",
+            semantic_planner.get("planner_mode"),
+        )
+    for name, payload in artifacts.items():
+        _add_string_source(sources, name, payload.get("planner_mode"))
+        nested = payload.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            _add_string_source(
+                sources,
+                f"{name}.semantic_plan",
+                nested.get("planner_mode"),
+            )
+    return sources
+
+
+def _semantic_release_eligible_sources(
+    *,
+    run_status: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    sources: dict[str, Any] = {}
+    _add_bool_source(sources, "run_status", run_status.get("semantic_release_eligible"))
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        _add_bool_source(
+            sources,
+            "evidence.semantic_planner",
+            semantic_planner.get("semantic_release_eligible"),
+        )
+    for name, payload in artifacts.items():
+        _add_bool_source(sources, name, payload.get("semantic_release_eligible"))
+        nested = payload.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            _add_bool_source(
+                sources,
+                f"{name}.semantic_plan",
+                nested.get("semantic_release_eligible"),
+            )
+    return sources
+
+
+def _semantic_codex_source_sources(
+    *,
+    evidence: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        _add_string_source(
+            sources,
+            "evidence.semantic_planner",
+            semantic_planner.get("source"),
+        )
+    semantic_plan = artifacts.get("semantic_plan")
+    if isinstance(semantic_plan, Mapping):
+        nested = semantic_plan.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            _add_string_source(
+                sources,
+                "semantic_plan.semantic_plan",
+                nested.get("source"),
+            )
+    return sources
+
+
+def _add_string_source(sources: dict[str, str], source: str, value: Any) -> None:
+    if isinstance(value, str) and value.strip():
+        sources[source] = value.strip()
+
+
+def _add_bool_source(sources: dict[str, Any], source: str, value: Any) -> None:
+    if isinstance(value, bool):
+        sources[source] = value
+
+
+def _numeric_or_none(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    return None
+
+
 def _metric_classification(
     prompt: Mapping[str, Any],
     terminal_status: str,
@@ -1711,6 +2576,11 @@ def _metric_classification(
     ok = run_status.get("ok") is True
     terminal = run_status.get("terminal") is True
     route = prompt.get("route")
+    if (
+        _requires_semantic_release_gate(prompt, terminal_status)
+        and terminal_status in SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES
+    ):
+        return "included_failure", "failed"
     if route in VISUAL_ROUTES and terminal_status in PASS_TERMINAL_STATUSES:
         if terminal_status == "completed_auto_visual" and ok and terminal:
             return "success", "passed"
@@ -1739,6 +2609,7 @@ def _failure_category(
             return "report_linkage_failure"
         return "artifact_handoff_failure"
     if terminal_status in {
+        "blocked_semantic_planner_unavailable",
         "blocked_missing_visual_provider",
         "blocked_preflight",
         "blocked_parallel_execution",
@@ -1746,6 +2617,8 @@ def _failure_category(
     }:
         return "provider_failure"
     if terminal_status == "blocked_missing_search_handoff":
+        return "artifact_handoff_failure"
+    if terminal_status == "completed_manual_planner_fallback":
         return "artifact_handoff_failure"
     if terminal_status == "blocked_missing_vlm_provider":
         return "vlm_failure"
@@ -1776,6 +2649,20 @@ def _failure_detail(
 ) -> str | None:
     if status == "passed":
         return None
+    if terminal_status == "completed_manual_planner_fallback":
+        return (
+            "manual planner fallback completed a useful run but cannot satisfy "
+            "semantic planner release metrics"
+        )
+    if terminal_status == "blocked_semantic_planner_unavailable":
+        return (
+            "Codex-native semantic planner was unavailable; this release-counted "
+            "run remains a semantic planner denominator failure"
+        )
+    if terminal_status == "completed_fixture":
+        return (
+            "fixture-only completion cannot satisfy semantic planner release metrics"
+        )
     if missing_artifacts:
         return "missing required status artifact(s): " + ", ".join(missing_artifacts)
     if status == "excluded":

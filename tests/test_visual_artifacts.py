@@ -30,6 +30,13 @@ from deepresearch.visual_artifacts import (  # noqa: E402
     visual_release_minimums,
 )
 
+prepare_search_handoff_run = prepare_run
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", ["primary source discovery"])
+    return prepare_search_handoff_run(*args, **kwargs)
+
 
 class VisualArtifactTests(unittest.TestCase):
     def temp_dir(self) -> Path:

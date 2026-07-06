@@ -28,6 +28,7 @@ from .search_handoff import (
     prepare_run,
     release_validation_identity_from_payload,
 )
+from .semantic_planner import BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
@@ -283,6 +284,42 @@ def run_skill_invocation(
         )
 
     run_dir = Path(prepared["run_dir"])
+    if prepared.get("status") == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+        status = _base_run_status(
+            invocation=normalized_invocation,
+            question=question,
+            selected_mode="blocked",
+            run_dir=run_dir,
+            status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+            ok=False,
+            terminal=True,
+            provenance={
+                "type": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+                "adapter": adapter_name,
+                "fixture_only": False,
+                "manual_handoff": False,
+                "real_child_execution": False,
+                "real_use_e2e_eligible": False,
+            },
+            diagnostics={
+                "actionable_cause": prepared.get("diagnostics", {}).get(
+                    "semantic_planning",
+                    "Codex-native semantic planner is unavailable.",
+                )
+            },
+            artifacts=_artifact_paths(run_dir, prepared.get("artifacts")),
+        )
+        if isinstance(prepared.get("semantic_planning"), Mapping):
+            status["semantic_planning"] = dict(prepared["semantic_planning"])
+            status["planner_mode"] = prepared.get("planner_mode")
+            status["semantic_release_eligible"] = prepared.get(
+                "semantic_release_eligible"
+            )
+            status["semantic_planning_status"] = prepared.get(
+                "semantic_planning_status"
+            )
+        return _write_run_status(run_dir, status)
+
     _write_run_status(
         run_dir,
         _base_run_status(
@@ -1853,6 +1890,13 @@ def _artifact_paths(run_dir: Path, extra_artifacts: Mapping[str, Any] | None = N
         "run_steps": "run_steps.json",
         "budget_estimate": "budget_estimate.json",
         "semantic_planner_validation": "semantic_planner_validation.json",
+        "semantic_expectation_oracle": "semantic_expectation_oracle.json",
+        "semantic_plan": "semantic_plan.json",
+        "semantic_plan_review": "semantic_plan_review.json",
+        "semantic_plan_delta": "semantic_plan_delta.json",
+        "semantic_materialization_diff": "semantic_materialization_diff.json",
+        "semantic_raw_request": "semantic_planner_raw/planner_request.json",
+        "semantic_raw_response": "semantic_planner_raw/planner_response.json",
         "visual_search_plan": VISUAL_SEARCH_PLAN_FILENAME,
         "visual_candidates": VISUAL_CANDIDATES_FILENAME,
         "image_fetch_status": IMAGE_FETCH_STATUS_FILENAME,
@@ -1886,6 +1930,24 @@ def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict
         run_dir,
         output.get("artifacts") if isinstance(output.get("artifacts"), Mapping) else None,
     )
+    semantic_summary = _semantic_planning_summary(run_dir)
+    if semantic_summary:
+        output["semantic_planning"] = semantic_summary
+        output["planner_mode"] = semantic_summary["planner_mode"]
+        output["semantic_release_eligible"] = semantic_summary["semantic_release_eligible"]
+        output["semantic_planning_status"] = semantic_summary["status"]
+        if semantic_summary["semantic_release_eligible"] is not True:
+            diagnostics = (
+                dict(output.get("diagnostics", {}))
+                if isinstance(output.get("diagnostics"), Mapping)
+                else {}
+            )
+            diagnostics.setdefault(
+                "semantic_planning",
+                semantic_summary.get("user_visible_diagnostic")
+                or "semantic planner release eligibility was not established",
+            )
+            output["diagnostics"] = diagnostics
     missing_required = _missing_required_synthesized_artifacts(run_dir, output)
     if missing_required:
         diagnostics = (
@@ -1931,7 +1993,53 @@ def _finalize_handoff_payload(run_dir: Path, payload: Mapping[str, Any]) -> dict
     }
     if isinstance(output.get("visual_summary"), Mapping):
         output["artifact_handoff"]["visual_summary"] = dict(output["visual_summary"])
+    if isinstance(output.get("semantic_planning"), Mapping):
+        output["artifact_handoff"]["semantic_planning"] = dict(output["semantic_planning"])
     return output
+
+
+def _semantic_planning_summary(run_dir: Path) -> dict[str, Any]:
+    evidence = _read_optional_json(run_dir / "evidence.json")
+    planner = evidence.get("semantic_planner") if isinstance(evidence, Mapping) else {}
+    planner = planner if isinstance(planner, Mapping) else {}
+    planning_status = _read_optional_json(run_dir / "status.json")
+    validation = _read_optional_json(run_dir / "semantic_planner_validation.json")
+    review = _read_optional_json(run_dir / "semantic_plan_review.json")
+    planner_mode = str(
+        planner.get("planner_mode")
+        or planning_status.get("planner_mode")
+        or validation.get("planner_mode")
+        or review.get("planner_mode")
+        or "unknown"
+    )
+    release_eligible = (
+        planner.get("semantic_release_eligible")
+        if "semantic_release_eligible" in planner
+        else planning_status.get("semantic_release_eligible")
+    )
+    if release_eligible is None:
+        release_eligible = validation.get("semantic_release_eligible")
+    diagnostics = planner.get("diagnostics")
+    diagnostic_text = None
+    if isinstance(diagnostics, Mapping):
+        diagnostic_text = diagnostics.get("user_visible_diagnostic")
+    if not any((planner, planning_status, validation, review)):
+        return {}
+    return {
+        "schema_version": "codex-deepresearch.semantic-planning-summary.v0",
+        "status": str(
+            planner.get("status")
+            or planning_status.get("semantic_planning_status")
+            or review.get("status")
+            or "unknown"
+        ),
+        "planner_mode": planner_mode,
+        "semantic_release_eligible": bool(release_eligible),
+        "validation_ok": validation.get("ok"),
+        "review_verdict": review.get("final_verdict"),
+        "semantic_fit_score": review.get("semantic_fit_score"),
+        "user_visible_diagnostic": diagnostic_text,
+    }
 
 
 def _sync_terminal_status_artifacts(run_dir: Path, run_status: Mapping[str, Any]) -> None:

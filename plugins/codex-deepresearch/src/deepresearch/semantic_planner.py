@@ -3,16 +3,57 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 from collections import Counter
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
 SEMANTIC_PLANNER_SCHEMA_VERSION = "codex-deepresearch.semantic-planner.v0"
 SEMANTIC_PLANNER_VALIDATION_FILENAME = "semantic_planner_validation.json"
+SEMANTIC_EXPECTATION_ORACLE_FILENAME = "semantic_expectation_oracle.json"
+SEMANTIC_PLAN_FILENAME = "semantic_plan.json"
+SEMANTIC_PLAN_REVIEW_FILENAME = "semantic_plan_review.json"
+SEMANTIC_PLAN_DELTA_FILENAME = "semantic_plan_delta.json"
+SEMANTIC_MATERIALIZATION_DIFF_FILENAME = "semantic_materialization_diff.json"
+SEMANTIC_RAW_DIRNAME = "semantic_planner_raw"
+SEMANTIC_RAW_REQUEST_FILENAME = "planner_request.json"
+SEMANTIC_RAW_RESPONSE_FILENAME = "planner_response.json"
+PLANNER_MODE_CODEX_SEMANTIC = "codex_semantic"
+PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK = "heuristic_template_fallback"
+PLANNER_MODE_MANUAL_ANGLES = "manual_angles"
+PLANNER_MODE_FIXTURE = "fixture"
+PLANNER_MODE_BLOCKED = "blocked"
+BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE = "blocked_semantic_planner_unavailable"
+SEMANTIC_FIT_SCORE_THRESHOLD = 9.0
+ALLOWED_PLANNER_MODES = (
+    PLANNER_MODE_CODEX_SEMANTIC,
+    PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+    PLANNER_MODE_MANUAL_ANGLES,
+    PLANNER_MODE_FIXTURE,
+    PLANNER_MODE_BLOCKED,
+)
+RELEASE_INELIGIBLE_PLANNER_MODES = {
+    PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+    PLANNER_MODE_MANUAL_ANGLES,
+    PLANNER_MODE_FIXTURE,
+    PLANNER_MODE_BLOCKED,
+}
+SEMANTIC_COMMON_INTEGRITY_FIELDS = (
+    "question_scope",
+    "raw_request_path",
+    "raw_response_path",
+    "raw_request_hash",
+    "raw_response_hash",
+    "provenance",
+    "template_use",
+    "session_id",
+    "session_id_unavailable_reason",
+)
 
 ALLOWED_EVIDENCE_NEEDS = (
     "official_source",
@@ -98,24 +139,36 @@ class SemanticPlan:
     source: str
     expected_evidence_needs: list[str]
     angles: list[SemanticAngle]
+    planner_mode: str = PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK
+    semantic_release_eligible: bool = False
+    status: str = "prepared_heuristic_template_fallback"
+    diagnostics: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["angles"] = [angle.to_dict() for angle in self.angles]
+        data["diagnostics"] = dict(self.diagnostics or {})
         return data
 
 
-def plan_semantic_angles(
+def heuristic_template_planner(
     *,
     question: str,
-    explicit_angles: Sequence[str] | None = None,
+    route_fallback_angles: Sequence[str] | None = None,
+    planner_mode: str = PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
 ) -> SemanticPlan:
-    """Return deterministic semantic angles for a research question."""
+    """Return the explicit release-ineligible keyword/template fallback plan."""
 
+    if planner_mode not in {
+        PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+        PLANNER_MODE_FIXTURE,
+    }:
+        raise ValueError("heuristic_template_planner requires a heuristic or fixture planner_mode")
     normalized_question = " ".join(question.strip().split())
     question_class = classify_question(normalized_question)
-    if explicit_angles is not None:
-        normalized = _normalize_explicit_angles(explicit_angles)
+    diagnostics = _fallback_diagnostics(planner_mode)
+    if route_fallback_angles is not None:
+        normalized = _normalize_explicit_angles(route_fallback_angles)
         angles = [
             _explicit_angle_record(
                 angle=angle,
@@ -128,9 +181,13 @@ def plan_semantic_angles(
             schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
             question_class=question_class,
             broad_question=len({angle.evidence_need for angle in angles}) >= 4,
-            source="explicit",
+            source="heuristic_template_planner",
             expected_evidence_needs=_ordered_unique(angle.evidence_need for angle in angles),
             angles=angles,
+            planner_mode=planner_mode,
+            semantic_release_eligible=False,
+            status="prepared_heuristic_template_fallback",
+            diagnostics=diagnostics,
         )
 
     if question_class == _CLASS_GENERAL:
@@ -152,9 +209,13 @@ def plan_semantic_angles(
             schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
             question_class=question_class,
             broad_question=False,
-            source="default",
+            source="heuristic_template_planner",
             expected_evidence_needs=["primary_source"],
             angles=[angle],
+            planner_mode=planner_mode,
+            semantic_release_eligible=False,
+            status="prepared_heuristic_template_fallback",
+            diagnostics=diagnostics,
         )
 
     templates = _templates_for_class(question_class)
@@ -176,9 +237,113 @@ def plan_semantic_angles(
         schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
         question_class=question_class,
         broad_question=True,
-        source="semantic",
+        source="heuristic_template_planner",
         expected_evidence_needs=[angle.evidence_need for angle in angles],
         angles=angles,
+        planner_mode=planner_mode,
+        semantic_release_eligible=False,
+        status="prepared_heuristic_template_fallback",
+        diagnostics=diagnostics,
+    )
+
+
+def manual_angle_planner(
+    *,
+    question: str,
+    explicit_angles: Sequence[str],
+    status: str = "prepared_manual_fallback",
+) -> SemanticPlan:
+    """Return a release-ineligible plan from user-supplied/manual angles."""
+
+    normalized_question = " ".join(question.strip().split())
+    question_class = classify_question(normalized_question)
+    normalized = _normalize_explicit_angles(explicit_angles)
+    angles = [
+        _explicit_angle_record(
+            angle=angle,
+            index=index,
+            question_class=question_class,
+        )
+        for index, angle in enumerate(normalized, start=1)
+    ]
+    return SemanticPlan(
+        schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
+        question_class=question_class,
+        broad_question=len({angle.evidence_need for angle in angles}) >= 4,
+        source="manual_angles",
+        expected_evidence_needs=_ordered_unique(angle.evidence_need for angle in angles),
+        angles=angles,
+        planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+        semantic_release_eligible=False,
+        status=status,
+        diagnostics=_fallback_diagnostics(PLANNER_MODE_MANUAL_ANGLES),
+    )
+
+
+def manual_fallback_plan(
+    *,
+    question: str,
+    status: str = "manual_angles_pending",
+) -> SemanticPlan:
+    """Return the schema stub for a manual fallback run before angles exist."""
+
+    normalized_question = " ".join(question.strip().split())
+    question_class = classify_question(normalized_question)
+    return SemanticPlan(
+        schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
+        question_class=question_class,
+        broad_question=False,
+        source="manual_fallback",
+        expected_evidence_needs=[],
+        angles=[],
+        planner_mode=PLANNER_MODE_MANUAL_ANGLES,
+        semantic_release_eligible=False,
+        status=status,
+        diagnostics=_fallback_diagnostics(PLANNER_MODE_MANUAL_ANGLES),
+    )
+
+
+def blocked_semantic_planner_plan(
+    *,
+    question: str,
+    reason: str,
+) -> SemanticPlan:
+    """Return a release-ineligible blocked semantic-planner-unavailable stub."""
+
+    normalized_question = " ".join(question.strip().split())
+    question_class = classify_question(normalized_question)
+    return SemanticPlan(
+        schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
+        question_class=question_class,
+        broad_question=False,
+        source=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+        expected_evidence_needs=[],
+        angles=[],
+        planner_mode=PLANNER_MODE_BLOCKED,
+        semantic_release_eligible=False,
+        status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+        diagnostics={
+            **_fallback_diagnostics(PLANNER_MODE_BLOCKED),
+            "blocked_reason": reason,
+        },
+    )
+
+
+def plan_semantic_angles(
+    *,
+    question: str,
+    explicit_angles: Sequence[str] | None = None,
+) -> SemanticPlan:
+    """Compatibility wrapper returning release-ineligible fallback plans."""
+
+    if explicit_angles is not None:
+        return manual_angle_planner(question=question, explicit_angles=explicit_angles)
+    return blocked_semantic_planner_plan(
+        question=question,
+        reason=(
+            "Codex-native semantic planner is not implemented yet; refusing to "
+            "materialize heuristic template tasks as semantic decomposition."
+        ),
     )
 
 
@@ -293,6 +458,171 @@ def write_semantic_planner_validation(
     return artifact
 
 
+def write_semantic_integrity_artifacts(
+    *,
+    run_dir: str | Path,
+    question: str,
+    plan: SemanticPlan,
+    routing: Sequence[Mapping[str, Any]] | None = None,
+    search_tasks: Sequence[Mapping[str, Any]] | None = None,
+    created_at: str | None = None,
+) -> dict[str, str]:
+    """Write P3-SP1 semantic integrity schema stubs for one run."""
+
+    run_path = Path(run_dir)
+    timestamp = created_at or _utc_now_from_run(run_path)
+    raw_dir = run_path / SEMANTIC_RAW_DIRNAME
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_request_path = raw_dir / SEMANTIC_RAW_REQUEST_FILENAME
+    raw_response_path = raw_dir / SEMANTIC_RAW_RESPONSE_FILENAME
+
+    request_payload = {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_planner_raw_request",
+        "run_id": run_path.name,
+        "created_at": timestamp,
+        "planner_mode": plan.planner_mode,
+        "semantic_release_eligible": False,
+        "question": question,
+        "question_scope": _question_scope(question, plan),
+        "template_use": _template_use(plan),
+        "provenance": _planner_provenance(plan),
+    }
+    response_payload = {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_planner_raw_response",
+        "run_id": run_path.name,
+        "created_at": timestamp,
+        "planner_mode": plan.planner_mode,
+        "semantic_release_eligible": False,
+        "semantic_plan": plan.to_dict(),
+        "diagnostics": dict(plan.diagnostics or {}),
+        "provenance": _planner_provenance(plan),
+    }
+    _write_json(raw_request_path, request_payload)
+    _write_json(raw_response_path, response_payload)
+    raw_request_hash = _sha256_file(raw_request_path)
+    raw_response_hash = _sha256_file(raw_response_path)
+
+    base = _integrity_base_payload(
+        run_path=run_path,
+        question=question,
+        plan=plan,
+        created_at=timestamp,
+        raw_request_path=raw_request_path,
+        raw_response_path=raw_response_path,
+        raw_request_hash=raw_request_hash,
+        raw_response_hash=raw_response_hash,
+    )
+    oracle_requirement_map = _oracle_requirement_map(plan)
+    requirement_coverage_map = _requirement_coverage_map(plan)
+    semantic_fit_score = _release_ineligible_semantic_fit_score(plan)
+
+    artifacts = {
+        SEMANTIC_EXPECTATION_ORACLE_FILENAME: {
+            **base,
+            "artifact_type": "semantic_expectation_oracle",
+            "oracle_requirement_map": oracle_requirement_map,
+            "locked_before_plan_visible": plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC,
+            "reverse_fit_risk": plan.planner_mode != PLANNER_MODE_CODEX_SEMANTIC,
+        },
+        SEMANTIC_PLAN_FILENAME: {
+            **base,
+            "artifact_type": "semantic_plan",
+            "semantic_plan": plan.to_dict(),
+            "angles": [angle.to_dict() for angle in plan.angles],
+            "requirement_coverage_map": requirement_coverage_map,
+            "routing_count": len(routing or []),
+            "search_task_count": len(search_tasks or []),
+        },
+        SEMANTIC_PLAN_REVIEW_FILENAME: {
+            **base,
+            "artifact_type": "semantic_plan_review",
+            "semantic_fit_score": semantic_fit_score,
+            "blockers": _semantic_review_blockers(plan),
+            "warnings": [],
+            "reviewer_independence": _reviewer_independence(plan),
+            "substitute_implementation_check": _substitute_implementation_check(plan),
+            "final_verdict": "release_ineligible",
+        },
+        SEMANTIC_PLAN_DELTA_FILENAME: {
+            **base,
+            "artifact_type": "semantic_plan_delta",
+            "delta_applied": False,
+            "delta_status": "not_applicable",
+            "base_plan_path": SEMANTIC_PLAN_FILENAME,
+            "oracle_requirement_map": oracle_requirement_map,
+            "reviewer_independence": _reviewer_independence(plan),
+            "substitute_implementation_check": _substitute_implementation_check(plan),
+        },
+        SEMANTIC_MATERIALIZATION_DIFF_FILENAME: {
+            **base,
+            "artifact_type": "semantic_materialization_diff",
+            "status": "stub_only",
+            "valid": False,
+            "full_materialization_validation_implemented": False,
+            "out_of_scope_issue": "P3-SP4",
+            "oracle_requirement_map": oracle_requirement_map,
+            "reviewer_independence": _reviewer_independence(plan),
+            "substitute_implementation_check": _substitute_implementation_check(plan),
+        },
+    }
+    written: dict[str, str] = {
+        "semantic_raw_request": str(raw_request_path),
+        "semantic_raw_response": str(raw_response_path),
+    }
+    for filename, payload in artifacts.items():
+        path = run_path / filename
+        _write_json(path, payload)
+        written[_artifact_key(filename)] = str(path)
+    return written
+
+
+def write_blocked_semantic_planner_artifacts(
+    *,
+    run_dir: str | Path,
+    question: str,
+    reason: str,
+    created_at: str | None = None,
+) -> dict[str, str]:
+    """Write blocked semantic planner stubs plus validation for preflight blocks."""
+
+    plan = blocked_semantic_planner_plan(question=question, reason=reason)
+    artifacts = write_semantic_integrity_artifacts(
+        run_dir=run_dir,
+        question=question,
+        plan=plan,
+        routing=[],
+        search_tasks=[],
+        created_at=created_at,
+    )
+    validation = semantic_planner_validation(
+        run_dir=run_dir,
+        evidence={
+            "run_id": Path(run_dir).name,
+            "question": question,
+            "semantic_planner": plan.to_dict(),
+            "semantic_angles": [],
+        },
+        tasks=[],
+    )
+    _write_json(Path(run_dir) / SEMANTIC_PLANNER_VALIDATION_FILENAME, validation)
+    artifacts["semantic_planner_validation"] = str(
+        Path(run_dir) / SEMANTIC_PLANNER_VALIDATION_FILENAME
+    )
+    return artifacts
+
+
+def semantic_integrity_artifact_filenames() -> tuple[str, ...]:
+    return (
+        SEMANTIC_EXPECTATION_ORACLE_FILENAME,
+        SEMANTIC_PLAN_FILENAME,
+        SEMANTIC_PLAN_REVIEW_FILENAME,
+        SEMANTIC_PLAN_DELTA_FILENAME,
+        SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+    )
+
+
 def semantic_planner_validation(
     *,
     run_dir: str | Path,
@@ -365,6 +695,14 @@ def semantic_planner_validation(
             }
         )
 
+    planner_mode = str(planner_metadata.get("planner_mode") or "")
+    semantic_release_eligible = bool(planner_metadata.get("semantic_release_eligible"))
+    semantic_status = _semantic_release_status(
+        run_path=run_path,
+        planner_metadata=planner_metadata,
+    )
+    failures.extend(semantic_status["failures"])
+
     covered_needs = [
         need for need in expected_needs if need in evidence_need_counts
     ]
@@ -372,6 +710,9 @@ def semantic_planner_validation(
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "fixture_id": str(planner_metadata.get("fixture_id") or run_path.name),
         "run_id": str(evidence.get("run_id") or run_path.name),
+        "planner_mode": planner_mode or "unknown",
+        "semantic_release_eligible": semantic_release_eligible,
+        "semantic_status": semantic_status,
         "question_class": question_class,
         "broad_question": broad_question,
         "angle_count": len(angles),
@@ -404,6 +745,7 @@ def semantic_planner_validation(
             "report_status": str(run_path / "report_status.json"),
         },
     }
+    artifact.update(_semantic_common_integrity_fields(run_path))
     return artifact
 
 
@@ -1216,6 +1558,24 @@ def _read_optional_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _semantic_common_integrity_fields(run_path: Path) -> dict[str, Any]:
+    sources = [
+        payload
+        for payload in (
+            _read_optional_json(run_path / SEMANTIC_PLAN_FILENAME),
+            _read_optional_json(run_path / SEMANTIC_EXPECTATION_ORACLE_FILENAME),
+        )
+        if isinstance(payload, Mapping)
+    ]
+    integrity: dict[str, Any] = {}
+    for field in SEMANTIC_COMMON_INTEGRITY_FIELDS:
+        for payload in sources:
+            if field in payload:
+                integrity[field] = payload[field]
+                break
+    return integrity
+
+
 def _expected_needs_for_class(
     question_class: str,
     angles: Sequence[Mapping[str, Any]],
@@ -1303,6 +1663,276 @@ def _string_list(value: Any) -> list[str]:
 
 def _list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _fallback_diagnostics(planner_mode: str) -> dict[str, Any]:
+    labels = {
+        PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK: "keyword/template fallback planner",
+        PLANNER_MODE_MANUAL_ANGLES: "manual user-provided angle fallback",
+        PLANNER_MODE_FIXTURE: "fixture-only test planner",
+        PLANNER_MODE_BLOCKED: "semantic planner unavailable",
+    }
+    return {
+        "semantic_release_eligible": False,
+        "planner_mode": planner_mode,
+        "fallback_kind": labels.get(planner_mode, "release-ineligible planner"),
+        "user_visible_diagnostic": (
+            "True semantic decomposition did not run; this path is useful only as "
+            "a release-ineligible fallback and cannot satisfy semantic planner gates."
+        ),
+    }
+
+
+def _question_scope(question: str, plan: SemanticPlan) -> dict[str, Any]:
+    return {
+        "original_question": question,
+        "question_hash": _sha256_text(question),
+        "question_class": plan.question_class,
+        "planner_mode": plan.planner_mode,
+        "angle_count": len(plan.angles),
+    }
+
+
+def _template_use(plan: SemanticPlan) -> dict[str, Any]:
+    uses_template = plan.planner_mode in {
+        PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
+        PLANNER_MODE_FIXTURE,
+    }
+    return {
+        "uses_preselected_template": uses_template,
+        "template_source": "heuristic_template_planner" if uses_template else None,
+        "template_release_eligible": False,
+        "template_angle_titles": [angle.title for angle in plan.angles] if uses_template else [],
+    }
+
+
+def _planner_provenance(plan: SemanticPlan) -> dict[str, Any]:
+    return {
+        "planner_mode": plan.planner_mode,
+        "planner_source": plan.source,
+        "raw_request_required": True,
+        "raw_response_required": True,
+        "session_id": None,
+        "session_id_unavailable_reason": (
+            "P3-SP1 records deterministic release-ineligible schema stubs; "
+            "Codex-native planner sessions are introduced by P3-SP2."
+        ),
+        "semantic_release_eligible": False,
+    }
+
+
+def _integrity_base_payload(
+    *,
+    run_path: Path,
+    question: str,
+    plan: SemanticPlan,
+    created_at: str,
+    raw_request_path: Path,
+    raw_response_path: Path,
+    raw_request_hash: str,
+    raw_response_hash: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "run_id": run_path.name,
+        "created_at": created_at,
+        "planner_mode": plan.planner_mode,
+        "semantic_release_eligible": False,
+        "status": plan.status,
+        "question_scope": _question_scope(question, plan),
+        "raw_request_path": str(raw_request_path),
+        "raw_response_path": str(raw_response_path),
+        "raw_request_hash": raw_request_hash,
+        "raw_response_hash": raw_response_hash,
+        "provenance": _planner_provenance(plan),
+        "template_use": _template_use(plan),
+        "session_id": None,
+        "session_id_unavailable_reason": _planner_provenance(plan)[
+            "session_id_unavailable_reason"
+        ],
+    }
+
+
+def _oracle_requirement_map(plan: SemanticPlan) -> list[dict[str, Any]]:
+    if not plan.angles:
+        return []
+    return [
+        {
+            "requirement_id": f"req_{index:03d}",
+            "source": "fallback_angle",
+            "text": angle.title,
+            "non_negotiable": False,
+            "covered_by_angle_ids": [angle.angle_id],
+            "covered_by_task_ids": [],
+        }
+        for index, angle in enumerate(plan.angles, start=1)
+    ]
+
+
+def _requirement_coverage_map(plan: SemanticPlan) -> list[dict[str, Any]]:
+    return [
+        {
+            "requirement_id": f"req_{index:03d}",
+            "angle_id": angle.angle_id,
+            "coverage_status": "fallback_release_ineligible",
+            "evidence_need": angle.evidence_need,
+        }
+        for index, angle in enumerate(plan.angles, start=1)
+    ]
+
+
+def _release_ineligible_semantic_fit_score(plan: SemanticPlan) -> float | None:
+    if plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC and plan.semantic_release_eligible:
+        return SEMANTIC_FIT_SCORE_THRESHOLD
+    return None
+
+
+def _semantic_review_blockers(plan: SemanticPlan) -> list[dict[str, Any]]:
+    if plan.planner_mode in RELEASE_INELIGIBLE_PLANNER_MODES:
+        return [
+            {
+                "code": "release_ineligible_planner_mode",
+                "planner_mode": plan.planner_mode,
+                "message": "Fallback/manual/fixture planners cannot satisfy semantic fit review.",
+            }
+        ]
+    if not plan.semantic_release_eligible:
+        return [
+            {
+                "code": "semantic_review_not_implemented",
+                "planner_mode": plan.planner_mode,
+                "message": "Semantic review gate has not made this plan release-eligible.",
+            }
+        ]
+    return []
+
+
+def _reviewer_independence(plan: SemanticPlan) -> dict[str, Any]:
+    independent = plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC and plan.semantic_release_eligible
+    return {
+        "independent": independent,
+        "oracle_planner_shared_provenance": not independent,
+        "reviewer_planner_shared_provenance": not independent,
+        "status": "not_implemented_release_ineligible" if not independent else "passed",
+    }
+
+
+def _substitute_implementation_check(plan: SemanticPlan) -> dict[str, Any]:
+    passed = plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC and plan.semantic_release_eligible
+    return {
+        "passed": passed,
+        "checked": True,
+        "planner_mode": plan.planner_mode,
+        "blocked_reason": None if passed else "fallback_or_unreviewed_semantic_plan",
+    }
+
+
+def _artifact_key(filename: str) -> str:
+    return filename.removesuffix(".json")
+
+
+def _semantic_release_status(
+    *,
+    run_path: Path,
+    planner_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    planner_mode = str(planner_metadata.get("planner_mode") or "")
+    semantic_release_eligible = bool(planner_metadata.get("semantic_release_eligible"))
+    review = _read_optional_json(run_path / SEMANTIC_PLAN_REVIEW_FILENAME)
+    semantic_fit_score = None
+    blockers: list[Any] = []
+    substitute_check: Mapping[str, Any] = {}
+    if isinstance(review, Mapping):
+        semantic_fit_score = review.get("semantic_fit_score")
+        blockers = _list(review.get("blockers"))
+        raw_substitute = review.get("substitute_implementation_check")
+        if isinstance(raw_substitute, Mapping):
+            substitute_check = raw_substitute
+
+    failures: list[dict[str, Any]] = []
+    if planner_mode not in ALLOWED_PLANNER_MODES:
+        failures.append(
+            {
+                "code": "planner_mode_missing_or_unknown",
+                "planner_mode": planner_mode or None,
+            }
+        )
+    if planner_mode in RELEASE_INELIGIBLE_PLANNER_MODES:
+        failures.append(
+            {
+                "code": "release_ineligible_planner_mode",
+                "planner_mode": planner_mode,
+                "message": "Heuristic, manual, fixture, and blocked planners cannot pass semantic validation.",
+            }
+        )
+    if not semantic_release_eligible:
+        failures.append({"code": "semantic_release_ineligible"})
+    if planner_mode == PLANNER_MODE_CODEX_SEMANTIC and semantic_release_eligible:
+        try:
+            numeric_score = float(semantic_fit_score)
+        except (TypeError, ValueError):
+            numeric_score = None
+        if numeric_score is None or not math.isfinite(numeric_score):
+            failures.append(
+                {
+                    "code": "semantic_fit_score_missing_or_non_finite",
+                    "semantic_fit_score": semantic_fit_score,
+                    "threshold": SEMANTIC_FIT_SCORE_THRESHOLD,
+                }
+            )
+        elif numeric_score < SEMANTIC_FIT_SCORE_THRESHOLD:
+            failures.append(
+                {
+                    "code": "semantic_fit_score_below_threshold",
+                    "semantic_fit_score": semantic_fit_score,
+                    "threshold": SEMANTIC_FIT_SCORE_THRESHOLD,
+                }
+            )
+        if blockers:
+            failures.append({"code": "semantic_review_blockers_present", "count": len(blockers)})
+        if substitute_check.get("passed") is not True:
+            failures.append({"code": "substitute_implementation_check_failed"})
+    else:
+        if semantic_fit_score is not None:
+            try:
+                score_value = float(semantic_fit_score)
+            except (TypeError, ValueError):
+                score_value = -1.0
+            if score_value >= SEMANTIC_FIT_SCORE_THRESHOLD:
+                failures.append(
+                    {
+                        "code": "release_ineligible_fit_score_must_not_pass",
+                        "semantic_fit_score": semantic_fit_score,
+                    }
+                )
+    return {
+        "planner_mode": planner_mode or "unknown",
+        "semantic_release_eligible": semantic_release_eligible,
+        "semantic_fit_score": semantic_fit_score,
+        "review_blocker_count": len(blockers),
+        "substitute_implementation_check_passed": substitute_check.get("passed"),
+        "failures": failures,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def _sha256_text(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+def _utc_now_from_run(run_path: Path) -> str:
+    try:
+        created = _read_optional_json(run_path / "status.json")
+        if isinstance(created, Mapping) and isinstance(created.get("created_at"), str):
+            return str(created["created_at"])
+    except OSError:
+        pass
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

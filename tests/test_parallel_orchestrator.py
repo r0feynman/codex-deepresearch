@@ -25,13 +25,21 @@ from deepresearch import (  # noqa: E402
     inspect_run_state,
     merge_evidence_shards,
     plan_research_tasks,
-    prepare_run,
+    prepare_run as prepare_search_handoff_run,
     read_trace_records,
     run_parallel_orchestration,
     synthesize_report,
     validate_artifacts,
     validate_trace_file,
 )
+
+
+TEST_MANUAL_ANGLES = ("primary source discovery",)
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", list(TEST_MANUAL_ANGLES))
+    return prepare_search_handoff_run(*args, **kwargs)
 
 
 class ParallelOrchestratorTests(unittest.TestCase):
@@ -2452,6 +2460,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "real codex child failure regression",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
                 "--route",
@@ -2564,6 +2574,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "real codex auth blocker regression",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
                 "--route",
@@ -2635,6 +2647,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "M18 CLI fixture smoke",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
                 "--route",

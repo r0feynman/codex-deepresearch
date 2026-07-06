@@ -238,6 +238,8 @@ class BudgetEstimatorTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "Non-finite cost cap",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
                 "--max-cost-usd",
@@ -288,6 +290,8 @@ class BudgetEstimatorTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "Deep budget confirmation",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
                 "--budget",
@@ -316,6 +320,8 @@ class BudgetEstimatorTests(unittest.TestCase):
                 str(runs_dir),
                 "--route",
                 "visual_required",
+                "--angle",
+                "primary source discovery",
                 "--max-images",
                 "0",
             ],
@@ -357,6 +363,8 @@ class BudgetEstimatorTests(unittest.TestCase):
                 str(RUNNER),
                 "prepare",
                 "Exhaustive without cost cap",
+                "--angle",
+                "primary source discovery",
                 "--runs-dir",
                 str(runs_dir),
                 "--budget",
@@ -389,6 +397,7 @@ class BudgetEstimatorTests(unittest.TestCase):
             max_subagents=2,
             max_agents=2,
             codex_runner="serial",
+            angles=["primary source discovery"],
         )
         run_dir = Path(prepared["run_dir"])
 

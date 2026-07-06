@@ -96,6 +96,7 @@ class FetchClaimsTests(unittest.TestCase):
             question="example search question",
             runs_dir=self.temp_runs_dir(),
             route="text_only",
+            angles=["primary source discovery"],
         )
         run_dir = Path(prepared["run_dir"])
         self.write_search_results(run_dir, records)
@@ -108,6 +109,7 @@ class FetchClaimsTests(unittest.TestCase):
             question="example file question",
             runs_dir=self.temp_runs_dir(),
             route="text_only",
+            angles=["primary source discovery"],
         )
         run_dir = Path(prepared["run_dir"])
         evidence_path = run_dir / "evidence.json"

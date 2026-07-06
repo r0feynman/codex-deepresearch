@@ -32,6 +32,13 @@ from deepresearch.visual_artifacts import (  # noqa: E402
 )
 import deepresearch.page_image_extraction as page_images  # noqa: E402
 
+prepare_search_handoff_run = prepare_run
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("angles", ["primary source discovery"])
+    return prepare_search_handoff_run(*args, **kwargs)
+
 
 PNG_1X1 = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -1464,6 +1471,7 @@ class PageImageExtractionTests(unittest.TestCase):
             question="Text-only page should not fetch images",
             runs_dir=self.temp_runs_dir(),
             route="text_only",
+            angles=["text-only source extraction"],
         )
         run_dir = Path(prepared["run_dir"])
         (run_dir / "sources").mkdir(exist_ok=True)
