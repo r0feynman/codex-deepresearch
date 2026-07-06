@@ -254,6 +254,9 @@ def render_run_detail(payload: Mapping[str, Any]) -> str:
             f"rejected={_int(partial_parallel.get('rejected_shard_count'))} "
             f"failed={_int(partial_parallel.get('failed_task_count'))} "
             f"blocked={_int(partial_parallel.get('blocked_task_count'))} "
+            f"discarded={_int(partial_parallel.get('discarded_task_count'))} "
+            f"retried={_int(partial_parallel.get('retried_task_count'))} "
+            f"retry_exhausted={_int(partial_parallel.get('retry_exhausted_task_count'))} "
             f"final_artifact_gate_passed={_display_bool(partial_parallel.get('final_artifact_gate_passed'))}"
         ),
         (

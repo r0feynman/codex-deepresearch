@@ -338,9 +338,9 @@ class RunMonitorTests(unittest.TestCase):
             "failed_task_count": 1,
             "blocked_task_count": 0,
             "rejected_shard_count": 0,
-            "discarded_task_count": 0,
-            "retried_task_count": 0,
-            "retry_exhausted_task_count": 0,
+            "discarded_task_count": 2,
+            "retried_task_count": 3,
+            "retry_exhausted_task_count": 1,
         }
         self.write_json(
             run_dir / "parallel_orchestration_status.json",
@@ -374,6 +374,7 @@ class RunMonitorTests(unittest.TestCase):
         self.assertTrue(detail["partial_parallel"]["final_artifact_gate_passed"])
         self.assertIn("Partial parallel: partial=yes reason=failed_tasks", rendered)
         self.assertIn("accepted=4 omitted=1 rejected=0 failed=1", rendered)
+        self.assertIn("blocked=0 discarded=2 retried=3 retry_exhausted=1", rendered)
         self.assertIn("final_artifact_gate_passed=yes", rendered)
         self.assertNotIn("no-report", rendered)
         self.assertNotIn("no accepted shards", rendered.lower())
