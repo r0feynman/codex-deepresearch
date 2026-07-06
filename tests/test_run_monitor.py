@@ -414,6 +414,117 @@ class RunMonitorTests(unittest.TestCase):
         self.assertEqual(detail["shards"]["planned"], 5)
         self.assertIn("completed=1", render_run_detail(detail))
 
+    def test_child_timeout_probe_summary_is_visible_in_monitor_detail(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        run_dir = self.make_run(runs_dir, "run-probe-001")
+        probe = {
+            "schema_version": "codex-deepresearch.child-attempt-probe.v0",
+            "task_id": "task_probe_001",
+            "attempt": 1,
+            "child_thread_id": "codex-task_probe_001",
+            "child_started_at": "2026-07-03T00:00:00Z",
+            "child_timed_out_at": "2026-07-03T00:05:00Z",
+            "child_timeout_at": "2026-07-03T00:05:00Z",
+            "child_finished_at": None,
+            "elapsed_seconds": 300.0,
+            "child_elapsed_seconds": 300.0,
+            "timeout_seconds": 300.0,
+            "timeout": True,
+            "output_shard_path": str(run_dir / "evidence_shards/task_probe_001/evidence_shard.json"),
+            "child_failure_code": "codex_child_schema_invalid",
+            "first_shard_observed_at": "2026-07-03T00:05:00Z",
+            "first_parent_valid_shard_at": None,
+            "last_validation_attempt_at": "2026-07-03T00:05:00Z",
+            "last_validation_result": {
+                "state": "invalid",
+                "valid": False,
+                "error_count": 1,
+                "errors": [
+                    {
+                        "path": "$.evidence.schema_version",
+                        "code": "invalid_enum",
+                        "message": "unsupported schema version",
+                    }
+                ],
+            },
+            "shard_exists": True,
+            "shard_exists_at_timeout": True,
+            "shard_schema_version": "codex-deepresearch.evidence-shard.v0",
+            "shard_parent_valid": False,
+            "missing_required_fields": ["run_id", "mode"],
+            "top_level_missing_fields": ["run_id", "mode"],
+            "runner_recoverable_valid_shard": False,
+            "runner_recoverability": {
+                "state": "not_recoverable_parent_invalid_shard",
+                "recoverable": False,
+                "basis": ["shard_parent_valid", "last_validation_result"],
+            },
+            "sidecar_status": {},
+            "last_child_event": {
+                "event_type": "function_call",
+                "message_preview": "writing shard",
+            },
+            "last_child_event_type": "function_call",
+            "last_tool_or_command_call": {
+                "kind": "command",
+                "preview": "python3 write_shard.py",
+            },
+            "last_tool_or_command_kind": "command",
+            "last_tool_or_command_preview": "python3 write_shard.py",
+            "last_child_message_preview": "writing shard",
+            "last_message_text_preview": "writing shard",
+            "unknowns": [{"field": "root_cause", "reason": "not proven"}],
+            "candidate_causes": [
+                {
+                    "cause": "shard_schema_invalid_at_timeout_probe",
+                    "basis": ["last_validation_result.errors"],
+                    "confidence": "medium",
+                }
+            ],
+            "candidate_cause_confidence": "medium",
+            "candidate_cause_basis": ["last_validation_result.errors"],
+        }
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "run_id": "run-probe-001",
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task_probe_001",
+                        "state": "failed",
+                        "attempt": 1,
+                        "attempt_diagnostics": [
+                            {
+                                "attempt": 1,
+                                "child_failure_code": "codex_child_schema_invalid",
+                                "timeout": True,
+                                "attempt_probe": probe,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        detail = inspect_run_monitor(run_dir)
+        rendered = render_run_detail(detail)
+
+        self.assertEqual(detail["child_attempt_probes"]["count"], 1)
+        self.assertEqual(detail["child_attempt_probes"]["timeout_count"], 1)
+        self.assertEqual(detail["child_attempt_probes"]["schema_invalid_count"], 1)
+        probe_summary = detail["child_attempt_probes"]["probes"][0]
+        self.assertEqual(probe_summary["task_id"], "task_probe_001")
+        self.assertEqual(
+            probe_summary["candidate_causes"][0]["confidence"],
+            "medium",
+        )
+        self.assertEqual(probe_summary["child_timeout_at"], "2026-07-03T00:05:00Z")
+        self.assertTrue(probe_summary["shard_exists_at_timeout"])
+        self.assertEqual(probe_summary["candidate_cause_confidence"], "medium")
+        self.assertEqual(probe_summary["last_tool_or_command_call"]["kind"], "command")
+        self.assertIn("Child probes: count=1 timeouts=1 schema_invalid=1", rendered)
+
     def test_real_parallel_failure_blocked_and_degraded_labels_are_honest(self) -> None:
         cases = [
             (

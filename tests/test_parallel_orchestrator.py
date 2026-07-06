@@ -221,12 +221,20 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn(str(shard_dir / "search_results.jsonl"), command[-1])
         self.assertIn(str(shard_dir / "visual_observations.jsonl"), command[-1])
         self.assertIn(str(shard_dir / "verifier_votes.jsonl"), command[-1])
+        self.assertIn("Evidence Schema v0 JSON envelope", command[-1])
+        self.assertIn("set `schema_version` exactly `0.1.0`", command[-1])
+        for field in ("run_id", "created_at", "mode", "search_provider", "vlm_provider"):
+            self.assertIn(f"`{field}`", command[-1])
+        self.assertIn(f"Set top-level `run_id` exactly `{run_dir.name}`", command[-1])
+        self.assertIn("`mode` exactly `codex-plugin`", command[-1])
+        self.assertIn("`search_provider` exactly `codex-native`", command[-1])
+        self.assertIn("`vlm_provider` exactly `codex-interactive`", command[-1])
+        self.assertIn("codex-deepresearch.evidence-shard.v0", command[-1])
         self.assertIn("write a minimal valid `evidence_shard.json`", command[-1])
         self.assertIn("before any optional sidecars", command[-1])
         self.assertIn("invoke them with `python3`, not `python`", command[-1])
         self.assertIn(f"Do not write sidecars outside {shard_dir}", command[-1])
         self.assertIn("Write claim text, caveats, rationales, and synthesized source snippets in English", command[-1])
-        self.assertIn("Use `vlm_provider` exactly `codex-interactive`", command[-1])
         self.assertIn("Every source must include a non-empty `local_artifact_path`", command[-1])
         self.assertIn("Verifier vote `method` must be one of", command[-1])
         self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", command[-1])
@@ -850,6 +858,164 @@ class ParallelOrchestratorTests(unittest.TestCase):
         wait_events = [event for event in result.events if event["event_type"] == "wait"]
         self.assertEqual(wait_events[-1]["raw_event"]["child_event_artifacts"], artifacts)
 
+    def test_codex_exec_timeout_without_shard_records_attempt_probe(self) -> None:
+        run_dir = self.prepare()
+        stdout = json.dumps(
+            {
+                "type": "message",
+                "status": "running",
+                "message": "still collecting sources",
+            },
+            sort_keys=True,
+        ) + "\n"
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.subprocess.run") as run_mock,
+        ):
+            run_mock.side_effect = subprocess.TimeoutExpired(
+                cmd="codex",
+                timeout=12,
+                output=stdout,
+                stderr="timeout stderr",
+            )
+
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=12,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        attempt = task["attempt_diagnostics"][0]
+        self.assertTrue(attempt["timeout"])
+        self.assertEqual(attempt["child_failure_code"], "codex_child_timeout")
+        probe = attempt["attempt_probe"]
+        self.assertEqual(probe["child_failure_code"], "codex_child_timeout")
+        self.assertTrue(probe["timeout"])
+        self.assertIsNotNone(probe["child_started_at"])
+        self.assertIsNotNone(probe["child_timed_out_at"])
+        self.assertEqual(probe["child_timeout_at"], probe["child_timed_out_at"])
+        self.assertIsNone(probe["child_finished_at"])
+        self.assertGreaterEqual(probe["elapsed_seconds"], 0)
+        self.assertEqual(probe["child_elapsed_seconds"], probe["elapsed_seconds"])
+        self.assertEqual(probe["timeout_seconds"], 12)
+        self.assertFalse(probe["shard_exists"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertTrue(probe["parent_probe_after_timeout"])
+        self.assertIsNone(probe["parent_probe_observed_shard_at"])
+        self.assertIn(
+            "no_direct_timeout_instant_shard_observation_available",
+            probe["unobservable_reasons"]["shard_exists_at_timeout"],
+        )
+        self.assertFalse(probe["shard_parent_valid"])
+        self.assertIn("run_id", probe["top_level_missing_fields"])
+        self.assertEqual(probe["last_validation_result"]["state"], "invalid")
+        self.assertIn("first_shard_observed_at", {item["field"] for item in probe["unknowns"]})
+        self.assertEqual(
+            probe["candidate_causes"][0]["cause"],
+            "no_shard_observed_during_parent_probe_after_timeout",
+        )
+        self.assertEqual(probe["candidate_causes"][0]["confidence"], "medium")
+        self.assertEqual(probe["candidate_cause_confidence"], "medium")
+        self.assertIn("parent_probe_observed_shard_at", probe["candidate_cause_basis"])
+        self.assertIn("search_results", probe["sidecars"])
+        self.assertIn("search_results", probe["sidecar_status"])
+        self.assertIn("visual_observations", probe["sidecars"])
+        self.assertIn("verifier_votes", probe["sidecars"])
+        self.assertIn("last_tool_or_command_call", probe["unobservable_reasons"])
+        self.assertIsNone(probe["root_cause"])
+
+    def test_codex_exec_timeout_with_legacy_invalid_shard_records_schema_probe(self) -> None:
+        run_dir = self.prepare()
+
+        def timeout_after_legacy_shard(command, **_kwargs):
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(
+                shard_path,
+                {
+                    "schema_version": "codex-deepresearch.evidence-shard.v0",
+                    "sources": [],
+                },
+            )
+            raise subprocess.TimeoutExpired(
+                cmd=command,
+                timeout=12,
+                output=json.dumps(
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": {"cmd": "OPENAI_API_KEY=FAKE_TEST_VALUE python3 write_shard.py --token FAKE_FLAG_VALUE"},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                stderr="timeout after legacy shard",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=timeout_after_legacy_shard,
+            ),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=12,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        attempt = task["attempt_diagnostics"][0]
+        self.assertTrue(attempt["timeout"])
+        self.assertEqual(attempt["child_failure_code"], "codex_child_schema_invalid")
+        probe = attempt["attempt_probe"]
+        self.assertTrue(probe["timeout"])
+        self.assertEqual(probe["child_failure_code"], "codex_child_schema_invalid")
+        self.assertTrue(probe["shard_exists"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertTrue(probe["parent_probe_after_timeout"])
+        self.assertIsNotNone(probe["parent_probe_observed_shard_at"])
+        self.assertIsNotNone(probe["parent_probe_validation_attempt_at"])
+        self.assertIsNone(probe["parent_probe_validated_shard_at"])
+        self.assertEqual(
+            probe["shard_schema_version"],
+            "codex-deepresearch.evidence-shard.v0",
+        )
+        self.assertFalse(probe["shard_parent_valid"])
+        self.assertIn("run_id", probe["missing_required_fields"])
+        self.assertIn("run_id", probe["top_level_missing_fields"])
+        self.assertEqual(probe["last_tool_or_command_kind"], "command")
+        self.assertIn("python3 write_shard.py", probe["last_tool_or_command_preview"])
+        self.assertNotIn("FAKE_TEST_VALUE", probe["last_tool_or_command_preview"])
+        self.assertNotIn("FAKE_FLAG_VALUE", probe["last_tool_or_command_preview"])
+        self.assertIn("<redacted-secret>", probe["last_tool_or_command_preview"])
+        self.assertEqual(probe["last_tool_or_command_call"]["kind"], "command")
+        self.assertEqual(
+            probe["candidate_causes"][0]["cause"],
+            "invalid_shard_observed_during_parent_probe_after_timeout",
+        )
+        self.assertEqual(probe["candidate_causes"][0]["confidence"], "medium")
+        self.assertEqual(probe["candidate_cause_confidence"], "medium")
+        self.assertIn("top_level_missing_fields", probe["candidate_cause_basis"])
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(
+            failed_task["attempt_diagnostics"][0]["attempt_probe"]["last_validation_result"]["state"],
+            "invalid",
+        )
+
     def test_codex_exec_context_includes_child_artifacts_without_prompt_leak(self) -> None:
         run_dir = self.prepare()
         task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
@@ -1000,6 +1166,35 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 "missing_expected_sidecars"
             ],
             expected_missing,
+        )
+        task_record = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        probe = task_record["attempt_diagnostics"][0]["attempt_probe"]
+        self.assertTrue(probe["timeout"])
+        self.assertTrue(probe["shard_exists"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertTrue(probe["parent_probe_after_timeout"])
+        self.assertIsNotNone(probe["parent_probe_observed_shard_at"])
+        self.assertIsNotNone(probe["parent_probe_validation_attempt_at"])
+        self.assertIsNotNone(probe["parent_probe_validated_shard_at"])
+        self.assertTrue(probe["shard_parent_valid"])
+        self.assertTrue(probe["runner_recoverable_valid_shard"])
+        self.assertEqual(probe["runner_recoverability"]["state"], "recoverable_valid_shard")
+        self.assertIn("parent_probe_validated_shard_at", probe["runner_recoverability"]["basis"])
+        self.assertIsNone(probe["first_parent_valid_shard_at"])
+        self.assertEqual(
+            probe["unobservable_reasons"]["first_parent_valid_shard_at"],
+            "parent_valid_shard_was_observed_only_during_parent_probe_after_timeout",
+        )
+        self.assertEqual(
+            probe["candidate_causes"][0]["cause"],
+            "valid_shard_recoverable_during_parent_probe_after_timeout",
+        )
+        self.assertIn("parent_probe_validated_shard_at", probe["candidate_cause_basis"])
+        self.assertEqual(
+            result["merge"]["accepted_shards"][0]["diagnostics"]["attempt_diagnostics"][0][
+                "attempt_probe"
+            ]["runner_recoverable_valid_shard"],
+            True,
         )
 
     def test_codex_exec_capacity_failure_retries_and_recovers_with_attempt_diagnostics(self) -> None:
@@ -1233,7 +1428,14 @@ class ParallelOrchestratorTests(unittest.TestCase):
             task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
             shard_path = run_dir / task["output_shard_path"]
             shard_path.parent.mkdir(parents=True, exist_ok=True)
-            self.write_json(shard_path, {"schema_version": "0.1.0", "sources": []})
+            self.write_json(
+                shard_path,
+                {
+                    "schema_version": "codex-deepresearch.evidence-shard.v0",
+                    "sources": [],
+                    "claims": [],
+                },
+            )
             return subprocess.CompletedProcess(
                 args=command,
                 returncode=0,
@@ -1266,7 +1468,109 @@ class ParallelOrchestratorTests(unittest.TestCase):
         attempt = task["attempt_diagnostics"][0]
         self.assertEqual(attempt["child_failure_code"], "codex_child_schema_invalid")
         self.assertEqual(attempt["retry_decision"], "do_not_retry")
+        self.assertFalse(attempt["timeout"])
+        probe = attempt["attempt_probe"]
+        self.assertFalse(probe["timeout"])
+        self.assertTrue(probe["shard_exists"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertEqual(
+            probe["shard_schema_version"],
+            "codex-deepresearch.evidence-shard.v0",
+        )
+        self.assertFalse(probe["shard_parent_valid"])
+        self.assertIn("shard_exists_at_timeout", probe["unobservable_reasons"])
+        self.assertEqual(probe["child_failure_code"], "codex_child_schema_invalid")
+        self.assertIn("run_id", probe["missing_required_fields"])
+        self.assertIn("run_id", probe["top_level_missing_fields"])
+        self.assertIn("mode", probe["missing_required_fields"])
+        self.assertEqual(probe["last_validation_result"]["state"], "invalid")
+        self.assertTrue(probe["candidate_causes"])
         self.assertFalse(result["merge"]["failed_tasks"][0]["retryable"])
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertTrue(
+            any(
+                error["code"] == "invalid_enum"
+                for error in failed_task["validation"]["errors"]
+            ),
+            failed_task["validation"],
+        )
+
+    def test_codex_exec_failed_child_with_invalid_legacy_shard_is_schema_invalid(self) -> None:
+        run_dir = self.prepare()
+
+        def fake_codex_exec(command, **_kwargs):
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(
+                shard_path,
+                {
+                    "schema_version": "codex-deepresearch.evidence-shard.v0",
+                    "sources": [],
+                    "claims": [],
+                },
+            )
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout='{"type":"message","status":"error","message":"wrote invalid shard then failed"}\n',
+                stderr="child exited after invalid shard",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0) as sleep_mock,
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_parallel_no_accepted_shards")
+        run_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["failure_category"], "invalid_shard")
+        self.assertEqual(task["child_failure_code"], "codex_child_schema_invalid")
+        attempt = task["attempt_diagnostics"][0]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["failure_category"], "invalid_shard")
+        self.assertEqual(attempt["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(attempt["retry_decision"], "do_not_retry")
+        self.assertFalse(attempt["timeout"])
+        self.assertIn("validation", attempt)
+        probe = attempt["attempt_probe"]
+        self.assertFalse(probe["timeout"])
+        self.assertTrue(probe["shard_exists"])
+        self.assertIsNone(probe["shard_exists_at_timeout"])
+        self.assertEqual(
+            probe["shard_schema_version"],
+            "codex-deepresearch.evidence-shard.v0",
+        )
+        self.assertFalse(probe["shard_parent_valid"])
+        self.assertEqual(probe["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(probe["candidate_causes"][0]["cause"], "child_shard_schema_invalid")
+        self.assertEqual(probe["last_validation_result"]["state"], "invalid")
+        self.assertTrue(
+            any(
+                error["code"] == "invalid_enum"
+                for error in probe["validation_errors"]
+            ),
+            probe["validation_errors"],
+        )
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_shard")
+        self.assertEqual(failed_task["child_failure_code"], "codex_child_schema_invalid")
+        self.assertFalse(failed_task["retryable"])
 
     def test_codex_exec_capacity_retry_exhaustion_fails_without_timeout(self) -> None:
         run_dir = self.prepare()
@@ -1564,6 +1868,92 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(failed_task["adapter"], "codex-exec")
         self.assertEqual(failed_task["failure_category"], "codex_exec_failed")
         self.assertEqual(failed_task["stdout_stderr_summary"]["stderr"], "deterministic child failure")
+
+    def test_partial_degraded_codex_exec_with_accepted_shard_is_synthesizable_partial(self) -> None:
+        run_dir = self.prepare()
+
+        class PartialDegradingCodexAdapter(CodexExecAdapter):
+            name = "codex-exec"
+
+            def __init__(self):
+                super().__init__(project_root=ROOT, timeout_seconds=120)
+
+            def available(self) -> bool:
+                return True
+
+            def run_task(self, task, *, run_dir, max_threads):
+                child_thread_id = f"codex-{task['id']}"
+                if str(task["id"]).endswith("001"):
+                    shard_path = run_dir / task["output_shard_path"]
+                    shard_path.parent.mkdir(parents=True, exist_ok=True)
+                    self_outer.write_json(shard_path, self_outer.shard(run_dir, task))
+                    return type("Result", (), {
+                        "task_id": task["id"],
+                        "status": "completed",
+                        "child_thread_id": child_thread_id,
+                        "events": (),
+                        "shard_path": str(shard_path),
+                        "failure_category": None,
+                        "message": None,
+                    })()
+                diagnostic = (
+                    "codex exec exited 1; adapter=codex-exec; "
+                    f"task_id={task['id']}; cwd={ROOT}; "
+                    "stderr=Auth sandbox approval blocked; stdout=<empty>"
+                )
+                return type("Result", (), {
+                    "task_id": task["id"],
+                    "status": "failed",
+                    "child_thread_id": child_thread_id,
+                    "events": ({
+                        "event_type": "wait",
+                        "task_id": task["id"],
+                        "child_thread_id": child_thread_id,
+                        "child_status": "failed",
+                        "child_message": diagnostic,
+                        "failure_category": "codex_exec_failed",
+                        "raw_event": {
+                            "adapter": "codex-exec",
+                            "task_id": task["id"],
+                            "cwd": str(ROOT),
+                            "run_dir": str(run_dir),
+                            "output_shard_path": str(run_dir / task["output_shard_path"]),
+                            "command": ["codex", "exec", "--json", "<prompt>"],
+                            "command_string": "codex exec --json <prompt>",
+                        },
+                    },),
+                    "shard_path": None,
+                    "failure_category": "codex_exec_failed",
+                    "message": diagnostic,
+                })()
+
+        self_outer = self
+        with mock.patch(
+            "deepresearch.parallel_orchestrator._adapter",
+            return_value=PartialDegradingCodexAdapter(),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                min_tasks=2,
+                max_tasks=2,
+                allow_degraded=True,
+            )
+
+        self.assertEqual(result["status"], "completed_partial_parallel")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["parallel_degraded"])
+        self.assertFalse(result["needs_serial_handoff"])
+        self.assertEqual(result["accepted_shard_count"], 1)
+        self.assertEqual(result["evidence_source"]["type"], "real_child_execution")
+        self.assertTrue(result["evidence_source"]["real_child_execution"])
+        self.assertFalse(result["evidence_source"]["real_use_e2e_eligible"])
+        self.assertEqual(len(result["merge"]["accepted_shards"]), 1)
+        self.assertEqual(result["failure_counts"]["failed_tasks"], 1)
+        self.assertEqual(result["diagnostics"]["shard_counts"]["accepted_shards"], 1)
+        self.assertNotIn("no evidence shards were accepted", json.dumps(result["diagnostics"]))
+        state = inspect_run_state(run_dir)
+        self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
 
     def test_shard_merge_deduplicates_sources_images_and_claim_text(self) -> None:
         run_dir = self.prepare()
