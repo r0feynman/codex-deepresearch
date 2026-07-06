@@ -2180,21 +2180,26 @@ def _valid_semantic_question_scope(value: Any) -> bool:
 def _valid_semantic_provenance(value: Any) -> bool:
     return (
         isinstance(value, Mapping)
-        and _non_empty_string(value.get("planner_mode"))
-        and _non_empty_string(value.get("planner_source"))
+        and value.get("planner_mode") == "codex_semantic"
+        and value.get("planner_source") == "codex_semantic"
         and value.get("raw_request_required") is True
         and value.get("raw_response_required") is True
         and _non_empty_string(value.get("session_id_unavailable_reason"))
-        and isinstance(value.get("semantic_release_eligible"), bool)
+        and value.get("semantic_release_eligible") is True
     )
 
 
 def _valid_semantic_template_use(value: Any) -> bool:
+    template_source = value.get("template_source") if isinstance(value, Mapping) else None
     return (
         isinstance(value, Mapping)
-        and isinstance(value.get("uses_preselected_template"), bool)
-        and isinstance(value.get("template_release_eligible"), bool)
-        and isinstance(value.get("template_angle_titles"), list)
+        and value.get("uses_preselected_template") is False
+        and value.get("template_release_eligible") is False
+        and value.get("template_angle_titles") == []
+        and (
+            template_source is None
+            or (isinstance(template_source, str) and not template_source.strip())
+        )
     )
 
 

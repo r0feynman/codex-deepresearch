@@ -895,6 +895,102 @@ class PublicBetaValidationTests(unittest.TestCase):
             field="angles",
         )
 
+    def test_codex_semantic_text_run_rejects_template_use_fallback_claims(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "template-use-fallback",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        artifact_files = (
+            "semantic_expectation_oracle.json",
+            "semantic_plan.json",
+            "semantic_plan_review.json",
+            "semantic_planner_validation.json",
+        )
+        for filename in artifact_files:
+            path = run_dir / filename
+            payload = self.read_json(path)
+            template_use = dict(payload["template_use"])
+            template_use["uses_preselected_template"] = True
+            template_use["template_source"] = "heuristic_template_planner"
+            template_use["template_angle_titles"] = ["Primary source discovery"]
+            payload["template_use"] = template_use
+            self.write_json(path, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        failures = result["semantic_release_checks"]["failures"]
+        template_failures = {
+            (failure.get("artifact"), failure.get("field"))
+            for failure in failures
+            if failure.get("check") == "semantic_artifact_integrity"
+        }
+        self.assertTrue(
+            {
+                ("semantic_expectation_oracle", "template_use"),
+                ("semantic_plan", "template_use"),
+                ("semantic_plan_review", "template_use"),
+                ("semantic_planner_validation", "template_use"),
+            }.issubset(template_failures),
+            failures,
+        )
+
+    def test_codex_semantic_text_run_rejects_heuristic_planner_provenance(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "heuristic-planner-provenance",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        artifact_files = (
+            "semantic_expectation_oracle.json",
+            "semantic_plan.json",
+            "semantic_plan_review.json",
+            "semantic_planner_validation.json",
+        )
+        for filename in artifact_files:
+            path = run_dir / filename
+            payload = self.read_json(path)
+            provenance = dict(payload["provenance"])
+            provenance["planner_source"] = "heuristic_template_planner"
+            payload["provenance"] = provenance
+            self.write_json(path, payload)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        failures = result["semantic_release_checks"]["failures"]
+        provenance_failures = {
+            (failure.get("artifact"), failure.get("field"))
+            for failure in failures
+            if failure.get("check") == "semantic_artifact_integrity"
+        }
+        self.assertTrue(
+            {
+                ("semantic_expectation_oracle", "provenance"),
+                ("semantic_plan", "provenance"),
+                ("semantic_plan_review", "provenance"),
+                ("semantic_planner_validation", "provenance"),
+            }.issubset(provenance_failures),
+            failures,
+        )
+
     def test_codex_semantic_text_run_requires_oracle_and_coverage_angle_match(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
