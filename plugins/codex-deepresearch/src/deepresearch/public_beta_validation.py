@@ -107,20 +107,32 @@ SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES = (
     "semantic_plan.semantic_plan",
 )
 SEMANTIC_MIN_RELEASE_ANGLES = 2
+SEMANTIC_MIN_ANGLE_OVERLAP_TOKENS = 2
+SEMANTIC_MIN_ANGLE_UNIQUE_TOKENS = 4
 GENERIC_SEMANTIC_ANGLE_TEXTS = {
     "primary source discovery",
     "find authoritative sources that directly answer the research question",
 }
+GENERIC_SEMANTIC_PLACEHOLDER_PATTERNS = (
+    r"\bangle\s*\d+\b",
+    r"\bangle_\d+\b",
+    r"\bevidence\s+angle\b",
+    r"\bsupport\s+angle\b",
+)
 GENERIC_SEMANTIC_TOKENS = {
     "and",
     "answer",
     "authoritative",
+    "compare",
     "directly",
+    "does",
     "discovery",
+    "do",
     "evidence",
     "find",
     "for",
     "from",
+    "how",
     "official",
     "primary",
     "public",
@@ -128,9 +140,14 @@ GENERIC_SEMANTIC_TOKENS = {
     "research",
     "source",
     "sources",
+    "support",
+    "supports",
+    "supporting",
     "that",
     "the",
+    "what",
     "with",
+    "which",
 }
 BLOCKED_TERMINAL_STATUSES = {
     "blocked_preflight",
@@ -2280,9 +2297,19 @@ def _valid_semantic_angle(
         return False
     if _generic_or_original_semantic_text(question_context, original_question):
         return False
+    combined_text = f"{title} {research_question}"
+    if _semantic_placeholder_text(combined_text):
+        return False
 
-    angle_tokens = _semantic_meaningful_tokens(f"{title} {research_question}")
-    return bool(angle_tokens & original_tokens)
+    all_tokens = _semantic_token_list(combined_text)
+    meaningful_tokens = _semantic_meaningful_token_list(combined_text)
+    unique_meaningful_tokens = set(meaningful_tokens)
+    if len(unique_meaningful_tokens) < SEMANTIC_MIN_ANGLE_UNIQUE_TOKENS:
+        return False
+    if len(meaningful_tokens) * 2 < len(all_tokens):
+        return False
+    overlap_tokens = unique_meaningful_tokens & original_tokens
+    return len(overlap_tokens) >= SEMANTIC_MIN_ANGLE_OVERLAP_TOKENS
 
 
 def _generic_or_original_semantic_text(text: str, original_question: str) -> bool:
@@ -2291,6 +2318,14 @@ def _generic_or_original_semantic_text(text: str, original_question: str) -> boo
         return True
     return bool(original_question) and normalized == _normalized_semantic_text(
         original_question
+    )
+
+
+def _semantic_placeholder_text(text: str) -> bool:
+    normalized = _normalized_semantic_text(text)
+    return any(
+        re.search(pattern, normalized)
+        for pattern in GENERIC_SEMANTIC_PLACEHOLDER_PATTERNS
     )
 
 
@@ -2335,12 +2370,24 @@ def _semantic_angle_ids(value: Any) -> set[str]:
     }
 
 
-def _semantic_meaningful_tokens(text: str) -> set[str]:
-    return {
+def _semantic_token_list(text: str) -> list[str]:
+    return [
         token
         for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
-        if len(token) > 2 and token not in GENERIC_SEMANTIC_TOKENS
-    }
+        if len(token) > 2
+    ]
+
+
+def _semantic_meaningful_token_list(text: str) -> list[str]:
+    return [
+        token
+        for token in _semantic_token_list(text)
+        if token not in GENERIC_SEMANTIC_TOKENS
+    ]
+
+
+def _semantic_meaningful_tokens(text: str) -> set[str]:
+    return set(_semantic_meaningful_token_list(text))
 
 
 def _normalized_semantic_text(text: str) -> str:

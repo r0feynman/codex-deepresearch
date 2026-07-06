@@ -707,16 +707,19 @@ class PublicBetaValidationTests(unittest.TestCase):
                 )
                 angles = []
                 for index, evidence_need in enumerate(evidence_needs, start=1):
+                    scope_label = evidence_need.replace("_", " ")
                     angle = {
                         "angle_id": f"angle_{index:03d}",
-                        "title": f"deterministic release validation evidence angle {index}",
+                        "title": (
+                            f"deterministic release validation {scope_label} scope"
+                        ),
                         "research_question": (
                             "Which deterministic software release validation "
-                            f"tradeoffs are source-backed for angle {index}?"
+                            f"tradeoffs require {scope_label} review?"
                         ),
                         "question_context": (
                             "Scope deterministic release validation evidence for "
-                            f"public beta prompt {prompt['id']} angle {index}."
+                            f"public beta prompt {prompt['id']} and {scope_label}."
                         ),
                         "route": "text_only",
                         "evidence_need": evidence_need,
@@ -760,6 +763,70 @@ class PublicBetaValidationTests(unittest.TestCase):
                     artifact="semantic_plan",
                     field="angles",
                 )
+
+    def test_codex_semantic_text_run_rejects_low_specificity_software_evidence_angles(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "low-specificity-software-evidence",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        evidence_needs = ("primary_source", "comparative_analysis")
+        angles = [
+            {
+                "angle_id": f"angle_{index:03d}",
+                "title": f"software evidence angle {index}",
+                "research_question": f"How does software evidence support angle {index}?",
+                "question_context": (
+                    "Low-specificity software evidence scope for public beta "
+                    f"prompt {prompt['id']}."
+                ),
+                "route": "text_only",
+                "evidence_need": evidence_need,
+                "expected_artifacts": ["source list", "supporting quotes"],
+                "success_criteria": ["Claims remain tied to source spans."],
+                "report_section": f"Software Evidence {index}",
+            }
+            for index, evidence_need in enumerate(evidence_needs, start=1)
+        ]
+        plan = self.read_json(run_dir / "semantic_plan.json")
+        plan["angles"] = angles
+        plan["semantic_plan"]["angles"] = [dict(angle) for angle in angles]
+        plan["requirement_coverage_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "angle_id": angle["angle_id"],
+                "coverage_status": "covered",
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        oracle = self.read_json(run_dir / "semantic_expectation_oracle.json")
+        oracle["oracle_requirement_map"] = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "description": f"Resolve software evidence angle {index}.",
+                "covered_by_angle_ids": [angle["angle_id"]],
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assert_semantic_artifact_integrity_failure(
+            result,
+            artifact="semantic_plan",
+            field="angles",
+        )
 
     def test_codex_semantic_text_run_requires_oracle_and_coverage_angle_match(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -2256,10 +2323,13 @@ class PublicBetaValidationTests(unittest.TestCase):
             "cite",
             "compare",
             "for",
+            "from",
             "guidance",
             "public",
             "research",
             "the",
+            "visual",
+            "evidence",
         }
         prompt_terms: list[str] = []
         for raw_token in prompt["prompt"].replace("-", " ").replace("/", " ").split():
