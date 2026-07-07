@@ -879,12 +879,30 @@ class PublicBetaValidationTests(unittest.TestCase):
             any(failure.startswith("holdout_prompt_overlap") for failure in holdout["failures"])
         )
 
-    def test_default_blind_holdout_blocks_without_raw_selector_transcript(self) -> None:
+    def test_default_blind_holdout_is_release_ready_with_raw_selector_transcript(self) -> None:
         holdout = load_blind_holdout_manifest(DEFAULT_BLIND_HOLDOUT_MANIFEST)
 
+        self.assertTrue(holdout["release_gate_ready"])
+        self.assertEqual(holdout["failures"], [])
+        self.assertEqual(len(holdout["prompts"]), 12)
+
+    def test_blind_holdout_blocks_without_raw_selector_transcript(self) -> None:
+        temp = self.temp_dir()
+        manifest = self.read_json(DEFAULT_BLIND_HOLDOUT_MANIFEST)
+        oracle_file = (DEFAULT_BLIND_HOLDOUT_MANIFEST.parent / "semantic_oracles.json").resolve()
+        for prompt in manifest["prompts"]:
+            fragment = prompt["oracle_path"].split("#", 1)[1]
+            prompt["oracle_path"] = f"{oracle_file}#{fragment}"
+        audit_path = DEFAULT_BLIND_HOLDOUT_MANIFEST.parent / manifest["selector_provenance"]["audit_artifact_path"]
+        self.write_json(temp / audit_path.name, self.read_json(audit_path))
+        manifest["selector_provenance"].pop("raw_selector_transcript_path", None)
+        manifest["selector_provenance"].pop("raw_selector_transcript_hash", None)
+        manifest_path = temp / "holdout-missing-raw-transcript.json"
+        self.write_json(manifest_path, manifest)
+
+        holdout = load_blind_holdout_manifest(manifest_path)
+
         self.assertFalse(holdout["release_gate_ready"])
-        self.assertIn("selector_not_release_eligible", holdout["failures"])
-        self.assertIn("selector_audit_not_release_eligible", holdout["failures"])
         self.assertIn("selector_raw_transcript_path_missing", holdout["failures"])
 
     def test_semantic_anti_overfit_default_scan_passes_current_tree(self) -> None:

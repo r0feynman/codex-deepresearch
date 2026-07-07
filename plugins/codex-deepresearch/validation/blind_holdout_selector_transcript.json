@@ -1,0 +1,299 @@
+{
+  "artifact_type": "blind_holdout_selector_raw_transcript",
+  "implementation_freeze": {
+    "commit": "2bef9dc",
+    "record_type": "commit",
+    "release_eligible": true,
+    "timestamp": "2026-07-08T08:48:05+09:00"
+  },
+  "raw_request": {
+    "implementation_freeze": {
+      "commit": "2bef9dc",
+      "record_type": "commit",
+      "release_eligible": true,
+      "timestamp": "2026-07-08T08:48:05+09:00"
+    },
+    "request_text": "You are the independent blind-holdout selector for Codex DeepResearch issue #133. Do not edit files. Do not inspect or read the repository's existing blind_holdout_semantic_prompts.json, semantic_oracles.json, public_beta_semantic_prompts.json, semantic_regression_prompts.json, planner code, tests, fixtures, or golden files. Treat this as a fresh post-freeze selection session.\n\nImplementation freeze commit: 2bef9dc\nSelection time UTC should be current when you answer.\n\nTask: select exactly 12 public-safe blind holdout research prompts for semantic release validation. Requirements:\n- At least 4 Korean-language prompts.\n- At least 4 visual-required or visual-optional prompts.\n- At least 4 official/regulatory/source-quality-constrained prompts.\n- At least 3 ambiguous-domain prompts.\n- At least 3 non-software-domain prompts.\n- Mix domains beyond software: health/public data, finance/regulation, sports/culture/film/media, science/space, public safety, infrastructure, education, consumer policy.\n- Prompts must be safe for a public repo and must not require private accounts, personal data, credentials, or user uploads.\n- Each prompt should require meaningful semantic decomposition rather than keyword/template splitting.\n- Avoid obvious overlap with common previous examples: EV battery fire, NASA JWST first images, Apollo image analysis, Next.js caching, Nano Banana photo service.\n\nReturn ONLY valid JSON with this shape:\n{\n  \"schema_version\": \"codex-deepresearch.semantic-blind-holdout-selector-transcript.v0\",\n  \"artifact_type\": \"blind_holdout_selector_raw_transcript\",\n  \"selector_independent\": true,\n  \"release_eligible\": true,\n  \"implementation_freeze\": {\"commit\": \"2bef9dc\", \"record_type\": \"commit\"},\n  \"raw_response\": {\n    \"selection_completed\": true,\n    \"prompt_count\": 12,\n    \"selected_prompt_ids\": [\"holdout-independent-001\", ...],\n    \"selection_rationale\": \"...\",\n    \"prompts\": [\n      {\n        \"id\": \"holdout-independent-001\",\n        \"prompt\": \"...\",\n        \"route\": \"text_only|visual_required|visual_optional\",\n        \"categories\": [\"korean\", \"visual\", \"official_regulatory_source_quality\", \"ambiguous_domain\", \"non_software_domain\"],\n        \"expected_modalities\": [\"text\", \"visual\"],\n        \"expected_source_policy\": [\"public_safe_sources\", \"source_backed_claims\", \"official_or_regulatory_sources\"],\n        \"oracle_notes\": \"What a semantically good planner must preserve and decompose for this prompt.\"\n      }\n    ]\n  }\n}\n\nUse only category labels from this allowed set: korean, visual, official_regulatory_source_quality, ambiguous_domain, non_software_domain, policy_regulatory_domain, software_implementation. The prompt ids must be holdout-independent-001 through holdout-independent-012 in order.",
+    "selection_constraints": {
+      "min_ambiguous_domain": 3,
+      "min_korean": 4,
+      "min_non_software_domain": 3,
+      "min_official_regulatory_source_quality": 4,
+      "min_visual": 4,
+      "prompt_count": 12,
+      "public_safe": true
+    }
+  },
+  "raw_response": {
+    "prompt_count": 12,
+    "prompts": [
+      {
+        "categories": [
+          "korean",
+          "official_regulatory_source_quality",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-001",
+        "oracle_notes": "A good planner must preserve the Korean language, separate outbreak counts from vaccination coverage and surveillance effects, prioritize official public-health data, and avoid treating imported cases, domestic transmission, and reporting changes as the same phenomenon.",
+        "prompt": "질병관리청과 WHO/UNICEF 등 공개 공식 자료만 사용해 2023~2025년 한국 홍역 발생 증가를 '국내 전파', '해외유입', '예방접종률', '감시체계 변화'로 나누어 설명하고, 각 주장에 어떤 표나 자료가 필요한지 구분해 달라.",
+        "route": "text_only"
+      },
+      {
+        "categories": [
+          "korean",
+          "visual",
+          "official_regulatory_source_quality",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text",
+          "visual"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-002",
+        "oracle_notes": "A good planner must decompose official warning levels, map symbology, visual signage evidence, evacuation decision criteria, and limits of inference from static maps or generic hazard symbols.",
+        "prompt": "서울시, 행정안전부, 기상청의 공개 자료와 지도 또는 안전표지 이미지를 근거로, 반지하와 지하차도 침수 위험 안내에서 색상, 아이콘, 경보 단계가 각각 무엇을 의미하는지 분석하고, 실제 대피 판단에 필요한 정보와 지도에서 추론하면 안 되는 정보를 분리해 달라.",
+        "route": "visual_required"
+      },
+      {
+        "categories": [
+          "official_regulatory_source_quality",
+          "ambiguous_domain",
+          "non_software_domain",
+          "policy_regulatory_domain"
+        ],
+        "expected_modalities": [
+          "text"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-003",
+        "oracle_notes": "A good planner must preserve jurisdictional ambiguity, distinguish mandatory rules from voluntary or framework-based reporting, and split scope, timing, assurance, litigation status, and company applicability into separate evidence-backed questions.",
+        "prompt": "For a U.S.-listed company with significant California revenue but no EU listing, compare what SEC climate disclosure rules, California SB 253 and SB 261, and ISSB-based reporting could require or not require. Use official or regulatory sources only, separating legal status, effective dates, entity scope, assurance requirements, and uncertainty from litigation or rulemaking.",
+        "route": "text_only"
+      },
+      {
+        "categories": [
+          "visual",
+          "official_regulatory_source_quality",
+          "ambiguous_domain",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text",
+          "visual"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-004",
+        "oracle_notes": "A good planner must separate rule interpretation from visual evidence, avoid deciding facts not visible in authenticated imagery, and handle ambiguity between law text, referee protocol, broadcast diagrams, and unverifiable social clips.",
+        "prompt": "Using public official sources and publicly viewable match footage stills or diagrams where available, analyze a disputed soccer offside explanation: separate what can be resolved from the Laws of the Game text, what depends on camera frame or line-drawing evidence, and what remains uncertain without authenticated footage.",
+        "route": "visual_optional"
+      },
+      {
+        "categories": [
+          "visual",
+          "official_regulatory_source_quality",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text",
+          "visual"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-005",
+        "oracle_notes": "A good planner must keep image observations separate from compositional conclusions, require official mission or peer-reviewed evidence for scientific interpretation, and avoid overreading photographs as chemical proof.",
+        "prompt": "Use NASA OSIRIS-REx official pages and released Bennu sample images to explain which visible sample features are observational facts versus scientific interpretations about composition. Distinguish image-based observations, lab-analysis claims, and claims that require peer-reviewed or mission-team evidence.",
+        "route": "visual_required"
+      },
+      {
+        "categories": [
+          "official_regulatory_source_quality",
+          "ambiguous_domain",
+          "non_software_domain",
+          "policy_regulatory_domain"
+        ],
+        "expected_modalities": [
+          "text"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-006",
+        "oracle_notes": "A good planner must preserve legal-domain ambiguity, separate U.S. and EU authorities, distinguish proposed, final, stayed, and enforced obligations, and avoid converting consumer-policy summaries into legal advice.",
+        "prompt": "Compare U.S. FTC negative-option or click-to-cancel requirements with EU consumer-rights or Digital Services Act expectations for a streaming subscription signup and cancellation flow. Decompose jurisdiction, business model, covered practices, enforcement status, and what cannot be concluded from press summaries alone.",
+        "route": "text_only"
+      },
+      {
+        "categories": [
+          "korean",
+          "official_regulatory_source_quality",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-007",
+        "oracle_notes": "A good planner must maintain Korean output intent, separate rankings from scaled scores and sampling caveats, use official education data, and preserve uncertainty around pandemic-period comparability.",
+        "prompt": "OECD PISA와 교육부 공개 자료를 사용해 한국 학생의 최근 수학과 읽기 성취 변화가 '순위 변화', '점수 변화', '표본 또는 응답률', '코로나19 영향' 중 무엇을 말해 주는지 분리해서 설명해 달라. 단순 국가순위 비교로 과장하면 안 되는 부분도 밝혀 달라.",
+        "route": "text_only"
+      },
+      {
+        "categories": [
+          "korean",
+          "visual",
+          "official_regulatory_source_quality",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text",
+          "visual"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-008",
+        "oracle_notes": "A good planner must distinguish restoration status, rerelease context, and critical reevaluation, while separating visual poster or still-image cues from claims requiring official catalog, festival, or archival text evidence.",
+        "prompt": "한국영상자료원, 영화진흥위원회, 영화제 공식 자료와 공개 포스터 또는 스틸 이미지를 바탕으로 한 편의 복원 한국 고전영화가 왜 '복원', '재개봉', '재평가'로 불리는지 구분해 달라. 포스터나 스틸에서 확인 가능한 시대·장르 단서와 텍스트 자료로만 확인 가능한 사실을 분리해야 한다.",
+        "route": "visual_required"
+      },
+      {
+        "categories": [
+          "visual",
+          "official_regulatory_source_quality",
+          "ambiguous_domain",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text",
+          "visual"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-009",
+        "oracle_notes": "A good planner must decompose route accessibility into durable infrastructure, current outages, transfers, and map symbols, preserving timestamp sensitivity and not equating an accessible station icon with an accessible complete trip.",
+        "prompt": "For a trip planned on the research date from Jackson Heights-Roosevelt Avenue to World Trade Center, use MTA official maps, station pages, and elevator outage feeds to determine whether the route can be described as step-free. Separate permanent station accessibility, temporary outages, transfer geometry, map-symbol interpretation, and timestamped service advisories.",
+        "route": "visual_optional"
+      },
+      {
+        "categories": [
+          "official_regulatory_source_quality",
+          "ambiguous_domain",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-010",
+        "oracle_notes": "A good planner must separate wastewater trends from clinical case surveillance, account for lag and coverage differences, avoid individual medical inference, and preserve the distinction between early signal, confirmed outbreak, and public-health uncertainty.",
+        "prompt": "Using CDC National Wastewater Surveillance System and state health department public dashboards, evaluate whether a rise in wastewater viral activity but flat reported cases should be described as an outbreak signal. Decompose surveillance modality, geographic coverage, reporting lag, clinical testing behavior, and confidence level; do not infer individual risk.",
+        "route": "text_only"
+      },
+      {
+        "categories": [
+          "official_regulatory_source_quality",
+          "ambiguous_domain",
+          "non_software_domain",
+          "policy_regulatory_domain"
+        ],
+        "expected_modalities": [
+          "text"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-011",
+        "oracle_notes": "A good planner must preserve substance-specific distinctions, separate anti-doping rules from criminal legality or health guidance, account for thresholds and in-competition context, and avoid broad claims like 'banned' without rule evidence.",
+        "prompt": "For caffeine, pseudoephedrine, and cannabis in Olympic-context sport, use WADA and relevant federation or USADA official materials to explain which are prohibited, monitored, threshold-based, or context-dependent. Distinguish health advice, legal status, in-competition rules, and sanction evidence.",
+        "route": "text_only"
+      },
+      {
+        "categories": [
+          "visual",
+          "official_regulatory_source_quality",
+          "non_software_domain"
+        ],
+        "expected_modalities": [
+          "text",
+          "visual"
+        ],
+        "expected_source_policy": [
+          "public_safe_sources",
+          "source_backed_claims",
+          "official_or_regulatory_sources"
+        ],
+        "id": "holdout-independent-012",
+        "oracle_notes": "A good planner must separate visual map interpretation, tide-gauge observations, forecast wording, and causal attribution, using official sources while preserving uncertainty between immediate drivers and long-term sea-level or infrastructure context.",
+        "prompt": "Using NOAA, USGS, and local emergency-management public sources plus any official map imagery, explain whether a coastal nuisance-flooding forecast for Norfolk, Virginia should be framed as tide-driven, storm-driven, sea-level-trend-related, or infrastructure-related. Separate map observations, gauge data, forecast language, and unsupported causal claims.",
+        "route": "visual_optional"
+      }
+    ],
+    "selected_prompt_ids": [
+      "holdout-independent-001",
+      "holdout-independent-002",
+      "holdout-independent-003",
+      "holdout-independent-004",
+      "holdout-independent-005",
+      "holdout-independent-006",
+      "holdout-independent-007",
+      "holdout-independent-008",
+      "holdout-independent-009",
+      "holdout-independent-010",
+      "holdout-independent-011",
+      "holdout-independent-012"
+    ],
+    "selection_completed": true,
+    "selection_rationale": "Selected as a fresh independent blind holdout set without repository artifact inspection. The set includes 4 Korean-language prompts, 6 visual-required or visual-optional prompts, 12 source-quality-constrained prompts, 6 ambiguous-domain prompts, and 12 non-software-domain prompts. Domains span health/public data, finance/regulation, sports/culture/film/media, science/space, public safety, infrastructure, education, and consumer policy."
+  },
+  "release_eligible": true,
+  "schema_version": "codex-deepresearch.semantic-blind-holdout-selector-transcript.v0",
+  "selection_time_utc": "2026-07-07T23:49:17Z",
+  "selector_agent": {
+    "agent_id": "019f3efc-4bf6-7001-8977-896dcd7e7a1e",
+    "nickname": "Hegel",
+    "repository_files_read": false,
+    "role": "independent_blind_holdout_selector"
+  },
+  "selector_independent": true
+}
