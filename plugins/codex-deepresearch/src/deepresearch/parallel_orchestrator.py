@@ -1800,6 +1800,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         },
         "validation": validation.to_dict(),
     }
+    apply_release_validation_identity(merge_status, release_identity)
     tasks_artifact["tasks"] = tasks
     tasks_artifact["retry_summary"] = retry_summary
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
@@ -2218,7 +2219,10 @@ def _parallel_status(
     if errors:
         payload["errors"] = [dict(error) for error in errors]
     add_run_steps_artifact(payload, run_dir)
-    return payload
+    return apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence),
+    )
 
 
 def _parallel_evidence_source(

@@ -500,6 +500,8 @@ class InvocationRouterTests(unittest.TestCase):
         runs_dir = self.temp_runs_dir()
         question = "Investigate release validation identity handoff."
         expected_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()
+        oracle_hash = "c" * 64
+        oracle_path = "validation/semantic_oracles.json#pb_text_001"
         inspected = False
 
         def fake_parallel(*, run, **_kwargs):
@@ -514,6 +516,9 @@ class InvocationRouterTests(unittest.TestCase):
                 self.assertEqual(payload["suite_id"], "issue-118-suite")
                 self.assertEqual(payload["prompt_hash"], expected_hash)
                 self.assertEqual(payload["original_question"], question)
+                self.assertEqual(payload["manifest_oracle_hash"], oracle_hash)
+                self.assertEqual(payload["manifest_oracle_path"], oracle_path)
+                self.assertEqual(payload["manifest_oracle_fragment_id"], "pb_text_001")
                 self.assertEqual(payload["execution_mode"], "codex-plugin")
                 self.assertEqual(payload["runner_mode"], "full-runner")
             self.assertEqual(run_status["selected_mode"], "full-runner")
@@ -551,6 +556,8 @@ class InvocationRouterTests(unittest.TestCase):
                 max_tasks=1,
                 prompt_id="pb-text-001",
                 suite_id="issue-118-suite",
+                manifest_oracle_hash=oracle_hash,
+                manifest_oracle_path=oracle_path,
             )
 
         self.assertTrue(inspected)
@@ -558,6 +565,9 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(result["prompt_id"], "pb-text-001")
         self.assertEqual(result["suite_id"], "issue-118-suite")
         self.assertEqual(result["prompt_hash"], expected_hash)
+        self.assertEqual(result["manifest_oracle_hash"], oracle_hash)
+        self.assertEqual(result["manifest_oracle_path"], oracle_path)
+        self.assertEqual(result["manifest_oracle_fragment_id"], "pb_text_001")
         self.assertEqual(result["execution_mode"], "codex-plugin")
         self.assertEqual(result["runner_mode"], "full-runner")
 
@@ -2603,6 +2613,43 @@ class InvocationRouterTests(unittest.TestCase):
         visual_provider_status = self.read_json(Path(result["artifacts"]["visual_provider_status"]))
         self.assertTrue(visual_provider_status["ok"])
         self.assertEqual(visual_provider_status["status"], "fixture_visual_provider")
+
+    def test_invoke_carries_manifest_oracle_binding_into_parallel_handoff(self) -> None:
+        oracle_hash = "c" * 64
+        oracle_path = "validation/semantic_oracles.json#pb_text_003"
+        result = run_skill_invocation(
+            "$deep-research: investigate release manifest binding",
+            runs_dir=self.temp_runs_dir(),
+            adapter_name="fixture",
+            route="text_only",
+            angles=["primary source discovery"],
+            budget_preset="quick",
+            min_tasks=1,
+            max_tasks=1,
+            prompt_id="pb-text-003",
+            suite_id="issue-133-invoke",
+            manifest_oracle_hash=oracle_hash,
+            manifest_oracle_path=oracle_path,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["manifest_oracle_hash"], oracle_hash)
+        run_dir = Path(result["run_dir"])
+        for artifact_name in (
+            "run_status.json",
+            "evidence.json",
+            "status.json",
+            "research_tasks.json",
+            "parallel_orchestration_status.json",
+        ):
+            with self.subTest(artifact_name=artifact_name):
+                payload = self.read_json(run_dir / artifact_name)
+                self.assertEqual(payload["manifest_oracle_hash"], oracle_hash)
+                self.assertEqual(payload["manifest_oracle_path"], oracle_path)
+                self.assertEqual(payload["manifest_oracle_fragment_id"], "pb_text_003")
+        tasks = self.read_json(run_dir / "research_tasks.json")["tasks"]
+        self.assertTrue(tasks)
+        self.assertEqual(tasks[0]["manifest_oracle_hash"], oracle_hash)
 
     def test_real_parallel_provenance_is_preserved_in_final_status(self) -> None:
         runs_dir = self.temp_runs_dir()
