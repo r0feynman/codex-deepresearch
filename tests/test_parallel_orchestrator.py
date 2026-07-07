@@ -493,6 +493,19 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["retrieval_status"], "fetched")
         self.assertEqual(records[0]["url"], "https://example.com/retry-2")
+        self.assertEqual(records[0]["semantic_plan_task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(records[0]["semantic_plan_hash"], task["semantic_plan_hash"])
+        self.assertEqual(records[0]["approved_delta_id"], task["approved_delta_id"])
+        assignments = [
+            json.loads(line)
+            for line in (run_dir / "subagent_assignments.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertGreaterEqual(len(assignments), 2)
+        latest_assignment = assignments[-1]
+        self.assertEqual(latest_assignment["semantic_plan_task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(latest_assignment["semantic_plan_hash"], task["semantic_plan_hash"])
+        self.assertEqual(latest_assignment["approved_delta_id"], task["approved_delta_id"])
 
     def test_release_validation_invalid_child_search_sidecar_retry_exhaustion_fails(self) -> None:
         prepared = prepare_run(

@@ -85,6 +85,21 @@ class PublicBetaValidationTests(unittest.TestCase):
             if line.strip()
         ]
 
+    def write_oracle_bound_public_beta_prompt_manifest(
+        self,
+        root: Path,
+    ) -> tuple[Path, dict[str, Any]]:
+        manifest = self.read_json(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        for prompt in manifest["prompts"]:
+            oracle_hash = hashlib.sha256(
+                f"{prompt['id']}:test-oracle-fragment".encode("utf-8")
+            ).hexdigest()
+            prompt["oracle_path"] = f"semantic_oracles.json#{prompt['id']}"
+            prompt["oracle_hash"] = oracle_hash
+        manifest_path = root / "public_beta_prompts_oracle_bound.json"
+        self.write_json(manifest_path, manifest)
+        return manifest_path, load_public_beta_prompt_manifest(manifest_path)
+
     def write_manual_trace_audit_manifest(
         self,
         root: Path,
@@ -124,12 +139,11 @@ class PublicBetaValidationTests(unittest.TestCase):
             materialization_diff_hash = hashlib.sha256(f"{audit_id}:diff".encode("utf-8")).hexdigest()
             final_report_hash = hashlib.sha256(f"{audit_id}:report".encode("utf-8")).hexdigest()
             chain_proof = {}
-            for step_index, step in enumerate(chain_steps):
-                artifact_path = artifact_root / audit_id / f"{step}.json"
+
+            def trace_metadata(step: str, step_index: int) -> dict[str, Any]:
                 previous_step = chain_steps[step_index - 1] if step_index > 0 else None
                 next_step = chain_steps[step_index + 1] if step_index + 1 < len(chain_steps) else None
-                payload = {
-                    "schema_version": "codex-deepresearch.manual-trace-step.v0",
+                metadata = {
                     "audit_id": audit_id,
                     "run_id": run_id,
                     "prompt_id": prompt_id,
@@ -139,15 +153,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "fixture_only": fixture_only,
                     "previous_step": previous_step,
                     "next_step": next_step,
-                    "alignment_subject": "sanitized semantic trace audit",
-                    "provenance": {
-                        "public_safe": True,
-                        "fixture_only": fixture_only,
-                        "release_eligible": live and not fixture_only,
-                    },
                 }
                 if step in {"locked_oracle", "semantic_plan", "semantic_review"}:
-                    payload["oracle_hash"] = oracle_hash
+                    metadata["oracle_hash"] = oracle_hash
                 if step in {
                     "semantic_plan",
                     "semantic_review",
@@ -158,30 +166,178 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "accepted_shards",
                     "final_report",
                 }:
-                    payload["semantic_plan_hash"] = semantic_plan_hash
+                    metadata["semantic_plan_hash"] = semantic_plan_hash
                 if step in {"materialization_diff", "final_report"}:
-                    payload["materialization_diff_hash"] = materialization_diff_hash
-                if step == "accepted_shards":
-                    payload["accepted_shard_refs"] = [
+                    metadata["materialization_diff_hash"] = materialization_diff_hash
+                if step == "final_report":
+                    metadata["final_report_hash"] = final_report_hash
+                return metadata
+
+            def base_payload(step: str, step_index: int) -> dict[str, Any]:
+                return {
+                    "run_id": run_id,
+                    "prompt_id": prompt_id,
+                    "public_safe": True,
+                    "fixture_only": fixture_only,
+                    "manual_trace_audit": trace_metadata(step, step_index),
+                    "provenance": {
+                        "public_safe": True,
+                        "fixture_only": fixture_only,
+                        "release_eligible": live and not fixture_only,
+                    },
+                }
+
+            task = {
+                "id": "task_search_001",
+                "task_id": "task_search_001",
+                "semantic_plan_task_id": "task_search_001",
+                "semantic_plan_hash": semantic_plan_hash,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_001",
+                "route": route,
+                "query": "sanitized manual trace audit query",
+                "freshness_requirement": "any",
+                "source_policy": {"decision": "allowed", "flags": []},
+                "expected_source_types": ["web"],
+                "expected_visual_targets": ["sanitized visual target"] if route != "text_only" else [],
+                "expected_artifacts": ["source list"],
+                "success_criteria": ["Trace alignment is source linked."],
+                "done_condition": "Accepted shard aligns with the final report.",
+                "max_sources": 3,
+                "max_images": 2 if route != "text_only" else 0,
+            }
+            shard_ref = {
+                "task_id": task["task_id"],
+                "path": f"evidence_shards/{audit_id}/evidence_shard.json",
+                "shard_path": f"evidence_shards/{audit_id}/evidence_shard.json",
+                "artifact_hash": hashlib.sha256(
+                    f"{audit_id}:accepted-shard".encode("utf-8")
+                ).hexdigest(),
+            }
+
+            def step_payload(step: str, step_index: int) -> dict[str, Any]:
+                payload = base_payload(step, step_index)
+                if step == "original_question":
+                    payload.update(
                         {
-                            "task_id": "task_search_001",
-                            "shard_path": f"evidence_shards/{audit_id}/evidence_shard.json",
-                            "artifact_hash": hashlib.sha256(
-                                f"{audit_id}:accepted-shard".encode("utf-8")
+                            "schema_version": "codex-deepresearch.run-status.v0",
+                            "status": "completed_parallel",
+                            "original_question": "Sanitized manual trace audit prompt",
+                            "question": "Sanitized manual trace audit prompt",
+                            "prompt_hash": hashlib.sha256(
+                                f"{audit_id}:prompt".encode("utf-8")
                             ).hexdigest(),
                         }
-                    ]
-                if step == "final_report":
-                    payload["final_report_hash"] = final_report_hash
-                    payload["final_report_alignment"] = {
-                        "original_question": True,
-                        "locked_oracle": True,
-                        "semantic_plan": True,
-                        "semantic_review": True,
-                        "materialization_diff": True,
-                        "accepted_shards": True,
-                        "final_answer": True,
-                    }
+                    )
+                elif step == "locked_oracle":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.semantic-planner.v0",
+                            "artifact_type": "semantic_expectation_oracle",
+                            "oracle_hash": oracle_hash,
+                            "manifest_oracle_hash": oracle_hash,
+                            "plan_visible_to_oracle": False,
+                            "used_production_planner_output": False,
+                            "used_hidden_template_class": False,
+                            "used_fixed_angle_inventory": False,
+                            "oracle_requirement_map": [],
+                        }
+                    )
+                elif step == "semantic_plan":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.semantic-planner.v0",
+                            "artifact_type": "semantic_plan",
+                            "oracle_hash": oracle_hash,
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "semantic_plan": {"bounded_tasks": [task]},
+                        }
+                    )
+                elif step == "semantic_review":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.semantic-planner.v0",
+                            "artifact_type": "semantic_plan_review",
+                            "oracle_hash": oracle_hash,
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "semantic_fit_score": 9.6,
+                            "blockers": [],
+                        }
+                    )
+                elif step == "materialization_diff":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.semantic-planner.v0",
+                            "artifact_type": "semantic_materialization_diff",
+                            "valid": True,
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "materialization_diff_hash": materialization_diff_hash,
+                            "approved_delta_id": "base_plan",
+                        }
+                    )
+                elif step == "research_tasks":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                            "status": "completed",
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "tasks": [{**task, "state": "merged"}],
+                        }
+                    )
+                elif step in {"search_tasks", "visual_tasks"}:
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.search-handoff.v0",
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "tasks": [task],
+                        }
+                    )
+                elif step == "accepted_shards":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                            "status": "completed",
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "accepted_shards": [shard_ref],
+                        }
+                    )
+                elif step == "final_report":
+                    payload.update(
+                        {
+                            "schema_version": "codex-deepresearch.report-status.v0",
+                            "status": "completed",
+                            "semantic_plan_hash": semantic_plan_hash,
+                            "materialization_diff_hash": materialization_diff_hash,
+                            "final_report_hash": final_report_hash,
+                            "accepted_shards": [shard_ref],
+                            "final_report_alignment": {
+                                "original_question": True,
+                                "locked_oracle": True,
+                                "semantic_plan": True,
+                                "semantic_review": True,
+                                "materialization_diff": True,
+                                "accepted_shards": True,
+                                "final_answer": True,
+                            },
+                        }
+                    )
+                return payload
+
+            for step_index, step in enumerate(chain_steps):
+                artifact_name = {
+                    "original_question": "run_status.json",
+                    "locked_oracle": "semantic_expectation_oracle.json",
+                    "semantic_plan": "semantic_plan.json",
+                    "semantic_review": "semantic_plan_review.json",
+                    "materialization_diff": "semantic_materialization_diff.json",
+                    "research_tasks": "research_tasks.json",
+                    "search_tasks": "search_tasks.json",
+                    "visual_tasks": "visual_tasks.json",
+                    "accepted_shards": "merge_status.json",
+                    "final_report": "report_status.json",
+                }[step]
+                artifact_path = artifact_root / audit_id / artifact_name
+                payload = step_payload(step, step_index)
                 self.write_json(artifact_path, payload)
                 chain_proof[step] = {
                     "status": "verified",
@@ -344,17 +500,38 @@ class PublicBetaValidationTests(unittest.TestCase):
 
     def test_manual_trace_audit_gate_rejects_placeholder_artifacts(self) -> None:
         manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+        audit = self.read_json(manifest_path)["audits"][0]
         self.mutate_manual_trace_audit_step(
             manifest_path,
             step="semantic_plan",
-            replacement={"status": "verified"},
+            replacement={
+                "schema_version": "codex-deepresearch.manual-trace-step.v0",
+                "run_id": audit["run_id"],
+                "prompt_id": audit["prompt_id"],
+                "status": "verified",
+                "public_safe": True,
+                "fixture_only": False,
+                "manual_trace_audit": {
+                    "audit_id": audit["id"],
+                    "run_id": audit["run_id"],
+                    "prompt_id": audit["prompt_id"],
+                    "step": "semantic_plan",
+                    "status": "verified",
+                    "public_safe": True,
+                    "fixture_only": False,
+                    "previous_step": "locked_oracle",
+                    "next_step": "semantic_review",
+                    "oracle_hash": audit["oracle_hash"],
+                    "semantic_plan_hash": audit["semantic_plan_hash"],
+                },
+            },
         )
 
         gate = load_manual_trace_audits(manifest_path)
 
         self.assertFalse(gate["valid"])
         self.assertTrue(
-            any("semantic_plan_artifact_placeholder_or_wrong_schema" in failure for failure in gate["failures"]),
+            any("semantic_plan_artifact_wrapper_not_allowed" in failure for failure in gate["failures"]),
             gate["failures"],
         )
 
@@ -379,7 +556,10 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.mutate_manual_trace_audit_step(
             manifest_path,
             step="accepted_shards",
-            mutator=lambda payload: payload.pop("accepted_shard_refs", None),
+            mutator=lambda payload: (
+                payload.pop("accepted_shard_refs", None),
+                payload.pop("accepted_shards", None),
+            ),
         )
 
         gate = load_manual_trace_audits(manifest_path)
@@ -651,8 +831,58 @@ class PublicBetaValidationTests(unittest.TestCase):
             {finding["code"] for finding in scan["findings"]},
         )
 
+    def test_semantic_anti_overfit_scan_rejects_hash_helper_alias_routing(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_helper_bad.py"
+        helper = "public_beta" + "_prompt" + "_hash"
+        task_symbol = "bounded" + "_tasks"
+        bad.write_text(
+            "\n".join(
+                [
+                    f"digest = {helper}(question)",
+                    "if digest == 'abc':",
+                    f"    {task_symbol} = []",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "prompt" + "_hash" + "_alias" + "_routing",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
+    def test_semantic_anti_overfit_scan_rejects_hash_keyed_plan_lookup(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_hash_lookup_bad.py"
+        helper = "normalized" + "_question" + "_hash"
+        route_symbol = "route"
+        bad.write_text(
+            "\n".join(
+                [
+                    f"routing_key = {helper}(question)",
+                    "plan_by_hash = {'abc': {'route': 'text_only'}}",
+                    f"{route_symbol} = plan_by_hash[routing_key]['route']",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "prompt" + "_hash" + "_alias" + "_routing",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
     def test_semantic_release_report_lists_hashes_and_required_artifacts(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        manifest_path, manifest = self.write_oracle_bound_public_beta_prompt_manifest(
+            self.temp_dir()
+        )
         runs_dir = self.temp_dir()
         suite_id = "semantic-release-report"
         prompt_runs = self.write_all_passing_prompt_runs(
@@ -668,6 +898,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
+            prompt_manifest=manifest_path,
             prompt_runs=prompt_runs,
             manual_audit_manifest=manual_audit_manifest,
         )
@@ -768,6 +999,33 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
+    def test_semantic_release_checks_require_manifest_oracle_binding(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = next(prompt for prompt in manifest["prompts"] if prompt["route"] == "text_only")
+        run_dir = self.write_text_run(
+            self.temp_dir() / "missing-oracle-binding",
+            prompt=prompt,
+            suite_id="semantic-oracle-binding-required",
+            status="completed_parallel",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="semantic-oracle-binding-required",
+        )
+
+        self.assertEqual(result["status"], "failed", result)
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertTrue(
+            any(
+                failure.get("check") == "manifest_oracle_binding"
+                and "lacks required oracle_hash/oracle_path" in failure.get("detail", "")
+                for failure in failures
+            ),
+            failures,
+        )
+
     def test_default_suite_records_blocked_runs_separately_from_failures(self) -> None:
         with self.assertRaises(PublicBetaValidationError) as raised:
             run_public_beta_validation(
@@ -810,7 +1068,9 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(Path(visual["status_artifacts"]["visual_provider_status"]).is_file())
 
     def test_supplied_runs_count_pass_fail_and_blocked_metric_buckets(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        manifest_path, manifest = self.write_oracle_bound_public_beta_prompt_manifest(
+            self.temp_dir()
+        )
         prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
         runs_dir = self.temp_dir()
         suite_id = "public-beta-supplied"
@@ -833,6 +1093,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 runs_dir=self.temp_dir(),
                 suite_id=suite_id,
                 clean=True,
+                prompt_manifest=manifest_path,
                 prompt_runs={
                     "pb-text-001": passing_run,
                     "pb-text-002": failed_run,
@@ -994,7 +1255,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(metric["denominator_completed_non_blocked"], 1)
 
     def test_codex_semantic_text_run_with_required_artifacts_can_pass(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
         run_dir = self.write_text_run(
             self.temp_dir() / "codex-semantic",
@@ -1962,7 +2223,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                 self.assertEqual(result["failure_category"], "artifact_handoff_failure")
 
     def test_partial_parallel_reliability_counts_passing_text_and_visual_runs(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        manifest_path, manifest = self.write_oracle_bound_public_beta_prompt_manifest(
+            self.temp_dir()
+        )
         prompts = {prompt["id"]: prompt for prompt in manifest["prompts"]}
         runs_dir = self.temp_dir()
         suite_id = "public-beta-partial-reliability"
@@ -2001,6 +2264,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
+            prompt_manifest=manifest_path,
             prompt_runs=prompt_runs,
             manual_audit_manifest=manual_audit_manifest,
         )
@@ -2323,7 +2587,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
     def test_completed_codex_plugin_full_runner_identity_envelope_passes_contract(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = manifest["prompts"][0]
         run_dir = self.write_text_run(
             self.temp_dir() / "full-runner-contract",
@@ -2494,7 +2758,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertIn("hidden Codex-native API call", result["failure_detail"])
 
     def test_visual_identity_status_artifacts_have_matching_run_id_and_fresh_timestamp(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = next(
             prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
         )
@@ -2739,7 +3003,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
 
     def test_visual_gate_counts_codex_interactive_images_with_real_candidate_fetch_lineage(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = next(
             prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
         )
@@ -2801,7 +3065,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(counts["report_cited_visual_or_mixed_claims"], 1)
 
     def test_visual_gate_ignores_budget_pruned_surplus_records(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = next(
             prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
         )
@@ -2943,7 +3207,9 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
     def test_codex_native_runs_can_complete_without_external_gate_results(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        manifest_path, manifest = self.write_oracle_bound_public_beta_prompt_manifest(
+            self.temp_dir()
+        )
         runs_dir = self.temp_dir()
         suite_id = "codex-native-no-external-gates"
         prompt_runs = {}
@@ -2971,6 +3237,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
+            prompt_manifest=manifest_path,
             prompt_runs=prompt_runs,
             manual_audit_manifest=manual_audit_manifest,
         )
@@ -2993,7 +3260,9 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
     def test_external_gated_completion_accepts_automated_cli_as_external_json_only(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        manifest_path, manifest = self.write_oracle_bound_public_beta_prompt_manifest(
+            self.temp_dir()
+        )
         runs_dir = self.temp_dir()
         suite_id = "external-gated-real-use"
         prompt_runs = self.write_all_passing_prompt_runs(
@@ -3014,6 +3283,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
+            prompt_manifest=manifest_path,
             prompt_runs=prompt_runs,
             gate_results=gate_results,
             completion_mode="external-gated",
@@ -3056,7 +3326,9 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
     def test_minimal_spoofed_external_gate_results_are_rejected_as_diagnostics(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        manifest_path, manifest = self.write_oracle_bound_public_beta_prompt_manifest(
+            self.temp_dir()
+        )
         runs_dir = self.temp_dir()
         suite_id = "spoofed-external-gates"
         prompt_runs = self.write_all_passing_prompt_runs(
@@ -3077,6 +3349,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
+            prompt_manifest=manifest_path,
             prompt_runs=prompt_runs,
             gate_results=gate_results,
             manual_audit_manifest=manual_audit_manifest,

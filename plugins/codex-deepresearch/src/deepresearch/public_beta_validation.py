@@ -1283,7 +1283,7 @@ def run_semantic_anti_overfit_scan(
         scan_paths = [
             PLUGIN_ROOT / "src" / "deepresearch" / "semantic_planner.py",
             PLUGIN_ROOT / "skills",
-            root / "tests",
+            root / "tests" / "fixtures",
         ]
     files = _semantic_scan_files(scan_paths)
     findings: list[dict[str, Any]] = []
@@ -1371,15 +1371,37 @@ def _semantic_prompt_hash_alias_routing_findings(text: str) -> list[str]:
         text,
     ):
         alias_names.add(match.group(1))
+    hash_helper = (
+        r"(?:public_beta_prompt_hash|_prompt_hash|prompt_hash_for_question|"
+        r"normalized_question_hash|question_hash|hash_prompt|hash_question)"
+    )
+    for match in re.finditer(
+        rf"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*{hash_helper}\s*\(",
+        text,
+    ):
+        alias_names.add(match.group(1))
+    for match in re.finditer(
+        rf"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^=\n]{{0,160}}"
+        rf"sha256\s*\(\s*(?:normalize_public_beta_prompt_text|normalize_question|"
+        rf"_normalize_prompt_text)\s*\([^;\n]{{0,200}}hexdigest\s*\(",
+        text,
+    ):
+        alias_names.add(match.group(1))
 
     findings: list[str] = []
     semantic_target = r"(semantic_plan|bounded_tasks|expected_plan|angle|route)"
     for alias in sorted(alias_names):
-        if re.search(
+        branches_on_alias = re.search(
             rf"(?is)\b(if|elif|match)\b.{{0,180}}\b{re.escape(alias)}\b"
             rf".{{0,260}}{semantic_target}",
             text,
-        ):
+        )
+        lookup_by_alias = re.search(
+            rf"(?is){semantic_target}\s*=\s*.{{0,260}}\[[^\]]*"
+            rf"\b{re.escape(alias)}\b[^\]]*\]",
+            text,
+        )
+        if branches_on_alias or lookup_by_alias:
             findings.append("prompt_hash_alias_routing")
             break
     if re.search(
@@ -1388,6 +1410,25 @@ def _semantic_prompt_hash_alias_routing_findings(text: str) -> list[str]:
         text,
     ):
         findings.append("prompt_sha256_routing")
+    if re.search(
+        rf"(?is){semantic_target}\s*=\s*.{{0,260}}\[[^\]]*"
+        rf"(?:{hash_helper}\s*\(|sha256\s*\()[^\]]*\]",
+        text,
+    ):
+        findings.append("prompt_hash_alias_routing")
+    if re.search(
+        rf"(?is)\b(?:plan|route|angle|task|bounded_tasks|semantic_plan)_by_"
+        rf"(?:hash|digest)\b.{{0,420}}(?:prompt_hash|{hash_helper}\s*\(|sha256\s*\()"
+        rf".{{0,420}}{semantic_target}",
+        text,
+    ):
+        findings.append("prompt_hash_alias_routing")
+    if re.search(
+        rf"(?is)\{{.{{0,260}}(?:{hash_helper}\s*\(|sha256\s*\()"
+        rf".{{0,420}}{semantic_target}",
+        text,
+    ):
+        findings.append("prompt_hash_alias_routing")
     return findings
 
 
@@ -1719,29 +1760,45 @@ def _manual_trace_step_content_failures(
     failures: list[str] = []
     if not isinstance(payload, Mapping):
         return [f"{audit_id}:{step}_artifact_not_structured_json"]
-    if payload.get("schema_version") != "codex-deepresearch.manual-trace-step.v0":
-        failures.append(f"{audit_id}:{step}_artifact_placeholder_or_wrong_schema")
+    if payload.get("schema_version") == "codex-deepresearch.manual-trace-step.v0":
+        failures.append(f"{audit_id}:{step}_artifact_wrapper_not_allowed")
+    failures.extend(
+        _manual_trace_step_artifact_shape_failures(
+            audit_id=audit_id,
+            step=step,
+            payload=payload,
+        )
+    )
 
     expected_run_id = str(audit.get("run_id") or "").strip()
     expected_prompt_id = str(audit.get("prompt_id") or "").strip()
+    trace = payload.get("manual_trace_audit")
+    if not isinstance(trace, Mapping):
+        failures.append(f"{audit_id}:{step}_manual_trace_audit_missing")
+        trace = {}
+    for field, expected in (("run_id", expected_run_id), ("prompt_id", expected_prompt_id)):
+        if expected and payload.get(field) != expected:
+            failures.append(f"{audit_id}:{step}_{field}_mismatch")
+        elif not expected:
+            failures.append(f"{audit_id}:{step}_{field}_expected_value_missing")
     for field, expected in (
         ("audit_id", audit_id),
         ("step", step),
         ("run_id", expected_run_id),
         ("prompt_id", expected_prompt_id),
     ):
-        if expected and payload.get(field) != expected:
-            failures.append(f"{audit_id}:{step}_{field}_mismatch")
+        if expected and trace.get(field) != expected:
+            failures.append(f"{audit_id}:{step}_trace_{field}_mismatch")
         elif not expected:
-            failures.append(f"{audit_id}:{step}_{field}_expected_value_missing")
-    if payload.get("status") != "verified":
+            failures.append(f"{audit_id}:{step}_trace_{field}_expected_value_missing")
+    if trace.get("status") != "verified":
         failures.append(f"{audit_id}:{step}_artifact_not_verified")
-    if payload.get("public_safe") is not True:
+    if payload.get("public_safe") is not True or trace.get("public_safe") is not True:
         failures.append(f"{audit_id}:{step}_artifact_not_public_safe")
     provenance = payload.get("provenance")
     if payload.get("fixture_only") is True or (
         isinstance(provenance, Mapping) and provenance.get("fixture_only") is True
-    ):
+    ) or trace.get("fixture_only") is True:
         failures.append(f"{audit_id}:{step}_fixture_only")
 
     previous_step = (
@@ -1754,22 +1811,22 @@ def _manual_trace_step_content_failures(
         if step_index + 1 < len(MANUAL_TRACE_AUDIT_REQUIRED_CHAIN)
         else None
     )
-    if payload.get("previous_step") != previous_step:
+    if trace.get("previous_step") != previous_step:
         failures.append(f"{audit_id}:{step}_previous_step_mismatch")
-    if payload.get("next_step") != next_step:
+    if trace.get("next_step") != next_step:
         failures.append(f"{audit_id}:{step}_next_step_mismatch")
 
     required_hashes = _manual_trace_required_hash_fields_for_step(step)
     for field in required_hashes:
         expected_hash = str(audit.get(field) or "").strip()
-        actual_hash = payload.get(field)
+        actual_hash = payload.get(field) or trace.get(field)
         if not _sha256_hex_string(actual_hash):
             failures.append(f"{audit_id}:{step}_{field}_missing")
         elif expected_hash and str(actual_hash) != expected_hash:
             failures.append(f"{audit_id}:{step}_{field}_mismatch")
 
     if step == "accepted_shards":
-        shard_refs = payload.get("accepted_shard_refs")
+        shard_refs = payload.get("accepted_shards") or payload.get("accepted_shard_refs")
         if not isinstance(shard_refs, list) or not shard_refs:
             failures.append(f"{audit_id}:accepted_shards_refs_missing")
         else:
@@ -1806,6 +1863,69 @@ def _manual_trace_step_content_failures(
                         f"{audit_id}:final_report_alignment_{field}_missing"
                     )
     return failures
+
+
+def _manual_trace_step_artifact_shape_failures(
+    *,
+    audit_id: str,
+    step: str,
+    payload: Mapping[str, Any],
+) -> list[str]:
+    failures: list[str] = []
+    schema = payload.get("schema_version")
+    artifact_type = payload.get("artifact_type")
+    if step == "original_question":
+        if schema != RUN_STATUS_SCHEMA_VERSION:
+            failures.append(f"{audit_id}:{step}_artifact_schema_mismatch")
+        if not _non_empty_manifest_string(payload.get("original_question")) and not _non_empty_manifest_string(payload.get("question")):
+            failures.append(f"{audit_id}:{step}_original_question_missing")
+    elif step == "locked_oracle":
+        if artifact_type != "semantic_expectation_oracle":
+            failures.append(f"{audit_id}:{step}_artifact_type_mismatch")
+        if payload.get("plan_visible_to_oracle") is not False:
+            failures.append(f"{audit_id}:{step}_oracle_reverse_fit_missing")
+    elif step == "semantic_plan":
+        if artifact_type != "semantic_plan":
+            failures.append(f"{audit_id}:{step}_artifact_type_mismatch")
+        semantic_plan = payload.get("semantic_plan")
+        if not isinstance(semantic_plan, Mapping) or not isinstance(semantic_plan.get("bounded_tasks"), list) or not semantic_plan.get("bounded_tasks"):
+            failures.append(f"{audit_id}:{step}_bounded_tasks_missing")
+    elif step == "semantic_review":
+        if artifact_type != "semantic_plan_review":
+            failures.append(f"{audit_id}:{step}_artifact_type_mismatch")
+        if _numeric_or_none(payload.get("semantic_fit_score")) is None:
+            failures.append(f"{audit_id}:{step}_semantic_fit_score_missing")
+    elif step == "materialization_diff":
+        if artifact_type != "semantic_materialization_diff":
+            failures.append(f"{audit_id}:{step}_artifact_type_mismatch")
+        if payload.get("valid") is not True:
+            failures.append(f"{audit_id}:{step}_materialization_diff_not_valid")
+    elif step == "research_tasks":
+        if schema != "codex-deepresearch.parallel-orchestration.v0":
+            failures.append(f"{audit_id}:{step}_artifact_schema_mismatch")
+        if not _manual_trace_payload_has_tasks(payload):
+            failures.append(f"{audit_id}:{step}_tasks_missing")
+    elif step in {"search_tasks", "visual_tasks"}:
+        if schema != "codex-deepresearch.search-handoff.v0":
+            failures.append(f"{audit_id}:{step}_artifact_schema_mismatch")
+        if not _manual_trace_payload_has_tasks(payload):
+            failures.append(f"{audit_id}:{step}_tasks_missing")
+    elif step == "accepted_shards":
+        if schema != "codex-deepresearch.parallel-orchestration.v0":
+            failures.append(f"{audit_id}:{step}_artifact_schema_mismatch")
+        if payload.get("status") not in {"completed", "completed_parallel", "completed_fixture"}:
+            failures.append(f"{audit_id}:{step}_status_not_completed")
+    elif step == "final_report":
+        if schema not in {"codex-deepresearch.report-status.v0", "codex-deepresearch.report-generation.v0"}:
+            failures.append(f"{audit_id}:{step}_artifact_schema_mismatch")
+        if payload.get("status") != "completed":
+            failures.append(f"{audit_id}:{step}_status_not_completed")
+    return failures
+
+
+def _manual_trace_payload_has_tasks(payload: Mapping[str, Any]) -> bool:
+    tasks = payload.get("tasks")
+    return isinstance(tasks, list) and bool(tasks) and all(isinstance(task, Mapping) for task in tasks)
 
 
 def _manual_trace_required_hash_fields_for_step(step: str) -> tuple[str, ...]:
@@ -3694,8 +3814,14 @@ def _manifest_oracle_binding_failures(
     review: Any,
 ) -> list[dict[str, Any]]:
     expected_hash = prompt.get("oracle_hash")
-    if expected_hash is None:
-        return []
+    expected_path = str(prompt.get("oracle_path") or "").strip()
+    if expected_hash is None or not expected_path:
+        return [
+            {
+                "check": "manifest_oracle_binding",
+                "detail": "prompt manifest lacks required oracle_hash/oracle_path for semantic release readiness",
+            }
+        ]
     if not _sha256_hex_string(expected_hash):
         return [
             {
@@ -3752,7 +3878,6 @@ def _manifest_oracle_binding_failures(
             }
         )
 
-    expected_path = str(prompt.get("oracle_path") or "").strip()
     expected_fragment = (
         expected_path.split("#", 1)[1].strip() if "#" in expected_path else ""
     )

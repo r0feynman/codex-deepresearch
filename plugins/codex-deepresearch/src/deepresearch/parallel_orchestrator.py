@@ -1990,6 +1990,15 @@ def _release_validation_search_result(
     result = {
         "id": _string_value(record, "id"),
         "task_id": task_id,
+        "semantic_plan_task_id": _string_value(record, "semantic_plan_task_id")
+        if _release_child_field_present(record, "semantic_plan_task_id")
+        else task_id,
+        "semantic_plan_hash": _string_value(record, "semantic_plan_hash")
+        if _release_child_field_present(record, "semantic_plan_hash")
+        else str(task.get("semantic_plan_hash") or ""),
+        "approved_delta_id": _string_value(record, "approved_delta_id")
+        if _release_child_field_present(record, "approved_delta_id")
+        else str(task.get("approved_delta_id") or "base_plan"),
         "angle_id": angle_id,
         "route": route,
         "provider": provider,
@@ -2766,6 +2775,11 @@ def _assign_task(
         "max_concurrent_codex_subagents": max_concurrent,
         "parallel_degraded": parallel_degraded,
         "task_scope_hash": _task_scope_hash(task),
+        "semantic_plan_task_id": task.get("semantic_plan_task_id") or task["id"],
+        "semantic_plan_hash": task.get("semantic_plan_hash"),
+        "approved_delta_id": task.get("approved_delta_id") or (
+            "base_plan" if task.get("semantic_plan_hash") else None
+        ),
         "task_scope": {
             "query": task.get("query"),
             "route": task.get("route"),
