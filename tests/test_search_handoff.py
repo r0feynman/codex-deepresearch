@@ -137,6 +137,181 @@ class SearchHandoffTests(unittest.TestCase):
                 self.assertEqual(payload["runner_mode"], "full-runner")
                 self.assertIn("created_at", payload)
 
+    def test_prepare_records_manifest_oracle_binding_before_child_work(self) -> None:
+        oracle_hash = "a" * 64
+        oracle_path = "validation/semantic_oracles.json#pb_text_001"
+        result = prepare_run(
+            question="Example manifest oracle binding prompt.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-001",
+            suite_id="issue-133-suite",
+            manifest_oracle_hash=oracle_hash,
+            manifest_oracle_path=oracle_path,
+        )
+        run_dir = Path(result["run_dir"])
+
+        self.assertEqual(result["manifest_oracle_hash"], oracle_hash)
+        self.assertEqual(result["manifest_oracle_path"], oracle_path)
+        self.assertEqual(result["manifest_oracle_fragment_id"], "pb_text_001")
+        for artifact_name in (
+            "evidence.json",
+            "status.json",
+            "search_tasks.json",
+            "visual_tasks.json",
+            "semantic_expectation_oracle.json",
+            "semantic_plan_review.json",
+        ):
+            with self.subTest(artifact_name=artifact_name):
+                payload = self.load_json(run_dir / artifact_name)
+                self.assertEqual(payload["manifest_oracle_hash"], oracle_hash)
+                self.assertEqual(payload["manifest_oracle_path"], oracle_path)
+                self.assertEqual(payload["manifest_oracle_fragment_id"], "pb_text_001")
+
+        oracle = self.load_json(run_dir / "semantic_expectation_oracle.json")
+        self.assertEqual(
+            oracle["oracle_provenance"]["manifest_oracle_hash"],
+            oracle_hash,
+        )
+        oracle_request = self.load_json(
+            run_dir / "semantic_oracle_raw" / "oracle_request.json"
+        )
+        self.assertNotIn("manifest_oracle_hash", oracle_request)
+        oracle_response = self.load_json(
+            run_dir / "semantic_oracle_raw" / "oracle_response.json"
+        )
+        self.assertEqual(oracle_response["manifest_oracle_hash"], oracle_hash)
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+        self.assertEqual(
+            review["reviewer_provenance"]["manifest_oracle_path"],
+            oracle_path,
+        )
+        reviewer_request = self.load_json(
+            run_dir / "semantic_reviewer_raw" / "reviewer_request.json"
+        )
+        self.assertNotIn("manifest_oracle_hash", reviewer_request)
+        reviewer_response = self.load_json(
+            run_dir / "semantic_reviewer_raw" / "reviewer_response.json"
+        )
+        self.assertEqual(reviewer_response["manifest_oracle_fragment_id"], "pb_text_001")
+
+    def test_cli_prepare_accepts_manifest_oracle_binding(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        oracle_hash = "b" * 64
+        oracle_path = "validation/semantic_oracles.json#pb_text_002"
+        completed = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "CLI manifest oracle binding prompt.",
+                "--runs-dir",
+                str(runs_dir),
+                "--route",
+                "text_only",
+                "--angle",
+                "primary source discovery",
+                "--prompt-id",
+                "pb-text-002",
+                "--suite-id",
+                "issue-133-cli",
+                "--manifest-oracle-hash",
+                oracle_hash,
+                "--manifest-oracle-path",
+                oracle_path,
+                "--allow-release-ineligible-materialization-for-tests",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        run_dir = Path(result["run_dir"])
+        run_status = self.load_json(run_dir / "status.json")
+        self.assertEqual(run_status["manifest_oracle_hash"], oracle_hash)
+        self.assertEqual(run_status["manifest_oracle_fragment_id"], "pb_text_002")
+
+    def test_release_run_inputs_rejects_non_release_holdout_manifest(self) -> None:
+        completed = subprocess.run(
+            [
+                str(RUNNER),
+                "semantic-release-run-inputs",
+                "--runs-dir",
+                str(self.temp_runs_dir()),
+                "--suite-id",
+                "issue-133-release-inputs",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("blind holdout manifest is not release-ready", completed.stderr)
+
+    def test_release_run_inputs_emit_manifest_bound_commands(self) -> None:
+        holdout_manifest = self.load_json(
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "blind_holdout_semantic_prompts.json"
+        )
+        oracle_file = (
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_oracles.json"
+        ).resolve()
+        holdout_manifest["implementation_freeze"] = {
+            "commit": "3c763cae07b79522a6f75aa27cf630619d66c79d",
+            "timestamp": "2026-07-07T04:40:42Z",
+        }
+        holdout_manifest["selector_provenance"] = {
+            "independent": True,
+            "release_eligible": True,
+            "selected_after_freeze": True,
+            "selector": "temporary test selector",
+        }
+        for prompt in holdout_manifest["prompts"]:
+            fragment = prompt["oracle_path"].split("#", 1)[1]
+            prompt["oracle_path"] = f"{oracle_file}#{fragment}"
+        holdout_path = self.temp_runs_dir() / "release-ready-holdout.json"
+        holdout_path.write_text(json.dumps(holdout_manifest), encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                str(RUNNER),
+                "semantic-release-run-inputs",
+                "--runs-dir",
+                str(self.temp_runs_dir()),
+                "--suite-id",
+                "issue-133-release-inputs",
+                "--blind-holdout-manifest",
+                str(holdout_path),
+                "--manual-audit-manifest",
+                "/tmp/manual-audits.json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(len(payload["prepare_commands"]), 62)
+        first = payload["prepare_commands"][0]
+        self.assertIn("--manifest-oracle-hash", first["command"])
+        self.assertEqual(
+            first["semantic_release_validation_input"]["flag"],
+            "--regression-run",
+        )
+        validation_command = payload["semantic_release_validation_command"]
+        self.assertIn("--blind-holdout-manifest", validation_command)
+        self.assertIn("--manual-audit-manifest", validation_command)
+
     def test_prepare_exposes_release_ineligible_semantic_diagnostics(self) -> None:
         result = prepare_run(
             question="Compare public sources for an example search question.",

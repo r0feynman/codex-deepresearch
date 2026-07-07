@@ -87,6 +87,9 @@ SEMANTIC_COMMON_INTEGRITY_FIELDS = (
     "template_use",
     "session_id",
     "session_id_unavailable_reason",
+    "manifest_oracle_hash",
+    "manifest_oracle_path",
+    "manifest_oracle_fragment_id",
 )
 SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
     "query",
@@ -1079,6 +1082,7 @@ def write_semantic_expectation_oracle(
     provided_sources: Sequence[Mapping[str, Any]] | None = None,
     provided_images: Sequence[Mapping[str, Any]] | None = None,
     created_at: str | None = None,
+    manifest_oracle_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write and lock the semantic expectation oracle before planning."""
 
@@ -1122,6 +1126,7 @@ def write_semantic_expectation_oracle(
             raw_request_hash=raw_request_content_hash,
             adapter_response=adapter_response,
         )
+    _apply_manifest_oracle_binding(raw_response, manifest_oracle_binding)
     raw_response["run_id"] = run_path.name
     raw_response["created_at"] = timestamp
     raw_response["raw_request_content_hash"] = raw_request_content_hash
@@ -1164,6 +1169,7 @@ def write_semantic_plan_review(
     plan: SemanticPlan,
     oracle: Mapping[str, Any],
     created_at: str | None = None,
+    manifest_oracle_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Review a semantic plan against the locked oracle and write review artifacts."""
 
@@ -1227,6 +1233,7 @@ def write_semantic_plan_review(
             raw_request_hash=raw_request_content_hash,
             adapter_response=adapter_response,
         )
+    _apply_manifest_oracle_binding(raw_response, manifest_oracle_binding)
     raw_response["run_id"] = run_path.name
     raw_response["created_at"] = timestamp
     raw_response["raw_request_content_hash"] = raw_request_content_hash
@@ -1250,6 +1257,37 @@ def write_semantic_plan_review(
     )
     _write_json(run_path / SEMANTIC_PLAN_REVIEW_FILENAME, review)
     return review
+
+
+def _apply_manifest_oracle_binding(
+    payload: dict[str, Any],
+    binding: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(binding, Mapping):
+        return payload
+    clean = {
+        field: str(binding.get(field) or "").strip()
+        for field in (
+            "manifest_oracle_hash",
+            "manifest_oracle_path",
+            "manifest_oracle_fragment_id",
+        )
+    }
+    if not all(clean.values()):
+        return payload
+    payload.update(clean)
+    for provenance_field in (
+        "provenance",
+        "oracle_provenance",
+        "reviewer_provenance",
+        "planner_provenance",
+    ):
+        provenance = payload.get(provenance_field)
+        if isinstance(provenance, Mapping):
+            merged = dict(provenance)
+            merged.update(clean)
+            payload[provenance_field] = merged
+    return payload
 
 
 def invoke_codex_semantic_reviewer_adapter(
@@ -1555,6 +1593,7 @@ def _expectation_oracle_from_raw_response(
     provenance.setdefault("generated_before_plan_timestamp", timestamp)
     oracle["oracle_provenance"] = provenance
     oracle["provenance"] = provenance
+    _apply_manifest_oracle_binding(oracle, raw_response)
     oracle["raw_request_path"] = str(raw_request_path)
     oracle["raw_response_path"] = str(raw_response_path)
     oracle["raw_request_content_hash"] = raw_request_content_hash
@@ -1897,6 +1936,7 @@ def _semantic_plan_review_from_raw_response(
     reviewer_provenance["raw_response_artifact_hash"] = raw_response_hash
     reviewer_provenance["raw_response_hash"] = raw_response_hash
     review["reviewer_provenance"] = reviewer_provenance
+    _apply_manifest_oracle_binding(review, raw_response)
     review["reviewer_surface"] = reviewer_provenance.get("model_or_surface")
     review["reviewer_prompt_version"] = reviewer_provenance.get("prompt_version")
     review["reviewer_independence"] = _reviewer_independence_from_artifacts(

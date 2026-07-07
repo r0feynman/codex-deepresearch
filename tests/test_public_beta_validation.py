@@ -1022,6 +1022,29 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
+    def test_semantic_release_checks_accept_manifest_oracle_binding(self) -> None:
+        manifest = load_public_beta_semantic_manifest(DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST)
+        prompt = next(prompt for prompt in manifest["prompts"] if prompt["route"] == "text_only")
+        run_dir = self.write_text_run(
+            self.temp_dir() / "oracle-binding-pass",
+            prompt=prompt,
+            suite_id="semantic-oracle-binding-pass",
+            status="completed_parallel",
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="semantic-oracle-binding-pass",
+        )
+
+        self.assertEqual(result["status"], "passed", result)
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertFalse(
+            any(failure.get("check") == "manifest_oracle_binding" for failure in failures),
+            failures,
+        )
+
     def test_semantic_release_checks_require_manifest_oracle_binding(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompt = next(prompt for prompt in manifest["prompts"] if prompt["route"] == "text_only")

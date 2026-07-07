@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -32,6 +33,9 @@ from deepresearch import (
     DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
     DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
     PublicBetaValidationError,
+    load_blind_holdout_manifest,
+    load_public_beta_semantic_manifest,
+    load_semantic_regression_manifest,
     SanitizedRealVisualE2EError,
     parse_scenario_run,
     parse_public_beta_gate_result,
@@ -298,6 +302,9 @@ def run_prepare(args: argparse.Namespace) -> int:
             suite_id=args.suite_id,
             prompt_hash=args.prompt_hash,
             original_question=args.original_question,
+            manifest_oracle_hash=args.manifest_oracle_hash,
+            manifest_oracle_path=args.manifest_oracle_path,
+            manifest_oracle_fragment_id=args.manifest_oracle_fragment_id,
             _allow_release_ineligible_materialization_for_tests=(
                 args.allow_release_ineligible_materialization_for_tests
             ),
@@ -344,6 +351,9 @@ def run_invoke(args: argparse.Namespace) -> int:
         suite_id=args.suite_id,
         prompt_hash=args.prompt_hash,
         original_question=args.original_question,
+        manifest_oracle_hash=args.manifest_oracle_hash,
+        manifest_oracle_path=args.manifest_oracle_path,
+        manifest_oracle_fragment_id=args.manifest_oracle_fragment_id,
         _allow_release_ineligible_materialization_for_tests=(
             args.allow_release_ineligible_materialization_for_tests
         ),
@@ -1010,6 +1020,120 @@ def run_semantic_release_validation_command(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 2
 
 
+def run_semantic_release_run_inputs_command(args: argparse.Namespace) -> int:
+    try:
+        regression_manifest = load_semantic_regression_manifest(
+            resolve_repo_path(args.semantic_regression_manifest)
+        )
+        public_manifest = load_public_beta_semantic_manifest(
+            resolve_repo_path(args.public_beta_semantic_manifest)
+        )
+        holdout_manifest = load_blind_holdout_manifest(
+            resolve_repo_path(args.blind_holdout_manifest),
+            known_manifests=[regression_manifest, public_manifest],
+        )
+    except (PublicBetaValidationError, OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if holdout_manifest.get("release_gate_ready") is not True:
+        failures = holdout_manifest.get("failures") or ["holdout_release_gate_not_ready"]
+        print(
+            "ERROR: blind holdout manifest is not release-ready: "
+            + "; ".join(str(failure) for failure in failures),
+            file=sys.stderr,
+        )
+        return 2
+
+    prompt_sets = [
+        ("semantic_regression", "--regression-run", regression_manifest),
+        ("public_beta_semantic", "--public-beta-run", public_manifest),
+        ("blind_holdout", "--holdout-run", holdout_manifest),
+    ]
+    prepare_commands = []
+    validation_args = []
+    for suite_label, validation_flag, manifest in prompt_sets:
+        for prompt in manifest["prompts"]:
+            prompt_id = prompt["id"]
+            fragment_id = _manifest_oracle_fragment_id(str(prompt["oracle_path"]))
+            command = [
+                str(Path(__file__).resolve()),
+                "prepare" if args.mode == "prepare" else "invoke",
+            ]
+            if args.mode == "invoke":
+                command.extend([f"$deep-research: {prompt['prompt']}"])
+            else:
+                command.append(prompt["prompt"])
+            command.extend(
+                [
+                    "--runs-dir",
+                    args.runs_dir,
+                    "--route",
+                    prompt["route"],
+                    "--prompt-id",
+                    prompt_id,
+                    "--suite-id",
+                    args.suite_id,
+                    "--prompt-hash",
+                    prompt["prompt_hash"],
+                    "--original-question",
+                    prompt["prompt"],
+                    "--manifest-oracle-hash",
+                    prompt["oracle_hash"],
+                    "--manifest-oracle-path",
+                    prompt["oracle_path"],
+                    "--manifest-oracle-fragment-id",
+                    fragment_id,
+                ]
+            )
+            prepare_commands.append(
+                {
+                    "suite": suite_label,
+                    "prompt_id": prompt_id,
+                    "mode": args.mode,
+                    "command": command,
+                    "shell": shlex.join(command),
+                    "semantic_release_validation_input": {
+                        "flag": validation_flag,
+                        "value": f"{prompt_id}=<run_dir>",
+                    },
+                }
+            )
+            validation_args.extend([validation_flag, f"{prompt_id}=<run_dir>"])
+    validation_command = [
+        str(Path(__file__).resolve()),
+        "semantic-release-validation",
+        "--runs-dir",
+        args.runs_dir,
+        "--suite-id",
+        args.suite_id,
+        "--semantic-regression-manifest",
+        args.semantic_regression_manifest,
+        "--public-beta-semantic-manifest",
+        args.public_beta_semantic_manifest,
+        "--blind-holdout-manifest",
+        args.blind_holdout_manifest,
+        *validation_args,
+    ]
+    if args.manual_audit_manifest:
+        validation_command.extend(["--manual-audit-manifest", args.manual_audit_manifest])
+    payload = {
+        "schema_version": "codex-deepresearch.semantic-release-run-inputs.v0",
+        "suite_id": args.suite_id,
+        "mode": args.mode,
+        "runs_dir": args.runs_dir,
+        "prepare_commands": prepare_commands,
+        "semantic_release_validation_command": validation_command,
+        "semantic_release_validation_shell": shlex.join(validation_command),
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _manifest_oracle_fragment_id(oracle_path: str) -> str:
+    return oracle_path.split("#", 1)[1].strip() if "#" in oracle_path else ""
+
+
 def add_release_validation_identity_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--prompt-id",
@@ -1034,6 +1158,24 @@ def add_release_validation_identity_args(parser: argparse.ArgumentParser) -> Non
         help=(
             "Optional manifest prompt text used for prompt_hash binding. Defaults "
             "to the normalized invocation question."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-oracle-hash",
+        help="Release manifest oracle fragment sha256 to bind before child execution.",
+    )
+    parser.add_argument(
+        "--manifest-oracle-path",
+        help=(
+            "Release manifest oracle path, usually relative to the manifest and "
+            "including a #fragment id."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-oracle-fragment-id",
+        help=(
+            "Optional oracle fragment id. If omitted, it is derived from "
+            "--manifest-oracle-path when that path includes a #fragment."
         ),
     )
 
@@ -1434,6 +1576,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exit zero while still writing a failed/not-ready semantic release report.",
     )
     semantic_release.set_defaults(func=run_semantic_release_validation_command)
+
+    semantic_release_inputs = subparsers.add_parser(
+        "semantic-release-run-inputs",
+        help=(
+            "Emit manifest-bound prepare/invoke commands and the matching "
+            "semantic-release-validation run inputs."
+        ),
+    )
+    semantic_release_inputs.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory to pass to each generated prepare/invoke command.",
+    )
+    semantic_release_inputs.add_argument(
+        "--suite-id",
+        default="semantic-release-validation",
+        help="Suite id to bind into generated release-counted runs.",
+    )
+    semantic_release_inputs.add_argument(
+        "--mode",
+        choices=("prepare", "invoke"),
+        default="prepare",
+        help="Generate prepare commands or full invoke commands.",
+    )
+    semantic_release_inputs.add_argument(
+        "--semantic-regression-manifest",
+        default=str(DEFAULT_SEMANTIC_REGRESSION_MANIFEST.relative_to(REPO_ROOT)),
+        help="30-prompt semantic regression manifest.",
+    )
+    semantic_release_inputs.add_argument(
+        "--public-beta-semantic-manifest",
+        default=str(DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST.relative_to(REPO_ROOT)),
+        help="20-run Public Beta semantic manifest.",
+    )
+    semantic_release_inputs.add_argument(
+        "--blind-holdout-manifest",
+        default=str(DEFAULT_BLIND_HOLDOUT_MANIFEST.relative_to(REPO_ROOT)),
+        help="Blind holdout manifest with selector/freeze provenance.",
+    )
+    semantic_release_inputs.add_argument(
+        "--manual-audit-manifest",
+        help=(
+            "Optional manual trace audit manifest path to include in the "
+            "generated semantic-release-validation command."
+        ),
+    )
+    semantic_release_inputs.set_defaults(func=run_semantic_release_run_inputs_command)
 
     resolve = subparsers.add_parser(
         "resolve-config",

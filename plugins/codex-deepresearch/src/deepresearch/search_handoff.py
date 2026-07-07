@@ -60,6 +60,9 @@ RELEASE_VALIDATION_IDENTITY_FIELDS = (
     "suite_id",
     "prompt_hash",
     "original_question",
+    "manifest_oracle_hash",
+    "manifest_oracle_path",
+    "manifest_oracle_fragment_id",
     "execution_mode",
     "runner_mode",
 )
@@ -92,6 +95,9 @@ def prepare_run(
     suite_id: str | None = None,
     prompt_hash: str | None = None,
     original_question: str | None = None,
+    manifest_oracle_hash: str | None = None,
+    manifest_oracle_path: str | None = None,
+    manifest_oracle_fragment_id: str | None = None,
     user_constraints: Sequence[str] | None = None,
     provided_sources: Sequence[Mapping[str, Any]] | None = None,
     provided_images: Sequence[Mapping[str, Any]] | None = None,
@@ -124,6 +130,9 @@ def prepare_run(
         suite_id=suite_id,
         prompt_hash=prompt_hash,
         original_question=original_question,
+        manifest_oracle_hash=manifest_oracle_hash,
+        manifest_oracle_path=manifest_oracle_path,
+        manifest_oracle_fragment_id=manifest_oracle_fragment_id,
     )
 
     config = resolve_config(
@@ -162,6 +171,7 @@ def prepare_run(
         provided_sources=provided_sources,
         provided_images=provided_images,
         created_at=now,
+        manifest_oracle_binding=release_identity,
     )
     _record_semantic_artifact_trace(
         run_dir,
@@ -262,6 +272,7 @@ def prepare_run(
         plan=semantic_plan,
         oracle=locked_oracle,
         created_at=now,
+        manifest_oracle_binding=release_identity,
     )
     semantic_review["semantic_plan_candidate_artifact_hash"] = pre_review_semantic_plan_hash
     _write_json(run_dir / SEMANTIC_PLAN_REVIEW_FILENAME, semantic_review)
@@ -1004,12 +1015,23 @@ def build_release_validation_identity(
     suite_id: str | None = None,
     prompt_hash: str | None = None,
     original_question: str | None = None,
+    manifest_oracle_hash: str | None = None,
+    manifest_oracle_path: str | None = None,
+    manifest_oracle_fragment_id: str | None = None,
 ) -> dict[str, str]:
     """Build the canonical release-validation identity envelope if requested."""
 
     provided = any(
         isinstance(value, str) and value.strip()
-        for value in (prompt_id, suite_id, prompt_hash, original_question)
+        for value in (
+            prompt_id,
+            suite_id,
+            prompt_hash,
+            original_question,
+            manifest_oracle_hash,
+            manifest_oracle_path,
+            manifest_oracle_fragment_id,
+        )
     )
     if not provided:
         return {}
@@ -1030,13 +1052,59 @@ def build_release_validation_identity(
         raise SearchHandoffError(
             "prompt_hash does not match the canonical hash of original_question"
         )
-    return {
+    identity = {
         "prompt_id": clean_prompt_id,
         "suite_id": clean_suite_id,
         "prompt_hash": clean_prompt_hash,
         "original_question": clean_original_question,
         "execution_mode": "codex-plugin",
         "runner_mode": "full-runner",
+    }
+    oracle_binding = _release_manifest_oracle_binding(
+        manifest_oracle_hash=manifest_oracle_hash,
+        manifest_oracle_path=manifest_oracle_path,
+        manifest_oracle_fragment_id=manifest_oracle_fragment_id,
+    )
+    identity.update(oracle_binding)
+    return identity
+
+
+def _release_manifest_oracle_binding(
+    *,
+    manifest_oracle_hash: str | None,
+    manifest_oracle_path: str | None,
+    manifest_oracle_fragment_id: str | None,
+) -> dict[str, str]:
+    provided = any(
+        isinstance(value, str) and value.strip()
+        for value in (
+            manifest_oracle_hash,
+            manifest_oracle_path,
+            manifest_oracle_fragment_id,
+        )
+    )
+    if not provided:
+        return {}
+    clean_hash = (manifest_oracle_hash or "").strip()
+    clean_path = (manifest_oracle_path or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", clean_hash):
+        raise SearchHandoffError("manifest_oracle_hash must be a lowercase sha256 hex string")
+    if not clean_path:
+        raise SearchHandoffError("manifest_oracle_path is required with manifest_oracle_hash")
+    derived_fragment = clean_path.split("#", 1)[1].strip() if "#" in clean_path else ""
+    clean_fragment = (manifest_oracle_fragment_id or derived_fragment).strip()
+    if derived_fragment and clean_fragment != derived_fragment:
+        raise SearchHandoffError(
+            "manifest_oracle_fragment_id must match the fragment in manifest_oracle_path"
+        )
+    if not clean_fragment:
+        raise SearchHandoffError(
+            "manifest_oracle_fragment_id is required when manifest_oracle_path has no fragment"
+        )
+    return {
+        "manifest_oracle_hash": clean_hash,
+        "manifest_oracle_path": clean_path,
+        "manifest_oracle_fragment_id": clean_fragment,
     }
 
 
