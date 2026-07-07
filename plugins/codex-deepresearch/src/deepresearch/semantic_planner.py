@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import shlex
 import shutil
+import subprocess
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -29,6 +32,11 @@ PLANNER_MODE_MANUAL_ANGLES = "manual_angles"
 PLANNER_MODE_FIXTURE = "fixture"
 PLANNER_MODE_BLOCKED = "blocked"
 BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE = "blocked_semantic_planner_unavailable"
+CODEX_SEMANTIC_ADAPTER_NAME = "codex_native_semantic_candidate_adapter"
+CODEX_SEMANTIC_PROMPT_VERSION = "p3-sp2-candidate-v1"
+CODEX_SEMANTIC_PLANNER_COMMAND_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_COMMAND"
+CODEX_SEMANTIC_PLANNER_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"
+CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND = "codex_exec_json"
 SEMANTIC_FIT_SCORE_THRESHOLD = 9.0
 ALLOWED_PLANNER_MODES = (
     PLANNER_MODE_CODEX_SEMANTIC,
@@ -126,6 +134,13 @@ class SemanticAngle:
     expected_artifacts: list[str]
     success_criteria: list[str]
     report_section: str
+    why_this_angle_matters: str = ""
+    included_scope: list[str] = field(default_factory=list)
+    excluded_scope: list[str] = field(default_factory=list)
+    expected_source_types: list[str] = field(default_factory=list)
+    expected_visual_targets: list[str] = field(default_factory=list)
+    search_queries: list[str] = field(default_factory=list)
+    risk_or_contradiction_checks: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -139,15 +154,31 @@ class SemanticPlan:
     source: str
     expected_evidence_needs: list[str]
     angles: list[SemanticAngle]
+    intent_summary: str = ""
+    domain_entities: list[dict[str, Any]] = field(default_factory=list)
+    constraints: list[dict[str, Any]] = field(default_factory=list)
+    question_scope: str = "narrow"
+    decomposition_strategy: str = ""
+    requirement_coverage_map: list[dict[str, Any]] = field(default_factory=list)
+    negative_scope: list[str] = field(default_factory=list)
+    bounded_tasks: list[dict[str, Any]] = field(default_factory=list)
+    planner_provenance: dict[str, Any] = field(default_factory=dict)
+    model_or_surface: str = ""
+    original_question: str = ""
+    language: str = ""
     planner_mode: str = PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK
     semantic_release_eligible: bool = False
     status: str = "prepared_heuristic_template_fallback"
     diagnostics: dict[str, Any] | None = None
+    raw_request_payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    raw_response_payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["angles"] = [angle.to_dict() for angle in self.angles]
         data["diagnostics"] = dict(self.diagnostics or {})
+        data.pop("raw_request_payload", None)
+        data.pop("raw_response_payload", None)
         return data
 
 
@@ -307,6 +338,9 @@ def blocked_semantic_planner_plan(
     *,
     question: str,
     reason: str,
+    raw_request_payload: Mapping[str, Any] | None = None,
+    raw_response_payload: Mapping[str, Any] | None = None,
+    planner_provenance: Mapping[str, Any] | None = None,
 ) -> SemanticPlan:
     """Return a release-ineligible blocked semantic-planner-unavailable stub."""
 
@@ -319,6 +353,8 @@ def blocked_semantic_planner_plan(
         source=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
         expected_evidence_needs=[],
         angles=[],
+        planner_provenance=dict(planner_provenance or {}),
+        original_question=normalized_question,
         planner_mode=PLANNER_MODE_BLOCKED,
         semantic_release_eligible=False,
         status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
@@ -326,6 +362,161 @@ def blocked_semantic_planner_plan(
             **_fallback_diagnostics(PLANNER_MODE_BLOCKED),
             "blocked_reason": reason,
         },
+        raw_request_payload=dict(raw_request_payload or {}),
+        raw_response_payload=dict(raw_response_payload or {}),
+    )
+
+
+def codex_semantic_candidate_plan(
+    *,
+    question: str,
+    user_constraints: Sequence[str] | None = None,
+    depth_preset: str = "standard",
+    visual_preference: str | None = None,
+    budget_cap: Mapping[str, Any] | None = None,
+    provided_sources: Sequence[Mapping[str, Any]] | None = None,
+    provided_images: Sequence[Mapping[str, Any]] | None = None,
+) -> SemanticPlan:
+    """Build the P3-SP2 Codex-native semantic candidate plan.
+
+    The adapter keeps the candidate release-ineligible until P3-SP3/P3-SP4
+    reviewer and E2E gates make it eligible.
+    """
+
+    original_question = question.strip()
+    raw_request = _codex_semantic_raw_request(
+        question=original_question,
+        user_constraints=user_constraints or [],
+        depth_preset=depth_preset,
+        visual_preference=visual_preference,
+        budget_cap=budget_cap or {},
+        provided_sources=provided_sources or [],
+        provided_images=provided_images or [],
+    )
+    raw_request["adapter_request_hash"] = _sha256_payload(raw_request)
+    try:
+        adapter_response = invoke_codex_semantic_planner_adapter(raw_request)
+    except SemanticPlannerAdapterUnavailable as exc:
+        return _blocked_codex_semantic_adapter_plan(
+            question=original_question,
+            raw_request=raw_request,
+            reason=str(exc) or "Codex semantic planner adapter is unavailable.",
+            failure_category="adapter_unavailable",
+        )
+    except Exception as exc:  # pragma: no cover - defensive boundary guard
+        return _blocked_codex_semantic_adapter_plan(
+            question=original_question,
+            raw_request=raw_request,
+            reason=f"Codex semantic planner adapter failed: {exc.__class__.__name__}",
+            failure_category="adapter_failed",
+        )
+    if adapter_response is None:
+        return _blocked_codex_semantic_adapter_plan(
+            question=original_question,
+            raw_request=raw_request,
+            reason=(
+                "Codex semantic planner adapter is not configured; refusing to "
+                "materialize local heuristic output as codex_semantic."
+            ),
+            failure_category="adapter_unavailable",
+        )
+    try:
+        raw_response = _structured_codex_adapter_response(
+            raw_request=raw_request,
+            adapter_response=adapter_response,
+        )
+        candidate = _candidate_plan_from_adapter_response(raw_response)
+    except SemanticPlannerAdapterUnavailable as exc:
+        return _blocked_codex_semantic_adapter_plan(
+            question=original_question,
+            raw_request=raw_request,
+            raw_response=adapter_response,
+            reason=str(exc) or "Codex semantic planner adapter returned invalid output.",
+            failure_category="adapter_invalid_response",
+        )
+    angles = [
+        SemanticAngle(
+            angle_id=str(angle["angle_id"]),
+            title=str(angle["title"]),
+            research_question=str(angle["research_question"]),
+            question_context=original_question,
+            route=str(angle["route"]),
+            evidence_need=str(angle["evidence_need"]),
+            expected_artifacts=list(angle["expected_artifacts"]),
+            success_criteria=list(angle["success_criteria"]),
+            report_section=str(angle["report_section"]),
+            why_this_angle_matters=str(angle["why_this_angle_matters"]),
+            included_scope=list(angle["included_scope"]),
+            excluded_scope=list(angle["excluded_scope"]),
+            expected_source_types=list(angle["expected_source_types"]),
+            expected_visual_targets=list(angle["expected_visual_targets"]),
+            search_queries=list(angle["search_queries"]),
+            risk_or_contradiction_checks=list(angle["risk_or_contradiction_checks"]),
+        )
+        for angle in candidate["angles"]
+    ]
+    question_class = _question_class_from_candidate(candidate, angles)
+    parsed_response_hash = _sha256_text(
+        json.dumps(candidate, sort_keys=True, ensure_ascii=True)
+    )
+    raw_response["parsed_response_hash"] = parsed_response_hash
+    raw_response.setdefault("candidate_plan", candidate)
+    raw_response["raw_response_hash"] = _sha256_payload(raw_response)
+    provenance = {
+        "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+        "planner_source": "codex_semantic",
+        "planner_adapter": CODEX_SEMANTIC_ADAPTER_NAME,
+        "prompt_version": CODEX_SEMANTIC_PROMPT_VERSION,
+        "model_or_surface": _adapter_model_or_surface(raw_response),
+        "child_session_id": _adapter_child_session_id(raw_response),
+        "session_id": _adapter_child_session_id(raw_response),
+        "session_id_unavailable_reason": _adapter_session_unavailable_reason(raw_response),
+        "raw_request_required": True,
+        "raw_response_required": True,
+        "adapter_request_hash": raw_request["adapter_request_hash"],
+        "raw_response_hash": raw_response["raw_response_hash"],
+        "parsed_response_hash": parsed_response_hash,
+        "preselected_template_class": None,
+        "semantic_release_eligible": False,
+        "adapter_invocation": dict(raw_response.get("provenance") or {}),
+    }
+    diagnostics = {
+        "semantic_release_eligible": False,
+        "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+        "fallback_kind": None,
+        "user_visible_diagnostic": (
+            "A Codex semantic candidate plan was generated, but it remains "
+            "release-ineligible until independent semantic review and E2E gates pass."
+        ),
+        "parsed_response_hash": parsed_response_hash,
+    }
+    return SemanticPlan(
+        schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
+        question_class=question_class,
+        broad_question=candidate["question_scope"] == "broad",
+        source="codex_semantic",
+        expected_evidence_needs=_ordered_unique(
+            angle.evidence_need for angle in angles
+        ),
+        angles=angles,
+        intent_summary=str(candidate["intent_summary"]),
+        domain_entities=list(candidate["domain_entities"]),
+        constraints=list(candidate["constraints"]),
+        question_scope=str(candidate["question_scope"]),
+        decomposition_strategy=str(candidate["decomposition_strategy"]),
+        requirement_coverage_map=list(candidate["requirement_coverage_map"]),
+        negative_scope=list(candidate["negative_scope"]),
+        bounded_tasks=list(candidate["bounded_tasks"]),
+        planner_provenance=provenance,
+        model_or_surface=_adapter_model_or_surface(raw_response),
+        original_question=original_question,
+        language=str(candidate["language"]),
+        planner_mode=PLANNER_MODE_CODEX_SEMANTIC,
+        semantic_release_eligible=False,
+        status="candidate_codex_semantic_release_ineligible",
+        diagnostics=diagnostics,
+        raw_request_payload=raw_request,
+        raw_response_payload=raw_response,
     )
 
 
@@ -333,18 +524,1769 @@ def plan_semantic_angles(
     *,
     question: str,
     explicit_angles: Sequence[str] | None = None,
+    user_constraints: Sequence[str] | None = None,
+    depth_preset: str = "standard",
+    visual_preference: str | None = None,
+    budget_cap: Mapping[str, Any] | None = None,
+    provided_sources: Sequence[Mapping[str, Any]] | None = None,
+    provided_images: Sequence[Mapping[str, Any]] | None = None,
 ) -> SemanticPlan:
-    """Compatibility wrapper returning release-ineligible fallback plans."""
+    """Compatibility wrapper returning manual fallback or semantic candidate plans."""
 
     if explicit_angles is not None:
         return manual_angle_planner(question=question, explicit_angles=explicit_angles)
+    return codex_semantic_candidate_plan(
+        question=question,
+        user_constraints=user_constraints,
+        depth_preset=depth_preset,
+        visual_preference=visual_preference,
+        budget_cap=budget_cap,
+        provided_sources=provided_sources,
+        provided_images=provided_images,
+    )
+
+
+class SemanticPlannerAdapterUnavailable(RuntimeError):
+    """Raised when no real Codex semantic planner response can be consumed."""
+
+
+def invoke_codex_semantic_planner_adapter(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Invoke the configured Codex-native semantic planner boundary.
+
+    The default path is intentionally unavailable unless a Codex exec JSON
+    command is configured. Production code must not synthesize codex_semantic
+    output locally or accept arbitrary subprocesses as Codex-native provenance.
+    """
+
+    command_text = os.environ.get(CODEX_SEMANTIC_PLANNER_COMMAND_ENV, "").strip()
+    if not command_text:
+        return None
+    command = shlex.split(command_text)
+    if not command:
+        return None
+    command_boundary = validate_codex_semantic_adapter_command(command)
+    timeout_seconds = float(os.environ.get(CODEX_SEMANTIC_PLANNER_TIMEOUT_ENV, "300"))
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        input=json.dumps(dict(request), ensure_ascii=False, sort_keys=True),
+        text=True,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        raise SemanticPlannerAdapterUnavailable(
+            f"Codex semantic planner command exited {completed.returncode}; "
+            f"stderr={_preview_text(completed.stderr)}; stdout={_preview_text(completed.stdout)}"
+        )
+    payload, codex_events = _parse_codex_exec_json_output(completed.stdout)
+    codex_event_provenance = _codex_event_provenance(codex_events)
+    provenance = dict(payload.get("provenance") or {})
+    provenance.setdefault("adapter_command", _redacted_command(command))
+    provenance.setdefault(
+        "adapter_invocation_kind",
+        command_boundary["adapter_invocation_kind"],
+    )
+    provenance.setdefault("raw_request_hash", request.get("adapter_request_hash"))
+    for key, value in codex_event_provenance.items():
+        provenance.setdefault(key, value)
+    payload = dict(payload)
+    payload["provenance"] = provenance
+    return payload
+
+
+def _blocked_codex_semantic_adapter_plan(
+    *,
+    question: str,
+    raw_request: Mapping[str, Any],
+    reason: str,
+    failure_category: str,
+    raw_response: Mapping[str, Any] | None = None,
+) -> SemanticPlan:
+    blocked_response = {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_planner_raw_response",
+        "planner_adapter": CODEX_SEMANTIC_ADAPTER_NAME,
+        "prompt_version": CODEX_SEMANTIC_PROMPT_VERSION,
+        "planner_mode": PLANNER_MODE_BLOCKED,
+        "semantic_release_eligible": False,
+        "status": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+        "failure_category": failure_category,
+        "blocked_reason": reason,
+        "adapter_response": dict(raw_response or {}),
+        "provenance": {
+            "planner_mode": PLANNER_MODE_BLOCKED,
+            "planner_source": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+            "planner_adapter": CODEX_SEMANTIC_ADAPTER_NAME,
+            "prompt_version": CODEX_SEMANTIC_PROMPT_VERSION,
+            "child_session_id": None,
+            "session_id": None,
+            "session_id_unavailable_reason": "Semantic planner adapter was unavailable.",
+            "adapter_request_hash": raw_request.get("adapter_request_hash"),
+            "semantic_release_eligible": False,
+        },
+    }
+    provenance = {
+        "planner_mode": PLANNER_MODE_BLOCKED,
+        "planner_source": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+        "planner_adapter": CODEX_SEMANTIC_ADAPTER_NAME,
+        "prompt_version": CODEX_SEMANTIC_PROMPT_VERSION,
+        "child_session_id": None,
+        "session_id": None,
+        "session_id_unavailable_reason": "Semantic planner adapter was unavailable.",
+        "adapter_request_hash": raw_request.get("adapter_request_hash"),
+        "raw_response_hash": _sha256_payload(blocked_response),
+        "failure_category": failure_category,
+        "semantic_release_eligible": False,
+        "preselected_template_class": None,
+    }
     return blocked_semantic_planner_plan(
         question=question,
-        reason=(
-            "Codex-native semantic planner is not implemented yet; refusing to "
-            "materialize heuristic template tasks as semantic decomposition."
+        reason=reason,
+        raw_request_payload=raw_request,
+        raw_response_payload=blocked_response,
+        planner_provenance=provenance,
+    )
+
+
+def _structured_codex_adapter_response(
+    *,
+    raw_request: Mapping[str, Any],
+    adapter_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(adapter_response, Mapping):
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter returned a non-object response"
+        )
+    raw_response = dict(adapter_response)
+    raw_response.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    raw_response.setdefault("artifact_type", "semantic_planner_raw_response")
+    raw_response.setdefault("planner_adapter", CODEX_SEMANTIC_ADAPTER_NAME)
+    raw_response.setdefault("prompt_version", CODEX_SEMANTIC_PROMPT_VERSION)
+    raw_response.setdefault("planner_mode", PLANNER_MODE_CODEX_SEMANTIC)
+    raw_response.setdefault("semantic_release_eligible", False)
+    provenance = dict(raw_response.get("provenance") or {})
+    if not provenance:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response is missing provenance"
+        )
+    raw_response["provenance"] = validate_codex_semantic_adapter_provenance(
+        raw_request=raw_request,
+        provenance=provenance,
+    )
+    if raw_response.get("planner_mode") != PLANNER_MODE_CODEX_SEMANTIC:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response is not marked codex_semantic"
+        )
+    if raw_response.get("semantic_release_eligible") is True:
+        raise SemanticPlannerAdapterUnavailable(
+            "P3-SP2 codex_semantic candidates must remain semantic_release_eligible=false"
+        )
+    return raw_response
+
+
+def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> dict[str, Any]:
+    candidate = raw_response.get("candidate_plan")
+    if not isinstance(candidate, Mapping):
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response is missing candidate_plan"
+        )
+    candidate_plan = dict(candidate)
+    candidate_plan.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    candidate_plan.setdefault("planner_mode", PLANNER_MODE_CODEX_SEMANTIC)
+    candidate_plan.setdefault("semantic_release_eligible", False)
+    candidate_plan.setdefault("source", "codex_semantic")
+    if candidate_plan.get("planner_mode") != PLANNER_MODE_CODEX_SEMANTIC:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic candidate_plan is not marked codex_semantic"
+        )
+    if candidate_plan.get("semantic_release_eligible") is True:
+        raise SemanticPlannerAdapterUnavailable(
+            "P3-SP2 candidate_plan must keep semantic_release_eligible=false"
+        )
+    required_fields = (
+        "intent_summary",
+        "domain_entities",
+        "constraints",
+        "question_scope",
+        "decomposition_strategy",
+        "requirement_coverage_map",
+        "negative_scope",
+        "angles",
+        "bounded_tasks",
+        "language",
+    )
+    missing = [field for field in required_fields if field not in candidate_plan]
+    if missing:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic candidate_plan is missing required fields: "
+            + ", ".join(missing)
+        )
+    if not isinstance(candidate_plan.get("angles"), list) or not candidate_plan["angles"]:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic candidate_plan must include non-empty angles"
+        )
+    if not isinstance(candidate_plan.get("bounded_tasks"), list) or not candidate_plan["bounded_tasks"]:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic candidate_plan must include non-empty bounded_tasks"
+        )
+    return candidate_plan
+
+
+def _adapter_model_or_surface(raw_response: Mapping[str, Any]) -> str:
+    provenance = raw_response.get("provenance")
+    if isinstance(provenance, Mapping):
+        value = provenance.get("model_or_surface") or provenance.get("model") or provenance.get("adapter")
+        if value:
+            return str(value)
+    return str(raw_response.get("model_or_surface") or "codex-semantic-planner-adapter")
+
+
+def _adapter_child_session_id(raw_response: Mapping[str, Any]) -> str | None:
+    provenance = raw_response.get("provenance")
+    if isinstance(provenance, Mapping):
+        value = provenance.get("child_session_id") or provenance.get("session_id")
+        if value:
+            return str(value)
+    return None
+
+
+def _adapter_session_unavailable_reason(raw_response: Mapping[str, Any]) -> str | None:
+    if _adapter_child_session_id(raw_response):
+        return None
+    provenance = raw_response.get("provenance")
+    if isinstance(provenance, Mapping) and provenance.get("session_id_unavailable_reason"):
+        return str(provenance["session_id_unavailable_reason"])
+    return "Adapter returned structured raw response provenance without a child session id."
+
+
+def _sha256_payload(payload: Mapping[str, Any]) -> str:
+    return _sha256_text(json.dumps(dict(payload), sort_keys=True, ensure_ascii=True))
+
+
+def _redacted_command(command: Sequence[str]) -> list[str]:
+    redacted: list[str] = []
+    sensitive_next = False
+    for part in command:
+        if sensitive_next:
+            redacted.append("<redacted>")
+            sensitive_next = False
+            continue
+        lowered = part.lower()
+        if any(token in lowered for token in ("key", "token", "secret", "password")):
+            redacted.append("<redacted>")
+            if part.startswith("--"):
+                sensitive_next = True
+        else:
+            redacted.append(part)
+    return redacted
+
+
+def validate_codex_semantic_adapter_command(command: Sequence[str]) -> dict[str, Any]:
+    """Validate that the semantic adapter boundary is Codex exec JSON only."""
+
+    parts = [str(part) for part in command]
+    if not parts:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner command is empty; expected codex exec --json"
+        )
+    command_basename = Path(parts[0]).name
+    if command_basename != "codex":
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner command must use codex exec --json; "
+            f"got command basename {command_basename!r}"
+        )
+    if len(parts) < 2 or parts[1] != "exec":
+        subcommand = parts[1] if len(parts) >= 2 else "<missing>"
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner command must use codex exec --json; "
+            f"got subcommand {subcommand!r}"
+        )
+    if not _codex_command_has_json_mode(parts):
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner command must enable JSON mode with --json "
+            "or an equivalent JSON output flag"
+        )
+    return {
+        "adapter_invocation_kind": CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
+        "command_basename": command_basename,
+        "subcommand": "exec",
+        "json_mode": True,
+    }
+
+
+def _codex_command_has_json_mode(command: Sequence[str]) -> bool:
+    for index, part in enumerate(command[2:], start=2):
+        lowered = part.lower()
+        if lowered == "--json":
+            return True
+        if lowered in {"--output-format", "--format"}:
+            if index + 1 < len(command) and str(command[index + 1]).lower() in {"json", "jsonl"}:
+                return True
+        if lowered.startswith("--output-format=") or lowered.startswith("--format="):
+            value = lowered.split("=", 1)[1]
+            if value in {"json", "jsonl"}:
+                return True
+    return False
+
+
+def validate_codex_semantic_adapter_provenance(
+    *,
+    raw_request: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate Codex-native raw-response provenance for codex_semantic output."""
+
+    if not isinstance(provenance, Mapping):
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response provenance is not an object"
+        )
+    normalized = dict(provenance)
+    invocation_kind = str(normalized.get("adapter_invocation_kind") or "")
+    if invocation_kind != CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response must record "
+            f"adapter_invocation_kind={CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND}"
+        )
+    request_hash = str(raw_request.get("adapter_request_hash") or "")
+    if request_hash and str(normalized.get("raw_request_hash") or "") != request_hash:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response provenance does not match the raw request hash"
+        )
+    adapter_command = normalized.get("adapter_command")
+    if adapter_command:
+        if isinstance(adapter_command, str):
+            command_parts = shlex.split(adapter_command)
+        elif isinstance(adapter_command, Sequence) and not isinstance(adapter_command, (str, bytes)):
+            command_parts = [str(part) for part in adapter_command]
+        else:
+            raise SemanticPlannerAdapterUnavailable(
+                "Codex semantic planner adapter provenance has invalid adapter_command"
+            )
+        validate_codex_semantic_adapter_command(command_parts)
+    identity_fields = (
+        "child_session_id",
+        "session_id",
+        "raw_response_id",
+        "codex_event_id",
+        "response_id",
+    )
+    if not any(str(normalized.get(field) or "").strip() for field in identity_fields):
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner adapter response lacks Codex raw response identity; "
+            "expected child/session/raw response id or codex event id"
+        )
+    return normalized
+
+
+def _parse_codex_exec_json_output(stdout: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    text = (stdout or "").strip()
+    if not text:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner command returned empty JSON output"
+        )
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return _parse_codex_exec_jsonl_output(text)
+    if isinstance(payload, Mapping):
+        direct = _semantic_adapter_payload_from_value(payload)
+        if direct is not None:
+            return direct, []
+        events = payload.get("events")
+        if isinstance(events, list):
+            event_payload = _semantic_adapter_payload_from_events(events)
+            if event_payload is not None:
+                return event_payload, [dict(event) for event in events if isinstance(event, Mapping)]
+    if isinstance(payload, list):
+        event_payload = _semantic_adapter_payload_from_events(payload)
+        if event_payload is not None:
+            return event_payload, [dict(event) for event in payload if isinstance(event, Mapping)]
+    raise SemanticPlannerAdapterUnavailable(
+        "Codex semantic planner command returned JSON without a semantic adapter response object"
+    )
+
+
+def _parse_codex_exec_jsonl_output(text: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SemanticPlannerAdapterUnavailable(
+                f"Codex semantic planner command returned invalid JSONL on line {line_number}: {exc}"
+            ) from exc
+        if not isinstance(event, Mapping):
+            raise SemanticPlannerAdapterUnavailable(
+                f"Codex semantic planner command returned non-object JSONL event on line {line_number}"
+            )
+        events.append(dict(event))
+    event_payload = _semantic_adapter_payload_from_events(events)
+    if event_payload is None:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic planner JSONL output did not include a semantic adapter response object"
+        )
+    return event_payload, events
+
+
+def _semantic_adapter_payload_from_events(events: Sequence[Any]) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if not isinstance(event, Mapping):
+            continue
+        payload = _semantic_adapter_payload_from_value(event)
+        if payload is not None:
+            return payload
+        for key in (
+            "semantic_planner_response",
+            "adapter_response",
+            "response",
+            "payload",
+            "data",
+            "output",
+            "content",
+            "message",
+        ):
+            payload = _semantic_adapter_payload_from_value(event.get(key))
+            if payload is not None:
+                return payload
+    return None
+
+
+def _semantic_adapter_payload_from_value(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        if _is_semantic_adapter_response_payload(value):
+            return dict(value)
+        for key in ("content", "message", "output", "text", "json"):
+            payload = _semantic_adapter_payload_from_value(value.get(key))
+            if payload is not None:
+                return payload
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or not stripped.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        return _semantic_adapter_payload_from_value(parsed)
+    return None
+
+
+def _is_semantic_adapter_response_payload(value: Mapping[str, Any]) -> bool:
+    return (
+        "candidate_plan" in value
+        or value.get("artifact_type") == "semantic_planner_raw_response"
+    )
+
+
+def _codex_event_provenance(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    provenance: dict[str, Any] = {}
+    event_types: list[str] = []
+    for event in events:
+        event_type = event.get("type") or event.get("event_type")
+        if event_type:
+            event_types.append(str(event_type))
+    for event in reversed(events):
+        for target, aliases in {
+            "codex_event_id": ("id", "event_id", "codex_event_id"),
+            "session_id": ("session_id", "conversation_id", "thread_id"),
+            "child_session_id": ("child_session_id", "child_thread_id"),
+            "raw_response_id": ("raw_response_id", "response_id", "message_id"),
+        }.items():
+            if target in provenance:
+                continue
+            for alias in aliases:
+                value = event.get(alias)
+                if value:
+                    provenance[target] = str(value)
+                    break
+    if event_types:
+        provenance["codex_event_types"] = list(dict.fromkeys(event_types))
+    return provenance
+
+
+def _preview_text(value: str, limit: int = 240) -> str:
+    text = " ".join((value or "").split())
+    if not text:
+        return "<empty>"
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def validate_semantic_candidate_plan(
+    *,
+    original_question: str,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate P3-SP2 candidate semantics before independent review exists."""
+
+    failures: list[dict[str, Any]] = []
+    question = original_question.strip()
+    requirements = [
+        requirement
+        for requirement in plan.get("requirement_coverage_map", [])
+        if isinstance(requirement, Mapping)
+    ]
+    angles = [
+        angle for angle in plan.get("angles", []) if isinstance(angle, Mapping)
+    ]
+    tasks = [
+        task for task in plan.get("bounded_tasks", []) if isinstance(task, Mapping)
+    ]
+    scope = str(plan.get("question_scope") or "")
+    if scope == "broad" and not (5 <= len(angles) <= 8):
+        failures.append({"code": "broad_angle_count_out_of_range"})
+    if scope == "broad" and not (20 <= len(tasks) <= 40):
+        failures.append({"code": "broad_task_count_out_of_range"})
+    if scope == "narrow" and tasks and not (6 <= len(tasks) <= 12):
+        failures.append({"code": "narrow_task_count_out_of_range"})
+    angle_ids = {str(angle.get("angle_id") or "") for angle in angles}
+    task_ids = {str(task.get("task_id") or "") for task in tasks}
+    executable_text = _candidate_executable_text(angles=angles, tasks=tasks)
+    subject_tokens = _core_question_tokens(question)
+    if subject_tokens and not _candidate_text_covers_subject(executable_text, subject_tokens):
+        failures.append({"code": "subject_requirement_drift"})
+    for requirement in requirements:
+        if requirement.get("coverage_status") != "covered":
+            failures.append(
+                {
+                    "code": "requirement_not_covered",
+                    "requirement_id": requirement.get("requirement_id"),
+                }
+            )
+        if requirement.get("non_negotiable") is True:
+            covered_angles = set(_string_list(requirement.get("covered_by_angle_ids")))
+            covered_tasks = set(_string_list(requirement.get("covered_by_task_ids")))
+            if not covered_angles or not covered_angles <= angle_ids:
+                failures.append(
+                    {
+                        "code": "non_negotiable_missing_angle_coverage",
+                        "requirement_id": requirement.get("requirement_id"),
+                    }
+                )
+            if not covered_tasks or not covered_tasks <= task_ids:
+                failures.append(
+                    {
+                        "code": "non_negotiable_missing_task_coverage",
+                        "requirement_id": requirement.get("requirement_id"),
+                    }
+                )
+        requirement_type = str(requirement.get("requirement_type") or "")
+        if requirement_type == "time_range" and not _candidate_has_recent_task(tasks):
+            failures.append(
+                {
+                    "code": "time_requirement_missing_recent_task",
+                    "requirement_id": requirement.get("requirement_id"),
+                }
+            )
+        if requirement_type == "geography" and not _candidate_has_geography_task(
+            requirement=requirement,
+            tasks=tasks,
+        ):
+            failures.append(
+                {
+                    "code": "geography_requirement_missing_task_scope",
+                    "requirement_id": requirement.get("requirement_id"),
+                }
+            )
+        if requirement_type == "deliverable_shape" and requirement.get("non_negotiable") is True:
+            if not _candidate_has_deliverable_task(requirement=requirement, tasks=tasks):
+                failures.append(
+                    {
+                        "code": "deliverable_requirement_missing_task_output",
+                        "requirement_id": requirement.get("requirement_id"),
+                    }
+                )
+    tasks_per_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
+    if scope == "broad":
+        for angle_id in angle_ids:
+            if tasks_per_angle[angle_id] < 2:
+                failures.append(
+                    {
+                        "code": "broad_angle_has_too_few_tasks",
+                        "angle_id": angle_id,
+                    }
+                )
+    required_task_fields = (
+        "task_id",
+        "angle_id",
+        "query",
+        "route",
+        "freshness_requirement",
+        "source_policy",
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "success_criteria",
+        "max_sources",
+        "max_images",
+        "done_condition",
+    )
+    for task in tasks:
+        for field_name in required_task_fields:
+            if field_name not in task:
+                failures.append(
+                    {
+                        "code": "bounded_task_missing_field",
+                        "task_id": task.get("task_id"),
+                        "field": field_name,
+                    }
+                )
+        angle_title = next(
+            (
+                str(angle.get("title") or "")
+                for angle in angles
+                if str(angle.get("angle_id") or "") == str(task.get("angle_id") or "")
+            ),
+            "",
+        )
+        if _normalize_text(str(task.get("query") or "")) == _normalize_text(angle_title):
+            failures.append(
+                {
+                    "code": "task_query_copies_angle_title",
+                    "task_id": task.get("task_id"),
+                }
+            )
+    visual_required = any(
+        str(requirement.get("requirement_type") or "") == "visual_modality"
+        for requirement in requirements
+    ) or question_mentions_visual_evidence(question)
+    if visual_required:
+        visual_angles = [
+            angle for angle in angles if str(angle.get("route") or "") != "text_only"
+        ]
+        visual_tasks = [
+            task for task in tasks if str(task.get("route") or "") != "text_only"
+        ]
+        if not visual_angles or not visual_tasks:
+            failures.append({"code": "visual_requirement_missing_visual_route"})
+        if not any(_string_list(task.get("expected_visual_targets")) for task in visual_tasks):
+            failures.append({"code": "visual_requirement_missing_targets"})
+    official_required = any(
+        str(requirement.get("requirement_type") or "") == "source_quality"
+        and (
+            "official" in str(requirement.get("requirement_text") or "").lower()
+            or "regulatory" in str(requirement.get("requirement_text") or "").lower()
+            or "\uaddc\uc81c" in str(requirement.get("requirement_text") or "")
+        )
+        for requirement in requirements
+    )
+    if official_required:
+        official_tasks = [
+            task
+            for task in tasks
+            if any(
+                token in " ".join(_string_list(task.get("expected_source_types"))).lower()
+                for token in ("official", "regulatory", "primary")
+            )
+            or "official" in json.dumps(task.get("source_policy"), sort_keys=True).lower()
+            or "regulatory" in json.dumps(task.get("source_policy"), sort_keys=True).lower()
+        ]
+        if not official_tasks:
+            failures.append({"code": "official_source_requirement_missing"})
+        official_success_tasks = [
+            task
+            for task in tasks
+            if any(
+                token in " ".join(_string_list(task.get("success_criteria"))).lower()
+                for token in ("official", "regulatory", "primary", "\uacf5\uc2dd", "\uaddc\uc81c")
+            )
+        ]
+        if not official_success_tasks:
+            failures.append({"code": "official_source_success_criteria_missing"})
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "planner_mode": plan.get("planner_mode"),
+        "semantic_release_eligible": bool(plan.get("semantic_release_eligible")),
+        "failure_count": len(failures),
+        "failures": failures,
+        "ok": not failures,
+    }
+
+
+def _codex_semantic_raw_request(
+    *,
+    question: str,
+    user_constraints: Sequence[str],
+    depth_preset: str,
+    visual_preference: str | None,
+    budget_cap: Mapping[str, Any],
+    provided_sources: Sequence[Mapping[str, Any]],
+    provided_images: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_planner_raw_request",
+        "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+        "planner_adapter": CODEX_SEMANTIC_ADAPTER_NAME,
+        "prompt_version": CODEX_SEMANTIC_PROMPT_VERSION,
+        "semantic_release_eligible": False,
+        "original_question": question,
+        "user_constraints": [str(item) for item in user_constraints],
+        "depth_preset": depth_preset,
+        "visual_preference": visual_preference or "auto",
+        "budget_cap": dict(budget_cap),
+        "provided_sources": [dict(item) for item in provided_sources],
+        "provided_images": [dict(item) for item in provided_images],
+        "planner_instructions": [
+            "Decompose the user's raw question into prompt-specific research angles.",
+            "Preserve every explicit requirement and justified inferred constraint.",
+            "Create bounded executable research tasks with source, visual, and done-condition fields.",
+            "Do not use hidden template classes, fixed domain menus, canned task lists, or copied angle titles.",
+        ],
+        "response_schema_shape": {
+            "intent_summary": "string",
+            "domain_entities": "list",
+            "constraints": "list",
+            "question_scope": "broad|narrow",
+            "decomposition_strategy": "string",
+            "requirement_coverage_map": "list",
+            "negative_scope": "list",
+            "angles": "list",
+            "bounded_tasks": "list",
+        },
+    }
+
+
+def _fixture_semantic_candidate_response_for_validation_tests(
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    question = str(request["original_question"])
+    constraints = _fixture_extract_semantic_requirements(
+        question=question,
+        user_constraints=_string_list(request.get("user_constraints")),
+        visual_preference=str(request.get("visual_preference") or "auto"),
+    )
+    entities = _fixture_extract_domain_entities(question, constraints)
+    scope = _fixture_infer_candidate_question_scope(question, constraints)
+    subject = _fixture_subject_phrase(question, entities)
+    depth = str(request.get("depth_preset") or "standard")
+    budget_cap = request.get("budget_cap")
+    budget = budget_cap if isinstance(budget_cap, Mapping) else {}
+    angles = _fixture_build_candidate_angles(
+        question=question,
+        subject=subject,
+        entities=entities,
+        requirements=constraints,
+        scope=scope,
+    )
+    bounded_tasks = _fixture_build_candidate_bounded_tasks(
+        question=question,
+        subject=subject,
+        angles=angles,
+        requirements=constraints,
+        scope=scope,
+        depth_preset=depth,
+        budget_cap=budget,
+    )
+    coverage = _fixture_candidate_requirement_coverage(
+        requirements=constraints,
+        angles=angles,
+        bounded_tasks=bounded_tasks,
+    )
+    candidate_plan = {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "planner_mode": PLANNER_MODE_FIXTURE,
+        "semantic_release_eligible": False,
+        "source": "fixture_semantic_candidate_response_for_validation_tests",
+        "model_or_surface": "fixture-validation-helper",
+        "original_question": question,
+        "language": _fixture_question_language(question),
+        "depth_preset": depth,
+        "intent_summary": _fixture_intent_summary(question, subject, constraints),
+        "domain_entities": entities,
+        "constraints": constraints,
+        "question_scope": scope,
+        "decomposition_strategy": _fixture_decomposition_strategy(scope, subject, constraints),
+        "requirement_coverage_map": coverage,
+        "negative_scope": _fixture_negative_scope(question, subject),
+        "angles": angles,
+        "bounded_tasks": bounded_tasks,
+    }
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_planner_raw_response",
+        "planner_mode": PLANNER_MODE_FIXTURE,
+        "planner_adapter": "fixture_semantic_candidate_response_for_validation_tests",
+        "prompt_version": "fixture-validation-helper",
+        "semantic_release_eligible": False,
+        "candidate_plan": candidate_plan,
+    }
+
+
+def _fixture_extract_semantic_requirements(
+    *,
+    question: str,
+    user_constraints: Sequence[str],
+    visual_preference: str,
+) -> list[dict[str, Any]]:
+    requirements: list[dict[str, Any]] = []
+
+    def add(
+        requirement_type: str,
+        text: str,
+        *,
+        prompt_text: str | None = None,
+        explicit: bool = True,
+        non_negotiable: bool = True,
+        inferred_reason: str | None = None,
+    ) -> None:
+        requirements.append(
+            {
+                "requirement_id": f"req_{len(requirements) + 1:03d}",
+                "requirement_type": requirement_type,
+                "requirement_text": text,
+                "prompt_text": prompt_text or text,
+                "prompt_span": _fixture_prompt_span(question, prompt_text or text),
+                "explicit": explicit,
+                "non_negotiable": non_negotiable,
+                "inferred_reason": inferred_reason,
+            }
+        )
+
+    add("subject", question, prompt_text=question)
+    for item in user_constraints:
+        add("user_constraint", item, prompt_text=item)
+    if question_mentions_visual_evidence(question) or visual_preference in {
+        "visual_required",
+        "visual_optional",
+    }:
+        add(
+            "visual_modality",
+            "Visual evidence or image/chart/figure analysis is required.",
+            prompt_text=_fixture_first_matching_text(question, _VISUAL_KEYWORDS) or question,
+        )
+    if _contains_any(
+        question.lower(),
+        (
+            "official",
+            "regulatory",
+            "regulation",
+            "regulator",
+            "primary source",
+            "\uacf5\uc2dd",
+            "\uaddc\uc81c",
+            "\uadfc\uac70",
+            "\uc815\ubd80",
+        ),
+    ):
+        add(
+            "source_quality",
+            "Official, regulatory, or primary source evidence is required.",
+            prompt_text=_fixture_first_matching_text(
+                question,
+                ("official", "regulatory", "regulation", "\uacf5\uc2dd", "\uaddc\uc81c", "\uadfc\uac70"),
+            )
+            or question,
+        )
+    if _contains_any(
+        question.lower(),
+        ("latest", "current", "recent", "202", "\ucd5c\uc2e0", "\ud604\uc7ac", "\ucd5c\uadfc"),
+    ):
+        add(
+            "time_range",
+            "Current or recent evidence is required.",
+            prompt_text=_fixture_first_matching_text(
+                question, ("latest", "current", "recent", "\ucd5c\uc2e0", "\ud604\uc7ac", "\ucd5c\uadfc")
+            )
+            or question,
+        )
+    geography = _fixture_extract_geography_requirement(question)
+    if geography:
+        add("geography", geography, prompt_text=geography)
+    if _contains_any(
+        question.lower(),
+        ("report", "table", "checklist", "matrix", "\ub9ac\ud3ec\ud2b8", "\ubcf4\uace0\uc11c", "\ud45c", "\uc54c\ub824\uc918"),
+    ):
+        deliverable_prompt = _fixture_first_matching_text(
+            question,
+            (
+                "report",
+                "table",
+                "checklist",
+                "matrix",
+                "\ub9ac\ud3ec\ud2b8",
+                "\ubcf4\uace0\uc11c",
+                "\ud45c",
+                "\uc54c\ub824\uc918",
+            ),
+        )
+        add(
+            "deliverable_shape",
+            "The final answer must synthesize findings into a user-readable deliverable.",
+            prompt_text=deliverable_prompt or question,
+            explicit=deliverable_prompt not in {None, "\uc54c\ub824\uc918"},
+            non_negotiable=deliverable_prompt not in {None, "\uc54c\ub824\uc918"},
+            inferred_reason="The prompt asks for synthesized research output.",
+        )
+    if _contains_any(
+        question.lower(),
+        (
+            "safety",
+            "risk",
+            "fire",
+            "hazard",
+            "\uc548\uc804",
+            "\ud654\uc7ac",
+            "\uc704\ud5d8",
+            "\ub9ac\uc2a4\ud06c",
+        ),
+    ):
+        add(
+            "safety_risk",
+            "Safety, risk, incident, or hazard evidence must be handled explicitly.",
+            prompt_text=_fixture_first_matching_text(
+                question, ("safety", "risk", "fire", "\uc548\uc804", "\ud654\uc7ac", "\uc704\ud5d8")
+            )
+            or question,
+        )
+    return requirements
+
+
+def _fixture_extract_domain_entities(
+    question: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    lower = question.lower()
+    entities: list[dict[str, str]] = []
+
+    def add(name: str, entity_type: str, evidence: str) -> None:
+        if not any(item["name"].lower() == name.lower() for item in entities):
+            entities.append({"name": name, "type": entity_type, "evidence": evidence})
+
+    concept_rules = (
+        (("codex deepresearch", "deepresearch"), "Codex DeepResearch", "software_system"),
+        (("semantic planner",), "semantic planner", "software_component"),
+        (("runner",), "runner", "software_component"),
+        (("next.js", "nextjs", "app router"), "Next.js App Router", "technology"),
+        (("ev", "electric vehicle", "\uc804\uae30\ucc28"), "EV", "domain_subject"),
+        (("battery", "\ubc30\ud130\ub9ac"), "battery", "domain_subject"),
+        (("fire", "\ud654\uc7ac"), "fire safety", "risk"),
+        (("thermal", "\uc5f4\ud3ed\uc8fc"), "thermal runaway", "failure_mode"),
+        (("regulation", "regulatory", "\uaddc\uc81c"), "regulation", "source_domain"),
+        (("safety test", "crash test", "\uc548\uc804 \ud14c\uc2a4\ud2b8"), "safety test", "evidence_artifact"),
+        (("image", "photo", "figure", "chart", "\uc774\ubbf8\uc9c0", "\uc0ac\uc9c4", "\ub3c4\ud45c"), "visual evidence", "modality"),
+    )
+    for needles, name, entity_type in concept_rules:
+        matched = next((needle for needle in needles if needle in lower or needle in question), None)
+        if matched:
+            add(name, entity_type, matched)
+    if (
+        any(entity["name"] == "EV" for entity in entities)
+        and any(entity["name"] == "battery" for entity in entities)
+        and any(entity["name"] == "fire safety" for entity in entities)
+    ):
+        add("thermal runaway", "failure_mode", "EV battery fire safety inference")
+    for match in re.finditer(r"\b[A-Z][A-Za-z0-9.+-]*(?:\s+[A-Z][A-Za-z0-9.+-]*){0,3}\b", question):
+        text = match.group(0).strip()
+        if len(text) > 1 and text.lower() not in {"the", "and"}:
+            add(text, "named_entity", text)
+    if not entities:
+        add(_fixture_subject_phrase(question, []), "question_subject", question)
+    return [dict(item) for item in entities[:12]]
+
+
+def _fixture_infer_candidate_question_scope(
+    question: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> str:
+    lower = question.lower()
+    if _contains_any(
+        lower,
+        ("compare", "impact", "risk", "strategy", "research", "investigate", "\uc870\uc0ac", "\ubd84\uc11d", "\ube44\uad50", "\uc601\ud5a5"),
+    ):
+        return "broad"
+    if any(
+        str(requirement.get("requirement_type") or "")
+        in {"visual_modality", "source_quality", "safety_risk"}
+        for requirement in requirements
+    ):
+        return "broad"
+    if len(requirements) >= 3:
+        return "broad"
+    return "narrow"
+
+
+def _fixture_build_candidate_angles(
+    *,
+    question: str,
+    subject: str,
+    entities: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+    scope: str,
+) -> list[dict[str, Any]]:
+    requirement_types = {str(req.get("requirement_type") or "") for req in requirements}
+    is_implementation = _fixture_is_software_implementation_question(question, entities)
+    specs: list[tuple[str, str, str, str, list[str], list[str]]] = []
+    specs.append(
+        (
+            f"{subject} source baseline",
+            f"What primary evidence directly defines the current state of {subject}?",
+            "text_only",
+            "primary_source",
+            ["primary sources", "source excerpts"],
+            ["primary or authoritative sources"],
+        )
+    )
+    if "source_quality" in requirement_types:
+        specs.append(
+            (
+                f"{subject} official and regulatory evidence",
+                f"Which official, regulatory, or primary sources govern {subject}?",
+                "text_only",
+                "official_source",
+                ["official source matrix", "regulatory excerpts"],
+                ["official agencies", "regulators", "primary documents"],
+            )
+        )
+    if "visual_modality" in requirement_types:
+        specs.append(
+            (
+                f"{subject} visual evidence and figures",
+                f"What do relevant images, charts, diagrams, or figures show about {subject}?",
+                "visual_required",
+                "visual_observation",
+                ["visual observation notes", "image evidence table"],
+                ["image pages", "charts", "figures", "diagrams"],
+            )
+        )
+    if "safety_risk" in requirement_types:
+        specs.append(
+            (
+                f"{subject} mechanism and failure modes",
+                f"What mechanisms, incidents, hazards, or failure modes explain {subject}?",
+                "text_only",
+                "failure_pattern",
+                ["failure mode inventory", "incident evidence"],
+                ["incident reports", "technical safety sources"],
+            )
+        )
+    if "time_range" in requirement_types:
+        specs.append(
+            (
+                f"{subject} recent changes",
+                f"What recent changes, incidents, releases, or guidance affect {subject}?",
+                "text_only",
+                "recent_change",
+                ["recent-change timeline", "current status notes"],
+                ["recent official updates", "dated sources"],
+            )
+        )
+    if "geography" in requirement_types:
+        specs.append(
+            (
+                f"{subject} geographic scope",
+                f"How do the requested geography or jurisdiction constraints change {subject}?",
+                "text_only",
+                "comparative_analysis",
+                ["jurisdiction comparison", "geographic caveats"],
+                ["local regulators", "regional data"],
+            )
+        )
+    if is_implementation:
+        specs.extend(
+            [
+                (
+                    f"{subject} architecture contract",
+                    f"What architecture boundaries and artifact contracts are needed for {subject}?",
+                    "text_only",
+                    "implementation_detail",
+                    ["architecture contract", "integration map"],
+                    ["repository docs", "code references", "design notes"],
+                ),
+                (
+                    f"{subject} validation strategy",
+                    f"What tests and failure cases prove {subject} behaves as requested?",
+                    "text_only",
+                    "failure_pattern",
+                    ["test matrix", "negative cases"],
+                    ["test files", "failure artifacts"],
+                ),
+            ]
+        )
+    specs.append(
+        (
+            f"{subject} contradictions and caveats",
+            f"What counter-evidence, limitations, or caveats could change the conclusion about {subject}?",
+            "text_only",
+            "counter_evidence",
+            ["counter-evidence matrix", "caveat register"],
+            ["independent sources", "conflicting reports"],
+        )
+    )
+    specs.append(
+        (
+            f"{subject} decision implications",
+            f"What practical implications, risks, or next decisions follow from the evidence about {subject}?",
+            "text_only",
+            "risk_or_guardrail",
+            ["decision implications", "risk guardrails"],
+            ["risk analysis", "implementation or policy guidance"],
+        )
+    )
+    if scope == "broad":
+        target_count = min(8, max(5, len(specs)))
+    else:
+        target_count = min(4, max(2, len(specs)))
+    specs = _fixture_dedupe_angle_specs(specs)[:target_count]
+    while scope == "broad" and len(specs) < 5:
+        index = len(specs) + 1
+        specs.append(
+            (
+                f"{subject} evidence axis {index}",
+                f"What additional prompt-specific evidence is needed for {subject} axis {index}?",
+                "text_only",
+                _fixture_unused_evidence_need(specs),
+                [f"{subject} evidence notes {index}"],
+                ["prompt-specific supporting sources"],
+            )
+        )
+    angles: list[dict[str, Any]] = []
+    for index, (title, research_question, route, evidence_need, artifacts, sources) in enumerate(
+        specs, start=1
+    ):
+        angle_id = f"angle_{index:03d}"
+        visual_targets = (
+            _fixture_visual_targets(subject, requirements)
+            if route != "text_only"
+            else []
+        )
+        angles.append(
+            {
+                "angle_id": angle_id,
+                "title": title,
+                "research_question": research_question,
+                "why_this_angle_matters": (
+                    f"This angle covers a distinct requirement for {subject} without "
+                    "changing the user's requested domain."
+                ),
+                "included_scope": _fixture_included_scope_for_angle(title, requirements),
+                "excluded_scope": _fixture_negative_scope(question, subject),
+                "route": route,
+                "evidence_need": evidence_need,
+                "expected_source_types": sources,
+                "expected_visual_targets": visual_targets,
+                "expected_artifacts": artifacts,
+                "search_queries": [
+                    f"{subject} {research_question}",
+                    f"{subject} {evidence_need.replace('_', ' ')} evidence",
+                ],
+                "success_criteria": [
+                    f"Findings must mention {subject} or a listed domain entity.",
+                    "Claims must be linked to source metadata or visual observations.",
+                ],
+                "report_section": _report_section_from_title(title),
+                "risk_or_contradiction_checks": [
+                    "Check whether sources disagree or omit important caveats.",
+                    "Flag stale, low-quality, or out-of-scope evidence.",
+                ],
+            }
+        )
+    return angles
+
+
+def _fixture_build_candidate_bounded_tasks(
+    *,
+    question: str,
+    subject: str,
+    angles: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+    scope: str,
+    depth_preset: str,
+    budget_cap: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if scope == "broad":
+        target = {"deep": 48, "exhaustive": 80}.get(depth_preset, 24)
+    else:
+        target = 9
+    if scope == "broad":
+        target = max(20, min(target, 40 if depth_preset not in {"deep", "exhaustive"} else target))
+    source_cap = max(1, int(budget_cap.get("max_sources") or 20))
+    image_cap = max(0, int(budget_cap.get("max_images") or 12))
+    tasks: list[dict[str, Any]] = []
+    task_index = 1
+    per_angle = max(2 if scope == "broad" else 1, math.ceil(target / max(1, len(angles))))
+    for angle in angles:
+        for occurrence in range(1, per_angle + 1):
+            if len(tasks) >= target:
+                break
+            route = str(angle["route"])
+            visual_targets = _string_list(angle.get("expected_visual_targets"))
+            expected_source_types = _string_list(angle.get("expected_source_types"))
+            query = _fixture_candidate_task_query(
+                subject=subject,
+                angle=angle,
+                occurrence=occurrence,
+                original_question=question,
+            )
+            expected_artifacts = _string_list(angle.get("expected_artifacts"))
+            success_criteria = [
+                *_string_list(angle.get("success_criteria")),
+                f"The task is complete only when it can support or reject a claim about {subject}.",
+            ]
+            if _fixture_requires_official_source(requirements):
+                success_criteria.append(
+                    "Use official, regulatory, or primary sources when supporting source-quality claims."
+                )
+            deliverable_requirement = _fixture_deliverable_requirement(requirements)
+            if deliverable_requirement:
+                expected_artifacts = _ordered_unique(
+                    [
+                        *expected_artifacts,
+                        _fixture_deliverable_artifact_name(deliverable_requirement),
+                    ]
+                )
+                success_criteria.append(
+                    "Outputs must preserve the requested report/table/checklist deliverable shape."
+                )
+            max_images = 0
+            if route != "text_only":
+                max_images = max(1, min(3, image_cap or 3))
+            tasks.append(
+                {
+                    "task_id": f"task_semantic_{task_index:03d}",
+                    "angle_id": str(angle["angle_id"]),
+                    "query": query,
+                    "route": route,
+                    "freshness_requirement": _fixture_freshness_for_requirements(requirements),
+                    "source_policy": _fixture_source_policy_for_requirements(requirements),
+                    "expected_source_types": expected_source_types,
+                    "expected_visual_targets": visual_targets,
+                    "expected_artifacts": expected_artifacts,
+                    "success_criteria": success_criteria,
+                    "max_sources": max(1, min(5, source_cap)),
+                    "max_images": max_images,
+                    "done_condition": (
+                        "Stop when the requested evidence type is found, source quality is "
+                        "recorded, and caveats or missing evidence are explicitly noted."
+                    ),
+                }
+            )
+            task_index += 1
+    return tasks
+
+
+def _fixture_requires_official_source(requirements: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        str(requirement.get("requirement_type") or "") == "source_quality"
+        for requirement in requirements
+    )
+
+
+def _fixture_deliverable_requirement(
+    requirements: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    for requirement in requirements:
+        if (
+            str(requirement.get("requirement_type") or "") == "deliverable_shape"
+            and requirement.get("non_negotiable") is True
+        ):
+            return requirement
+    return None
+
+
+def _fixture_deliverable_artifact_name(requirement: Mapping[str, Any]) -> str:
+    prompt_text = str(requirement.get("prompt_text") or "").lower()
+    if "table" in prompt_text or "\ud45c" in prompt_text or "matrix" in prompt_text:
+        return "requested table or matrix"
+    if "checklist" in prompt_text:
+        return "requested checklist"
+    return "requested report outline"
+
+
+def _fixture_candidate_requirement_coverage(
+    *,
+    requirements: Sequence[Mapping[str, Any]],
+    angles: Sequence[Mapping[str, Any]],
+    bounded_tasks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for requirement in requirements:
+        requirement_type = str(requirement.get("requirement_type") or "")
+        covered_angles = _fixture_coverage_angle_ids(requirement_type, angles)
+        covered_tasks = [
+            str(task.get("task_id"))
+            for task in bounded_tasks
+            if str(task.get("angle_id")) in covered_angles
+        ]
+        if not covered_angles and angles:
+            covered_angles = [str(angles[0]["angle_id"])]
+            covered_tasks = [
+                str(task.get("task_id"))
+                for task in bounded_tasks
+                if str(task.get("angle_id")) in covered_angles
+            ]
+        output.append(
+            {
+                **dict(requirement),
+                "covered_by_angle_ids": covered_angles,
+                "covered_by_task_ids": covered_tasks,
+                "coverage_status": "covered" if covered_angles and covered_tasks else "not_covered",
+            }
+        )
+    return output
+
+
+def _candidate_executable_text(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> str:
+    values: list[Any] = []
+    for angle in angles:
+        values.extend(
+            [
+                angle.get("title"),
+                angle.get("research_question"),
+                angle.get("why_this_angle_matters"),
+                angle.get("included_scope"),
+                angle.get("expected_source_types"),
+                angle.get("expected_visual_targets"),
+                angle.get("expected_artifacts"),
+                angle.get("search_queries"),
+                angle.get("success_criteria"),
+                angle.get("risk_or_contradiction_checks"),
+            ]
+        )
+    for task in tasks:
+        values.extend(
+            [
+                task.get("query"),
+                task.get("source_policy"),
+                task.get("expected_source_types"),
+                task.get("expected_visual_targets"),
+                task.get("expected_artifacts"),
+                task.get("success_criteria"),
+                task.get("done_condition"),
+            ]
+        )
+    return json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
+
+
+def _core_question_tokens(question: str) -> set[str]:
+    stopwords = {
+        "research",
+        "investigate",
+        "analyze",
+        "report",
+        "table",
+        "checklist",
+        "official",
+        "source",
+        "sources",
+        "image",
+        "images",
+        "chart",
+        "charts",
+        "figure",
+        "figures",
+        "current",
+        "recent",
+        "latest",
+        "tell",
+        "show",
+        "about",
+        "with",
+        "from",
+        "and",
+        "the",
+        "\uc870\uc0ac",
+        "\uc870\uc0ac\ud574\uc918",
+        "\ubd84\uc11d",
+        "\ubcf4\uace0\uc11c",
+        "\ub9ac\ud3ec\ud2b8",
+        "\ud45c",
+        "\uacf5\uc2dd",
+        "\uaddc\uc81c",
+        "\uadfc\uac70",
+        "\uc774\ubbf8\uc9c0",
+        "\ub3c4\ud45c",
+        "\uc54c\ub824\uc918",
+        "\ud574\uc918",
+        "\uc911\uc2ec\uc73c\ub85c",
+    }
+    tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9.+#-]+|[\uac00-\ud7a3]+", question)
+        if len(token) >= 2
+    }
+    return {token for token in tokens if token not in stopwords}
+
+
+def _candidate_text_covers_subject(text: str, subject_tokens: set[str]) -> bool:
+    if not subject_tokens:
+        return True
+    matched = {token for token in subject_tokens if token in text}
+    required = 1 if len(subject_tokens) == 1 else min(2, len(subject_tokens))
+    return len(matched) >= required
+
+
+def _candidate_has_recent_task(tasks: Sequence[Mapping[str, Any]]) -> bool:
+    for task in tasks:
+        if str(task.get("freshness_requirement") or "").lower() == "recent":
+            return True
+    return False
+
+
+def _candidate_has_geography_task(
+    *,
+    requirement: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    geo_text = str(requirement.get("prompt_text") or requirement.get("requirement_text") or "")
+    geo_tokens = _core_question_tokens(geo_text)
+    if not geo_tokens:
+        return True
+    for task in tasks:
+        task_text = json.dumps(
+            [
+                task.get("query"),
+                task.get("expected_source_types"),
+                task.get("expected_artifacts"),
+                task.get("success_criteria"),
+                task.get("done_condition"),
+            ],
+            ensure_ascii=False,
+        ).lower()
+        if any(token in task_text for token in geo_tokens):
+            return True
+    return False
+
+
+def _candidate_has_deliverable_task(
+    *,
+    requirement: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    prompt_text = str(requirement.get("prompt_text") or "").lower()
+    if "table" in prompt_text or "\ud45c" in prompt_text or "matrix" in prompt_text:
+        deliverable_tokens = ("table", "matrix", "\ud45c")
+    elif "checklist" in prompt_text:
+        deliverable_tokens = ("checklist",)
+    else:
+        deliverable_tokens = ("report", "\ubcf4\uace0\uc11c", "\ub9ac\ud3ec\ud2b8")
+    for task in tasks:
+        task_output_text = json.dumps(
+            [
+                task.get("expected_artifacts"),
+                task.get("success_criteria"),
+                task.get("done_condition"),
+            ],
+            ensure_ascii=False,
+        ).lower()
+        if any(token in task_output_text for token in deliverable_tokens):
+            return True
+    return False
+
+
+def _fixture_prompt_span(question: str, text: str) -> dict[str, int | None]:
+    if not text:
+        return {"start": None, "end": None}
+    index = question.find(text)
+    if index < 0:
+        return {"start": None, "end": None}
+    return {"start": index, "end": index + len(text)}
+
+
+def _fixture_first_matching_text(question: str, candidates: Sequence[str]) -> str | None:
+    lower = question.lower()
+    for candidate in candidates:
+        if candidate in question or candidate.lower() in lower:
+            return candidate
+    return None
+
+
+def _fixture_question_language(question: str) -> str:
+    return "ko" if re.search(r"[\uac00-\ud7a3]", question) else "en"
+
+
+def _fixture_intent_summary(
+    question: str,
+    subject: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> str:
+    requirement_labels = _ordered_unique(
+        str(requirement.get("requirement_type") or "")
+        for requirement in requirements
+        if requirement.get("requirement_type")
+    )
+    return (
+        f"Research {subject} by preserving the user's requested scope from the "
+        f"original question: {question}. Required dimensions: "
+        + ", ".join(requirement_labels)
+        + "."
+    )
+
+
+def _fixture_decomposition_strategy(
+    scope: str,
+    subject: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> str:
+    requirement_labels = _ordered_unique(
+        str(requirement.get("requirement_type") or "")
+        for requirement in requirements
+        if requirement.get("requirement_type")
+    )
+    return (
+        f"Treat the question as {scope}. Split {subject} by user requirements "
+        f"({', '.join(requirement_labels)}) so each non-negotiable constraint "
+        "has at least one angle and executable bounded tasks."
+    )
+
+
+def _fixture_subject_phrase(question: str, entities: Sequence[Mapping[str, Any]]) -> str:
+    preferred = [
+        str(entity.get("name") or "")
+        for entity in entities
+        if str(entity.get("type") or "") in {
+            "software_system",
+            "technology",
+            "domain_subject",
+            "question_subject",
+        }
+    ]
+    if preferred:
+        if {"EV", "battery"} <= set(preferred):
+            return "EV battery fire safety"
+        if "Codex DeepResearch" in preferred and "semantic planner" in preferred:
+            return "Codex DeepResearch semantic planner"
+        return " ".join(preferred[:3])
+    tokens = [
+        token
+        for token in re.findall(r"[A-Za-z0-9.+#-]+|[\uac00-\ud7a3]+", question)
+        if token.lower()
+        not in {
+            "research",
+            "investigate",
+            "analyze",
+            "show",
+            "tell",
+            "\uc870\uc0ac",
+            "\uc870\uc0ac\ud574\uc918",
+            "\ubd84\uc11d",
+            "\uc54c\ub824\uc918",
+        }
+    ]
+    return " ".join(tokens[:8]) if tokens else "the user question"
+
+
+def _fixture_extract_geography_requirement(question: str) -> str | None:
+    geography_terms = (
+        "United States",
+        "US",
+        "U.S.",
+        "EU",
+        "Europe",
+        "Korea",
+        "South Korea",
+        "\ud55c\uad6d",
+        "\ubbf8\uad6d",
+        "\uc720\ub7fd",
+        "\uc11c\uc6b8",
+    )
+    return _fixture_first_matching_text(question, geography_terms)
+
+
+def _fixture_is_software_implementation_question(
+    question: str,
+    entities: Sequence[Mapping[str, Any]],
+) -> bool:
+    lower = question.lower()
+    names = {str(entity.get("name") or "").lower() for entity in entities}
+    software_subject = bool(
+        {"codex deepresearch", "semantic planner", "runner"} & names
+        or _contains_any(lower, ("api", "sdk", "next.js", "nextjs", "app router"))
+    )
+    implementation_request = _contains_any(
+        lower,
+        (
+            "implement",
+            "implementation",
+            "architecture",
+            "migration",
+            "code",
+            "test strategy",
+            "\uad6c\ud604",
+            "\uc544\ud0a4\ud14d\ucc98",
+            "\ud14c\uc2a4\ud2b8 \uc804\ub7b5",
         ),
     )
+    return software_subject and implementation_request
+
+
+def _fixture_negative_scope(question: str, subject: str) -> list[str]:
+    lower = question.lower()
+    if _fixture_is_software_implementation_question(question, []) or (
+        "codex" in lower and ("implement" in lower or "architecture" in lower)
+    ):
+        return [
+            "Do not answer unrelated product-market or policy topics unless requested.",
+            "Do not replace implementation architecture analysis with generic research advice.",
+        ]
+    return [
+        "Do not drift into Codex runner architecture or internal implementation tasks.",
+        f"Do not replace {subject} with a generic software-planning topic.",
+    ]
+
+
+def _fixture_visual_targets(
+    subject: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    has_visual = any(
+        str(requirement.get("requirement_type") or "") == "visual_modality"
+        for requirement in requirements
+    )
+    if not has_visual:
+        return []
+    return [
+        f"{subject} public images",
+        f"{subject} charts or figures",
+        f"{subject} diagrams or screenshots",
+    ]
+
+
+def _fixture_included_scope_for_angle(
+    title: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    included = [title]
+    for requirement in requirements:
+        requirement_type = str(requirement.get("requirement_type") or "")
+        if requirement_type in {"subject", "source_quality", "visual_modality", "safety_risk"}:
+            included.append(str(requirement.get("requirement_text") or requirement_type))
+    return _ordered_unique(included)
+
+
+def _fixture_dedupe_angle_specs(
+    specs: Sequence[tuple[str, str, str, str, list[str], list[str]]],
+) -> list[tuple[str, str, str, str, list[str], list[str]]]:
+    output: list[tuple[str, str, str, str, list[str], list[str]]] = []
+    seen_titles: set[str] = set()
+    seen_needs: set[str] = set()
+    for spec in specs:
+        title = _normalize_text(spec[0])
+        evidence_need = spec[3]
+        if title in seen_titles:
+            continue
+        if evidence_need in seen_needs and evidence_need not in {
+            "visual_observation",
+            "implementation_detail",
+        }:
+            continue
+        seen_titles.add(title)
+        seen_needs.add(evidence_need)
+        output.append(spec)
+    return output
+
+
+def _fixture_unused_evidence_need(
+    specs: Sequence[tuple[str, str, str, str, list[str], list[str]]],
+) -> str:
+    used = {spec[3] for spec in specs}
+    for need in ALLOWED_EVIDENCE_NEEDS:
+        if need not in used:
+            return need
+    return "primary_source"
+
+
+def _fixture_freshness_for_requirements(requirements: Sequence[Mapping[str, Any]]) -> str:
+    if any(str(req.get("requirement_type") or "") == "time_range" for req in requirements):
+        return "recent"
+    return "any"
+
+
+def _fixture_source_policy_for_requirements(requirements: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    official = any(
+        str(req.get("requirement_type") or "") == "source_quality"
+        for req in requirements
+    )
+    return {
+        "decision": "allowed",
+        "requires_official_or_primary": official,
+        "quality_requirements": (
+            ["official", "regulatory", "primary"] if official else ["source-backed"]
+        ),
+        "flags": [],
+    }
+
+
+def _fixture_candidate_task_query(
+    *,
+    subject: str,
+    angle: Mapping[str, Any],
+    occurrence: int,
+    original_question: str,
+) -> str:
+    title = str(angle.get("title") or "angle")
+    research_question = str(angle.get("research_question") or title)
+    variants = (
+        "collect source-backed evidence",
+        "verify claims and caveats",
+        "find contradictions or missing evidence",
+        "prepare report-ready artifacts",
+    )
+    variant = variants[(occurrence - 1) % len(variants)]
+    return (
+        f"{subject} / {variant}: {research_question} "
+        f"Original ask: {original_question}"
+    )
+
+
+def _fixture_coverage_angle_ids(
+    requirement_type: str,
+    angles: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    matched: list[str] = []
+    for angle in angles:
+        route = str(angle.get("route") or "")
+        evidence_need = str(angle.get("evidence_need") or "")
+        title = str(angle.get("title") or "").lower()
+        if requirement_type == "subject":
+            matched.append(str(angle["angle_id"]))
+        elif requirement_type == "visual_modality" and route != "text_only":
+            matched.append(str(angle["angle_id"]))
+        elif requirement_type == "source_quality" and evidence_need == "official_source":
+            matched.append(str(angle["angle_id"]))
+        elif requirement_type == "time_range" and evidence_need == "recent_change":
+            matched.append(str(angle["angle_id"]))
+        elif requirement_type == "geography" and "geographic" in title:
+            matched.append(str(angle["angle_id"]))
+        elif requirement_type == "safety_risk" and evidence_need == "failure_pattern":
+            matched.append(str(angle["angle_id"]))
+        elif requirement_type in {"deliverable_shape", "user_constraint"}:
+            matched.append(str(angle["angle_id"]))
+    return _ordered_unique(matched)
+
+
+def _question_class_from_candidate(
+    candidate: Mapping[str, Any],
+    angles: Sequence[SemanticAngle],
+) -> str:
+    candidate_class = str(candidate.get("question_class") or "")
+    if candidate_class in {
+        _CLASS_GENERAL,
+        _CLASS_TECHNICAL,
+        _CLASS_PRODUCT,
+        _CLASS_VISUAL,
+        _CLASS_POLICY,
+        _CLASS_IMPLEMENTATION,
+    }:
+        return candidate_class
+    if any(angle.route != "text_only" for angle in angles):
+        return _CLASS_VISUAL
+    if any(
+        str(req.get("requirement_type") or "") in {"source_quality", "safety_risk"}
+        for req in _list(candidate.get("constraints"))
+        if isinstance(req, Mapping)
+    ):
+        return _CLASS_POLICY
+    return _CLASS_GENERAL
 
 
 def classify_question(question: str) -> str:
@@ -476,7 +2418,7 @@ def write_semantic_integrity_artifacts(
     raw_request_path = raw_dir / SEMANTIC_RAW_REQUEST_FILENAME
     raw_response_path = raw_dir / SEMANTIC_RAW_RESPONSE_FILENAME
 
-    request_payload = {
+    request_payload = dict(plan.raw_request_payload) if plan.raw_request_payload else {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "artifact_type": "semantic_planner_raw_request",
         "run_id": run_path.name,
@@ -488,7 +2430,17 @@ def write_semantic_integrity_artifacts(
         "template_use": _template_use(plan),
         "provenance": _planner_provenance(plan),
     }
-    response_payload = {
+    request_payload.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    request_payload.setdefault("artifact_type", "semantic_planner_raw_request")
+    request_payload["run_id"] = run_path.name
+    request_payload["created_at"] = timestamp
+    request_payload.setdefault("question", question)
+    if not plan.raw_request_payload:
+        request_payload.setdefault("question_scope", _question_scope(question, plan))
+    request_payload.setdefault("template_use", _template_use(plan))
+    request_payload.setdefault("provenance", _planner_provenance(plan))
+
+    response_payload = dict(plan.raw_response_payload) if plan.raw_response_payload else {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "artifact_type": "semantic_planner_raw_response",
         "run_id": run_path.name,
@@ -499,6 +2451,13 @@ def write_semantic_integrity_artifacts(
         "diagnostics": dict(plan.diagnostics or {}),
         "provenance": _planner_provenance(plan),
     }
+    response_payload.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    response_payload.setdefault("artifact_type", "semantic_planner_raw_response")
+    response_payload["run_id"] = run_path.name
+    response_payload["created_at"] = timestamp
+    response_payload.setdefault("semantic_plan", plan.to_dict())
+    response_payload.setdefault("diagnostics", dict(plan.diagnostics or {}))
+    response_payload.setdefault("provenance", _planner_provenance(plan))
     _write_json(raw_request_path, request_payload)
     _write_json(raw_response_path, response_payload)
     raw_request_hash = _sha256_file(raw_request_path)
@@ -530,6 +2489,15 @@ def write_semantic_integrity_artifacts(
             **base,
             "artifact_type": "semantic_plan",
             "semantic_plan": plan.to_dict(),
+            "intent_summary": plan.intent_summary,
+            "domain_entities": list(plan.domain_entities),
+            "constraints": list(plan.constraints),
+            "candidate_question_scope": plan.question_scope,
+            "decomposition_strategy": plan.decomposition_strategy,
+            "negative_scope": list(plan.negative_scope),
+            "bounded_tasks": list(plan.bounded_tasks),
+            "planner_provenance": dict(plan.planner_provenance),
+            "parsed_response_hash": _planner_provenance(plan).get("parsed_response_hash"),
             "angles": [angle.to_dict() for angle in plan.angles],
             "requirement_coverage_map": requirement_coverage_map,
             "routing_count": len(routing or []),
@@ -1707,6 +3675,8 @@ def _template_use(plan: SemanticPlan) -> dict[str, Any]:
 
 
 def _planner_provenance(plan: SemanticPlan) -> dict[str, Any]:
+    if plan.planner_provenance:
+        return dict(plan.planner_provenance)
     return {
         "planner_mode": plan.planner_mode,
         "planner_source": plan.source,
@@ -1744,6 +3714,7 @@ def _integrity_base_payload(
         "raw_response_path": str(raw_response_path),
         "raw_request_hash": raw_request_hash,
         "raw_response_hash": raw_response_hash,
+        "parsed_response_hash": _planner_provenance(plan).get("parsed_response_hash"),
         "provenance": _planner_provenance(plan),
         "template_use": _template_use(plan),
         "session_id": None,
@@ -1754,6 +3725,22 @@ def _integrity_base_payload(
 
 
 def _oracle_requirement_map(plan: SemanticPlan) -> list[dict[str, Any]]:
+    if plan.requirement_coverage_map:
+        return [
+            {
+                "requirement_id": str(record.get("requirement_id") or f"req_{index:03d}"),
+                "source": "codex_semantic_candidate",
+                "prompt_text": record.get("prompt_text"),
+                "requirement_text": record.get("requirement_text"),
+                "requirement_type": record.get("requirement_type"),
+                "non_negotiable": bool(record.get("non_negotiable")),
+                "covered_by_angle_ids": _string_list(record.get("covered_by_angle_ids")),
+                "covered_by_task_ids": _string_list(record.get("covered_by_task_ids")),
+                "coverage_status": record.get("coverage_status"),
+            }
+            for index, record in enumerate(plan.requirement_coverage_map, start=1)
+            if isinstance(record, Mapping)
+        ]
     if not plan.angles:
         return []
     return [
@@ -1770,6 +3757,8 @@ def _oracle_requirement_map(plan: SemanticPlan) -> list[dict[str, Any]]:
 
 
 def _requirement_coverage_map(plan: SemanticPlan) -> list[dict[str, Any]]:
+    if plan.requirement_coverage_map:
+        return [dict(record) for record in plan.requirement_coverage_map]
     return [
         {
             "requirement_id": f"req_{index:03d}",

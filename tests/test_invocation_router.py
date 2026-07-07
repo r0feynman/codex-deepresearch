@@ -561,7 +561,7 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertTrue(result["no_evidence_bundle"])
         self.assertEqual(result["artifacts"], {})
 
-    def test_negated_quick_answer_with_full_pipeline_intent_runs_full_runner(self) -> None:
+    def test_negated_quick_answer_with_full_pipeline_intent_blocks_without_semantic_planner(self) -> None:
         result = run_skill_invocation(
             "$deep-research: do not give me a quick answer about cache eviction; run the full pipeline",
             runs_dir=self.temp_runs_dir(),
@@ -576,10 +576,11 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertTrue(result["terminal"])
         self.assertEqual(result["selected_mode"], "blocked")
         self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(result["planner_mode"], "blocked")
         self.assertIn("run_status", result["artifacts"])
         self.assertIn("evidence", result["artifacts"])
         self.assertIn("semantic_planner_validation", result["artifacts"])
-        self.assertNotIn("report_status", result["artifacts"])
+        self.assertNotIn("parallel_orchestration_status", result["artifacts"])
 
     def test_quick_chat_flag_overrides_negated_text_marker(self) -> None:
         result = run_skill_invocation(
@@ -650,13 +651,14 @@ class InvocationRouterTests(unittest.TestCase):
                 "$deep-research: inspect product screenshots for evidence",
                 runs_dir=self.temp_runs_dir(),
                 route="visual_required",
-                budget_preset="quick",
+                budget_preset="standard",
             )
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["terminal"])
         self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
         self.assertEqual(result["selected_mode"], "blocked")
+        self.assertEqual(result["planner_mode"], "blocked")
         self.assertIn("actionable_cause", result["diagnostics"])
         self.assertIn("True semantic decomposition did not run", result["diagnostics"]["actionable_cause"])
         self.assertIn("run_status", result["artifacts"])
@@ -2322,6 +2324,7 @@ class InvocationRouterTests(unittest.TestCase):
 
         self.assertFalse(result["ok"], result)
         self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(result["planner_mode"], "blocked")
         acquire_mock.assert_not_called()
         ingest_mock.assert_not_called()
 

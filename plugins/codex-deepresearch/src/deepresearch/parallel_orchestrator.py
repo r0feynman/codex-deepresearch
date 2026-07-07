@@ -84,6 +84,19 @@ CODEX_CHILD_RELEASE_HANDOFF_INVALID = "codex_child_release_handoff_invalid"
 FAILED_RELEASE_HANDOFF_INVALID = "failed_release_handoff_invalid"
 CAPACITY_RETRY_MAX_ATTEMPTS = 3
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300.0
+SEMANTIC_BOUNDED_TASK_ALIGNMENT_FIELDS = (
+    "query",
+    "route",
+    "freshness_requirement",
+    "source_policy",
+    "expected_source_types",
+    "expected_visual_targets",
+    "expected_artifacts",
+    "success_criteria",
+    "max_sources",
+    "max_images",
+    "done_condition",
+)
 CAPACITY_RETRY_POLICY_DEFAULTS = {
     "max_attempts": CAPACITY_RETRY_MAX_ATTEMPTS,
     "initial_delay_seconds": 5.0,
@@ -642,6 +655,11 @@ def plan_research_tasks(
     )
     existing = _read_research_tasks(run_dir)
     if existing:
+        _enforce_semantic_bounded_task_alignment(
+            run_dir=run_dir,
+            evidence=evidence,
+            research_tasks=existing,
+        )
         write_semantic_planner_validation(
             run_dir=run_dir,
             evidence=evidence,
@@ -653,11 +671,37 @@ def plan_research_tasks(
     planner_tasks = evidence.get("search_tasks")
     if not isinstance(planner_tasks, list) or not planner_tasks:
         raise ParallelOrchestrationError("evidence.json must include search_tasks before planning")
+    _enforce_semantic_bounded_task_alignment(
+        run_dir=run_dir,
+        evidence=evidence,
+        search_tasks=planner_tasks,
+    )
 
-    semantic_floor = _semantic_task_floor(evidence, planner_tasks)
+    bounded_task_count = _semantic_bounded_task_count(evidence)
+    semantic_floor = bounded_task_count or _semantic_task_floor(evidence, planner_tasks)
     hard_task_cap = min(preset.max_codex_handoff_tasks, 100)
     requested_cap = max_tasks if max_tasks is not None else hard_task_cap
-    task_count = min(max(min_tasks, semantic_floor, 1), requested_cap, hard_task_cap)
+    if bounded_task_count:
+        planner_task_count = len([task for task in planner_tasks if isinstance(task, Mapping)])
+        if planner_task_count < bounded_task_count:
+            raise ParallelOrchestrationError(
+                "semantic bounded task metadata exceeds materialized search tasks: "
+                f"bounded_task_count={bounded_task_count}, search_task_count={planner_task_count}"
+            )
+        if max_tasks is not None and max_tasks < bounded_task_count:
+            raise ParallelOrchestrationError(
+                "semantic bounded tasks cannot be truncated by max_tasks: "
+                f"bounded_task_count={bounded_task_count}, max_tasks={max_tasks}"
+            )
+        if bounded_task_count > hard_task_cap:
+            raise ParallelOrchestrationError(
+                "semantic bounded tasks exceed the active budget preset handoff cap: "
+                f"bounded_task_count={bounded_task_count}, hard_task_cap={hard_task_cap}, "
+                f"budget_preset={preset_name}"
+            )
+        task_count = bounded_task_count
+    else:
+        task_count = min(max(min_tasks, semantic_floor, 1), requested_cap, hard_task_cap)
     now = _utc_now()
     tasks: list[dict[str, Any]] = []
     angle_occurrences: dict[str, int] = {}
@@ -665,16 +709,30 @@ def plan_research_tasks(
         base = planner_tasks[(index - 1) % len(planner_tasks)]
         if not isinstance(base, Mapping):
             continue
-        task_id = f"task_research_{index:03d}"
+        preserves_bounded_task = (
+            "task_id" in base
+            and "done_condition" in base
+            and "expected_source_types" in base
+        )
+        task_id = (
+            str(base.get("task_id") or base.get("id") or f"task_research_{index:03d}")
+            if preserves_bounded_task
+            else f"task_research_{index:03d}"
+        )
         route = str(base.get("route") or "text_only")
         max_images = _planner_max_images(base, evidence=evidence, route=route)
         angle_id = str(base.get("angle_id") or f"angle_{index:03d}")
         angle_occurrences[angle_id] = int(angle_occurrences.get(angle_id, 0)) + 1
-        query = _semantic_task_query(
-            base,
-            question=str(evidence.get("question") or ""),
-            occurrence=angle_occurrences[angle_id],
-        )
+        if preserves_bounded_task:
+            query = str(base.get("query") or "").strip()
+        else:
+            query = ""
+        if not query:
+            query = _semantic_task_query(
+                base,
+                question=str(evidence.get("question") or ""),
+                occurrence=angle_occurrences[angle_id],
+            )
         task = ResearchTask(
             id=task_id,
             angle_id=angle_id,
@@ -687,18 +745,30 @@ def plan_research_tasks(
             assigned_subagent_id=None,
             attempt=0,
             max_attempts=CAPACITY_RETRY_MAX_ATTEMPTS,
-            max_sources=max(1, int(base.get("max_results") or 3)),
+            max_sources=max(1, int(base.get("max_sources") or base.get("max_results") or 3)),
             max_images=max_images if route != "text_only" else 0,
-            source_policy={"decision": "allowed", "flags": []},
+            source_policy=dict(base.get("source_policy") or {"decision": "allowed", "flags": []}),
             output_shard_path=f"{EVIDENCE_SHARDS_DIRNAME}/{task_id}/evidence_shard.json",
             trace_event_ids=[],
         ).to_dict()
+        task["task_id"] = task_id
+        task["freshness_requirement"] = str(base.get("freshness_requirement") or "any")
+        task["expected_source_types"] = _string_list(base.get("expected_source_types"))
+        task["expected_visual_targets"] = _string_list(base.get("expected_visual_targets"))
+        task["expected_artifacts"] = _string_list(base.get("expected_artifacts"))
+        task["done_condition"] = str(base.get("done_condition") or "")
         task["search_task_id"] = str(base.get("id") or task_id)
         apply_release_validation_identity(
             task,
             release_validation_identity_from_payload(evidence),
         )
         tasks.append(task)
+    _enforce_semantic_bounded_task_alignment(
+        run_dir=run_dir,
+        evidence=evidence,
+        search_tasks=planner_tasks,
+        research_tasks=tasks,
+    )
     payload = {
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
@@ -759,10 +829,156 @@ def _semantic_task_floor(
     evidence: Mapping[str, Any],
     planner_tasks: Sequence[Any],
 ) -> int:
+    bounded_count = _semantic_bounded_task_count(evidence)
+    if bounded_count:
+        return bounded_count
     semantic_angles = evidence.get("semantic_angles")
     if isinstance(semantic_angles, list) and semantic_angles:
         return len([angle for angle in semantic_angles if isinstance(angle, Mapping)])
     return len([task for task in planner_tasks if isinstance(task, Mapping)])
+
+
+def _semantic_bounded_task_count(evidence: Mapping[str, Any]) -> int:
+    semantic_planner = evidence.get("semantic_planner")
+    if isinstance(semantic_planner, Mapping):
+        bounded_tasks = semantic_planner.get("bounded_tasks")
+        if isinstance(bounded_tasks, list) and bounded_tasks:
+            return len([task for task in bounded_tasks if isinstance(task, Mapping)])
+    return 0
+
+
+def _semantic_bounded_tasks_by_id(evidence: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    semantic_planner = evidence.get("semantic_planner")
+    if not isinstance(semantic_planner, Mapping):
+        return {}
+    bounded_tasks = semantic_planner.get("bounded_tasks")
+    if not isinstance(bounded_tasks, list):
+        return {}
+    task_map: dict[str, Mapping[str, Any]] = {}
+    for index, task in enumerate(bounded_tasks, start=1):
+        if not isinstance(task, Mapping):
+            continue
+        task_id = str(task.get("task_id") or task.get("id") or "").strip()
+        if not task_id:
+            raise ParallelOrchestrationError(
+                f"semantic bounded task at index {index} is missing task_id"
+            )
+        if task_id in task_map:
+            raise ParallelOrchestrationError(
+                f"semantic bounded task task_id {task_id!r} is duplicated"
+            )
+        task_map[task_id] = task
+    return task_map
+
+
+def _enforce_semantic_bounded_task_alignment(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    search_tasks: Sequence[Any] | None = None,
+    research_tasks: Sequence[Any] | None = None,
+) -> None:
+    bounded_by_id = _semantic_bounded_tasks_by_id(evidence)
+    if not bounded_by_id:
+        return
+    if search_tasks is None:
+        evidence_search_tasks = evidence.get("search_tasks")
+        if isinstance(evidence_search_tasks, list):
+            search_tasks = evidence_search_tasks
+    if search_tasks is None:
+        raise ParallelOrchestrationError(
+            "semantic bounded tasks require materialized search_tasks for alignment validation"
+        )
+    _assert_semantic_task_collection_alignment(
+        collection_name="search_tasks",
+        tasks=search_tasks,
+        bounded_by_id=bounded_by_id,
+    )
+    search_tasks_artifact = _read_search_tasks_artifact(run_dir)
+    if search_tasks_artifact:
+        _assert_semantic_task_collection_alignment(
+            collection_name="search_tasks.json",
+            tasks=search_tasks_artifact,
+            bounded_by_id=bounded_by_id,
+        )
+    if research_tasks is not None:
+        _assert_semantic_task_collection_alignment(
+            collection_name="research_tasks",
+            tasks=research_tasks,
+            bounded_by_id=bounded_by_id,
+        )
+
+
+def _read_search_tasks_artifact(run_dir: Path) -> list[Any]:
+    path = run_dir / "search_tasks.json"
+    if not path.exists():
+        return []
+    payload = _read_json(path)
+    tasks = payload.get("tasks") if isinstance(payload, Mapping) else None
+    return list(tasks) if isinstance(tasks, list) else []
+
+
+def _assert_semantic_task_collection_alignment(
+    *,
+    collection_name: str,
+    tasks: Sequence[Any],
+    bounded_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    materialized_by_id: dict[str, Mapping[str, Any]] = {}
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, Mapping):
+            raise ParallelOrchestrationError(
+                f"semantic {collection_name} entry at index {index} is not an object"
+            )
+        task_id = str(task.get("task_id") or task.get("id") or "").strip()
+        if not task_id:
+            raise ParallelOrchestrationError(
+                f"semantic {collection_name} entry at index {index} is missing task_id"
+            )
+        if task_id not in bounded_by_id:
+            raise ParallelOrchestrationError(
+                f"semantic {collection_name} task_id {task_id!r} is not present in "
+                "semantic_planner.bounded_tasks"
+            )
+        if task_id in materialized_by_id:
+            raise ParallelOrchestrationError(
+                f"semantic {collection_name} task_id {task_id!r} is duplicated"
+            )
+        materialized_by_id[task_id] = task
+        bounded_task = bounded_by_id[task_id]
+        for field in SEMANTIC_BOUNDED_TASK_ALIGNMENT_FIELDS:
+            actual = _semantic_alignment_value(task, field)
+            expected = _semantic_alignment_value(bounded_task, field)
+            if actual != expected:
+                raise ParallelOrchestrationError(
+                    "semantic bounded task alignment mismatch: "
+                    f"{collection_name}.{task_id}.{field} does not match "
+                    "semantic_planner.bounded_tasks"
+                )
+    missing = sorted(set(bounded_by_id) - set(materialized_by_id))
+    if missing:
+        raise ParallelOrchestrationError(
+            f"semantic {collection_name} is missing bounded task ids: "
+            + ", ".join(missing)
+        )
+
+
+def _semantic_alignment_value(task: Mapping[str, Any], field: str) -> Any:
+    value = task.get(field)
+    if field in {
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "success_criteria",
+    }:
+        return _string_list(value)
+    if field == "source_policy":
+        return dict(value) if isinstance(value, Mapping) else {}
+    if field in {"max_sources", "max_images"}:
+        return _nonnegative_int(value)
+    if field in {"query", "route", "freshness_requirement", "done_condition"}:
+        return str(value or "")
+    return value
 
 
 _TASK_QUERY_VARIANTS = (

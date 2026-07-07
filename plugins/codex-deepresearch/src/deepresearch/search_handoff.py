@@ -81,6 +81,9 @@ def prepare_run(
     suite_id: str | None = None,
     prompt_hash: str | None = None,
     original_question: str | None = None,
+    user_constraints: Sequence[str] | None = None,
+    provided_sources: Sequence[Mapping[str, Any]] | None = None,
+    provided_images: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a run directory and the Codex search handoff artifacts."""
 
@@ -129,6 +132,21 @@ def prepare_run(
             angles=angles,
             route=route,
         ),
+        user_constraints=user_constraints,
+        depth_preset=budget_preset,
+        visual_preference=route,
+        budget_cap={
+            "budget_preset": budget_preset,
+            "max_results": max_results,
+            "max_sources": max_sources or config.budget.max_sources,
+            "max_images": max_images if max_images is not None else config.budget.max_images,
+            "max_subagents": max_subagents
+            or max_agents
+            or config.budget.max_concurrent_codex_subagents,
+            "max_cost_usd": max_cost_usd,
+        },
+        provided_sources=provided_sources,
+        provided_images=provided_images,
     )
     if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
         return _prepare_blocked_semantic_planner_run(
@@ -180,17 +198,28 @@ def prepare_run(
         budget_estimate["planned_search"]["route_image_allocations"],
     )
     effective_max_results = int(budget_estimate["planned_search"]["max_results_per_task"])
-    search_tasks = [
-        _search_task(
-            normalized_question,
-            route_record,
-            index,
-            freshness_requirement=freshness_requirement,
-            max_results=effective_max_results,
-            use_angle_in_query=len(routing) > 1,
-        )
-        for index, route_record in enumerate(routing, start=1)
-    ]
+    if semantic_plan.bounded_tasks:
+        search_tasks = [
+            _search_task_from_bounded_task(
+                bounded_task,
+                index,
+                routing=routing,
+                fallback_max_results=effective_max_results,
+            )
+            for index, bounded_task in enumerate(semantic_plan.bounded_tasks, start=1)
+        ]
+    else:
+        search_tasks = [
+            _search_task(
+                normalized_question,
+                route_record,
+                index,
+                freshness_requirement=freshness_requirement,
+                max_results=effective_max_results,
+                use_angle_in_query=len(routing) > 1,
+            )
+            for index, route_record in enumerate(routing, start=1)
+        ]
     budget = _budget_to_evidence(config.budget_preset, config.budget)
     budget.update(
         {
@@ -226,6 +255,18 @@ def prepare_run(
             "broad_question": semantic_plan.broad_question,
             "source": semantic_plan.source,
             "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
+            "intent_summary": semantic_plan.intent_summary,
+            "domain_entities": list(semantic_plan.domain_entities),
+            "constraints": list(semantic_plan.constraints),
+            "question_scope": semantic_plan.question_scope,
+            "decomposition_strategy": semantic_plan.decomposition_strategy,
+            "requirement_coverage_map": list(semantic_plan.requirement_coverage_map),
+            "negative_scope": list(semantic_plan.negative_scope),
+            "bounded_tasks": list(semantic_plan.bounded_tasks),
+            "planner_provenance": dict(semantic_plan.planner_provenance),
+            "model_or_surface": semantic_plan.model_or_surface,
+            "original_question": semantic_plan.original_question,
+            "language": semantic_plan.language,
             "planner_mode": semantic_plan.planner_mode,
             "semantic_release_eligible": semantic_plan.semantic_release_eligible,
             "status": semantic_plan.status,
@@ -263,11 +304,19 @@ def prepare_run(
         "schema_version": HANDOFF_SCHEMA_VERSION,
         "run_id": run_id,
         "created_at": now,
-        "tasks": [
-            _visual_task(route_record, index)
-            for index, route_record in enumerate(routing, start=1)
-            if route_record["modality"] != "text_only"
-        ],
+        "tasks": (
+            [
+                _visual_task_from_search_task(task, index)
+                for index, task in enumerate(search_tasks, start=1)
+                if task["route"] != "text_only"
+            ]
+            if semantic_plan.bounded_tasks
+            else [
+                _visual_task(route_record, index)
+                for index, route_record in enumerate(routing, start=1)
+                if route_record["modality"] != "text_only"
+            ]
+        ),
     }
     apply_release_validation_identity(visual_tasks_artifact, release_identity)
     status = {
@@ -986,11 +1035,16 @@ def _routing_record(
                 "route": decision.modality,
                 "evidence_need": semantic_angle.evidence_need,
                 "expected_artifacts": list(semantic_angle.expected_artifacts),
+                "expected_source_types": list(semantic_angle.expected_source_types),
+                "expected_visual_targets": list(semantic_angle.expected_visual_targets),
                 "expected_evidence": _expected_evidence_for_angle(
                     semantic_angle.evidence_need,
                     decision.modality,
                 ),
                 "success_criteria": list(semantic_angle.success_criteria),
+                "done_condition": (
+                    "Stop when the task has source-backed findings and explicit caveats."
+                ),
                 "report_section": semantic_angle.report_section,
             }
         )
@@ -1014,8 +1068,11 @@ def _semantic_angle_evidence_record(route_record: Mapping[str, Any]) -> dict[str
         "route": route_record["modality"],
         "evidence_need": route_record.get("evidence_need") or "primary_source",
         "expected_artifacts": list(route_record.get("expected_artifacts", [])),
+        "expected_source_types": list(route_record.get("expected_source_types", [])),
+        "expected_visual_targets": list(route_record.get("expected_visual_targets", [])),
         "expected_evidence": list(route_record.get("expected_evidence", [])),
         "success_criteria": list(route_record.get("success_criteria", [])),
+        "done_condition": route_record.get("done_condition") or "",
         "report_section": route_record.get("report_section") or route_record["angle"],
     }
 
@@ -1099,8 +1156,11 @@ def _search_task(
         "query": query,
         "evidence_need": route_record.get("evidence_need") or "primary_source",
         "expected_artifacts": list(route_record.get("expected_artifacts", [])),
+        "expected_source_types": list(route_record.get("expected_source_types", [])),
+        "expected_visual_targets": list(route_record.get("expected_visual_targets", [])),
         "expected_evidence": list(route_record.get("expected_evidence", [])),
         "success_criteria": list(route_record.get("success_criteria", [])),
+        "done_condition": route_record.get("done_condition") or "",
         "report_section": route_record.get("report_section") or angle,
         "freshness_requirement": freshness_requirement,
         "modality": route_record["modality"],
@@ -1108,11 +1168,91 @@ def _search_task(
         "max_results": max_results,
         "visual_tasks": list(route_record.get("visual_tasks", [])),
         "max_images": int(route_record.get("max_images", 0)),
-        "source_policy": {
+        "source_policy": route_record.get("source_policy")
+        or {
             "decision": "allowed",
             "flags": [],
         },
     }
+
+
+def _search_task_from_bounded_task(
+    bounded_task: Mapping[str, Any],
+    index: int,
+    *,
+    routing: Sequence[Mapping[str, Any]],
+    fallback_max_results: int,
+) -> dict[str, Any]:
+    task_id = str(bounded_task.get("task_id") or f"task_search_{index:03d}")
+    angle_id = str(bounded_task.get("angle_id") or f"angle_{index:03d}")
+    route_record = next(
+        (
+            record
+            for record in routing
+            if str(record.get("id") or "") == angle_id
+        ),
+        {},
+    )
+    route = str(bounded_task.get("route") or route_record.get("modality") or "text_only")
+    max_sources = int(bounded_task.get("max_sources") or fallback_max_results or 1)
+    max_images = int(bounded_task.get("max_images") or 0)
+    if route == "text_only":
+        max_images = 0
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "angle_id": angle_id,
+        "angle": route_record.get("angle") or route_record.get("title") or angle_id,
+        "title": route_record.get("title") or route_record.get("angle") or angle_id,
+        "research_question": route_record.get("research_question")
+        or bounded_task.get("query")
+        or angle_id,
+        "question_context": route_record.get("question_context") or "",
+        "query": str(bounded_task.get("query") or ""),
+        "evidence_need": route_record.get("evidence_need") or "primary_source",
+        "expected_artifacts": list(bounded_task.get("expected_artifacts") or []),
+        "expected_source_types": list(bounded_task.get("expected_source_types") or []),
+        "expected_visual_targets": list(bounded_task.get("expected_visual_targets") or []),
+        "expected_evidence": _expected_evidence_for_angle(
+            str(route_record.get("evidence_need") or "primary_source"),
+            route,
+        ),
+        "success_criteria": list(bounded_task.get("success_criteria") or []),
+        "done_condition": str(bounded_task.get("done_condition") or ""),
+        "report_section": route_record.get("report_section")
+        or _report_section_from_task_query(str(bounded_task.get("query") or "")),
+        "freshness_requirement": str(bounded_task.get("freshness_requirement") or "any"),
+        "modality": route,
+        "route": route,
+        "max_results": max_sources,
+        "max_sources": max_sources,
+        "visual_tasks": list(bounded_task.get("expected_visual_targets") or []),
+        "max_images": max_images,
+        "source_policy": dict(bounded_task.get("source_policy") or {"decision": "allowed", "flags": []}),
+    }
+
+
+def _visual_task_from_search_task(search_task: Mapping[str, Any], index: int) -> dict[str, Any]:
+    return {
+        "id": f"task_visual_{index:03d}",
+        "task_id": search_task["task_id"],
+        "angle_id": search_task["angle_id"],
+        "angle": search_task.get("angle") or search_task["angle_id"],
+        "query": search_task["query"],
+        "route": search_task["route"],
+        "expected_visual_targets": list(search_task.get("expected_visual_targets") or []),
+        "expected_artifacts": list(search_task.get("expected_artifacts") or []),
+        "success_criteria": list(search_task.get("success_criteria") or []),
+        "done_condition": search_task.get("done_condition") or "",
+        "visual_tasks": list(search_task.get("visual_tasks") or []),
+        "max_images": search_task["max_images"],
+        "status": "planned",
+    }
+
+
+def _report_section_from_task_query(query: str) -> str:
+    prefix = query.split(":", 1)[0].split("/", 1)[0].strip()
+    return prefix[:80] if prefix else "Findings"
 
 
 def _visual_task(route_record: Mapping[str, Any], index: int) -> dict[str, Any]:
