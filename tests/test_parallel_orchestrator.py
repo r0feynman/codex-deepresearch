@@ -39,6 +39,7 @@ TEST_MANUAL_ANGLES = ("primary source discovery",)
 
 def prepare_run(*args, **kwargs):
     kwargs.setdefault("angles", list(TEST_MANUAL_ANGLES))
+    kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
     return prepare_search_handoff_run(*args, **kwargs)
 
 
@@ -2466,6 +2467,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 str(runs_dir),
                 "--route",
                 "text_only",
+                "--allow-release-ineligible-materialization-for-tests",
             ],
             cwd=ROOT,
             check=False,
@@ -2580,6 +2582,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 str(runs_dir),
                 "--route",
                 "text_only",
+                "--allow-release-ineligible-materialization-for-tests",
             ],
             cwd=ROOT,
             check=False,
@@ -2653,6 +2656,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 str(runs_dir),
                 "--route",
                 "text_only",
+                "--allow-release-ineligible-materialization-for-tests",
             ],
             cwd=ROOT,
             check=False,

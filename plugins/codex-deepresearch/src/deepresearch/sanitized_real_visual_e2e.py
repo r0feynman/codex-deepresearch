@@ -346,6 +346,7 @@ def _prepare_replay_run(
         vlm_provider=CODEX_INTERACTIVE_PROVIDER,
         max_results=max(8, candidate_count),
         max_images=fetched_artifacts,
+        _allow_release_ineligible_materialization_for_tests=True,
     )
     return Path(str(prepared["run_dir"]))
 

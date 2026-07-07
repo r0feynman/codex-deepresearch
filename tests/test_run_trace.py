@@ -20,7 +20,7 @@ from deepresearch import (  # noqa: E402
     fetch_claims,
     ingest_run,
     ingest_vision_observations,
-    prepare_run,
+    prepare_run as prepare_search_handoff_run,
     read_trace_records,
     synthesize_report,
     validate_trace_file,
@@ -28,6 +28,11 @@ from deepresearch import (  # noqa: E402
     verify_claims,
     enforce_guardrails,
 )
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
+    return prepare_search_handoff_run(*args, **kwargs)
 
 
 fetch_claims_module = importlib.import_module("deepresearch.fetch_claims")
@@ -112,13 +117,24 @@ class RunTraceTests(unittest.TestCase):
         validation = validate_trace_file(trace_path)
         self.assertTrue(validation.valid, validation.to_dict())
         records = read_trace_records(trace_path)
-        self.assertEqual(len(records), 1)
-        record = records[0]
+        self.assertGreaterEqual(len(records), 1)
+        for item in records:
+            self.assertTrue(validate_trace_record(item).valid, item)
+        record = next(
+            item for item in records if item.get("event_type") == "run_start"
+        )
         self.assertEqual(record["event_type"], "run_start")
         self.assertEqual(record["stage"], "planning")
         self.assertEqual(record["agent_role"], "planner")
         self.assertEqual(record["status"], "awaiting_search_results")
         self.assertIn("run_trace", record["artifacts"])
+        semantic_events = [
+            item["event_type"]
+            for item in records
+            if str(item.get("event_type", "")).startswith("semantic_")
+        ]
+        self.assertIn("semantic_oracle_request_created", semantic_events)
+        self.assertIn("semantic_oracle_locked", semantic_events)
 
         status = self.read_json(run_dir / "status.json")
         self.assertEqual(status["artifacts"]["run_trace"], str(trace_path))
@@ -163,8 +179,13 @@ class RunTraceTests(unittest.TestCase):
 
         trace_path = run_dir / "run_trace.jsonl"
         records = read_trace_records(trace_path)
+        lifecycle_records = [
+            record
+            for record in records
+            if not str(record.get("event_type", "")).startswith("semantic_")
+        ]
         self.assertEqual(
-            [record["stage"] for record in records],
+            [record["stage"] for record in lifecycle_records],
             [
                 "planning",
                 "ingest",

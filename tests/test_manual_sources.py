@@ -23,6 +23,7 @@ prepare_search_handoff_run = prepare_run
 
 def prepare_run(*args, **kwargs):
     kwargs.setdefault("angles", ["primary source discovery"])
+    kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
     return prepare_search_handoff_run(*args, **kwargs)
 
 

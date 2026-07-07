@@ -21,6 +21,33 @@ from deepresearch.vision_adapter import OpenAIResponsesVisionResult  # noqa: E40
 
 
 class InvocationRouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        original_prepare_run = invocation_router.prepare_run
+        original_run_skill_invocation = globals()["run_skill_invocation"]
+
+        def prepare_run_for_legacy_fixture(*args, **kwargs):
+            kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
+            return original_prepare_run(*args, **kwargs)
+
+        def run_skill_invocation_for_legacy_fixture(*args, **kwargs):
+            kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
+            return original_run_skill_invocation(*args, **kwargs)
+
+        patcher = mock.patch.object(
+            invocation_router,
+            "prepare_run",
+            side_effect=prepare_run_for_legacy_fixture,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        globals()["run_skill_invocation"] = run_skill_invocation_for_legacy_fixture
+        self.addCleanup(
+            lambda: globals().__setitem__(
+                "run_skill_invocation",
+                original_run_skill_invocation,
+            )
+        )
+
     def temp_runs_dir(self) -> Path:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)

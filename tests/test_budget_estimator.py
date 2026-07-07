@@ -17,11 +17,16 @@ from deepresearch import (  # noqa: E402
     BudgetCaps,
     BudgetEstimateError,
     estimate_budget,
-    prepare_run,
+    prepare_run as prepare_search_handoff_run,
     read_trace_records,
     resolve_config,
 )
 from deepresearch.modality_router import route_angles  # noqa: E402
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
+    return prepare_search_handoff_run(*args, **kwargs)
 
 
 class BudgetEstimatorTests(unittest.TestCase):
@@ -240,6 +245,7 @@ class BudgetEstimatorTests(unittest.TestCase):
                 "Non-finite cost cap",
                 "--angle",
                 "primary source discovery",
+                "--allow-release-ineligible-materialization-for-tests",
                 "--runs-dir",
                 str(runs_dir),
                 "--max-cost-usd",
@@ -292,6 +298,7 @@ class BudgetEstimatorTests(unittest.TestCase):
                 "Deep budget confirmation",
                 "--angle",
                 "primary source discovery",
+                "--allow-release-ineligible-materialization-for-tests",
                 "--runs-dir",
                 str(runs_dir),
                 "--budget",
@@ -322,6 +329,7 @@ class BudgetEstimatorTests(unittest.TestCase):
                 "visual_required",
                 "--angle",
                 "primary source discovery",
+                "--allow-release-ineligible-materialization-for-tests",
                 "--max-images",
                 "0",
             ],
@@ -365,6 +373,7 @@ class BudgetEstimatorTests(unittest.TestCase):
                 "Exhaustive without cost cap",
                 "--angle",
                 "primary source discovery",
+                "--allow-release-ineligible-materialization-for-tests",
                 "--runs-dir",
                 str(runs_dir),
                 "--budget",
@@ -403,7 +412,11 @@ class BudgetEstimatorTests(unittest.TestCase):
 
         estimate = json.loads((run_dir / "budget_estimate.json").read_text(encoding="utf-8"))
         status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
-        trace = read_trace_records(run_dir / "run_trace.jsonl")[0]
+        trace = next(
+            record
+            for record in read_trace_records(run_dir / "run_trace.jsonl")
+            if record.get("event_type") == "run_start"
+        )
         evidence = json.loads((run_dir / "evidence.json").read_text(encoding="utf-8"))
         search_tasks = json.loads((run_dir / "search_tasks.json").read_text(encoding="utf-8"))
         visual_tasks = json.loads((run_dir / "visual_tasks.json").read_text(encoding="utf-8"))

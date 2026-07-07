@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -343,6 +343,80 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(checks["validation_ok"])
         for artifact_name in checks["required_artifacts"]:
             self.assertIn(artifact_name, result["status_artifacts"])
+
+    def test_codex_semantic_text_run_requires_semantic_trace_index_proof(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "codex-semantic-bad-index",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        trace_path = run_dir / "run_trace.jsonl"
+        records = self.read_jsonl(trace_path)
+        for record in records:
+            if record.get("event_type") == "semantic_planner_request_created":
+                record["semantic_event_index"] = 2
+                record["order_validation"]["semantic_event_index"] = 2
+                break
+        self.write_jsonl(trace_path, records)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed", result)
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertTrue(
+            any(
+                failure.get("check") == "semantic_trace_ordering"
+                and failure.get("event") == "semantic_planner_request_created"
+                and failure.get("expected_semantic_event_index") == 3
+                for failure in failures
+            ),
+            failures,
+        )
+
+    def test_codex_semantic_text_run_requires_strict_semantic_trace_timestamps(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "codex-semantic-bad-timestamps",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        trace_path = run_dir / "run_trace.jsonl"
+        records = self.read_jsonl(trace_path)
+        shared_timestamp = records[0]["timestamp"]
+        for record in records:
+            if str(record.get("event_type", "")).startswith("semantic_"):
+                record["timestamp"] = shared_timestamp
+        self.write_jsonl(trace_path, records)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed", result)
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertTrue(
+            any(
+                failure.get("check") == "semantic_trace_ordering"
+                and "timestamps are not strictly increasing" in failure.get("detail", "")
+                for failure in failures
+            ),
+            failures,
+        )
 
     def test_codex_semantic_text_run_requires_complete_review_evidence(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -987,6 +1061,135 @@ class PublicBetaValidationTests(unittest.TestCase):
                 ("semantic_plan", "provenance"),
                 ("semantic_plan_review", "provenance"),
                 ("semantic_planner_validation", "provenance"),
+            }.issubset(provenance_failures),
+            failures,
+        )
+
+    def test_codex_semantic_text_run_rejects_fabricated_raw_artifacts_and_identity(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = {prompt["id"]: prompt for prompt in manifest["prompts"]}["pb-text-001"]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "fabricated-semantic-release",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            status="completed_serial_handoff",
+            ok=True,
+            semantic_planning="eligible",
+        )
+        fake_hash = "0" * 64
+
+        def strip_release_identity(provenance: dict[str, Any]) -> dict[str, Any]:
+            for field in (
+                "child_session_id",
+                "session_id",
+                "raw_response_id",
+                "codex_event_id",
+                "response_id",
+            ):
+                provenance.pop(field, None)
+            provenance["session_id_unavailable_reason"] = "fabricated unavailable reason"
+            return provenance
+
+        for filename in (
+            "semantic_expectation_oracle.json",
+            "semantic_plan.json",
+            "semantic_plan_review.json",
+            "semantic_planner_validation.json",
+        ):
+            path = run_dir / filename
+            payload = self.read_json(path)
+            payload["provenance"] = strip_release_identity(dict(payload["provenance"]))
+            payload["session_id"] = None
+            self.write_json(path, payload)
+
+        oracle_path = run_dir / "semantic_expectation_oracle.json"
+        oracle = self.read_json(oracle_path)
+        oracle_provenance = strip_release_identity(dict(oracle["oracle_provenance"]))
+        oracle_provenance.update(
+            {
+                "raw_request_path": "missing/oracle_request.json",
+                "raw_response_path": "missing/oracle_response.json",
+                "raw_request_hash": fake_hash,
+                "raw_request_artifact_hash": fake_hash,
+                "raw_response_hash": fake_hash,
+                "raw_response_artifact_hash": fake_hash,
+            }
+        )
+        oracle["oracle_provenance"] = oracle_provenance
+        oracle["raw_request_path"] = "missing/oracle_request.json"
+        oracle["raw_response_path"] = "missing/oracle_response.json"
+        oracle["raw_request_hash"] = fake_hash
+        oracle["raw_request_artifact_hash"] = fake_hash
+        oracle["raw_response_hash"] = fake_hash
+        oracle["raw_response_artifact_hash"] = fake_hash
+        self.write_json(oracle_path, oracle)
+
+        review_path = run_dir / "semantic_plan_review.json"
+        review = self.read_json(review_path)
+        reviewer_provenance = strip_release_identity(dict(review["reviewer_provenance"]))
+        reviewer_provenance.update(
+            {
+                "raw_request_path": "missing/reviewer_request.json",
+                "raw_response_path": "missing/reviewer_response.json",
+                "raw_request_hash": fake_hash,
+                "raw_request_artifact_hash": fake_hash,
+                "raw_response_hash": fake_hash,
+                "raw_response_artifact_hash": fake_hash,
+            }
+        )
+        review["semantic_fit_score"] = 9.2
+        review["blockers"] = []
+        review["substitute_implementation_check"] = {"passed": True, "checked": True}
+        review["verdict"] = "pass"
+        review["final_verdict"] = "pass"
+        review["non_negotiable_coverage_complete"] = True
+        review["reviewer_independence"] = {"independent": True, "status": "passed"}
+        review["reviewer_provenance"] = reviewer_provenance
+        review["reviewer_raw_request_path"] = "missing/reviewer_request.json"
+        review["reviewer_raw_response_path"] = "missing/reviewer_response.json"
+        review["reviewer_raw_request_hash"] = fake_hash
+        review["reviewer_raw_request_artifact_hash"] = fake_hash
+        review["reviewer_raw_response_hash"] = fake_hash
+        review["reviewer_raw_response_artifact_hash"] = fake_hash
+        self.write_json(review_path, review)
+
+        trace_path = run_dir / "run_trace.jsonl"
+        trace = self.read_jsonl(trace_path)
+        for record in trace:
+            if str(record.get("event_type", "")).startswith("semantic_"):
+                paths = record.get("semantic_artifact_paths")
+                hashes = record.get("artifact_hashes")
+                if isinstance(paths, dict) and isinstance(hashes, dict):
+                    for key in list(hashes):
+                        paths[key] = f"missing/{key}.json"
+                        hashes[key] = fake_hash
+        self.write_jsonl(trace_path, trace)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed", result)
+        failures = result["semantic_release_checks"]["failures"]
+        failure_checks = {failure.get("check") for failure in failures}
+        self.assertIn("semantic_raw_artifact", failure_checks)
+        self.assertIn("semantic_trace_ordering", failure_checks)
+        self.assertIn("oracle_provenance", failure_checks)
+        self.assertIn("reviewer_provenance", failure_checks)
+        provenance_failures = {
+            failure.get("artifact")
+            for failure in failures
+            if failure.get("check") == "semantic_artifact_integrity"
+            and failure.get("field") == "provenance"
+        }
+        self.assertTrue(
+            {
+                "semantic_expectation_oracle",
+                "semantic_plan",
+                "semantic_plan_review",
+                "semantic_planner_validation",
             }.issubset(provenance_failures),
             failures,
         )
@@ -2422,7 +2625,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures: list[dict[str, Any]] = []
             blockers: list[dict[str, Any]] = []
             score: float | None = 9.4
-            verdict = "passed"
+            verdict = "pass"
         elif mode == "heuristic_fallback":
             planner_mode = "heuristic_template_fallback"
             eligible = False
@@ -2593,11 +2796,121 @@ class PublicBetaValidationTests(unittest.TestCase):
             "session_id_unavailable_reason": session_id_unavailable_reason,
             "semantic_release_eligible": metadata["semantic_release_eligible"],
         }
-        raw_dir = run_dir / "semantic_raw"
-        raw_request_path = raw_dir / "semantic_request.json"
-        raw_response_path = raw_dir / "semantic_response.json"
+        oracle_raw_dir = run_dir / "semantic_oracle_raw"
+        planner_raw_dir = run_dir / "semantic_raw"
+        reviewer_raw_dir = run_dir / "semantic_reviewer_raw"
+        oracle_raw_request_path = oracle_raw_dir / "oracle_request.json"
+        oracle_raw_response_path = oracle_raw_dir / "oracle_response.json"
+        planner_raw_request_path = planner_raw_dir / "semantic_request.json"
+        planner_raw_response_path = planner_raw_dir / "semantic_response.json"
+        reviewer_raw_request_path = reviewer_raw_dir / "reviewer_request.json"
+        reviewer_raw_response_path = reviewer_raw_dir / "reviewer_response.json"
+        oracle_session_id = f"{run_dir.name}-oracle-session"
+        planner_session_id = f"{run_dir.name}-planner-session"
+        reviewer_session_id = f"{run_dir.name}-reviewer-session"
+
+        def payload_hash(payload: dict[str, Any]) -> str:
+            return hashlib.sha256(
+                json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+            ).hexdigest()
+
+        def write_raw_request(
+            path: Path,
+            payload: dict[str, Any],
+        ) -> tuple[str, str]:
+            content_hash = payload_hash(payload)
+            payload = {
+                **payload,
+                "raw_request_content_hash": content_hash,
+                "raw_request_hash": content_hash,
+            }
+            self.write_json(path, payload)
+            artifact_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            return content_hash, artifact_hash
+
+        oracle_requirements = [
+            {
+                "requirement_id": f"req_{index:03d}",
+                "description": f"Resolve {angle['title']} for the prompt.",
+                "covered_by_angle_ids": [angle["angle_id"]],
+                "non_negotiable": True,
+            }
+            for index, angle in enumerate(angles, start=1)
+        ]
+        expected_modalities = (
+            ["text", "visual"] if prompt["route"] == "visual_required" else ["text"]
+        )
+        oracle_contract = {
+            "oracle_requirement_map": oracle_requirements,
+            "question_scope": question_scope,
+            "bounded_task_range": {"min_tasks": 3, "max_tasks": 6},
+            "expected_entities": prompt_terms[:6] or [subject],
+            "expected_constraints": [
+                "Use public-safe evidence.",
+                "Cite source-backed claims.",
+            ],
+            "expected_modalities": expected_modalities,
+            "required_angles": [angle["title"] for angle in angles],
+            "forbidden_angles": [
+                "generic web search only",
+                "Codex implementation internals",
+            ],
+            "forbidden_internal_implementation_terms": [
+                "hidden template",
+                "keyword fallback",
+                "fixed angle inventory",
+            ],
+            "expected_report_shape": [
+                "source-grounded findings",
+                "comparison criteria",
+                "caveats and limits",
+            ],
+            "language": "en",
+        }
+        oracle_raw_request_content_hash, oracle_raw_request_artifact_hash = write_raw_request(
+            oracle_raw_request_path,
+            {
+                "schema_version": "codex-deepresearch.semantic-oracle.v0",
+                "artifact_type": "semantic_oracle_raw_request",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "question": prompt["prompt"],
+                "question_scope": question_scope,
+                "provided_sources": [],
+                "provided_images": [],
+                "oracle_instructions": [
+                    "Create expectations from the raw user question only.",
+                    "Do not inspect the planner output.",
+                ],
+            },
+        )
         self.write_json(
-            raw_request_path,
+            oracle_raw_response_path,
+            {
+                "schema_version": "codex-deepresearch.semantic-oracle.v0",
+                "artifact_type": "semantic_oracle_raw_response",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "raw_request_content_hash": oracle_raw_request_content_hash,
+                "raw_request_artifact_hash": oracle_raw_request_artifact_hash,
+                "raw_request_hash": oracle_raw_request_content_hash,
+                "oracle": oracle_contract,
+                "provenance": {
+                    "adapter_kind": "codex_semantic_oracle",
+                    "child_session_id": oracle_session_id,
+                    "raw_request_content_hash": oracle_raw_request_content_hash,
+                    "raw_request_artifact_hash": oracle_raw_request_artifact_hash,
+                    "raw_request_hash": oracle_raw_request_content_hash,
+                    "independent_of_planner": True,
+                    "non_release_fixture": False,
+                },
+            },
+        )
+        oracle_raw_response_hash = hashlib.sha256(
+            oracle_raw_response_path.read_bytes()
+        ).hexdigest()
+        planner_raw_request_content_hash, planner_raw_request_artifact_hash = write_raw_request(
+            planner_raw_request_path,
             {
                 "schema_version": "codex-deepresearch.semantic-planner.v0",
                 "artifact_type": "semantic_planner_raw_request",
@@ -2612,12 +2925,15 @@ class PublicBetaValidationTests(unittest.TestCase):
             },
         )
         self.write_json(
-            raw_response_path,
+            planner_raw_response_path,
             {
                 "schema_version": "codex-deepresearch.semantic-planner.v0",
                 "artifact_type": "semantic_planner_raw_response",
                 "run_id": run_dir.name,
                 "created_at": timestamp,
+                "raw_request_content_hash": planner_raw_request_content_hash,
+                "raw_request_artifact_hash": planner_raw_request_artifact_hash,
+                "raw_request_hash": planner_raw_request_content_hash,
                 "planner_mode": metadata["planner_mode"],
                 "semantic_release_eligible": metadata["semantic_release_eligible"],
                 "semantic_plan": semantic_plan,
@@ -2625,98 +2941,403 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "provenance": provenance,
             },
         )
-        raw_request_hash = hashlib.sha256(raw_request_path.read_bytes()).hexdigest()
-        raw_response_hash = hashlib.sha256(raw_response_path.read_bytes()).hexdigest()
-        base = {
-            "schema_version": "codex-deepresearch.semantic-planner.v0",
-            "run_id": run_dir.name,
-            "prompt_id": prompt["id"],
-            "prompt_hash": self.prompt_hash(prompt["prompt"]),
-            "suite_id": suite_id,
-            "original_question": prompt["prompt"],
-            "execution_mode": "codex-plugin",
-            "runner_mode": "full-runner",
-            "created_at": timestamp,
-            "planner_mode": metadata["planner_mode"],
-            "semantic_release_eligible": metadata["semantic_release_eligible"],
-            "question_scope": question_scope,
-            "raw_request_path": str(raw_request_path),
-            "raw_response_path": str(raw_response_path),
-            "raw_request_hash": raw_request_hash,
-            "raw_response_hash": raw_response_hash,
-            "provenance": provenance,
-            "template_use": template_use,
-            "session_id": None,
-            "session_id_unavailable_reason": session_id_unavailable_reason,
+        planner_raw_response_hash = hashlib.sha256(
+            planner_raw_response_path.read_bytes()
+        ).hexdigest()
+        planner_provenance = {
+            **provenance,
+            "session_id": planner_session_id,
+            "child_session_id": planner_session_id,
+            "raw_request_content_hash": planner_raw_request_content_hash,
+            "raw_request_artifact_hash": planner_raw_request_artifact_hash,
+            "raw_request_hash": planner_raw_request_artifact_hash,
+            "raw_response_artifact_hash": planner_raw_response_hash,
+            "raw_response_hash": planner_raw_response_hash,
         }
-        self.write_json(
-            run_dir / "semantic_expectation_oracle.json",
+        oracle_provenance = {
+            **provenance,
+            "adapter_kind": "codex_semantic_oracle",
+            "oracle_source": "codex_semantic",
+            "session_id": oracle_session_id,
+            "child_session_id": oracle_session_id,
+            "raw_request_path": str(oracle_raw_request_path),
+            "raw_response_path": str(oracle_raw_response_path),
+            "raw_request_content_hash": oracle_raw_request_content_hash,
+            "raw_request_artifact_hash": oracle_raw_request_artifact_hash,
+            "raw_request_hash": oracle_raw_request_artifact_hash,
+            "raw_response_artifact_hash": oracle_raw_response_hash,
+            "raw_response_hash": oracle_raw_response_hash,
+            "plan_visible_to_oracle": False,
+            "used_production_planner_output": False,
+            "used_hidden_template_class": False,
+            "used_fixed_angle_inventory": False,
+            "independent_of_planner": True,
+            "non_release_fixture": False,
+        }
+
+        def artifact_base(
+            *,
+            raw_request_path: Path,
+            raw_response_path: Path,
+            raw_request_hash: str,
+            raw_response_hash: str,
+            artifact_provenance: dict[str, Any],
+        ) -> dict[str, Any]:
+            return {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "run_id": run_dir.name,
+                "prompt_id": prompt["id"],
+                "prompt_hash": self.prompt_hash(prompt["prompt"]),
+                "suite_id": suite_id,
+                "original_question": prompt["prompt"],
+                "execution_mode": "codex-plugin",
+                "runner_mode": "full-runner",
+                "created_at": timestamp,
+                "planner_mode": metadata["planner_mode"],
+                "semantic_release_eligible": metadata["semantic_release_eligible"],
+                "question_scope": question_scope,
+                "raw_request_path": str(raw_request_path),
+                "raw_response_path": str(raw_response_path),
+                "raw_request_content_hash": artifact_provenance.get(
+                    "raw_request_content_hash"
+                ),
+                "raw_request_artifact_hash": artifact_provenance.get(
+                    "raw_request_artifact_hash",
+                    raw_request_hash,
+                ),
+                "raw_request_hash": raw_request_hash,
+                "raw_response_artifact_hash": artifact_provenance.get(
+                    "raw_response_artifact_hash",
+                    raw_response_hash,
+                ),
+                "raw_response_hash": raw_response_hash,
+                "provenance": artifact_provenance,
+                "template_use": template_use,
+                "session_id": artifact_provenance.get("session_id"),
+                "session_id_unavailable_reason": session_id_unavailable_reason,
+            }
+
+        oracle_base = artifact_base(
+            raw_request_path=oracle_raw_request_path,
+            raw_response_path=oracle_raw_response_path,
+            raw_request_hash=oracle_raw_request_artifact_hash,
+            raw_response_hash=oracle_raw_response_hash,
+            artifact_provenance=oracle_provenance,
+        )
+        planner_base = artifact_base(
+            raw_request_path=planner_raw_request_path,
+            raw_response_path=planner_raw_response_path,
+            raw_request_hash=planner_raw_request_artifact_hash,
+            raw_response_hash=planner_raw_response_hash,
+            artifact_provenance=planner_provenance,
+        )
+        oracle_payload = {
+            **oracle_base,
+            "artifact_type": "semantic_expectation_oracle",
+            **oracle_contract,
+            "oracle_provenance": oracle_provenance,
+            "plan_visible_to_oracle": False,
+            "used_production_planner_output": False,
+            "used_hidden_template_class": False,
+            "used_fixed_angle_inventory": False,
+        }
+        plan_payload = {
+            **planner_base,
+            "artifact_type": "semantic_plan",
+            "semantic_plan": semantic_plan,
+            "angles": angles,
+            "requirement_coverage_map": [
+                {
+                    "requirement_id": f"req_{index:03d}",
+                    "angle_id": angle["angle_id"],
+                    "coverage_status": "covered",
+                    "non_negotiable": True,
+                }
+                for index, angle in enumerate(angles, start=1)
+            ],
+        }
+        self.write_json(run_dir / "semantic_expectation_oracle.json", oracle_payload)
+        self.write_json(run_dir / "semantic_plan.json", plan_payload)
+        oracle_hash = hashlib.sha256(
+            (run_dir / "semantic_expectation_oracle.json").read_bytes()
+        ).hexdigest()
+        semantic_plan_hash = hashlib.sha256(
+            (run_dir / "semantic_plan.json").read_bytes()
+        ).hexdigest()
+        reviewer_raw_request_content_hash, reviewer_raw_request_artifact_hash = write_raw_request(
+            reviewer_raw_request_path,
             {
-                **base,
-                "artifact_type": "semantic_expectation_oracle",
-                "oracle_requirement_map": [
-                    {
-                        "requirement_id": f"req_{index:03d}",
-                        "description": f"Resolve {angle['title']} for the prompt.",
-                        "covered_by_angle_ids": [angle["angle_id"]],
-                    }
-                    for index, angle in enumerate(angles, start=1)
+                "schema_version": "codex-deepresearch.semantic-reviewer.v0",
+                "artifact_type": "semantic_reviewer_raw_request",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "question": prompt["prompt"],
+                "oracle_path": str(run_dir / "semantic_expectation_oracle.json"),
+                "oracle_hash": oracle_hash,
+                "semantic_plan_path": str(run_dir / "semantic_plan.json"),
+                "semantic_plan_hash": semantic_plan_hash,
+                "review_instructions": [
+                    "Review the plan against the locked oracle.",
+                    "Reject substitute implementation or subject drift.",
                 ],
             },
         )
         self.write_json(
-            run_dir / "semantic_plan.json",
+            reviewer_raw_response_path,
             {
-                **base,
-                "artifact_type": "semantic_plan",
-                "semantic_plan": semantic_plan,
-                "angles": angles,
-                "requirement_coverage_map": [
-                    {
-                        "requirement_id": f"req_{index:03d}",
-                        "angle_id": angle["angle_id"],
-                        "coverage_status": "covered",
-                    }
-                    for index, angle in enumerate(angles, start=1)
-                ],
-            },
-        )
-        self.write_json(
-            run_dir / "semantic_plan_review.json",
-            {
-                **base,
-                "artifact_type": "semantic_plan_review",
+                "schema_version": "codex-deepresearch.semantic-reviewer.v0",
+                "artifact_type": "semantic_reviewer_raw_response",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "raw_request_content_hash": reviewer_raw_request_content_hash,
+                "raw_request_artifact_hash": reviewer_raw_request_artifact_hash,
+                "raw_request_hash": reviewer_raw_request_content_hash,
                 "semantic_fit_score": metadata["semantic_fit_score"],
                 "blockers": list(metadata["blockers"]),
                 "warnings": [],
-                "reviewer_independence": {
-                    "independent": metadata["semantic_release_eligible"],
-                    "status": (
-                        "passed"
-                        if metadata["semantic_release_eligible"]
-                        else "release_ineligible"
-                    ),
+                "verdict": metadata["final_verdict"],
+                "provenance": {
+                    "adapter_kind": "codex_semantic_reviewer",
+                    "child_session_id": reviewer_session_id,
+                    "raw_request_content_hash": reviewer_raw_request_content_hash,
+                    "raw_request_artifact_hash": reviewer_raw_request_artifact_hash,
+                    "raw_request_hash": reviewer_raw_request_content_hash,
+                    "independent_of_oracle": True,
+                    "independent_of_planner": True,
+                    "non_release_fixture": False,
                 },
-                "substitute_implementation_check": {
-                    "passed": metadata["semantic_release_eligible"],
-                    "checked": True,
-                },
-                "final_verdict": metadata["final_verdict"],
             },
         )
-        self.write_json(
-            run_dir / "semantic_planner_validation.json",
-            {
-                **base,
-                "fixture_id": run_dir.name,
-                "question_class": "general",
-                "broad_question": False,
-                "angle_count": len(angles),
-                "task_count": len(angles),
-                "failures": list(metadata["failures"]),
-                "ok": not metadata["failures"],
-            },
+        reviewer_raw_response_hash = hashlib.sha256(
+            reviewer_raw_response_path.read_bytes()
+        ).hexdigest()
+        reviewer_provenance = {
+            **provenance,
+            "adapter_kind": "codex_semantic_reviewer",
+            "reviewer_source": "codex_semantic",
+            "session_id": reviewer_session_id,
+            "child_session_id": reviewer_session_id,
+            "raw_request_path": str(reviewer_raw_request_path),
+            "raw_response_path": str(reviewer_raw_response_path),
+            "raw_request_content_hash": reviewer_raw_request_content_hash,
+            "raw_request_artifact_hash": reviewer_raw_request_artifact_hash,
+            "raw_request_hash": reviewer_raw_request_artifact_hash,
+            "raw_response_artifact_hash": reviewer_raw_response_hash,
+            "raw_response_hash": reviewer_raw_response_hash,
+            "oracle_hash": oracle_hash,
+            "semantic_plan_hash": semantic_plan_hash,
+            "independent_of_oracle": True,
+            "independent_of_planner": True,
+            "non_release_fixture": False,
+        }
+        reviewer_base = artifact_base(
+            raw_request_path=reviewer_raw_request_path,
+            raw_response_path=reviewer_raw_response_path,
+            raw_request_hash=reviewer_raw_request_artifact_hash,
+            raw_response_hash=reviewer_raw_response_hash,
+            artifact_provenance=reviewer_provenance,
         )
+        review_payload = {
+            **reviewer_base,
+            "artifact_type": "semantic_plan_review",
+            "semantic_fit_score": metadata["semantic_fit_score"],
+            "blockers": list(metadata["blockers"]),
+            "warnings": [],
+            "substitute_implementation_check": {
+                "passed": metadata["semantic_release_eligible"],
+                "checked": True,
+            },
+            "oracle_hash": oracle_hash,
+            "semantic_expectation_oracle_hash": oracle_hash,
+            "semantic_plan_hash": semantic_plan_hash,
+            "reviewer_raw_request_path": str(reviewer_raw_request_path),
+            "reviewer_raw_response_path": str(reviewer_raw_response_path),
+            "reviewer_raw_request_content_hash": reviewer_raw_request_content_hash,
+            "reviewer_raw_request_artifact_hash": reviewer_raw_request_artifact_hash,
+            "reviewer_raw_request_hash": reviewer_raw_request_artifact_hash,
+            "reviewer_raw_response_artifact_hash": reviewer_raw_response_hash,
+            "reviewer_raw_response_hash": reviewer_raw_response_hash,
+            "reviewer_provenance": reviewer_provenance,
+            "verdict": metadata["final_verdict"],
+            "final_verdict": metadata["final_verdict"],
+            "non_negotiable_coverage_complete": metadata["semantic_release_eligible"],
+            "reviewer_independence": {
+                "independent": metadata["semantic_release_eligible"],
+                "status": (
+                    "passed"
+                    if metadata["semantic_release_eligible"]
+                    else "release_ineligible"
+                ),
+                "oracle_child_session_id": oracle_session_id,
+                "planner_child_session_id": planner_session_id,
+                "reviewer_child_session_id": reviewer_session_id,
+            },
+            "prd_score_dimensions": {
+                "intent_preservation": 9.6,
+                "required_entities_constraints": 9.4,
+                "angle_relevance_diversity": 9.3,
+                "modality_visual_routing": 9.2,
+                "forbidden_drift_avoidance": 9.5,
+                "executable_bounded_tasks": 9.4,
+            },
+        }
+        self.write_json(run_dir / "semantic_plan_review.json", review_payload)
+        review_hash = hashlib.sha256(
+            (run_dir / "semantic_plan_review.json").read_bytes()
+        ).hexdigest()
+        validation_payload = {
+            **planner_base,
+            "artifact_type": "semantic_planner_validation",
+            "fixture_id": run_dir.name,
+            "question_class": "general",
+            "broad_question": False,
+            "angle_count": len(angles),
+            "task_count": len(angles),
+            "failures": list(metadata["failures"]),
+            "ok": not metadata["failures"],
+            "semantic_review": {
+                "semantic_fit_score": metadata["semantic_fit_score"],
+                "verdict": metadata["final_verdict"],
+                "blocker_count": len(metadata["blockers"]),
+                "oracle_hash": oracle_hash,
+                "review_hash": review_hash,
+            },
+        }
+        self.write_json(run_dir / "semantic_planner_validation.json", validation_payload)
+        validation_hash = hashlib.sha256(
+            (run_dir / "semantic_planner_validation.json").read_bytes()
+        ).hexdigest()
+
+        required_order = [
+            "semantic_oracle_request_created",
+            "semantic_oracle_locked",
+            "semantic_planner_request_created",
+            "semantic_plan_created",
+            "semantic_reviewer_request_created",
+            "semantic_review_completed",
+        ]
+
+        def semantic_trace_timestamp(event_index: int) -> str:
+            raw = timestamp[:-1] + "+00:00" if timestamp.endswith("Z") else timestamp
+            base = datetime.fromisoformat(raw)
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
+            return (
+                base.astimezone(timezone.utc)
+                + timedelta(milliseconds=event_index)
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+        def trace_record(
+            event_type: str,
+            *,
+            event_index: int,
+            artifact_hashes: dict[str, str],
+            semantic_artifact_paths: dict[str, str],
+        ) -> dict[str, Any]:
+            return {
+                "schema_version": "codex-deepresearch.run-trace.v0",
+                "run_id": run_dir.name,
+                "event_id": f"{run_dir.name}-{event_index:03d}-{event_type}",
+                "event_type": event_type,
+                "timestamp": semantic_trace_timestamp(event_index),
+                "stage": "planning",
+                "agent_role": "semantic_gate",
+                "status": event_type,
+                "prompt_summary": prompt["prompt"][:200],
+                "output_preview": event_type,
+                "artifacts": {"run_trace": str(run_dir / "run_trace.jsonl")},
+                "semantic_event_index": event_index,
+                "artifact_hashes": artifact_hashes,
+                "semantic_artifact_paths": semantic_artifact_paths,
+                "order_validation": {
+                    "required_order": required_order,
+                    "current_event": event_type,
+                    "semantic_event_index": event_index,
+                },
+            }
+
+        self.write_jsonl(
+            run_dir / "run_trace.jsonl",
+            [
+                trace_record(
+                    "semantic_oracle_request_created",
+                    event_index=1,
+                    artifact_hashes={
+                        "semantic_oracle_raw_request": oracle_raw_request_artifact_hash,
+                    },
+                    semantic_artifact_paths={
+                        "semantic_oracle_raw_request": str(oracle_raw_request_path),
+                    },
+                ),
+                trace_record(
+                    "semantic_oracle_locked",
+                    event_index=2,
+                    artifact_hashes={
+                        "semantic_expectation_oracle": oracle_hash,
+                        "semantic_oracle_raw_response": oracle_raw_response_hash,
+                    },
+                    semantic_artifact_paths={
+                        "semantic_expectation_oracle": str(
+                            run_dir / "semantic_expectation_oracle.json"
+                        ),
+                        "semantic_oracle_raw_response": str(oracle_raw_response_path),
+                    },
+                ),
+                trace_record(
+                    "semantic_planner_request_created",
+                    event_index=3,
+                    artifact_hashes={
+                        "semantic_planner_raw_request": planner_raw_request_artifact_hash,
+                    },
+                    semantic_artifact_paths={
+                        "semantic_planner_raw_request": str(planner_raw_request_path),
+                    },
+                ),
+                trace_record(
+                    "semantic_plan_created",
+                    event_index=4,
+                    artifact_hashes={
+                        "semantic_plan": semantic_plan_hash,
+                        "semantic_planner_raw_response": planner_raw_response_hash,
+                    },
+                    semantic_artifact_paths={
+                        "semantic_plan": str(run_dir / "semantic_plan.json"),
+                        "semantic_planner_raw_response": str(planner_raw_response_path),
+                    },
+                ),
+                trace_record(
+                    "semantic_reviewer_request_created",
+                    event_index=5,
+                    artifact_hashes={
+                        "semantic_reviewer_raw_request": reviewer_raw_request_artifact_hash,
+                    },
+                    semantic_artifact_paths={
+                        "semantic_reviewer_raw_request": str(reviewer_raw_request_path),
+                    },
+                ),
+                trace_record(
+                    "semantic_review_completed",
+                    event_index=6,
+                    artifact_hashes={
+                        "semantic_plan_review": review_hash,
+                        "semantic_reviewer_raw_response": reviewer_raw_response_hash,
+                        "semantic_planner_validation": validation_hash,
+                    },
+                    semantic_artifact_paths={
+                        "semantic_plan_review": str(
+                            run_dir / "semantic_plan_review.json"
+                        ),
+                        "semantic_reviewer_raw_response": str(
+                            reviewer_raw_response_path
+                        ),
+                        "semantic_planner_validation": str(
+                            run_dir / "semantic_planner_validation.json"
+                        ),
+                    },
+                ),
+            ],
+        )
+        return
 
     def write_visual_run(
         self,
