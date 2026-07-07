@@ -341,11 +341,17 @@ def blocked_semantic_planner_plan(
     raw_request_payload: Mapping[str, Any] | None = None,
     raw_response_payload: Mapping[str, Any] | None = None,
     planner_provenance: Mapping[str, Any] | None = None,
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> SemanticPlan:
     """Return a release-ineligible blocked semantic-planner-unavailable stub."""
 
     normalized_question = " ".join(question.strip().split())
     question_class = classify_question(normalized_question)
+    diagnostic_payload = {
+        **_fallback_diagnostics(PLANNER_MODE_BLOCKED),
+        **dict(diagnostics or {}),
+        "blocked_reason": reason,
+    }
     return SemanticPlan(
         schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
         question_class=question_class,
@@ -358,10 +364,7 @@ def blocked_semantic_planner_plan(
         planner_mode=PLANNER_MODE_BLOCKED,
         semantic_release_eligible=False,
         status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
-        diagnostics={
-            **_fallback_diagnostics(PLANNER_MODE_BLOCKED),
-            "blocked_reason": reason,
-        },
+        diagnostics=diagnostic_payload,
         raw_request_payload=dict(raw_request_payload or {}),
         raw_response_payload=dict(raw_response_payload or {}),
     )
@@ -420,17 +423,28 @@ def codex_semantic_candidate_plan(
             ),
             failure_category="adapter_unavailable",
         )
+    parsed_raw_response: dict[str, Any] | None = None
     try:
         raw_response = _structured_codex_adapter_response(
             raw_request=raw_request,
             adapter_response=adapter_response,
         )
+        parsed_raw_response = raw_response
         candidate = _candidate_plan_from_adapter_response(raw_response)
+        candidate_validation = _codex_semantic_candidate_validation(
+            original_question=original_question,
+            candidate=candidate,
+        )
+        raw_response["candidate_validation"] = candidate_validation
+        if candidate_validation.get("ok") is not True:
+            raise SemanticPlannerAdapterUnavailable(
+                _candidate_validation_blocked_reason(candidate_validation)
+            )
     except SemanticPlannerAdapterUnavailable as exc:
         return _blocked_codex_semantic_adapter_plan(
             question=original_question,
             raw_request=raw_request,
-            raw_response=adapter_response,
+            raw_response=parsed_raw_response or adapter_response,
             reason=str(exc) or "Codex semantic planner adapter returned invalid output.",
             failure_category="adapter_invalid_response",
         )
@@ -605,6 +619,11 @@ def _blocked_codex_semantic_adapter_plan(
     failure_category: str,
     raw_response: Mapping[str, Any] | None = None,
 ) -> SemanticPlan:
+    diagnostic_payload = _blocked_codex_adapter_diagnostics(
+        failure_category=failure_category,
+        reason=reason,
+        raw_response=raw_response,
+    )
     blocked_response = {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "artifact_type": "semantic_planner_raw_response",
@@ -615,6 +634,7 @@ def _blocked_codex_semantic_adapter_plan(
         "status": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
         "failure_category": failure_category,
         "blocked_reason": reason,
+        "diagnostics": diagnostic_payload,
         "adapter_response": dict(raw_response or {}),
         "provenance": {
             "planner_mode": PLANNER_MODE_BLOCKED,
@@ -648,7 +668,40 @@ def _blocked_codex_semantic_adapter_plan(
         raw_request_payload=raw_request,
         raw_response_payload=blocked_response,
         planner_provenance=provenance,
+        diagnostics=diagnostic_payload,
     )
+
+
+def _blocked_codex_adapter_diagnostics(
+    *,
+    failure_category: str,
+    reason: str,
+    raw_response: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "failure_category": failure_category,
+        "adapter_response_received": raw_response is not None,
+        "adapter_invalid_response_reason": reason,
+    }
+    if not raw_response:
+        return diagnostics
+    candidate_validation = raw_response.get("candidate_validation")
+    if isinstance(candidate_validation, Mapping):
+        failures = candidate_validation.get("failures")
+        failure_codes = [
+            str(failure.get("code"))
+            for failure in failures
+            if isinstance(failure, Mapping) and failure.get("code")
+        ] if isinstance(failures, list) else []
+        diagnostics["candidate_validation"] = dict(candidate_validation)
+        diagnostics["candidate_validation_failure_codes"] = failure_codes
+        diagnostics["candidate_validation_failure_count"] = int(
+            candidate_validation.get("failure_count") or len(failure_codes)
+        )
+    diagnostics["adapter_response_preview"] = _preview_text(
+        json.dumps(dict(raw_response), ensure_ascii=False, sort_keys=True)
+    )
+    return diagnostics
 
 
 def _structured_codex_adapter_response(
@@ -733,6 +786,49 @@ def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> di
             "Codex semantic candidate_plan must include non-empty bounded_tasks"
         )
     return candidate_plan
+
+
+def _codex_semantic_candidate_validation(
+    *,
+    original_question: str,
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        validation = validate_semantic_candidate_plan(
+            original_question=original_question,
+            plan=candidate,
+        )
+    except Exception as exc:  # pragma: no cover - defensive boundary guard
+        validation = {
+            "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+            "planner_mode": candidate.get("planner_mode"),
+            "semantic_release_eligible": bool(
+                candidate.get("semantic_release_eligible")
+            ),
+            "failure_count": 1,
+            "failures": [
+                {
+                    "code": "candidate_validation_exception",
+                    "exception_type": exc.__class__.__name__,
+                    "message": str(exc),
+                }
+            ],
+            "ok": False,
+        }
+    return dict(validation)
+
+
+def _candidate_validation_blocked_reason(validation: Mapping[str, Any]) -> str:
+    failures = validation.get("failures")
+    failure_codes = [
+        str(failure.get("code"))
+        for failure in failures
+        if isinstance(failure, Mapping) and failure.get("code")
+    ] if isinstance(failures, list) else []
+    reason = "Codex semantic candidate_plan failed semantic validation"
+    if failure_codes:
+        reason += ": " + ", ".join(failure_codes[:8])
+    return reason
 
 
 def _adapter_model_or_surface(raw_response: Mapping[str, Any]) -> str:
@@ -1026,17 +1122,45 @@ def validate_semantic_candidate_plan(
 
     failures: list[dict[str, Any]] = []
     question = original_question.strip()
+    raw_requirements = plan.get("requirement_coverage_map", [])
+    if not isinstance(raw_requirements, list):
+        failures.append({"code": "requirement_coverage_map_not_list"})
+        raw_requirements = []
     requirements = [
         requirement
-        for requirement in plan.get("requirement_coverage_map", [])
+        for requirement in raw_requirements
         if isinstance(requirement, Mapping)
     ]
+    raw_angles = plan.get("angles", [])
+    if not isinstance(raw_angles, list):
+        failures.append({"code": "candidate_angles_not_list"})
+        raw_angles = []
     angles = [
-        angle for angle in plan.get("angles", []) if isinstance(angle, Mapping)
+        angle for angle in raw_angles if isinstance(angle, Mapping)
     ]
+    for index, angle in enumerate(raw_angles, start=1):
+        if not isinstance(angle, Mapping):
+            failures.append(
+                {
+                    "code": "semantic_angle_not_object",
+                    "angle_index": index,
+                }
+            )
+    raw_tasks = plan.get("bounded_tasks", [])
+    if not isinstance(raw_tasks, list):
+        failures.append({"code": "candidate_bounded_tasks_not_list"})
+        raw_tasks = []
     tasks = [
-        task for task in plan.get("bounded_tasks", []) if isinstance(task, Mapping)
+        task for task in raw_tasks if isinstance(task, Mapping)
     ]
+    for index, task in enumerate(raw_tasks, start=1):
+        if not isinstance(task, Mapping):
+            failures.append(
+                {
+                    "code": "bounded_task_not_object",
+                    "task_index": index,
+                }
+            )
     scope = str(plan.get("question_scope") or "")
     if scope == "broad" and not (5 <= len(angles) <= 8):
         failures.append({"code": "broad_angle_count_out_of_range"})
@@ -1111,6 +1235,54 @@ def validate_semantic_candidate_plan(
                         "angle_id": angle_id,
                     }
                 )
+    required_angle_fields = (
+        "angle_id",
+        "title",
+        "research_question",
+        "why_this_angle_matters",
+        "included_scope",
+        "excluded_scope",
+        "route",
+        "evidence_need",
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "search_queries",
+        "success_criteria",
+        "report_section",
+        "risk_or_contradiction_checks",
+    )
+    required_angle_list_fields = (
+        "included_scope",
+        "excluded_scope",
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "search_queries",
+        "success_criteria",
+        "risk_or_contradiction_checks",
+    )
+    for angle in angles:
+        angle_id = angle.get("angle_id")
+        for field_name in required_angle_fields:
+            if field_name not in angle:
+                failures.append(
+                    {
+                        "code": "semantic_angle_missing_field",
+                        "angle_id": angle_id,
+                        "field": field_name,
+                    }
+                )
+        for field_name in required_angle_list_fields:
+            if field_name in angle and not isinstance(angle.get(field_name), list):
+                failures.append(
+                    {
+                        "code": "semantic_angle_invalid_field_type",
+                        "angle_id": angle_id,
+                        "field": field_name,
+                        "expected_type": "list",
+                    }
+                )
     required_task_fields = (
         "task_id",
         "angle_id",
@@ -1126,6 +1298,12 @@ def validate_semantic_candidate_plan(
         "max_images",
         "done_condition",
     )
+    required_task_list_fields = (
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "success_criteria",
+    )
     for task in tasks:
         for field_name in required_task_fields:
             if field_name not in task:
@@ -1136,6 +1314,25 @@ def validate_semantic_candidate_plan(
                         "field": field_name,
                     }
                 )
+        for field_name in required_task_list_fields:
+            if field_name in task and not isinstance(task.get(field_name), list):
+                failures.append(
+                    {
+                        "code": "bounded_task_invalid_field_type",
+                        "task_id": task.get("task_id"),
+                        "field": field_name,
+                        "expected_type": "list",
+                    }
+                )
+        if "source_policy" in task and not isinstance(task.get("source_policy"), Mapping):
+            failures.append(
+                {
+                    "code": "bounded_task_invalid_field_type",
+                    "task_id": task.get("task_id"),
+                    "field": "source_policy",
+                    "expected_type": "object",
+                }
+            )
         angle_title = next(
             (
                 str(angle.get("title") or "")

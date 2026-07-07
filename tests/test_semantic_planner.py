@@ -434,6 +434,48 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("semantic_release_ineligible", codes)
         self.assertNotIn("release_ineligible_planner_mode", codes)
 
+    def assert_invalid_adapter_response_blocked(
+        self,
+        result: dict,
+        *,
+        expected_failure_codes: set[str],
+    ) -> None:
+        run_dir = Path(result["run_dir"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan_artifact = self.load_json(run_dir / "semantic_plan.json")
+        semantic_plan = semantic_plan_artifact["semantic_plan"]
+
+        self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(result["semantic_planning_status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(result["planner_mode"], PLANNER_MODE_BLOCKED)
+        self.assertFalse(result["semantic_release_eligible"])
+        self.assertEqual(evidence["semantic_angles"], [])
+        self.assertEqual(evidence["search_tasks"], [])
+        self.assertFalse((run_dir / "search_tasks.json").exists())
+        self.assertFalse((run_dir / "visual_tasks.json").exists())
+        self.assertFalse((run_dir / "research_tasks.json").exists())
+        self.assertEqual(semantic_plan["planner_mode"], PLANNER_MODE_BLOCKED)
+        self.assertEqual(semantic_plan["angles"], [])
+        self.assertEqual(semantic_plan["bounded_tasks"], [])
+
+        self.assertEqual(raw_response["failure_category"], "adapter_invalid_response")
+        candidate_validation = raw_response["adapter_response"]["candidate_validation"]
+        self.assertFalse(candidate_validation["ok"], candidate_validation)
+        failure_codes = {
+            failure["code"] for failure in candidate_validation["failures"]
+        }
+        self.assertTrue(
+            expected_failure_codes.issubset(failure_codes),
+            failure_codes,
+        )
+        diagnostic_codes = set(
+            raw_response["diagnostics"]["candidate_validation_failure_codes"]
+        )
+        self.assertTrue(expected_failure_codes.issubset(diagnostic_codes))
+
     def assert_integrity_artifacts(
         self,
         run_dir: Path,
@@ -1088,6 +1130,99 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
         self.assertEqual(raw_response["failure_category"], "adapter_invalid_response")
         self.assertIn("lacks Codex raw response identity", raw_response["blocked_reason"])
+
+    def test_codex_semantic_invalid_broad_candidates_block_before_materialization(self) -> None:
+        question = "2026 Korea battery safety image evidence from official sources as a table"
+
+        def remove_visual_routes(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            for angle in response["candidate_plan"]["angles"]:
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+            for task in response["candidate_plan"]["bounded_tasks"]:
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+            return response
+
+        def drift_to_wrong_subject(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            for angle in response["candidate_plan"]["angles"]:
+                angle["title"] = "Codex runner architecture"
+                angle["research_question"] = "How should Codex runner internals be implemented?"
+                angle["why_this_angle_matters"] = (
+                    "This generic implementation angle is out of scope."
+                )
+                angle["search_queries"] = ["Codex runner architecture implementation"]
+                angle["included_scope"] = ["Codex implementation"]
+                angle["expected_source_types"] = ["repository implementation notes"]
+                angle["expected_visual_targets"] = []
+                angle["expected_artifacts"] = ["implementation checklist"]
+                angle["success_criteria"] = [
+                    "Findings must explain Codex runner internals."
+                ]
+            for task in response["candidate_plan"]["bounded_tasks"]:
+                task["query"] = "Codex runner architecture implementation and test strategy"
+                task["success_criteria"] = [
+                    "Findings must explain Codex runner internals."
+                ]
+                task["expected_artifacts"] = ["implementation checklist"]
+                task["expected_source_types"] = ["repository implementation notes"]
+                task["expected_visual_targets"] = []
+                task["done_condition"] = (
+                    "Stop after documenting Codex runner implementation details."
+                )
+            return response
+
+        cases = (
+            (
+                "no_visual",
+                remove_visual_routes,
+                {"visual_requirement_missing_visual_route"},
+            ),
+            ("wrong_subject", drift_to_wrong_subject, {"subject_requirement_drift"}),
+        )
+        for case_name, mutator, expected_codes in cases:
+            with self.subTest(case=case_name):
+                result, _adapter_request = self.prepare_with_codex_adapter(
+                    question,
+                    requirement_types=(
+                        "subject",
+                        "visual_modality",
+                        "source_quality",
+                        "time_range",
+                        "geography",
+                        "deliverable_shape",
+                    ),
+                    visual_angle_indexes=(3,),
+                    response_mutator=mutator,
+                )
+
+                self.assert_invalid_adapter_response_blocked(
+                    result,
+                    expected_failure_codes=expected_codes,
+                )
+
+    def test_codex_semantic_malformed_nested_adapter_output_blocks_cleanly(self) -> None:
+        def remove_nested_fields(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            response["candidate_plan"]["angles"][0].pop("title")
+            response["candidate_plan"]["bounded_tasks"][0].pop("query")
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            "Research public water system resilience with official records",
+            requirement_types=("subject", "source_quality"),
+            response_mutator=remove_nested_fields,
+        )
+
+        self.assert_invalid_adapter_response_blocked(
+            result,
+            expected_failure_codes={
+                "semantic_angle_missing_field",
+                "bounded_task_missing_field",
+            },
+        )
 
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
         with self.assertRaisesRegex(
