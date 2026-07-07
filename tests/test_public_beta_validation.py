@@ -570,6 +570,29 @@ class PublicBetaValidationTests(unittest.TestCase):
             gate["failures"],
         )
 
+    def test_manual_trace_audit_gate_rejects_completed_fixture_accepted_shards(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+
+        def mark_completed_fixture(payload: dict[str, Any]) -> None:
+            payload["status"] = "completed_fixture"
+            payload["fixture_only"] = False
+            payload.setdefault("provenance", {})["fixture_only"] = False
+            payload.setdefault("manual_trace_audit", {})["fixture_only"] = False
+
+        self.mutate_manual_trace_audit_step(
+            manifest_path,
+            step="accepted_shards",
+            mutator=mark_completed_fixture,
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertTrue(
+            any("accepted_shards_status_not_completed" in failure for failure in gate["failures"]),
+            gate["failures"],
+        )
+
     def test_manual_trace_audit_gate_rejects_missing_final_report_alignment(self) -> None:
         manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
         self.mutate_manual_trace_audit_step(

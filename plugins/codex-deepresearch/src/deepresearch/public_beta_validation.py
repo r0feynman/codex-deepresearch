@@ -1913,7 +1913,7 @@ def _manual_trace_step_artifact_shape_failures(
     elif step == "accepted_shards":
         if schema != "codex-deepresearch.parallel-orchestration.v0":
             failures.append(f"{audit_id}:{step}_artifact_schema_mismatch")
-        if payload.get("status") not in {"completed", "completed_parallel", "completed_fixture"}:
+        if payload.get("status") not in {"completed", "completed_parallel"}:
             failures.append(f"{audit_id}:{step}_status_not_completed")
     elif step == "final_report":
         if schema not in {"codex-deepresearch.report-status.v0", "codex-deepresearch.report-generation.v0"}:
