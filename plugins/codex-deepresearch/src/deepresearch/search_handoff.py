@@ -286,6 +286,7 @@ def prepare_run(
         locked_oracle=locked_oracle,
         semantic_review=semantic_review,
     )
+    accepted_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
     _record_semantic_artifact_trace(
         run_dir,
         event_type="semantic_review_completed",
@@ -362,6 +363,8 @@ def prepare_run(
                 index,
                 routing=routing,
                 fallback_max_results=effective_max_results,
+                semantic_plan_hash=accepted_semantic_plan_hash,
+                approved_delta_id="base_plan",
             )
             for index, bounded_task in enumerate(semantic_plan.bounded_tasks, start=1)
         ]
@@ -523,6 +526,12 @@ def prepare_run(
         created_at=now,
         locked_oracle=locked_oracle,
         semantic_review=semantic_review,
+    )
+    final_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+    _stamp_semantic_materialization_lineage(
+        run_dir,
+        semantic_plan_hash=final_semantic_plan_hash,
+        approved_delta_id="base_plan",
     )
     write_semantic_materialization_diff(
         run_dir=run_dir,
@@ -1563,6 +1572,8 @@ def _search_task_from_bounded_task(
     *,
     routing: Sequence[Mapping[str, Any]],
     fallback_max_results: int,
+    semantic_plan_hash: str,
+    approved_delta_id: str,
 ) -> dict[str, Any]:
     task_id = str(bounded_task.get("task_id") or f"task_search_{index:03d}")
     angle_id = str(bounded_task.get("angle_id") or f"angle_{index:03d}")
@@ -1582,6 +1593,9 @@ def _search_task_from_bounded_task(
     return {
         "id": task_id,
         "task_id": task_id,
+        "semantic_plan_task_id": task_id,
+        "semantic_plan_hash": semantic_plan_hash,
+        "approved_delta_id": approved_delta_id,
         "angle_id": angle_id,
         "angle": route_record.get("angle") or route_record.get("title") or angle_id,
         "title": route_record.get("title") or route_record.get("angle") or angle_id,
@@ -1617,6 +1631,9 @@ def _visual_task_from_search_task(search_task: Mapping[str, Any], index: int) ->
     return {
         "id": f"task_visual_{index:03d}",
         "task_id": search_task["task_id"],
+        "semantic_plan_task_id": search_task.get("semantic_plan_task_id") or search_task["task_id"],
+        "semantic_plan_hash": search_task.get("semantic_plan_hash"),
+        "approved_delta_id": search_task.get("approved_delta_id") or "base_plan",
         "angle_id": search_task["angle_id"],
         "angle": search_task.get("angle") or search_task["angle_id"],
         "query": search_task["query"],
@@ -1633,6 +1650,56 @@ def _visual_task_from_search_task(search_task: Mapping[str, Any], index: int) ->
         "max_images": search_task["max_images"],
         "status": "planned",
     }
+
+
+def _stamp_semantic_materialization_lineage(
+    run_dir: Path,
+    *,
+    semantic_plan_hash: str,
+    approved_delta_id: str,
+) -> None:
+    def stamp(record: Any) -> None:
+        if not isinstance(record, dict):
+            return
+        task_id = (
+            record.get("semantic_plan_task_id")
+            or record.get("task_id")
+            or record.get("search_task_id")
+            or record.get("id")
+        )
+        if not isinstance(task_id, str) or not task_id.strip():
+            return
+        record["semantic_plan_task_id"] = task_id.strip()
+        record["semantic_plan_hash"] = semantic_plan_hash
+        record["approved_delta_id"] = str(record.get("approved_delta_id") or approved_delta_id)
+
+    for filename in ("search_tasks.json", "visual_tasks.json"):
+        path = run_dir / filename
+        if not path.exists():
+            continue
+        try:
+            payload = _read_json(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        tasks = payload.get("tasks") if isinstance(payload, Mapping) else None
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            stamp(task)
+        _write_json(path, payload)
+
+    evidence_path = run_dir / "evidence.json"
+    if evidence_path.exists():
+        try:
+            evidence = _read_json(evidence_path)
+        except (OSError, json.JSONDecodeError):
+            return
+        for key in ("search_tasks", "images"):
+            records = evidence.get(key) if isinstance(evidence, Mapping) else None
+            if isinstance(records, list):
+                for record in records:
+                    stamp(record)
+        _write_json(evidence_path, evidence)
 
 
 def _report_section_from_task_query(query: str) -> str:

@@ -4569,18 +4569,21 @@ def build_semantic_materialization_diff(
         if check.get("valid") is not True and check.get("required") is True
     ]
 
-    materialization_differences = (
+    suppressible_task_set_differences = (
         missing_task_ids
         or extra_task_ids
         or duplicate_task_ids
         or dropped_search_obligations
         or dropped_visual_obligations
+    )
+    materialization_differences = (
+        suppressible_task_set_differences
         or field_mismatches
         or lineage_failures
         or missing_required_artifacts
     )
     approved_difference = bool(
-        materialization_differences and approved_delta.get("valid") is True
+        suppressible_task_set_differences and approved_delta.get("valid") is True
     )
     if materialization_differences and not approved_difference:
         failures.append(
@@ -4592,6 +4595,13 @@ def build_semantic_materialization_diff(
                 "dropped_search_obligations": dropped_search_obligations,
                 "dropped_visual_obligations": dropped_visual_obligations,
                 "missing_required_artifacts": missing_required_artifacts,
+            }
+        )
+    if missing_required_artifacts:
+        failures.append(
+            {
+                "code": "semantic_materialization_missing_required_artifacts",
+                "artifacts": missing_required_artifacts,
             }
         )
     if field_mismatches:
@@ -4608,7 +4618,7 @@ def build_semantic_materialization_diff(
                 "count": len(lineage_failures),
             }
         )
-    if failed_artifacts and not approved_difference:
+    if failed_artifacts and (not approved_difference or missing_required_artifacts):
         failures.append(
             {
                 "code": "semantic_materialization_artifact_check_failed",
@@ -4651,6 +4661,7 @@ def build_semantic_materialization_diff(
         "duplicate_semantic_task_ids": duplicate_task_ids,
         "dropped_search_obligations": dropped_search_obligations,
         "dropped_visual_obligations": dropped_visual_obligations,
+        "missing_required_artifacts": missing_required_artifacts,
         "exact_task_set_equality": exact_task_set_equality,
         "per_artifact_task_set_equality": {
             str(check["artifact"]): check.get("task_set_equal") is True
@@ -4800,6 +4811,52 @@ def _materialization_collection_check(
                     "code": "angle_id_mismatch",
                     "expected": expected_angle_id,
                     "actual": actual_angle_id,
+                }
+            )
+        actual_plan_hash = record.get("semantic_plan_hash")
+        if not isinstance(actual_plan_hash, str) or not actual_plan_hash.strip():
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "semantic_plan_hash_missing",
+                    "expected": plan_hash,
+                    "actual": None,
+                }
+            )
+        elif plan_hash and actual_plan_hash.strip() != plan_hash:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "semantic_plan_hash_mismatch",
+                    "expected": plan_hash,
+                    "actual": actual_plan_hash.strip(),
+                }
+            )
+        actual_delta_id = record.get("approved_delta_id")
+        if not isinstance(actual_delta_id, str) or not actual_delta_id.strip():
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "approved_delta_id_missing",
+                    "expected": approved_delta_id,
+                    "actual": None,
+                }
+            )
+        elif actual_delta_id.strip() != approved_delta_id:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "approved_delta_id_mismatch",
+                    "expected": approved_delta_id,
+                    "actual": actual_delta_id.strip(),
                 }
             )
         if compare_fields:

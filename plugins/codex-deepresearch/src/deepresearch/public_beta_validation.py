@@ -1329,6 +1329,15 @@ def run_semantic_anti_overfit_scan(
                     "detail": "planner-facing file appears to branch semantic planning on prompt_hash",
                 }
             )
+        alias_findings = _semantic_prompt_hash_alias_routing_findings(text)
+        for code in alias_findings:
+            findings.append(
+                {
+                    "code": code,
+                    "path": str(path),
+                    "detail": "planner-facing file appears to route semantic planning through a prompt hash alias",
+                }
+            )
         if re.search(
             r"(?i)\b(expected_plan|expected_bounded_tasks|canned_expected_plan|golden_semantic_plan)\b",
             text,
@@ -1347,6 +1356,39 @@ def run_semantic_anti_overfit_scan(
         "scan_file_count": len(files),
         "findings": findings,
     }
+
+
+def _semantic_prompt_hash_alias_routing_findings(text: str) -> list[str]:
+    alias_names: set[str] = set()
+    for match in re.finditer(
+        r"(?im)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*prompt_hash\b",
+        text,
+    ):
+        alias_names.add(match.group(1))
+    for match in re.finditer(
+        r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^=\n]{0,120}"
+        r"sha256\s*\(\s*prompt\b[^;\n]{0,200}hexdigest\s*\(",
+        text,
+    ):
+        alias_names.add(match.group(1))
+
+    findings: list[str] = []
+    semantic_target = r"(semantic_plan|bounded_tasks|expected_plan|angle|route)"
+    for alias in sorted(alias_names):
+        if re.search(
+            rf"(?is)\b(if|elif|match)\b.{{0,180}}\b{re.escape(alias)}\b"
+            rf".{{0,260}}{semantic_target}",
+            text,
+        ):
+            findings.append("prompt_hash_alias_routing")
+            break
+    if re.search(
+        rf"(?is)\b(if|elif|match)\b.{{0,220}}sha256\s*\(\s*prompt\b"
+        rf".{{0,280}}{semantic_target}",
+        text,
+    ):
+        findings.append("prompt_sha256_routing")
+    return findings
 
 
 def _load_semantic_prompt_manifest(
@@ -1611,11 +1653,25 @@ def _manual_trace_audit_failures(
         failures.append(f"{audit_id}:risk_rank_missing")
     if not _non_empty_manifest_string(audit.get("risk_rationale")):
         failures.append(f"{audit_id}:risk_rationale_missing")
+    run_id = str(audit.get("run_id") or "").strip()
+    prompt_id = str(audit.get("prompt_id") or "").strip()
+    if not run_id:
+        failures.append(f"{audit_id}:run_id_missing")
+    if not prompt_id:
+        failures.append(f"{audit_id}:prompt_id_missing")
+    for hash_field in (
+        "oracle_hash",
+        "semantic_plan_hash",
+        "materialization_diff_hash",
+        "final_report_hash",
+    ):
+        if not _sha256_hex_string(audit.get(hash_field)):
+            failures.append(f"{audit_id}:{hash_field}_missing")
     chain = audit.get("chain_proof")
     if not isinstance(chain, Mapping):
         failures.append(f"{audit_id}:chain_proof_missing")
         return failures
-    for step in MANUAL_TRACE_AUDIT_REQUIRED_CHAIN:
+    for step_index, step in enumerate(MANUAL_TRACE_AUDIT_REQUIRED_CHAIN):
         proof = chain.get(step)
         if not isinstance(proof, Mapping):
             failures.append(f"{audit_id}:{step}_proof_missing")
@@ -1638,7 +1694,132 @@ def _manual_trace_audit_failures(
             continue
         if _file_sha256(artifact_path) != str(artifact_hash):
             failures.append(f"{audit_id}:{step}_artifact_hash_mismatch")
+            continue
+        payload = _read_optional_json(artifact_path)
+        failures.extend(
+            _manual_trace_step_content_failures(
+                audit=audit,
+                audit_id=audit_id,
+                step=step,
+                step_index=step_index,
+                payload=payload,
+            )
+        )
     return failures
+
+
+def _manual_trace_step_content_failures(
+    *,
+    audit: Mapping[str, Any],
+    audit_id: str,
+    step: str,
+    step_index: int,
+    payload: Any,
+) -> list[str]:
+    failures: list[str] = []
+    if not isinstance(payload, Mapping):
+        return [f"{audit_id}:{step}_artifact_not_structured_json"]
+    if payload.get("schema_version") != "codex-deepresearch.manual-trace-step.v0":
+        failures.append(f"{audit_id}:{step}_artifact_placeholder_or_wrong_schema")
+
+    expected_run_id = str(audit.get("run_id") or "").strip()
+    expected_prompt_id = str(audit.get("prompt_id") or "").strip()
+    for field, expected in (
+        ("audit_id", audit_id),
+        ("step", step),
+        ("run_id", expected_run_id),
+        ("prompt_id", expected_prompt_id),
+    ):
+        if expected and payload.get(field) != expected:
+            failures.append(f"{audit_id}:{step}_{field}_mismatch")
+        elif not expected:
+            failures.append(f"{audit_id}:{step}_{field}_expected_value_missing")
+    if payload.get("status") != "verified":
+        failures.append(f"{audit_id}:{step}_artifact_not_verified")
+    if payload.get("public_safe") is not True:
+        failures.append(f"{audit_id}:{step}_artifact_not_public_safe")
+    provenance = payload.get("provenance")
+    if payload.get("fixture_only") is True or (
+        isinstance(provenance, Mapping) and provenance.get("fixture_only") is True
+    ):
+        failures.append(f"{audit_id}:{step}_fixture_only")
+
+    previous_step = (
+        MANUAL_TRACE_AUDIT_REQUIRED_CHAIN[step_index - 1]
+        if step_index > 0
+        else None
+    )
+    next_step = (
+        MANUAL_TRACE_AUDIT_REQUIRED_CHAIN[step_index + 1]
+        if step_index + 1 < len(MANUAL_TRACE_AUDIT_REQUIRED_CHAIN)
+        else None
+    )
+    if payload.get("previous_step") != previous_step:
+        failures.append(f"{audit_id}:{step}_previous_step_mismatch")
+    if payload.get("next_step") != next_step:
+        failures.append(f"{audit_id}:{step}_next_step_mismatch")
+
+    required_hashes = _manual_trace_required_hash_fields_for_step(step)
+    for field in required_hashes:
+        expected_hash = str(audit.get(field) or "").strip()
+        actual_hash = payload.get(field)
+        if not _sha256_hex_string(actual_hash):
+            failures.append(f"{audit_id}:{step}_{field}_missing")
+        elif expected_hash and str(actual_hash) != expected_hash:
+            failures.append(f"{audit_id}:{step}_{field}_mismatch")
+
+    if step == "accepted_shards":
+        shard_refs = payload.get("accepted_shard_refs")
+        if not isinstance(shard_refs, list) or not shard_refs:
+            failures.append(f"{audit_id}:accepted_shards_refs_missing")
+        else:
+            for index, ref in enumerate(shard_refs, start=1):
+                if not isinstance(ref, Mapping):
+                    failures.append(f"{audit_id}:accepted_shards_ref_{index}_invalid")
+                    continue
+                for field in ("task_id", "shard_path"):
+                    if not _non_empty_manifest_string(ref.get(field)):
+                        failures.append(
+                            f"{audit_id}:accepted_shards_ref_{index}_{field}_missing"
+                        )
+                if not _sha256_hex_string(ref.get("artifact_hash")):
+                    failures.append(
+                        f"{audit_id}:accepted_shards_ref_{index}_artifact_hash_missing"
+                    )
+    if step == "final_report":
+        alignment = payload.get("final_report_alignment")
+        required_alignment = (
+            "original_question",
+            "locked_oracle",
+            "semantic_plan",
+            "semantic_review",
+            "materialization_diff",
+            "accepted_shards",
+            "final_answer",
+        )
+        if not isinstance(alignment, Mapping):
+            failures.append(f"{audit_id}:final_report_alignment_missing")
+        else:
+            for field in required_alignment:
+                if alignment.get(field) is not True:
+                    failures.append(
+                        f"{audit_id}:final_report_alignment_{field}_missing"
+                    )
+    return failures
+
+
+def _manual_trace_required_hash_fields_for_step(step: str) -> tuple[str, ...]:
+    if step == "locked_oracle":
+        return ("oracle_hash",)
+    if step in {"semantic_plan", "semantic_review"}:
+        return ("oracle_hash", "semantic_plan_hash")
+    if step == "materialization_diff":
+        return ("semantic_plan_hash", "materialization_diff_hash")
+    if step in {"research_tasks", "search_tasks", "visual_tasks", "accepted_shards"}:
+        return ("semantic_plan_hash",)
+    if step == "final_report":
+        return ("semantic_plan_hash", "materialization_diff_hash", "final_report_hash")
+    return ()
 
 
 def _semantic_manifest_run_ready(run: Mapping[str, Any]) -> tuple[bool, str | None]:
@@ -1772,6 +1953,7 @@ def evaluate_public_beta_prompt_run(
     semantic_release_checks: dict[str, Any] | None = None
     if _requires_semantic_release_gate(prompt, terminal_status):
         semantic_release_checks = _semantic_release_checks(
+            prompt=prompt,
             loaded_artifacts=loaded,
             run_status=run_status if isinstance(run_status, Mapping) else {},
             evidence=evidence if isinstance(evidence, Mapping) else {},
@@ -2654,7 +2836,7 @@ def _semantic_release_report(
     ]
     manual_trace_audit_gate = _manual_trace_audit_gate(
         manual_audit_manifest,
-        required=require_manual_trace_audits,
+        required=True,
     )
     valid = (
         not missing_entries
@@ -3130,6 +3312,7 @@ def _requires_semantic_release_gate(
 
 def _semantic_release_checks(
     *,
+    prompt: Mapping[str, Any],
     loaded_artifacts: Mapping[str, Any],
     run_status: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -3434,6 +3617,13 @@ def _semantic_release_checks(
                         "detail": f"semantic_expectation_oracle.{field} must be false",
                     }
                 )
+        failures.extend(
+            _manifest_oracle_binding_failures(
+                prompt=prompt,
+                oracle=oracle,
+                review=review,
+            )
+        )
 
     trace_failures = _semantic_trace_ordering_failures(
         run_path=run_path,
@@ -3495,6 +3685,109 @@ def _semantic_release_checks(
         "computed_materialization_diff": computed_materialization,
         "failures": failures,
     }
+
+
+def _manifest_oracle_binding_failures(
+    *,
+    prompt: Mapping[str, Any],
+    oracle: Any,
+    review: Any,
+) -> list[dict[str, Any]]:
+    expected_hash = prompt.get("oracle_hash")
+    if expected_hash is None:
+        return []
+    if not _sha256_hex_string(expected_hash):
+        return [
+            {
+                "check": "manifest_oracle_binding",
+                "detail": "prompt manifest oracle_hash is missing or invalid",
+            }
+        ]
+    if not isinstance(oracle, Mapping):
+        return [
+            {
+                "check": "manifest_oracle_binding",
+                "detail": "semantic_expectation_oracle artifact is missing",
+            }
+        ]
+
+    oracle_provenance = oracle.get("oracle_provenance") or oracle.get("provenance")
+    review_provenance = (
+        review.get("reviewer_provenance") or review.get("provenance")
+        if isinstance(review, Mapping)
+        else {}
+    )
+    manifest_hash_payloads = [
+        payload
+        for payload in (oracle, oracle_provenance, review, review_provenance)
+        if isinstance(payload, Mapping)
+    ]
+    manifest_hash_values = _string_field_values(
+        *manifest_hash_payloads,
+        names=(
+            "manifest_oracle_hash",
+            "registered_oracle_hash",
+            "oracle_manifest_hash",
+        ),
+    )
+    failures: list[dict[str, Any]] = []
+    expected_hash_str = str(expected_hash)
+    if not manifest_hash_values:
+        failures.append(
+            {
+                "check": "manifest_oracle_binding",
+                "field": "manifest_oracle_hash",
+                "expected_oracle_hash": expected_hash_str,
+                "detail": "run oracle artifact does not record the manifest oracle hash",
+            }
+        )
+    elif any(value != expected_hash_str for value in manifest_hash_values):
+        failures.append(
+            {
+                "check": "manifest_oracle_binding",
+                "field": "manifest_oracle_hash",
+                "expected_oracle_hash": expected_hash_str,
+                "observed_oracle_hashes": sorted(set(manifest_hash_values)),
+                "detail": "run oracle manifest hash does not match the prompt manifest",
+            }
+        )
+
+    expected_path = str(prompt.get("oracle_path") or "").strip()
+    expected_fragment = (
+        expected_path.split("#", 1)[1].strip() if "#" in expected_path else ""
+    )
+    if expected_path or expected_fragment:
+        path_values = _string_field_values(
+            *manifest_hash_payloads,
+            names=(
+                "manifest_oracle_path",
+                "registered_oracle_path",
+                "oracle_manifest_path",
+            ),
+        )
+        fragment_values = _string_field_values(
+            *manifest_hash_payloads,
+            names=(
+                "manifest_oracle_fragment_id",
+                "registered_oracle_fragment_id",
+                "oracle_manifest_fragment_id",
+            ),
+        )
+        path_matches = expected_path and expected_path in path_values
+        fragment_matches = expected_fragment and expected_fragment in fragment_values
+        if not path_matches and not fragment_matches:
+            failures.append(
+                {
+                    "check": "manifest_oracle_binding",
+                    "field": "manifest_oracle_fragment",
+                    "expected_oracle_path": expected_path,
+                    "expected_oracle_fragment_id": expected_fragment,
+                    "observed_oracle_paths": sorted(set(path_values)),
+                    "observed_oracle_fragment_ids": sorted(set(fragment_values)),
+                    "detail": "run oracle artifact does not bind to the prompt manifest oracle fragment",
+                }
+            )
+    return failures
 
 
 def _claims_eligible_codex_semantic(

@@ -759,6 +759,15 @@ def plan_research_tasks(
             trace_event_ids=[],
         ).to_dict()
         task["task_id"] = task_id
+        task["semantic_plan_task_id"] = str(
+            base.get("semantic_plan_task_id") or task_id
+        )
+        if base.get("semantic_plan_hash"):
+            task["semantic_plan_hash"] = str(base.get("semantic_plan_hash"))
+        if base.get("approved_delta_id"):
+            task["approved_delta_id"] = str(base.get("approved_delta_id"))
+        elif task.get("semantic_plan_hash"):
+            task["approved_delta_id"] = "base_plan"
         task["freshness_requirement"] = str(base.get("freshness_requirement") or "any")
         task["expected_source_types"] = _string_list(base.get("expected_source_types"))
         task["expected_visual_targets"] = _string_list(base.get("expected_visual_targets"))

@@ -109,6 +109,8 @@ class PublicBetaValidationTests(unittest.TestCase):
         audits = []
         for index in range(1, 6):
             audit_id = f"audit_{index:03d}"
+            run_id = f"manual-audit-run-{index:03d}"
+            prompt_id = f"manual-audit-{index:03d}"
             route = "visual_required" if index <= 2 else "text_only"
             categories = []
             if index <= 2:
@@ -117,16 +119,69 @@ class PublicBetaValidationTests(unittest.TestCase):
                 categories.append("korean")
             else:
                 categories.append("policy_regulatory_domain")
+            oracle_hash = hashlib.sha256(f"{audit_id}:oracle".encode("utf-8")).hexdigest()
+            semantic_plan_hash = hashlib.sha256(f"{audit_id}:plan".encode("utf-8")).hexdigest()
+            materialization_diff_hash = hashlib.sha256(f"{audit_id}:diff".encode("utf-8")).hexdigest()
+            final_report_hash = hashlib.sha256(f"{audit_id}:report".encode("utf-8")).hexdigest()
             chain_proof = {}
-            for step in chain_steps:
+            for step_index, step in enumerate(chain_steps):
                 artifact_path = artifact_root / audit_id / f"{step}.json"
+                previous_step = chain_steps[step_index - 1] if step_index > 0 else None
+                next_step = chain_steps[step_index + 1] if step_index + 1 < len(chain_steps) else None
                 payload = {
+                    "schema_version": "codex-deepresearch.manual-trace-step.v0",
                     "audit_id": audit_id,
+                    "run_id": run_id,
+                    "prompt_id": prompt_id,
                     "step": step,
                     "status": "verified",
                     "public_safe": True,
-                    "alignment_subject": "sanitized semantic trace audit fixture",
+                    "fixture_only": fixture_only,
+                    "previous_step": previous_step,
+                    "next_step": next_step,
+                    "alignment_subject": "sanitized semantic trace audit",
+                    "provenance": {
+                        "public_safe": True,
+                        "fixture_only": fixture_only,
+                        "release_eligible": live and not fixture_only,
+                    },
                 }
+                if step in {"locked_oracle", "semantic_plan", "semantic_review"}:
+                    payload["oracle_hash"] = oracle_hash
+                if step in {
+                    "semantic_plan",
+                    "semantic_review",
+                    "materialization_diff",
+                    "research_tasks",
+                    "search_tasks",
+                    "visual_tasks",
+                    "accepted_shards",
+                    "final_report",
+                }:
+                    payload["semantic_plan_hash"] = semantic_plan_hash
+                if step in {"materialization_diff", "final_report"}:
+                    payload["materialization_diff_hash"] = materialization_diff_hash
+                if step == "accepted_shards":
+                    payload["accepted_shard_refs"] = [
+                        {
+                            "task_id": "task_search_001",
+                            "shard_path": f"evidence_shards/{audit_id}/evidence_shard.json",
+                            "artifact_hash": hashlib.sha256(
+                                f"{audit_id}:accepted-shard".encode("utf-8")
+                            ).hexdigest(),
+                        }
+                    ]
+                if step == "final_report":
+                    payload["final_report_hash"] = final_report_hash
+                    payload["final_report_alignment"] = {
+                        "original_question": True,
+                        "locked_oracle": True,
+                        "semantic_plan": True,
+                        "semantic_review": True,
+                        "materialization_diff": True,
+                        "accepted_shards": True,
+                        "final_answer": True,
+                    }
                 self.write_json(artifact_path, payload)
                 chain_proof[step] = {
                     "status": "verified",
@@ -136,7 +191,12 @@ class PublicBetaValidationTests(unittest.TestCase):
             audits.append(
                 {
                     "id": audit_id,
-                    "prompt_id": f"manual-audit-{index:03d}",
+                    "run_id": run_id,
+                    "prompt_id": prompt_id,
+                    "oracle_hash": oracle_hash,
+                    "semantic_plan_hash": semantic_plan_hash,
+                    "materialization_diff_hash": materialization_diff_hash,
+                    "final_report_hash": final_report_hash,
                     "route": route,
                     "public_safe": True,
                     "release_eligible": live and not fixture_only,
@@ -162,6 +222,27 @@ class PublicBetaValidationTests(unittest.TestCase):
             },
         )
         return manifest_path
+
+    def mutate_manual_trace_audit_step(
+        self,
+        manifest_path: Path,
+        *,
+        step: str,
+        audit_index: int = 0,
+        replacement: dict[str, Any] | None = None,
+        mutator: Any = None,
+    ) -> None:
+        manifest = self.read_json(manifest_path)
+        proof = manifest["audits"][audit_index]["chain_proof"][step]
+        artifact_path = Path(proof["artifact_path"])
+        if not artifact_path.is_absolute():
+            artifact_path = manifest_path.parent / artifact_path
+        payload = replacement if replacement is not None else self.read_json(artifact_path)
+        if mutator is not None:
+            mutator(payload)
+        self.write_json(artifact_path, payload)
+        proof["artifact_hash"] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        self.write_json(manifest_path, manifest)
 
     def test_prompt_manifest_covers_public_safe_real_use_set(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -258,6 +339,91 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertIn("live_release_audits_not_performed", gate["failures"])
         self.assertTrue(
             any(failure.endswith(":fixture_only") for failure in gate["failures"]),
+            gate["failures"],
+        )
+
+    def test_manual_trace_audit_gate_rejects_placeholder_artifacts(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+        self.mutate_manual_trace_audit_step(
+            manifest_path,
+            step="semantic_plan",
+            replacement={"status": "verified"},
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertTrue(
+            any("semantic_plan_artifact_placeholder_or_wrong_schema" in failure for failure in gate["failures"]),
+            gate["failures"],
+        )
+
+    def test_manual_trace_audit_gate_rejects_wrong_prompt_id(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+        self.mutate_manual_trace_audit_step(
+            manifest_path,
+            step="locked_oracle",
+            mutator=lambda payload: payload.update({"prompt_id": "wrong-prompt"}),
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertTrue(
+            any("locked_oracle_prompt_id_mismatch" in failure for failure in gate["failures"]),
+            gate["failures"],
+        )
+
+    def test_manual_trace_audit_gate_rejects_missing_accepted_shard_refs(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+        self.mutate_manual_trace_audit_step(
+            manifest_path,
+            step="accepted_shards",
+            mutator=lambda payload: payload.pop("accepted_shard_refs", None),
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertTrue(
+            any("accepted_shards_refs_missing" in failure for failure in gate["failures"]),
+            gate["failures"],
+        )
+
+    def test_manual_trace_audit_gate_rejects_missing_final_report_alignment(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+        self.mutate_manual_trace_audit_step(
+            manifest_path,
+            step="final_report",
+            mutator=lambda payload: payload.pop("final_report_alignment", None),
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertTrue(
+            any("final_report_alignment_missing" in failure for failure in gate["failures"]),
+            gate["failures"],
+        )
+
+    def test_manual_trace_audit_gate_rejects_fixture_only_step_artifacts(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+
+        def mark_fixture(payload: dict[str, Any]) -> None:
+            payload["fixture_only"] = True
+            payload.setdefault("provenance", {})["fixture_only"] = True
+
+        self.mutate_manual_trace_audit_step(
+            manifest_path,
+            step="search_tasks",
+            mutator=mark_fixture,
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertTrue(
+            any("search_tasks_fixture_only" in failure for failure in gate["failures"]),
             gate["failures"],
         )
 
@@ -435,6 +601,56 @@ class PublicBetaValidationTests(unittest.TestCase):
             {finding["code"] for finding in scan["findings"]},
         )
 
+    def test_semantic_anti_overfit_scan_rejects_prompt_hash_alias_routing(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_alias_bad.py"
+        hash_symbol = "prompt" + "_hash"
+        route_symbol = "route"
+        bad.write_text(
+            "\n".join(
+                [
+                    f"routing_key = {hash_symbol}",
+                    "if routing_key == 'abc':",
+                    f"    {route_symbol} = 'visual_required'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "prompt" + "_hash" + "_alias" + "_routing",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
+    def test_semantic_anti_overfit_scan_rejects_prompt_sha256_digest_routing(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_digest_bad.py"
+        sha_name = "sha" + "256"
+        prompt_name = "prompt"
+        plan_symbol = "semantic" + "_plan"
+        bad.write_text(
+            "\n".join(
+                [
+                    "import hashlib",
+                    f"digest = hashlib.{sha_name}({prompt_name}.encode()).hexdigest()",
+                    "if digest == 'abc':",
+                    f"    {plan_symbol} = {'{}'}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "prompt" + "_hash" + "_alias" + "_routing",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
     def test_semantic_release_report_lists_hashes_and_required_artifacts(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
@@ -444,12 +660,16 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=runs_dir / "prompt-runs",
             suite_id=suite_id,
         )
+        manual_audit_manifest = self.write_manual_trace_audit_manifest(
+            runs_dir / "manual-audits"
+        )
 
         payload = run_public_beta_validation(
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
             prompt_runs=prompt_runs,
+            manual_audit_manifest=manual_audit_manifest,
         )
 
         report = payload["semantic_release_report"]
@@ -473,10 +693,10 @@ class PublicBetaValidationTests(unittest.TestCase):
             r"^[0-9a-f]{64}$",
         )
 
-    def test_semantic_release_report_requires_manual_trace_audits_when_enabled(self) -> None:
+    def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
-        suite_id = "semantic-release-report-manual-audit-required"
+        suite_id = "semantic-release-report-manual-audit-default-required"
         prompt_runs = self.write_all_passing_prompt_runs(
             manifest,
             runs_dir=runs_dir / "prompt-runs",
@@ -490,7 +710,6 @@ class PublicBetaValidationTests(unittest.TestCase):
                 clean=True,
                 prompt_runs=prompt_runs,
                 manual_audit_manifest=None,
-                require_manual_trace_audits=True,
             )
 
         payload = self.read_json(raised.exception.results_path)
@@ -521,6 +740,31 @@ class PublicBetaValidationTests(unittest.TestCase):
         failures = result["semantic_release_checks"]["failures"]
         self.assertTrue(
             any(failure.get("check") == "required_semantic_artifact_present" for failure in failures),
+            failures,
+        )
+
+    def test_semantic_release_checks_bind_locked_oracle_to_manifest_hash(self) -> None:
+        manifest = load_public_beta_semantic_manifest(DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST)
+        prompt = next(prompt for prompt in manifest["prompts"] if prompt["route"] == "text_only")
+        run_dir = self.write_text_run(
+            self.temp_dir() / "oracle-binding",
+            prompt=prompt,
+            suite_id="semantic-oracle-binding",
+            status="completed_parallel",
+        )
+        mismatched_prompt = dict(prompt)
+        mismatched_prompt["oracle_hash"] = "f" * 64
+
+        result = evaluate_public_beta_prompt_run(
+            mismatched_prompt,
+            run_dir,
+            suite_id="semantic-oracle-binding",
+        )
+
+        self.assertEqual(result["status"], "failed", result)
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertTrue(
+            any(failure.get("check") == "manifest_oracle_binding" for failure in failures),
             failures,
         )
 
@@ -1727,6 +1971,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=runs_dir,
             suite_id=suite_id,
         )
+        manual_audit_manifest = self.write_manual_trace_audit_manifest(
+            runs_dir / "manual-audits"
+        )
         for prompt in manifest["prompts"]:
             run_dir = prompt_runs[prompt["id"]]
             if prompt["route"] in {"visual_required", "visual_optional"}:
@@ -1755,6 +2002,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             suite_id=suite_id,
             clean=True,
             prompt_runs=prompt_runs,
+            manual_audit_manifest=manual_audit_manifest,
         )
 
         self.assertEqual(payload["status"], "passed")
@@ -2715,12 +2963,16 @@ class PublicBetaValidationTests(unittest.TestCase):
                     suite_id=suite_id,
                     status="completed_parallel",
                 )
+        manual_audit_manifest = self.write_manual_trace_audit_manifest(
+            runs_dir / "manual-audits"
+        )
 
         payload = run_public_beta_validation(
             runs_dir=self.temp_dir(),
             suite_id=suite_id,
             clean=True,
             prompt_runs=prompt_runs,
+            manual_audit_manifest=manual_audit_manifest,
         )
         self.assertEqual(payload["status"], "passed")
         self.assertEqual(payload["outcome_counts"]["passed"], 20)
@@ -2749,6 +3001,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=runs_dir / "prompt-runs",
             suite_id=suite_id,
         )
+        manual_audit_manifest = self.write_manual_trace_audit_manifest(
+            runs_dir / "manual-audits"
+        )
         gate_results = {}
         for gate_id in EXTERNAL_GATE_REQUIREMENTS:
             gate_path = runs_dir / f"{gate_id}.json"
@@ -2762,6 +3017,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             prompt_runs=prompt_runs,
             gate_results=gate_results,
             completion_mode="external-gated",
+            manual_audit_manifest=manual_audit_manifest,
         )
 
         automated_cli_gate = "automated_cli_real_provider_visual_e2e"
@@ -2808,6 +3064,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             runs_dir=runs_dir / "prompt-runs",
             suite_id=suite_id,
         )
+        manual_audit_manifest = self.write_manual_trace_audit_manifest(
+            runs_dir / "manual-audits"
+        )
         gate_results = {}
         for gate_id in EXTERNAL_GATE_REQUIREMENTS:
             spoofed_gate = runs_dir / f"{gate_id}.json"
@@ -2820,6 +3079,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             clean=True,
             prompt_runs=prompt_runs,
             gate_results=gate_results,
+            manual_audit_manifest=manual_audit_manifest,
         )
 
         self.assertEqual(payload["status"], "passed")
@@ -2976,6 +3236,69 @@ class PublicBetaValidationTests(unittest.TestCase):
             "adapter": "codex-exec",
             "approved_delta_id": "base_plan",
         }
+
+    def stamp_semantic_materialization_lineage(
+        self,
+        run_dir: Path,
+        *,
+        semantic_plan_hash: str,
+    ) -> None:
+        def stamp_record(record: dict[str, Any]) -> None:
+            task_id = (
+                record.get("semantic_plan_task_id")
+                or record.get("task_id")
+                or record.get("search_task_id")
+                or record.get("id")
+            )
+            if not isinstance(task_id, str) or not task_id.strip():
+                return
+            record["semantic_plan_task_id"] = task_id.strip()
+            record["semantic_plan_hash"] = semantic_plan_hash
+            record["approved_delta_id"] = str(record.get("approved_delta_id") or "base_plan")
+
+        for filename in (
+            "search_tasks.json",
+            "research_tasks.json",
+            "visual_tasks.json",
+            "visual_search_plan.json",
+        ):
+            path = run_dir / filename
+            if not path.exists():
+                continue
+            payload = self.read_json(path)
+            tasks = payload.get("tasks")
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if isinstance(task, dict):
+                        stamp_record(task)
+                self.write_json(path, payload)
+
+        evidence_path = run_dir / "evidence.json"
+        if evidence_path.exists():
+            evidence = self.read_json(evidence_path)
+            for key in ("search_tasks", "images"):
+                records = evidence.get(key)
+                if isinstance(records, list):
+                    for record in records:
+                        if isinstance(record, dict):
+                            stamp_record(record)
+            self.write_json(evidence_path, evidence)
+
+        for filename in (
+            "search_results.jsonl",
+            "subagent_assignments.jsonl",
+            "visual_candidates.jsonl",
+            "image_fetch_status.jsonl",
+            "visual_observations.jsonl",
+        ):
+            path = run_dir / filename
+            if not path.exists():
+                continue
+            records = self.read_jsonl(path)
+            for record in records:
+                if isinstance(record, dict):
+                    stamp_record(record)
+            self.write_jsonl(path, records)
 
     def write_text_run(
         self,
@@ -3344,6 +3667,22 @@ class PublicBetaValidationTests(unittest.TestCase):
             "Public beta test fixture records deterministic semantic artifacts "
             "without a live Codex session id."
         )
+        manifest_oracle_path = str(prompt.get("oracle_path") or "").strip()
+        manifest_oracle_hash = str(prompt.get("oracle_hash") or "").strip()
+        manifest_oracle_fragment_id = (
+            manifest_oracle_path.split("#", 1)[1].strip()
+            if "#" in manifest_oracle_path
+            else ""
+        )
+        manifest_oracle_binding = (
+            {
+                "manifest_oracle_hash": manifest_oracle_hash,
+                "manifest_oracle_path": manifest_oracle_path,
+                "manifest_oracle_fragment_id": manifest_oracle_fragment_id,
+            }
+            if manifest_oracle_hash
+            else {}
+        )
         provenance = {
             "planner_mode": metadata["planner_mode"],
             "planner_source": metadata["source"],
@@ -3433,6 +3772,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "created_at": timestamp,
                 "question": prompt["prompt"],
                 "question_scope": question_scope,
+                **manifest_oracle_binding,
                 "provided_sources": [],
                 "provided_images": [],
                 "oracle_instructions": [
@@ -3451,6 +3791,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "raw_request_content_hash": oracle_raw_request_content_hash,
                 "raw_request_artifact_hash": oracle_raw_request_artifact_hash,
                 "raw_request_hash": oracle_raw_request_content_hash,
+                **manifest_oracle_binding,
                 "oracle": oracle_contract,
                 "provenance": {
                     "adapter_kind": "codex_semantic_oracle",
@@ -3458,6 +3799,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "raw_request_content_hash": oracle_raw_request_content_hash,
                     "raw_request_artifact_hash": oracle_raw_request_artifact_hash,
                     "raw_request_hash": oracle_raw_request_content_hash,
+                    **manifest_oracle_binding,
                     "independent_of_planner": True,
                     "non_release_fixture": False,
                 },
@@ -3530,6 +3872,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "used_fixed_angle_inventory": False,
             "independent_of_planner": True,
             "non_release_fixture": False,
+            **manifest_oracle_binding,
         }
 
         def artifact_base(
@@ -3592,6 +3935,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             **oracle_base,
             "artifact_type": "semantic_expectation_oracle",
             **oracle_contract,
+            **manifest_oracle_binding,
             "oracle_provenance": oracle_provenance,
             "plan_visible_to_oracle": False,
             "used_production_planner_output": False,
@@ -3621,6 +3965,10 @@ class PublicBetaValidationTests(unittest.TestCase):
         semantic_plan_hash = hashlib.sha256(
             (run_dir / "semantic_plan.json").read_bytes()
         ).hexdigest()
+        self.stamp_semantic_materialization_lineage(
+            run_dir,
+            semantic_plan_hash=semantic_plan_hash,
+        )
         reviewer_raw_request_content_hash, reviewer_raw_request_artifact_hash = write_raw_request(
             reviewer_raw_request_path,
             {
@@ -3631,6 +3979,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "question": prompt["prompt"],
                 "oracle_path": str(run_dir / "semantic_expectation_oracle.json"),
                 "oracle_hash": oracle_hash,
+                **manifest_oracle_binding,
                 "semantic_plan_path": str(run_dir / "semantic_plan.json"),
                 "semantic_plan_hash": semantic_plan_hash,
                 "review_instructions": [
@@ -3707,6 +4056,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "oracle_hash": oracle_hash,
             "semantic_expectation_oracle_hash": oracle_hash,
             "semantic_plan_hash": semantic_plan_hash,
+            **manifest_oracle_binding,
             "reviewer_raw_request_path": str(reviewer_raw_request_path),
             "reviewer_raw_response_path": str(reviewer_raw_response_path),
             "reviewer_raw_request_content_hash": reviewer_raw_request_content_hash,
@@ -4274,6 +4624,13 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         (run_dir / "report.md").write_text(report, encoding="utf-8")
         if semantic_metadata:
+            semantic_plan_hash = hashlib.sha256(
+                (run_dir / "semantic_plan.json").read_bytes()
+            ).hexdigest()
+            self.stamp_semantic_materialization_lineage(
+                run_dir,
+                semantic_plan_hash=semantic_plan_hash,
+            )
             write_semantic_materialization_diff(
                 run_dir=run_dir,
                 require_research_tasks=True,
