@@ -2407,13 +2407,15 @@ def _provenance_identity_set(provenance: Mapping[str, Any]) -> set[str]:
         "child_session_id",
         "session_id",
         "raw_response_id",
-        "codex_event_id",
         "response_id",
         "adapter_invocation_id",
     ):
         value = provenance.get(field)
         if isinstance(value, str) and value.strip():
             identities.add(f"{field}:{value.strip()}")
+    event_identity = _qualified_codex_event_identity(provenance)
+    if event_identity:
+        identities.add(event_identity)
     return identities
 
 
@@ -2423,13 +2425,30 @@ def _provenance_release_identity_set(provenance: Mapping[str, Any]) -> set[str]:
         "child_session_id",
         "session_id",
         "raw_response_id",
-        "codex_event_id",
         "response_id",
     ):
         value = provenance.get(field)
         if isinstance(value, str) and value.strip():
             identities.add(f"{field}:{value.strip()}")
+    event_identity = _qualified_codex_event_identity(provenance)
+    if event_identity:
+        identities.add(event_identity)
     return identities
+
+
+def _qualified_codex_event_identity(provenance: Mapping[str, Any]) -> str | None:
+    event_id = str(provenance.get("codex_event_id") or "").strip()
+    if not event_id:
+        return None
+    session_id = str(
+        provenance.get("session_id")
+        or provenance.get("child_session_id")
+        or provenance.get("conversation_id")
+        or ""
+    ).strip()
+    if session_id:
+        return f"codex_event_id:{session_id}:{event_id}"
+    return f"codex_event_id:{event_id}"
 
 
 def _provenance_has_required_raw_artifacts(provenance: Mapping[str, Any]) -> bool:
@@ -2512,6 +2531,8 @@ def _semantic_adapter_payload_from_events(events: Sequence[Any]) -> dict[str, An
             "response",
             "payload",
             "data",
+            "item",
+            "items",
             "output",
             "content",
             "message",
@@ -2526,7 +2547,18 @@ def _semantic_adapter_payload_from_value(value: Any) -> dict[str, Any] | None:
     if isinstance(value, Mapping):
         if _is_semantic_adapter_response_payload(value):
             return dict(value)
-        for key in ("content", "message", "output", "text", "json"):
+        for key in (
+            "item",
+            "items",
+            "response",
+            "payload",
+            "data",
+            "content",
+            "message",
+            "output",
+            "text",
+            "json",
+        ):
             payload = _semantic_adapter_payload_from_value(value.get(key))
             if payload is not None:
                 return payload
@@ -2540,6 +2572,11 @@ def _semantic_adapter_payload_from_value(value: Any) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             return None
         return _semantic_adapter_payload_from_value(parsed)
+    if isinstance(value, Sequence):
+        for item in reversed(value):
+            payload = _semantic_adapter_payload_from_value(item)
+            if payload is not None:
+                return payload
     return None
 
 
@@ -2570,10 +2607,15 @@ def _codex_event_provenance(events: Sequence[Mapping[str, Any]]) -> dict[str, An
         }.items():
             if target in provenance:
                 continue
-            for alias in aliases:
-                value = event.get(alias)
-                if value:
-                    provenance[target] = str(value)
+            for source in (event, event.get("item")):
+                if not isinstance(source, Mapping):
+                    continue
+                for alias in aliases:
+                    value = source.get(alias)
+                    if value:
+                        provenance[target] = str(value)
+                        break
+                if target in provenance:
                     break
     if event_types:
         provenance["codex_event_types"] = list(dict.fromkeys(event_types))
