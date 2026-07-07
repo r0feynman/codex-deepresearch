@@ -917,6 +917,43 @@ class SemanticPlannerTests(unittest.TestCase):
                         ),
                     ]
                 )
+            elif stdout_format in {"jsonl_item_text", "jsonl_item_text_reused_item_id"}:
+                role = str(artifact_type or "semantic")
+                item_id = (
+                    "item_0"
+                    if stdout_format == "jsonl_item_text_reused_item_id"
+                    else f"{role}-item-001"
+                )
+                stdout = "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "thread.started",
+                                "thread_id": f"{role}-thread-jsonl-001",
+                            },
+                            sort_keys=True,
+                        ),
+                        json.dumps({"type": "turn.started"}, sort_keys=True),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "id": item_id,
+                                    "type": "agent_message",
+                                    "text": json.dumps(response, sort_keys=True),
+                                },
+                            },
+                            sort_keys=True,
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn.completed",
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                            },
+                            sort_keys=True,
+                        ),
+                    ]
+                )
             else:
                 stdout = json.dumps(response, sort_keys=True)
             return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
@@ -1959,6 +1996,97 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
         persisted_validation = self.load_json(run_dir / "semantic_planner_validation.json")
         self.assertTrue(persisted_validation["ok"], persisted_validation)
+
+    def test_codex_semantic_accepts_current_codex_jsonl_item_text_shape(self) -> None:
+        question = "Research coastal microgrid outage recovery using official source records"
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            requirement_types=("subject", "source_quality"),
+        )
+        run_dir = Path(result["run_dir"])
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        oracle_response = self.load_json(
+            run_dir / "semantic_oracle_raw" / "oracle_response.json"
+        )
+        reviewer_response = self.load_json(
+            run_dir / "semantic_reviewer_raw" / "reviewer_response.json"
+        )
+        oracle = self.load_json(run_dir / "semantic_expectation_oracle.json")
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+
+        self.assertEqual(result["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
+        self.assertTrue(result["semantic_release_eligible"])
+        self.assertEqual(semantic_plan["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
+        self.assertIn("candidate_plan", raw_response)
+        self.assertIn("expectation_oracle", oracle_response)
+        self.assertIn("semantic_plan_review", reviewer_response)
+        self.assertEqual(
+            raw_response["provenance"]["raw_request_hash"],
+            adapter_request["adapter_request_hash"],
+        )
+        cases = (
+            (
+                "planner",
+                raw_response["provenance"],
+                "semantic_planner_raw_request",
+            ),
+            ("oracle", oracle_response["provenance"], "semantic_oracle_raw_request"),
+            (
+                "reviewer",
+                reviewer_response["provenance"],
+                "semantic_reviewer_raw_request",
+            ),
+        )
+        for label, provenance, role in cases:
+            with self.subTest(label=label):
+                self.assertEqual(provenance["session_id"], f"{role}-thread-jsonl-001")
+                self.assertEqual(provenance["codex_event_id"], f"{role}-item-001")
+                self.assertIn("item.completed", provenance["codex_event_types"])
+        self.assertEqual(
+            semantic_plan["planner_provenance"]["adapter_invocation"]["session_id"],
+            "semantic_planner_raw_request-thread-jsonl-001",
+        )
+        self.assertEqual(
+            oracle["oracle_provenance"]["session_id"],
+            "semantic_oracle_raw_request-thread-jsonl-001",
+        )
+        self.assertEqual(
+            review["reviewer_provenance"]["session_id"],
+            "semantic_reviewer_raw_request-thread-jsonl-001",
+        )
+        persisted_validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assertTrue(persisted_validation["ok"], persisted_validation)
+
+    def test_codex_semantic_independence_qualifies_reused_item_ids_by_session(self) -> None:
+        question = "Research coastal microgrid outage recovery using official source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text_reused_item_id",
+            requirement_types=("subject", "source_quality"),
+        )
+        run_dir = Path(result["run_dir"])
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+
+        self.assertTrue(
+            review["reviewer_independence"]["independent"],
+            review["reviewer_independence"],
+        )
+        self.assertFalse(
+            review["reviewer_independence"]["reviewer_oracle_shared_provenance"],
+            review["reviewer_independence"],
+        )
+        self.assertIn(
+            "codex_event_id:semantic_oracle_raw_request-thread-jsonl-001:item_0",
+            review["reviewer_independence"]["oracle_identity"],
+        )
+        self.assertIn(
+            "codex_event_id:semantic_reviewer_raw_request-thread-jsonl-001:item_0",
+            review["reviewer_independence"]["reviewer_identity"],
+        )
 
     def test_codex_semantic_unavailable_blocks_without_local_template_fallback(self) -> None:
         question = "Research adapter unavailable behavior without manual angles"
