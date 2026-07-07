@@ -1073,10 +1073,11 @@ def write_semantic_expectation_oracle(
         provided_images=provided_images or [],
         created_at=timestamp,
     )
+    raw_request_content_hash = _sha256_payload(raw_request)
+    raw_request["raw_request_content_hash"] = raw_request_content_hash
+    raw_request["raw_request_hash"] = raw_request_content_hash
     _write_json(raw_request_path, raw_request)
-    raw_request_hash = _sha256_file(raw_request_path)
-    raw_request["raw_request_hash"] = raw_request_hash
-    _write_json(raw_request_path, raw_request)
+    raw_request_artifact_hash = _sha256_file(raw_request_path)
     try:
         adapter_response = invoke_codex_semantic_oracle_adapter(raw_request)
         adapter_unavailable_reason = None
@@ -1086,18 +1087,20 @@ def write_semantic_expectation_oracle(
     if adapter_response is None:
         raw_response = _deterministic_oracle_raw_response(
             request=raw_request,
-            raw_request_hash=raw_request_hash,
+            raw_request_hash=raw_request_content_hash,
             unavailable_reason=adapter_unavailable_reason,
         )
     else:
         raw_response = _structured_semantic_oracle_response(
             raw_request=raw_request,
-            raw_request_hash=raw_request_hash,
+            raw_request_hash=raw_request_content_hash,
             adapter_response=adapter_response,
         )
     raw_response["run_id"] = run_path.name
     raw_response["created_at"] = timestamp
-    raw_response["raw_request_hash"] = raw_request_hash
+    raw_response["raw_request_content_hash"] = raw_request_content_hash
+    raw_response["raw_request_artifact_hash"] = raw_request_artifact_hash
+    raw_response["raw_request_hash"] = raw_request_content_hash
     _write_json(raw_response_path, raw_response)
     raw_response_hash = _sha256_file(raw_response_path)
     oracle = _expectation_oracle_from_raw_response(
@@ -1105,7 +1108,8 @@ def write_semantic_expectation_oracle(
         question=question,
         raw_request_path=raw_request_path,
         raw_response_path=raw_response_path,
-        raw_request_hash=raw_request_hash,
+        raw_request_content_hash=raw_request_content_hash,
+        raw_request_artifact_hash=raw_request_artifact_hash,
         raw_response_hash=raw_response_hash,
         raw_response=raw_response,
         timestamp=timestamp,
@@ -1172,10 +1176,11 @@ def write_semantic_plan_review(
             "verdict": "pass|fail|release_ineligible",
         },
     }
+    raw_request_content_hash = _sha256_payload(raw_request)
+    raw_request["raw_request_content_hash"] = raw_request_content_hash
+    raw_request["raw_request_hash"] = raw_request_content_hash
     _write_json(raw_request_path, raw_request)
-    raw_request_hash = _sha256_file(raw_request_path)
-    raw_request["raw_request_hash"] = raw_request_hash
-    _write_json(raw_request_path, raw_request)
+    raw_request_artifact_hash = _sha256_file(raw_request_path)
     try:
         adapter_response = invoke_codex_semantic_reviewer_adapter(raw_request)
         adapter_unavailable_reason = None
@@ -1187,18 +1192,20 @@ def write_semantic_plan_review(
             request=raw_request,
             plan=plan,
             oracle=oracle,
-            raw_request_hash=raw_request_hash,
+            raw_request_hash=raw_request_content_hash,
             unavailable_reason=adapter_unavailable_reason,
         )
     else:
         raw_response = _structured_semantic_reviewer_response(
             raw_request=raw_request,
-            raw_request_hash=raw_request_hash,
+            raw_request_hash=raw_request_content_hash,
             adapter_response=adapter_response,
         )
     raw_response["run_id"] = run_path.name
     raw_response["created_at"] = timestamp
-    raw_response["raw_request_hash"] = raw_request_hash
+    raw_response["raw_request_content_hash"] = raw_request_content_hash
+    raw_response["raw_request_artifact_hash"] = raw_request_artifact_hash
+    raw_response["raw_request_hash"] = raw_request_content_hash
     raw_response["semantic_plan_candidate_hash"] = plan_hash
     _write_json(raw_response_path, raw_response)
     raw_response_hash = _sha256_file(raw_response_path)
@@ -1209,7 +1216,8 @@ def write_semantic_plan_review(
         oracle=oracle,
         raw_request_path=raw_request_path,
         raw_response_path=raw_response_path,
-        raw_request_hash=raw_request_hash,
+        raw_request_content_hash=raw_request_content_hash,
+        raw_request_artifact_hash=raw_request_artifact_hash,
         raw_response_hash=raw_response_hash,
         raw_response=raw_response,
         timestamp=timestamp,
@@ -1468,7 +1476,8 @@ def _expectation_oracle_from_raw_response(
     question: str,
     raw_request_path: Path,
     raw_response_path: Path,
-    raw_request_hash: str,
+    raw_request_content_hash: str,
+    raw_request_artifact_hash: str,
     raw_response_hash: str,
     raw_response: Mapping[str, Any],
     timestamp: str,
@@ -1508,16 +1517,24 @@ def _expectation_oracle_from_raw_response(
     provenance = dict(raw_response.get("provenance") or {})
     provenance.setdefault("oracle_adapter", raw_response.get("oracle_adapter"))
     provenance.setdefault("prompt_version", raw_response.get("prompt_version"))
-    provenance.setdefault("raw_request_path", str(raw_request_path))
-    provenance.setdefault("raw_response_path", str(raw_response_path))
-    provenance.setdefault("raw_request_hash", raw_request_hash)
-    provenance.setdefault("raw_response_hash", raw_response_hash)
+    adapter_raw_request_hash = provenance.get("raw_request_hash")
+    provenance["raw_request_path"] = str(raw_request_path)
+    provenance["raw_response_path"] = str(raw_response_path)
+    provenance["raw_request_content_hash"] = raw_request_content_hash
+    provenance["adapter_raw_request_hash"] = adapter_raw_request_hash or raw_request_content_hash
+    provenance["raw_request_artifact_hash"] = raw_request_artifact_hash
+    provenance["raw_request_hash"] = raw_request_artifact_hash
+    provenance["raw_response_artifact_hash"] = raw_response_hash
+    provenance["raw_response_hash"] = raw_response_hash
     provenance.setdefault("generated_before_plan_timestamp", timestamp)
     oracle["oracle_provenance"] = provenance
     oracle["provenance"] = provenance
     oracle["raw_request_path"] = str(raw_request_path)
     oracle["raw_response_path"] = str(raw_response_path)
-    oracle["raw_request_hash"] = raw_request_hash
+    oracle["raw_request_content_hash"] = raw_request_content_hash
+    oracle["raw_request_artifact_hash"] = raw_request_artifact_hash
+    oracle["raw_request_hash"] = raw_request_artifact_hash
+    oracle["raw_response_artifact_hash"] = raw_response_hash
     oracle["raw_response_hash"] = raw_response_hash
     oracle["session_id"] = provenance.get("session_id") or provenance.get("child_session_id")
     oracle["session_id_unavailable_reason"] = provenance.get(
@@ -1798,7 +1815,8 @@ def _semantic_plan_review_from_raw_response(
     oracle: Mapping[str, Any],
     raw_request_path: Path,
     raw_response_path: Path,
-    raw_request_hash: str,
+    raw_request_content_hash: str,
+    raw_request_artifact_hash: str,
     raw_response_hash: str,
     raw_response: Mapping[str, Any],
     timestamp: str,
@@ -1830,7 +1848,10 @@ def _semantic_plan_review_from_raw_response(
     review["oracle_content_hash"] = oracle.get("oracle_content_hash")
     review["reviewer_raw_request_path"] = str(raw_request_path)
     review["reviewer_raw_response_path"] = str(raw_response_path)
-    review["reviewer_raw_request_hash"] = raw_request_hash
+    review["reviewer_raw_request_content_hash"] = raw_request_content_hash
+    review["reviewer_raw_request_artifact_hash"] = raw_request_artifact_hash
+    review["reviewer_raw_request_hash"] = raw_request_artifact_hash
+    review["reviewer_raw_response_artifact_hash"] = raw_response_hash
     review["reviewer_raw_response_hash"] = raw_response_hash
     review["parsed_response_hash"] = _sha256_text(
         json.dumps(adapter_review or deterministic, sort_keys=True, ensure_ascii=True)
@@ -1838,10 +1859,17 @@ def _semantic_plan_review_from_raw_response(
     reviewer_provenance = dict(raw_response.get("provenance") or {})
     reviewer_provenance.setdefault("reviewer_adapter", raw_response.get("reviewer_adapter"))
     reviewer_provenance.setdefault("prompt_version", raw_response.get("prompt_version"))
-    reviewer_provenance.setdefault("raw_request_path", str(raw_request_path))
-    reviewer_provenance.setdefault("raw_response_path", str(raw_response_path))
-    reviewer_provenance.setdefault("raw_request_hash", raw_request_hash)
-    reviewer_provenance.setdefault("raw_response_hash", raw_response_hash)
+    adapter_raw_request_hash = reviewer_provenance.get("raw_request_hash")
+    reviewer_provenance["raw_request_path"] = str(raw_request_path)
+    reviewer_provenance["raw_response_path"] = str(raw_response_path)
+    reviewer_provenance["raw_request_content_hash"] = raw_request_content_hash
+    reviewer_provenance["adapter_raw_request_hash"] = (
+        adapter_raw_request_hash or raw_request_content_hash
+    )
+    reviewer_provenance["raw_request_artifact_hash"] = raw_request_artifact_hash
+    reviewer_provenance["raw_request_hash"] = raw_request_artifact_hash
+    reviewer_provenance["raw_response_artifact_hash"] = raw_response_hash
+    reviewer_provenance["raw_response_hash"] = raw_response_hash
     review["reviewer_provenance"] = reviewer_provenance
     review["reviewer_surface"] = reviewer_provenance.get("model_or_surface")
     review["reviewer_prompt_version"] = reviewer_provenance.get("prompt_version")
@@ -2323,14 +2351,26 @@ def _provenance_identity_set(provenance: Mapping[str, Any]) -> set[str]:
     return identities
 
 
+def _provenance_release_identity_set(provenance: Mapping[str, Any]) -> set[str]:
+    identities = set()
+    for field in (
+        "child_session_id",
+        "session_id",
+        "raw_response_id",
+        "codex_event_id",
+        "response_id",
+    ):
+        value = provenance.get(field)
+        if isinstance(value, str) and value.strip():
+            identities.add(f"{field}:{value.strip()}")
+    return identities
+
+
 def _provenance_has_required_raw_artifacts(provenance: Mapping[str, Any]) -> bool:
     return bool(
         str(provenance.get("raw_request_hash") or "").strip()
         and str(provenance.get("raw_response_hash") or "").strip()
-        and (
-            str(provenance.get("child_session_id") or provenance.get("session_id") or "").strip()
-            or str(provenance.get("session_id_unavailable_reason") or "").strip()
-        )
+        and _provenance_release_identity_set(provenance)
     )
 
 
@@ -5487,6 +5527,36 @@ def _semantic_release_status(
     if not semantic_release_eligible:
         failures.append({"code": "semantic_release_ineligible"})
     if planner_mode == PLANNER_MODE_CODEX_SEMANTIC and semantic_release_eligible:
+        plan_artifact = _read_optional_json(run_path / SEMANTIC_PLAN_FILENAME)
+        if not isinstance(plan_artifact, Mapping):
+            failures.append({"code": "semantic_plan_artifact_missing"})
+        else:
+            planner_provenance = plan_artifact.get("planner_provenance") or plan_artifact.get(
+                "provenance"
+            )
+            if not isinstance(planner_provenance, Mapping):
+                failures.append({"code": "semantic_planner_provenance_missing"})
+            elif not _provenance_release_identity_set(planner_provenance):
+                failures.append({"code": "semantic_planner_provenance_incomplete"})
+            if _provenance_is_non_release_fixture(planner_provenance):
+                failures.append({"code": "semantic_planner_non_release_fixture"})
+            failures.extend(
+                _semantic_raw_artifact_failures(
+                    run_path=run_path,
+                    artifact_label="planner",
+                    request_path=plan_artifact.get("raw_request_path"),
+                    response_path=plan_artifact.get("raw_response_path"),
+                    request_hash=(
+                        plan_artifact.get("raw_request_artifact_hash")
+                        or plan_artifact.get("raw_request_hash")
+                    ),
+                    response_hash=(
+                        plan_artifact.get("raw_response_artifact_hash")
+                        or plan_artifact.get("raw_response_hash")
+                    ),
+                    request_content_hash=plan_artifact.get("raw_request_content_hash"),
+                )
+            )
         try:
             numeric_score = float(semantic_fit_score)
         except (TypeError, ValueError):
@@ -5521,12 +5591,38 @@ def _semantic_release_status(
             independence = review.get("reviewer_independence")
             if not isinstance(independence, Mapping) or independence.get("independent") is not True:
                 failures.append({"code": "reviewer_independence_failed"})
+            reviewer_provenance = review.get("reviewer_provenance") or review.get(
+                "provenance"
+            )
+            if not isinstance(reviewer_provenance, Mapping):
+                failures.append({"code": "reviewer_provenance_missing"})
+            elif not _provenance_has_required_raw_artifacts(reviewer_provenance):
+                failures.append({"code": "reviewer_provenance_incomplete"})
+            if _provenance_is_non_release_fixture(reviewer_provenance):
+                failures.append({"code": "semantic_reviewer_non_release_fixture"})
             if not str(review.get("reviewer_raw_request_path") or "").strip():
                 failures.append({"code": "reviewer_raw_request_path_missing"})
             if not str(review.get("reviewer_raw_response_path") or "").strip():
                 failures.append({"code": "reviewer_raw_response_path_missing"})
             if not str(review.get("oracle_hash") or review.get("semantic_expectation_oracle_hash") or "").strip():
                 failures.append({"code": "review_oracle_hash_missing"})
+            failures.extend(
+                _semantic_raw_artifact_failures(
+                    run_path=run_path,
+                    artifact_label="reviewer",
+                    request_path=review.get("reviewer_raw_request_path"),
+                    response_path=review.get("reviewer_raw_response_path"),
+                    request_hash=(
+                        review.get("reviewer_raw_request_artifact_hash")
+                        or review.get("reviewer_raw_request_hash")
+                    ),
+                    response_hash=(
+                        review.get("reviewer_raw_response_artifact_hash")
+                        or review.get("reviewer_raw_response_hash")
+                    ),
+                    request_content_hash=review.get("reviewer_raw_request_content_hash"),
+                )
+            )
         failures.extend(_semantic_oracle_release_failures(run_path))
         failures.extend(_semantic_ordering_proof_failures(run_path))
         failures.extend(_semantic_waiver_release_failures(run_path))
@@ -5583,9 +5679,123 @@ def _semantic_oracle_release_failures(run_path: Path) -> list[dict[str, Any]]:
         failures.append({"code": "semantic_oracle_provenance_missing"})
     elif not _provenance_has_required_raw_artifacts(provenance):
         failures.append({"code": "semantic_oracle_provenance_incomplete"})
+    if isinstance(provenance, Mapping):
+        failures.extend(
+            _semantic_raw_artifact_failures(
+                run_path=run_path,
+                artifact_label="oracle",
+                request_path=provenance.get("raw_request_path") or oracle.get("raw_request_path"),
+                response_path=provenance.get("raw_response_path") or oracle.get("raw_response_path"),
+                request_hash=(
+                    provenance.get("raw_request_artifact_hash")
+                    or oracle.get("raw_request_artifact_hash")
+                    or provenance.get("raw_request_hash")
+                    or oracle.get("raw_request_hash")
+                ),
+                response_hash=(
+                    provenance.get("raw_response_artifact_hash")
+                    or oracle.get("raw_response_artifact_hash")
+                    or provenance.get("raw_response_hash")
+                    or oracle.get("raw_response_hash")
+                ),
+                request_content_hash=(
+                    provenance.get("raw_request_content_hash")
+                    or oracle.get("raw_request_content_hash")
+                ),
+            )
+        )
     if _provenance_is_non_release_fixture(provenance):
         failures.append({"code": "semantic_oracle_non_release_fixture"})
     return failures
+
+
+def _semantic_raw_artifact_failures(
+    *,
+    run_path: Path,
+    artifact_label: str,
+    request_path: Any,
+    response_path: Any,
+    request_hash: Any,
+    response_hash: Any,
+    request_content_hash: Any = None,
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    failures.extend(
+        _semantic_file_hash_failures(
+            run_path=run_path,
+            artifact_label=f"{artifact_label}_raw_request",
+            path_value=request_path,
+            expected_hash=request_hash,
+        )
+    )
+    failures.extend(
+        _semantic_file_hash_failures(
+            run_path=run_path,
+            artifact_label=f"{artifact_label}_raw_response",
+            path_value=response_path,
+            expected_hash=response_hash,
+        )
+    )
+    if request_content_hash:
+        request_artifact_path = _semantic_artifact_path(run_path, request_path)
+        if request_artifact_path is not None and request_artifact_path.exists():
+            payload = _read_optional_json(request_artifact_path)
+            if isinstance(payload, Mapping):
+                content_payload = dict(payload)
+                content_payload.pop("raw_request_content_hash", None)
+                content_payload.pop("raw_request_hash", None)
+                actual_content_hash = _sha256_payload(content_payload)
+                if actual_content_hash != str(request_content_hash):
+                    failures.append(
+                        {
+                            "code": f"{artifact_label}_raw_request_content_hash_mismatch",
+                            "expected_hash": str(request_content_hash),
+                            "actual_hash": actual_content_hash,
+                        }
+                    )
+    return failures
+
+
+def _semantic_file_hash_failures(
+    *,
+    run_path: Path,
+    artifact_label: str,
+    path_value: Any,
+    expected_hash: Any,
+) -> list[dict[str, Any]]:
+    path = _semantic_artifact_path(run_path, path_value)
+    if path is None:
+        return [{"code": f"{artifact_label}_path_missing"}]
+    if not path.exists():
+        return [
+            {
+                "code": f"{artifact_label}_artifact_missing",
+                "path": str(path),
+            }
+        ]
+    expected = str(expected_hash or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return [{"code": f"{artifact_label}_hash_missing_or_invalid"}]
+    actual = _sha256_file(path)
+    if actual != expected:
+        return [
+            {
+                "code": f"{artifact_label}_hash_mismatch",
+                "path": str(path),
+                "expected_hash": expected,
+                "actual_hash": actual,
+            }
+        ]
+    return []
+
+
+def _semantic_artifact_path(run_path: Path, path_value: Any) -> Path | None:
+    if not isinstance(path_value, str) or not path_value.strip():
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = run_path / path
+    return path
 
 
 def _semantic_ordering_proof_failures(run_path: Path) -> list[dict[str, Any]]:
@@ -5724,28 +5934,49 @@ def _semantic_ordering_proof_failures(run_path: Path) -> list[dict[str, Any]]:
             failures.append({"code": "semantic_ordering_event_missing_hashes", "event": event})
             continue
         artifact_paths = record.get("semantic_artifact_paths")
-        if isinstance(artifact_paths, Mapping):
-            for key, expected_hash in artifact_hashes.items():
-                raw_path = artifact_paths.get(key)
-                if not isinstance(raw_path, str) or not raw_path:
+        if not isinstance(artifact_paths, Mapping):
+            failures.append(
+                {"code": "semantic_ordering_event_missing_artifact_paths", "event": event}
+            )
+            continue
+        for key, expected_hash in artifact_hashes.items():
+            raw_path = artifact_paths.get(key)
+            if not isinstance(raw_path, str) or not raw_path:
+                failures.append(
+                    {
+                        "code": "semantic_ordering_artifact_path_missing",
+                        "event": event,
+                        "artifact": key,
+                    }
+                )
+                continue
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = run_path / path
+            if not path.exists():
+                failures.append(
+                    {
+                        "code": "semantic_ordering_artifact_missing",
+                        "event": event,
+                        "artifact": key,
+                        "path": str(path),
+                    }
+                )
+                continue
+            if _sha256_file(path) != expected_hash:
+                if (
+                    event == "semantic_plan_created"
+                    and key == "semantic_plan"
+                    and _semantic_plan_reviewed_candidate_hash(path) == expected_hash
+                ):
                     continue
-                path = Path(raw_path)
-                if not path.is_absolute():
-                    path = run_path / path
-                if path.exists() and _sha256_file(path) != expected_hash:
-                    if (
-                        event == "semantic_plan_created"
-                        and key == "semantic_plan"
-                        and _semantic_plan_reviewed_candidate_hash(path) == expected_hash
-                    ):
-                        continue
-                    failures.append(
-                        {
-                            "code": "semantic_ordering_hash_mismatch",
-                            "event": event,
-                            "artifact": key,
-                        }
-                    )
+                failures.append(
+                    {
+                        "code": "semantic_ordering_hash_mismatch",
+                        "event": event,
+                        "artifact": key,
+                    }
+                )
     return failures
 
 

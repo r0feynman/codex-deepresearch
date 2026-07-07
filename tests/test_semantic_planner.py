@@ -1362,6 +1362,176 @@ class SemanticPlannerTests(unittest.TestCase):
             semantic_codes,
         )
 
+    def test_generated_raw_request_hashes_match_final_oracle_and_reviewer_files(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+        oracle = self.load_json(run_dir / "semantic_expectation_oracle.json")
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+
+        cases = (
+            (
+                "oracle",
+                Path(oracle["raw_request_path"]),
+                oracle["raw_request_content_hash"],
+                oracle["raw_request_artifact_hash"],
+            ),
+            (
+                "reviewer",
+                Path(review["reviewer_raw_request_path"]),
+                review["reviewer_raw_request_content_hash"],
+                review["reviewer_raw_request_artifact_hash"],
+            ),
+        )
+        for label, request_path, expected_content_hash, expected_artifact_hash in cases:
+            with self.subTest(label=label):
+                self.assertTrue(request_path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                    expected_artifact_hash,
+                )
+                raw_request = self.load_json(request_path)
+                self.assertEqual(raw_request["raw_request_content_hash"], expected_content_hash)
+                self.assertEqual(raw_request["raw_request_hash"], expected_content_hash)
+                content_payload = dict(raw_request)
+                content_payload.pop("raw_request_content_hash", None)
+                content_payload.pop("raw_request_hash", None)
+                actual_content_hash = hashlib.sha256(
+                    json.dumps(
+                        content_payload,
+                        sort_keys=True,
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.assertEqual(actual_content_hash, expected_content_hash)
+
+    def test_fabricated_eligible_artifacts_fail_without_raw_artifacts_or_codex_identity(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+        fake_hash = "0" * 64
+
+        def strip_release_identity(provenance: dict) -> dict:
+            for field in (
+                "child_session_id",
+                "session_id",
+                "raw_response_id",
+                "codex_event_id",
+                "response_id",
+            ):
+                provenance.pop(field, None)
+            provenance["session_id_unavailable_reason"] = "fabricated unavailable reason"
+            return provenance
+
+        oracle_path = run_dir / "semantic_expectation_oracle.json"
+        oracle = self.load_json(oracle_path)
+        oracle_provenance = strip_release_identity(dict(oracle["oracle_provenance"]))
+        oracle_provenance.update(
+            {
+                "raw_request_path": "missing/oracle_request.json",
+                "raw_response_path": "missing/oracle_response.json",
+                "raw_request_hash": fake_hash,
+                "raw_request_artifact_hash": fake_hash,
+                "raw_response_hash": fake_hash,
+                "raw_response_artifact_hash": fake_hash,
+            }
+        )
+        oracle["oracle_provenance"] = oracle_provenance
+        oracle["provenance"] = oracle_provenance
+        oracle["raw_request_path"] = "missing/oracle_request.json"
+        oracle["raw_response_path"] = "missing/oracle_response.json"
+        oracle["raw_request_hash"] = fake_hash
+        oracle["raw_request_artifact_hash"] = fake_hash
+        oracle["raw_response_hash"] = fake_hash
+        oracle["raw_response_artifact_hash"] = fake_hash
+        self.write_json(oracle_path, oracle)
+
+        plan_path = run_dir / "semantic_plan.json"
+        plan = self.load_json(plan_path)
+        plan_provenance = strip_release_identity(dict(plan["planner_provenance"]))
+        plan["planner_provenance"] = plan_provenance
+        if isinstance(plan.get("semantic_plan"), dict):
+            plan["semantic_plan"]["planner_provenance"] = plan_provenance
+        plan["raw_request_path"] = "missing/planner_request.json"
+        plan["raw_response_path"] = "missing/planner_response.json"
+        plan["raw_request_hash"] = fake_hash
+        plan["raw_response_hash"] = fake_hash
+        self.write_json(plan_path, plan)
+
+        review_path = run_dir / "semantic_plan_review.json"
+        review = self.load_json(review_path)
+        reviewer_provenance = strip_release_identity(dict(review["reviewer_provenance"]))
+        reviewer_provenance.update(
+            {
+                "raw_request_path": "missing/reviewer_request.json",
+                "raw_response_path": "missing/reviewer_response.json",
+                "raw_request_hash": fake_hash,
+                "raw_request_artifact_hash": fake_hash,
+                "raw_response_hash": fake_hash,
+                "raw_response_artifact_hash": fake_hash,
+            }
+        )
+        review["semantic_fit_score"] = 9.2
+        review["blockers"] = []
+        review["substitute_implementation_check"] = {"passed": True, "checked": True}
+        review["verdict"] = "pass"
+        review["final_verdict"] = "pass"
+        review["non_negotiable_coverage_complete"] = True
+        review["reviewer_independence"] = {"independent": True, "status": "passed"}
+        review["reviewer_provenance"] = reviewer_provenance
+        review["provenance"] = reviewer_provenance
+        review["reviewer_raw_request_path"] = "missing/reviewer_request.json"
+        review["reviewer_raw_response_path"] = "missing/reviewer_response.json"
+        review["reviewer_raw_request_hash"] = fake_hash
+        review["reviewer_raw_request_artifact_hash"] = fake_hash
+        review["reviewer_raw_response_hash"] = fake_hash
+        review["reviewer_raw_response_artifact_hash"] = fake_hash
+        self.write_json(review_path, review)
+
+        trace_path = run_dir / "run_trace.jsonl"
+        records = self.read_jsonl(trace_path)
+        for record in records:
+            if str(record.get("event_type", "")).startswith("semantic_"):
+                paths = record.get("semantic_artifact_paths")
+                hashes = record.get("artifact_hashes")
+                if isinstance(paths, dict) and isinstance(hashes, dict):
+                    for key in list(hashes):
+                        paths[key] = f"missing/{key}.json"
+                        hashes[key] = fake_hash
+        trace_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+        validation = semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=search_tasks,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        semantic_codes = {
+            failure["code"]
+            for failure in validation["semantic_status"]["failures"]
+        }
+        self.assertIn("semantic_planner_provenance_incomplete", semantic_codes)
+        self.assertIn("semantic_oracle_provenance_incomplete", semantic_codes)
+        self.assertIn("reviewer_provenance_incomplete", semantic_codes)
+        self.assertIn("planner_raw_request_artifact_missing", semantic_codes)
+        self.assertIn("oracle_raw_request_artifact_missing", semantic_codes)
+        self.assertIn("reviewer_raw_request_artifact_missing", semantic_codes)
+        self.assertIn("semantic_ordering_artifact_missing", semantic_codes)
+
     def test_codex_semantic_accepts_structured_adapter_response_with_raw_provenance(self) -> None:
         question = "Research coastal microgrid outage recovery using official source records"
         result, adapter_request = self.prepare_with_codex_adapter(

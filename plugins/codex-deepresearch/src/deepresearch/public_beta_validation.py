@@ -1990,6 +1990,38 @@ def _semantic_release_checks(
                     "detail": "semantic_plan_review.reviewer_independence.independent is not true",
                 }
             )
+        reviewer_provenance = review.get("reviewer_provenance") or review.get("provenance")
+        if not isinstance(reviewer_provenance, Mapping):
+            failures.append(
+                {
+                    "check": "reviewer_provenance",
+                    "detail": "semantic_plan_review.reviewer_provenance is missing",
+                }
+            )
+        else:
+            for field in ("raw_request_hash", "raw_response_hash"):
+                if not isinstance(reviewer_provenance.get(field), str) or not reviewer_provenance.get(field):
+                    failures.append(
+                        {
+                            "check": "reviewer_provenance",
+                            "field": field,
+                            "detail": f"semantic reviewer provenance {field} is missing",
+                        }
+                    )
+            if not _semantic_provenance_has_codex_identity(reviewer_provenance):
+                failures.append(
+                    {
+                        "check": "reviewer_provenance",
+                        "detail": "semantic reviewer provenance lacks a Codex session/response/event identity",
+                    }
+                )
+            if reviewer_provenance.get("non_release_fixture") is True:
+                failures.append(
+                    {
+                        "check": "reviewer_provenance",
+                        "detail": "deterministic non-release reviewer fixture cannot satisfy semantic release",
+                    }
+                )
         for field in (
             "reviewer_raw_request_path",
             "reviewer_raw_response_path",
@@ -2005,6 +2037,23 @@ def _semantic_release_checks(
                         "detail": f"semantic_plan_review.{field} is missing",
                     }
                 )
+        failures.extend(
+            _semantic_raw_artifact_failures(
+                run_path=run_path,
+                artifact_label="reviewer",
+                request_path=review.get("reviewer_raw_request_path"),
+                response_path=review.get("reviewer_raw_response_path"),
+                request_hash=(
+                    review.get("reviewer_raw_request_artifact_hash")
+                    or review.get("reviewer_raw_request_hash")
+                ),
+                response_hash=(
+                    review.get("reviewer_raw_response_artifact_hash")
+                    or review.get("reviewer_raw_response_hash")
+                ),
+                request_content_hash=review.get("reviewer_raw_request_content_hash"),
+            )
+        )
 
     oracle = required_payloads.get("semantic_expectation_oracle")
     if isinstance(oracle, Mapping):
@@ -2025,7 +2074,14 @@ def _semantic_release_checks(
                             "field": field,
                             "detail": f"semantic oracle provenance {field} is missing",
                         }
-                    )
+                )
+            if not _semantic_provenance_has_codex_identity(provenance):
+                failures.append(
+                    {
+                        "check": "oracle_provenance",
+                        "detail": "semantic oracle provenance lacks a Codex session/response/event identity",
+                    }
+                )
             if provenance.get("non_release_fixture") is True:
                 failures.append(
                     {
@@ -2033,6 +2089,30 @@ def _semantic_release_checks(
                         "detail": "deterministic non-release oracle fixture cannot satisfy semantic release",
                     }
                 )
+            failures.extend(
+                _semantic_raw_artifact_failures(
+                    run_path=run_path,
+                    artifact_label="oracle",
+                    request_path=provenance.get("raw_request_path") or oracle.get("raw_request_path"),
+                    response_path=provenance.get("raw_response_path") or oracle.get("raw_response_path"),
+                    request_hash=(
+                        provenance.get("raw_request_artifact_hash")
+                        or oracle.get("raw_request_artifact_hash")
+                        or provenance.get("raw_request_hash")
+                        or oracle.get("raw_request_hash")
+                    ),
+                    response_hash=(
+                        provenance.get("raw_response_artifact_hash")
+                        or oracle.get("raw_response_artifact_hash")
+                        or provenance.get("raw_response_hash")
+                        or oracle.get("raw_response_hash")
+                    ),
+                    request_content_hash=(
+                        provenance.get("raw_request_content_hash")
+                        or oracle.get("raw_request_content_hash")
+                    ),
+                )
+            )
         for field in (
             "plan_visible_to_oracle",
             "used_production_planner_output",
@@ -2260,15 +2340,41 @@ def _semantic_trace_ordering_failures(
             )
             continue
         if not isinstance(paths, Mapping):
+            failures.append(
+                {
+                    "check": "semantic_trace_ordering",
+                    "event": event,
+                    "detail": "semantic trace event is missing semantic_artifact_paths",
+                }
+            )
             continue
         for key, expected_hash in hashes.items():
             raw_path = paths.get(key)
             if not isinstance(raw_path, str) or not raw_path:
+                failures.append(
+                    {
+                        "check": "semantic_trace_ordering",
+                        "event": event,
+                        "artifact": key,
+                        "detail": "semantic trace artifact path is missing",
+                    }
+                )
                 continue
             path = Path(raw_path)
             if not path.is_absolute():
                 path = run_path / path
-            if path.exists() and _file_sha256(path) != expected_hash:
+            if not path.exists():
+                failures.append(
+                    {
+                        "check": "semantic_trace_ordering",
+                        "event": event,
+                        "artifact": key,
+                        "path": str(path),
+                        "detail": "semantic trace artifact path does not exist",
+                    }
+                )
+                continue
+            if _file_sha256(path) != expected_hash:
                 if (
                     event == "semantic_plan_created"
                     and key == "semantic_plan"
@@ -2284,6 +2390,115 @@ def _semantic_trace_ordering_failures(
                     }
                 )
     return failures
+
+
+def _semantic_raw_artifact_failures(
+    *,
+    run_path: Path,
+    artifact_label: str,
+    request_path: Any,
+    response_path: Any,
+    request_hash: Any,
+    response_hash: Any,
+    request_content_hash: Any = None,
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    failures.extend(
+        _semantic_file_hash_failures(
+            run_path=run_path,
+            artifact_label=f"{artifact_label}_raw_request",
+            path_value=request_path,
+            expected_hash=request_hash,
+        )
+    )
+    failures.extend(
+        _semantic_file_hash_failures(
+            run_path=run_path,
+            artifact_label=f"{artifact_label}_raw_response",
+            path_value=response_path,
+            expected_hash=response_hash,
+        )
+    )
+    if request_content_hash:
+        request_artifact_path = _semantic_artifact_path(run_path, request_path)
+        if request_artifact_path is not None and request_artifact_path.exists():
+            payload = _read_optional_json(request_artifact_path)
+            if isinstance(payload, Mapping):
+                content_payload = dict(payload)
+                content_payload.pop("raw_request_content_hash", None)
+                content_payload.pop("raw_request_hash", None)
+                actual_content_hash = hashlib.sha256(
+                    json.dumps(
+                        content_payload,
+                        sort_keys=True,
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if actual_content_hash != str(request_content_hash):
+                    failures.append(
+                        {
+                            "check": "semantic_raw_artifact",
+                            "artifact": f"{artifact_label}_raw_request",
+                            "detail": "semantic raw request content hash does not match the request payload",
+                        }
+                    )
+    return failures
+
+
+def _semantic_file_hash_failures(
+    *,
+    run_path: Path,
+    artifact_label: str,
+    path_value: Any,
+    expected_hash: Any,
+) -> list[dict[str, Any]]:
+    path = _semantic_artifact_path(run_path, path_value)
+    if path is None:
+        return [
+            {
+                "check": "semantic_raw_artifact",
+                "artifact": artifact_label,
+                "detail": "semantic raw artifact path is missing",
+            }
+        ]
+    if not path.exists():
+        return [
+            {
+                "check": "semantic_raw_artifact",
+                "artifact": artifact_label,
+                "path": str(path),
+                "detail": "semantic raw artifact path does not exist",
+            }
+        ]
+    expected = str(expected_hash or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return [
+            {
+                "check": "semantic_raw_artifact",
+                "artifact": artifact_label,
+                "detail": "semantic raw artifact hash is missing or invalid",
+            }
+        ]
+    actual = _file_sha256(path)
+    if actual != expected:
+        return [
+            {
+                "check": "semantic_raw_artifact",
+                "artifact": artifact_label,
+                "path": str(path),
+                "detail": "semantic raw artifact hash does not match file content",
+            }
+        ]
+    return []
+
+
+def _semantic_artifact_path(run_path: Path, path_value: Any) -> Path | None:
+    if not isinstance(path_value, str) or not path_value.strip():
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = run_path / path
+    return path
 
 
 def _file_sha256(path: Path) -> str:
@@ -2461,9 +2676,22 @@ def _valid_semantic_provenance(value: Any) -> bool:
         and value.get("planner_source") == "codex_semantic"
         and value.get("raw_request_required") is True
         and value.get("raw_response_required") is True
-        and _non_empty_string(value.get("session_id_unavailable_reason"))
+        and _semantic_provenance_has_codex_identity(value)
         and value.get("semantic_release_eligible") is True
     )
+
+
+def _semantic_provenance_has_codex_identity(value: Mapping[str, Any]) -> bool:
+    for field in (
+        "child_session_id",
+        "session_id",
+        "raw_response_id",
+        "codex_event_id",
+        "response_id",
+    ):
+        if _non_empty_string(value.get(field)):
+            return True
+    return False
 
 
 def _valid_semantic_template_use(value: Any) -> bool:
