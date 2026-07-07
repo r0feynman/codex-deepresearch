@@ -10,7 +10,8 @@ import shlex
 import shutil
 import subprocess
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -23,9 +24,16 @@ SEMANTIC_PLAN_FILENAME = "semantic_plan.json"
 SEMANTIC_PLAN_REVIEW_FILENAME = "semantic_plan_review.json"
 SEMANTIC_PLAN_DELTA_FILENAME = "semantic_plan_delta.json"
 SEMANTIC_MATERIALIZATION_DIFF_FILENAME = "semantic_materialization_diff.json"
+SEMANTIC_REQUIREMENT_WAIVERS_FILENAME = "semantic_requirement_waivers.json"
 SEMANTIC_RAW_DIRNAME = "semantic_planner_raw"
+SEMANTIC_ORACLE_RAW_DIRNAME = "semantic_oracle_raw"
+SEMANTIC_REVIEWER_RAW_DIRNAME = "semantic_reviewer_raw"
 SEMANTIC_RAW_REQUEST_FILENAME = "planner_request.json"
 SEMANTIC_RAW_RESPONSE_FILENAME = "planner_response.json"
+SEMANTIC_ORACLE_RAW_REQUEST_FILENAME = "oracle_request.json"
+SEMANTIC_ORACLE_RAW_RESPONSE_FILENAME = "oracle_response.json"
+SEMANTIC_REVIEWER_RAW_REQUEST_FILENAME = "reviewer_request.json"
+SEMANTIC_REVIEWER_RAW_RESPONSE_FILENAME = "reviewer_response.json"
 PLANNER_MODE_CODEX_SEMANTIC = "codex_semantic"
 PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK = "heuristic_template_fallback"
 PLANNER_MODE_MANUAL_ANGLES = "manual_angles"
@@ -34,10 +42,28 @@ PLANNER_MODE_BLOCKED = "blocked"
 BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE = "blocked_semantic_planner_unavailable"
 CODEX_SEMANTIC_ADAPTER_NAME = "codex_native_semantic_candidate_adapter"
 CODEX_SEMANTIC_PROMPT_VERSION = "p3-sp2-candidate-v1"
+CODEX_SEMANTIC_ORACLE_ADAPTER_NAME = "codex_native_semantic_expectation_oracle"
+CODEX_SEMANTIC_ORACLE_PROMPT_VERSION = "p3-sp3-oracle-v1"
+CODEX_SEMANTIC_REVIEWER_ADAPTER_NAME = "codex_native_semantic_fit_reviewer"
+CODEX_SEMANTIC_REVIEWER_PROMPT_VERSION = "p3-sp3-reviewer-v1"
 CODEX_SEMANTIC_PLANNER_COMMAND_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_COMMAND"
+CODEX_SEMANTIC_ORACLE_COMMAND_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_COMMAND"
+CODEX_SEMANTIC_REVIEWER_COMMAND_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_COMMAND"
 CODEX_SEMANTIC_PLANNER_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"
+CODEX_SEMANTIC_ORACLE_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_TIMEOUT_SECONDS"
+CODEX_SEMANTIC_REVIEWER_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_TIMEOUT_SECONDS"
 CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND = "codex_exec_json"
 SEMANTIC_FIT_SCORE_THRESHOLD = 9.0
+SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES = (
+    "failed_semantic_fit",
+    "hidden_template_use",
+    "missing_non_negotiable_coverage",
+    "task_count_failure",
+    "subject_drift",
+    "required_modality_omission",
+    "source_quality_omission",
+    "generic_task_content",
+)
 ALLOWED_PLANNER_MODES = (
     PLANNER_MODE_CODEX_SEMANTIC,
     PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
@@ -379,6 +405,7 @@ def codex_semantic_candidate_plan(
     budget_cap: Mapping[str, Any] | None = None,
     provided_sources: Sequence[Mapping[str, Any]] | None = None,
     provided_images: Sequence[Mapping[str, Any]] | None = None,
+    raw_request_payload: Mapping[str, Any] | None = None,
 ) -> SemanticPlan:
     """Build the P3-SP2 Codex-native semantic candidate plan.
 
@@ -387,16 +414,19 @@ def codex_semantic_candidate_plan(
     """
 
     original_question = question.strip()
-    raw_request = _codex_semantic_raw_request(
-        question=original_question,
-        user_constraints=user_constraints or [],
-        depth_preset=depth_preset,
-        visual_preference=visual_preference,
-        budget_cap=budget_cap or {},
-        provided_sources=provided_sources or [],
-        provided_images=provided_images or [],
+    raw_request = (
+        dict(raw_request_payload)
+        if isinstance(raw_request_payload, Mapping)
+        else build_codex_semantic_raw_request(
+            question=original_question,
+            user_constraints=user_constraints or [],
+            depth_preset=depth_preset,
+            visual_preference=visual_preference,
+            budget_cap=budget_cap or {},
+            provided_sources=provided_sources or [],
+            provided_images=provided_images or [],
+        )
     )
-    raw_request["adapter_request_hash"] = _sha256_payload(raw_request)
     try:
         adapter_response = invoke_codex_semantic_planner_adapter(raw_request)
     except SemanticPlannerAdapterUnavailable as exc:
@@ -488,6 +518,7 @@ def codex_semantic_candidate_plan(
         "raw_request_required": True,
         "raw_response_required": True,
         "adapter_request_hash": raw_request["adapter_request_hash"],
+        "raw_request_hash": raw_request["adapter_request_hash"],
         "raw_response_hash": raw_response["raw_response_hash"],
         "parsed_response_hash": parsed_response_hash,
         "preselected_template_class": None,
@@ -544,6 +575,7 @@ def plan_semantic_angles(
     budget_cap: Mapping[str, Any] | None = None,
     provided_sources: Sequence[Mapping[str, Any]] | None = None,
     provided_images: Sequence[Mapping[str, Any]] | None = None,
+    raw_request_payload: Mapping[str, Any] | None = None,
 ) -> SemanticPlan:
     """Compatibility wrapper returning manual fallback or semantic candidate plans."""
 
@@ -557,11 +589,43 @@ def plan_semantic_angles(
         budget_cap=budget_cap,
         provided_sources=provided_sources,
         provided_images=provided_images,
+        raw_request_payload=raw_request_payload,
     )
 
 
 class SemanticPlannerAdapterUnavailable(RuntimeError):
     """Raised when no real Codex semantic planner response can be consumed."""
+
+
+def build_codex_semantic_raw_request(
+    *,
+    question: str,
+    user_constraints: Sequence[str] | None = None,
+    depth_preset: str = "standard",
+    visual_preference: str | None = None,
+    budget_cap: Mapping[str, Any] | None = None,
+    provided_sources: Sequence[Mapping[str, Any]] | None = None,
+    provided_images: Sequence[Mapping[str, Any]] | None = None,
+    run_id: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the planner raw request before the planner adapter is invoked."""
+
+    raw_request = _codex_semantic_raw_request(
+        question=question,
+        user_constraints=user_constraints or [],
+        depth_preset=depth_preset,
+        visual_preference=visual_preference,
+        budget_cap=budget_cap or {},
+        provided_sources=provided_sources or [],
+        provided_images=provided_images or [],
+    )
+    if run_id:
+        raw_request["run_id"] = run_id
+    if created_at:
+        raw_request["created_at"] = created_at
+    raw_request["adapter_request_hash"] = _sha256_payload(raw_request)
+    return raw_request
 
 
 def invoke_codex_semantic_planner_adapter(
@@ -657,6 +721,7 @@ def _blocked_codex_semantic_adapter_plan(
         "session_id": None,
         "session_id_unavailable_reason": "Semantic planner adapter was unavailable.",
         "adapter_request_hash": raw_request.get("adapter_request_hash"),
+        "raw_request_hash": raw_request.get("adapter_request_hash"),
         "raw_response_hash": _sha256_payload(blocked_response),
         "failure_category": failure_category,
         "semantic_release_eligible": False,
@@ -977,6 +1042,1305 @@ def validate_codex_semantic_adapter_provenance(
     return normalized
 
 
+def write_semantic_expectation_oracle(
+    *,
+    run_dir: str | Path,
+    question: str,
+    user_constraints: Sequence[str] | None = None,
+    depth_preset: str = "standard",
+    visual_preference: str | None = None,
+    budget_cap: Mapping[str, Any] | None = None,
+    provided_sources: Sequence[Mapping[str, Any]] | None = None,
+    provided_images: Sequence[Mapping[str, Any]] | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Write and lock the semantic expectation oracle before planning."""
+
+    run_path = Path(run_dir)
+    timestamp = created_at or _utc_now_from_run(run_path)
+    raw_dir = run_path / SEMANTIC_ORACLE_RAW_DIRNAME
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_request_path = raw_dir / SEMANTIC_ORACLE_RAW_REQUEST_FILENAME
+    raw_response_path = raw_dir / SEMANTIC_ORACLE_RAW_RESPONSE_FILENAME
+    raw_request = _semantic_oracle_raw_request(
+        run_id=run_path.name,
+        question=question,
+        user_constraints=user_constraints or [],
+        depth_preset=depth_preset,
+        visual_preference=visual_preference,
+        budget_cap=budget_cap or {},
+        provided_sources=provided_sources or [],
+        provided_images=provided_images or [],
+        created_at=timestamp,
+    )
+    _write_json(raw_request_path, raw_request)
+    raw_request_hash = _sha256_file(raw_request_path)
+    raw_request["raw_request_hash"] = raw_request_hash
+    _write_json(raw_request_path, raw_request)
+    try:
+        adapter_response = invoke_codex_semantic_oracle_adapter(raw_request)
+        adapter_unavailable_reason = None
+    except SemanticPlannerAdapterUnavailable as exc:
+        adapter_response = None
+        adapter_unavailable_reason = str(exc) or "semantic oracle adapter unavailable"
+    if adapter_response is None:
+        raw_response = _deterministic_oracle_raw_response(
+            request=raw_request,
+            raw_request_hash=raw_request_hash,
+            unavailable_reason=adapter_unavailable_reason,
+        )
+    else:
+        raw_response = _structured_semantic_oracle_response(
+            raw_request=raw_request,
+            raw_request_hash=raw_request_hash,
+            adapter_response=adapter_response,
+        )
+    raw_response["run_id"] = run_path.name
+    raw_response["created_at"] = timestamp
+    raw_response["raw_request_hash"] = raw_request_hash
+    _write_json(raw_response_path, raw_response)
+    raw_response_hash = _sha256_file(raw_response_path)
+    oracle = _expectation_oracle_from_raw_response(
+        run_path=run_path,
+        question=question,
+        raw_request_path=raw_request_path,
+        raw_response_path=raw_response_path,
+        raw_request_hash=raw_request_hash,
+        raw_response_hash=raw_response_hash,
+        raw_response=raw_response,
+        timestamp=timestamp,
+    )
+    _write_json(run_path / SEMANTIC_EXPECTATION_ORACLE_FILENAME, oracle)
+    return oracle
+
+
+def invoke_codex_semantic_oracle_adapter(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Invoke the independent Codex semantic expectation-oracle boundary."""
+
+    return _invoke_codex_semantic_json_adapter(
+        request=request,
+        command_env=CODEX_SEMANTIC_ORACLE_COMMAND_ENV,
+        timeout_env=CODEX_SEMANTIC_ORACLE_TIMEOUT_ENV,
+        role_label="semantic oracle",
+    )
+
+
+def write_semantic_plan_review(
+    *,
+    run_dir: str | Path,
+    question: str,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Review a semantic plan against the locked oracle and write review artifacts."""
+
+    run_path = Path(run_dir)
+    timestamp = created_at or _utc_now_from_run(run_path)
+    raw_dir = run_path / SEMANTIC_REVIEWER_RAW_DIRNAME
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_request_path = raw_dir / SEMANTIC_REVIEWER_RAW_REQUEST_FILENAME
+    raw_response_path = raw_dir / SEMANTIC_REVIEWER_RAW_RESPONSE_FILENAME
+    oracle_hash = _sha256_file(run_path / SEMANTIC_EXPECTATION_ORACLE_FILENAME)
+    plan_payload = plan.to_dict()
+    plan_hash = _sha256_text(json.dumps(plan_payload, sort_keys=True, ensure_ascii=True))
+    raw_request = {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_reviewer_raw_request",
+        "run_id": run_path.name,
+        "created_at": timestamp,
+        "reviewer_adapter": CODEX_SEMANTIC_REVIEWER_ADAPTER_NAME,
+        "prompt_version": CODEX_SEMANTIC_REVIEWER_PROMPT_VERSION,
+        "original_question": question,
+        "semantic_expectation_oracle_path": SEMANTIC_EXPECTATION_ORACLE_FILENAME,
+        "semantic_expectation_oracle_hash": oracle_hash,
+        "semantic_plan_candidate_hash": plan_hash,
+        "semantic_plan": plan_payload,
+        "review_instructions": [
+            "Compare the plan to the locked expectation oracle.",
+            "Reject reverse-fit, hidden template, generic wrapper, or substitute implementation behavior.",
+            "Require complete non-negotiable coverage, modality/source constraints, and bounded executable tasks.",
+        ],
+        "response_schema_shape": {
+            "semantic_fit_score": "number 0-10",
+            "score_dimensions": "object",
+            "blockers": "list",
+            "warnings": "list",
+            "substitute_implementation_check": "object",
+            "verdict": "pass|fail|release_ineligible",
+        },
+    }
+    _write_json(raw_request_path, raw_request)
+    raw_request_hash = _sha256_file(raw_request_path)
+    raw_request["raw_request_hash"] = raw_request_hash
+    _write_json(raw_request_path, raw_request)
+    try:
+        adapter_response = invoke_codex_semantic_reviewer_adapter(raw_request)
+        adapter_unavailable_reason = None
+    except SemanticPlannerAdapterUnavailable as exc:
+        adapter_response = None
+        adapter_unavailable_reason = str(exc) or "semantic reviewer adapter unavailable"
+    if adapter_response is None:
+        raw_response = _deterministic_review_raw_response(
+            request=raw_request,
+            plan=plan,
+            oracle=oracle,
+            raw_request_hash=raw_request_hash,
+            unavailable_reason=adapter_unavailable_reason,
+        )
+    else:
+        raw_response = _structured_semantic_reviewer_response(
+            raw_request=raw_request,
+            raw_request_hash=raw_request_hash,
+            adapter_response=adapter_response,
+        )
+    raw_response["run_id"] = run_path.name
+    raw_response["created_at"] = timestamp
+    raw_response["raw_request_hash"] = raw_request_hash
+    raw_response["semantic_plan_candidate_hash"] = plan_hash
+    _write_json(raw_response_path, raw_response)
+    raw_response_hash = _sha256_file(raw_response_path)
+    review = _semantic_plan_review_from_raw_response(
+        run_path=run_path,
+        question=question,
+        plan=plan,
+        oracle=oracle,
+        raw_request_path=raw_request_path,
+        raw_response_path=raw_response_path,
+        raw_request_hash=raw_request_hash,
+        raw_response_hash=raw_response_hash,
+        raw_response=raw_response,
+        timestamp=timestamp,
+    )
+    _write_json(run_path / SEMANTIC_PLAN_REVIEW_FILENAME, review)
+    return review
+
+
+def invoke_codex_semantic_reviewer_adapter(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Invoke the independent Codex semantic fit reviewer boundary."""
+
+    return _invoke_codex_semantic_json_adapter(
+        request=request,
+        command_env=CODEX_SEMANTIC_REVIEWER_COMMAND_ENV,
+        timeout_env=CODEX_SEMANTIC_REVIEWER_TIMEOUT_ENV,
+        role_label="semantic reviewer",
+    )
+
+
+def semantic_review_release_eligible(review: Mapping[str, Any]) -> bool:
+    """Return whether a review satisfies the P3-SP3 release gate."""
+
+    try:
+        score = float(review.get("semantic_fit_score"))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(score) or score < SEMANTIC_FIT_SCORE_THRESHOLD:
+        return False
+    blockers = review.get("blockers")
+    if not isinstance(blockers, list) or blockers:
+        return False
+    if review.get("verdict") != "pass" and review.get("final_verdict") != "pass":
+        return False
+    if review.get("non_negotiable_coverage_complete") is not True:
+        return False
+    substitute = review.get("substitute_implementation_check")
+    if not isinstance(substitute, Mapping) or substitute.get("passed") is not True:
+        return False
+    independence = review.get("reviewer_independence")
+    if not isinstance(independence, Mapping) or independence.get("independent") is not True:
+        return False
+    return True
+
+
+def semantic_plan_with_review_result(
+    plan: SemanticPlan,
+    review: Mapping[str, Any],
+) -> SemanticPlan:
+    """Return a plan annotated with the semantic review release decision."""
+
+    eligible = semantic_review_release_eligible(review)
+    diagnostics = dict(plan.diagnostics or {})
+    failed_diagnostic = (
+        "The semantic plan failed independent semantic review and cannot fan out."
+        if plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC
+        else diagnostics.get("user_visible_diagnostic")
+        or "True semantic decomposition did not run; this path is useful only as a release-ineligible fallback and cannot satisfy semantic planner gates."
+    )
+    diagnostics.update(
+        {
+            "semantic_release_eligible": eligible,
+            "semantic_fit_score": review.get("semantic_fit_score"),
+            "semantic_review_verdict": review.get("verdict") or review.get("final_verdict"),
+            "semantic_review_blocker_count": len(_list(review.get("blockers"))),
+            "user_visible_diagnostic": (
+                "The semantic plan passed independent oracle review."
+                if eligible
+                else failed_diagnostic
+            ),
+        }
+    )
+    return replace(
+        plan,
+        semantic_release_eligible=eligible,
+        status="semantic_review_passed" if eligible else "blocked_semantic_review_failed",
+        diagnostics=diagnostics,
+    )
+
+
+def _invoke_codex_semantic_json_adapter(
+    *,
+    request: Mapping[str, Any],
+    command_env: str,
+    timeout_env: str,
+    role_label: str,
+) -> Mapping[str, Any] | None:
+    command_text = os.environ.get(command_env, "").strip()
+    if not command_text:
+        return None
+    command = shlex.split(command_text)
+    if not command:
+        return None
+    command_boundary = validate_codex_semantic_adapter_command(command)
+    timeout_seconds = float(os.environ.get(timeout_env, "300"))
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        input=json.dumps(dict(request), ensure_ascii=False, sort_keys=True),
+        text=True,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        raise SemanticPlannerAdapterUnavailable(
+            f"Codex {role_label} command exited {completed.returncode}; "
+            f"stderr={_preview_text(completed.stderr)}; stdout={_preview_text(completed.stdout)}"
+        )
+    payload, codex_events = _parse_codex_exec_json_output(completed.stdout)
+    provenance = dict(payload.get("provenance") or {})
+    provenance.setdefault("adapter_command", _redacted_command(command))
+    provenance.setdefault(
+        "adapter_invocation_kind",
+        command_boundary["adapter_invocation_kind"],
+    )
+    for key, value in _codex_event_provenance(codex_events).items():
+        provenance.setdefault(key, value)
+    payload = dict(payload)
+    payload["provenance"] = provenance
+    return payload
+
+
+def _semantic_oracle_raw_request(
+    *,
+    run_id: str,
+    question: str,
+    user_constraints: Sequence[str],
+    depth_preset: str,
+    visual_preference: str | None,
+    budget_cap: Mapping[str, Any],
+    provided_sources: Sequence[Mapping[str, Any]],
+    provided_images: Sequence[Mapping[str, Any]],
+    created_at: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_oracle_raw_request",
+        "run_id": run_id,
+        "created_at": created_at,
+        "oracle_adapter": CODEX_SEMANTIC_ORACLE_ADAPTER_NAME,
+        "prompt_version": CODEX_SEMANTIC_ORACLE_PROMPT_VERSION,
+        "original_question": question,
+        "user_constraints": [str(item) for item in user_constraints],
+        "depth_preset": depth_preset,
+        "visual_preference": visual_preference or "auto",
+        "budget_cap": dict(budget_cap),
+        "provided_sources": [dict(item) for item in provided_sources],
+        "provided_images": [dict(item) for item in provided_images],
+        "oracle_instructions": [
+            "Create an expectation oracle from only the original user inputs.",
+            "Use only the listed question, constraints, budget, source, and image inputs.",
+            "Capture every explicit requirement and justified inferred constraint.",
+        ],
+        "response_schema_shape": {
+            "oracle_requirement_map": "list",
+            "question_scope": "broad|narrow",
+            "bounded_task_range": "object",
+            "expected_entities": "list",
+            "expected_constraints": "list",
+            "expected_modalities": "list",
+            "required_angles": "list",
+            "forbidden_angles": "list",
+            "forbidden_internal_implementation_terms": "list",
+            "expected_report_shape": "list",
+            "language": "string",
+        },
+    }
+
+
+def _semantic_oracle_required_fields() -> tuple[str, ...]:
+    return (
+        "oracle_requirement_map",
+        "question_scope",
+        "bounded_task_range",
+        "expected_entities",
+        "expected_constraints",
+        "expected_modalities",
+        "required_angles",
+        "forbidden_angles",
+        "forbidden_internal_implementation_terms",
+        "expected_report_shape",
+        "language",
+    )
+
+
+def _deterministic_oracle_raw_response(
+    *,
+    request: Mapping[str, Any],
+    raw_request_hash: str,
+    unavailable_reason: str | None,
+) -> dict[str, Any]:
+    oracle = _deterministic_expectation_oracle_from_request(request)
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_oracle_raw_response",
+        "oracle_adapter": "deterministic_semantic_oracle_fixture_non_release",
+        "prompt_version": "deterministic-p3-sp3-oracle-fixture",
+        "semantic_release_eligible": False,
+        "expectation_oracle": oracle,
+        "provenance": {
+            "oracle_adapter": "deterministic_semantic_oracle_fixture_non_release",
+            "prompt_version": "deterministic-p3-sp3-oracle-fixture",
+            "model_or_surface": "local-deterministic-non-release-fixture",
+            "child_session_id": None,
+            "session_id": None,
+            "session_id_unavailable_reason": (
+                unavailable_reason
+                or "No independent Codex oracle adapter was configured."
+            ),
+            "raw_request_hash": raw_request_hash,
+            "non_release_fixture": True,
+            "adapter_invocation_kind": "local_deterministic_fixture",
+        },
+    }
+
+
+def _structured_semantic_oracle_response(
+    *,
+    raw_request: Mapping[str, Any],
+    raw_request_hash: str,
+    adapter_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(adapter_response, Mapping):
+        raise SemanticPlannerAdapterUnavailable("semantic oracle response is not an object")
+    raw_response = dict(adapter_response)
+    raw_response.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    raw_response.setdefault("artifact_type", "semantic_oracle_raw_response")
+    raw_response.setdefault("oracle_adapter", CODEX_SEMANTIC_ORACLE_ADAPTER_NAME)
+    raw_response.setdefault("prompt_version", CODEX_SEMANTIC_ORACLE_PROMPT_VERSION)
+    raw_response.setdefault("semantic_release_eligible", False)
+    provenance = _validate_codex_semantic_role_provenance(
+        raw_request_hash=raw_request_hash,
+        provenance=raw_response.get("provenance"),
+        role_label="semantic oracle",
+    )
+    raw_response["provenance"] = provenance
+    if not isinstance(raw_response.get("expectation_oracle"), Mapping):
+        oracle_fields = {
+            key: raw_response.get(key)
+            for key in _semantic_oracle_required_fields()
+            if key in raw_response
+        }
+        if oracle_fields:
+            raw_response["expectation_oracle"] = oracle_fields
+    if not isinstance(raw_response.get("expectation_oracle"), Mapping):
+        raise SemanticPlannerAdapterUnavailable(
+            "semantic oracle adapter response is missing expectation_oracle"
+        )
+    return raw_response
+
+
+def _expectation_oracle_from_raw_response(
+    *,
+    run_path: Path,
+    question: str,
+    raw_request_path: Path,
+    raw_response_path: Path,
+    raw_request_hash: str,
+    raw_response_hash: str,
+    raw_response: Mapping[str, Any],
+    timestamp: str,
+) -> dict[str, Any]:
+    raw_oracle = raw_response.get("expectation_oracle")
+    oracle = dict(raw_oracle) if isinstance(raw_oracle, Mapping) else {}
+    fallback = _deterministic_expectation_oracle_from_request(
+        {
+            "original_question": question,
+            "user_constraints": [],
+            "depth_preset": "standard",
+            "visual_preference": "auto",
+            "budget_cap": {},
+            "provided_sources": [],
+            "provided_images": [],
+        }
+    )
+    for key, value in fallback.items():
+        oracle.setdefault(key, value)
+    oracle["schema_version"] = SEMANTIC_PLANNER_SCHEMA_VERSION
+    oracle["artifact_type"] = "semantic_expectation_oracle"
+    oracle["run_id"] = run_path.name
+    oracle["created_at"] = timestamp
+    oracle["locked_at"] = timestamp
+    oracle["generated_before_plan_timestamp"] = timestamp
+    oracle["semantic_release_eligible"] = False
+    oracle["plan_visible_to_oracle"] = False
+    oracle["used_production_planner_output"] = False
+    oracle["used_hidden_template_class"] = False
+    oracle["used_fixed_angle_inventory"] = False
+    oracle["no_reverse_fit_fields"] = {
+        "plan_visible_to_oracle": False,
+        "used_production_planner_output": False,
+        "used_hidden_template_class": False,
+        "used_fixed_angle_inventory": False,
+    }
+    provenance = dict(raw_response.get("provenance") or {})
+    provenance.setdefault("oracle_adapter", raw_response.get("oracle_adapter"))
+    provenance.setdefault("prompt_version", raw_response.get("prompt_version"))
+    provenance.setdefault("raw_request_path", str(raw_request_path))
+    provenance.setdefault("raw_response_path", str(raw_response_path))
+    provenance.setdefault("raw_request_hash", raw_request_hash)
+    provenance.setdefault("raw_response_hash", raw_response_hash)
+    provenance.setdefault("generated_before_plan_timestamp", timestamp)
+    oracle["oracle_provenance"] = provenance
+    oracle["provenance"] = provenance
+    oracle["raw_request_path"] = str(raw_request_path)
+    oracle["raw_response_path"] = str(raw_response_path)
+    oracle["raw_request_hash"] = raw_request_hash
+    oracle["raw_response_hash"] = raw_response_hash
+    oracle["session_id"] = provenance.get("session_id") or provenance.get("child_session_id")
+    oracle["session_id_unavailable_reason"] = provenance.get(
+        "session_id_unavailable_reason"
+    )
+    oracle["oracle_content_hash"] = _oracle_content_hash(oracle)
+    oracle["oracle_provenance"]["oracle_content_hash"] = oracle["oracle_content_hash"]
+    return oracle
+
+
+def _deterministic_expectation_oracle_from_request(
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    question = str(request.get("original_question") or request.get("question") or "")
+    user_constraints = _string_list(request.get("user_constraints"))
+    visual_preference = str(request.get("visual_preference") or "auto")
+    depth_preset = str(request.get("depth_preset") or "standard")
+    requirements = _fixture_extract_semantic_requirements(
+        question=question,
+        user_constraints=user_constraints,
+        visual_preference=visual_preference,
+    )
+    entities = _fixture_extract_domain_entities(question, requirements)
+    scope = _fixture_infer_candidate_question_scope(question, requirements)
+    requirement_map = _oracle_requirement_records(requirements)
+    expected_modalities = ["text"]
+    if any(
+        str(requirement.get("requirement_type") or "") == "visual_modality"
+        for requirement in requirements
+    ):
+        expected_modalities.append("visual")
+    return {
+        "oracle_requirement_map": requirement_map,
+        "question_scope": scope,
+        "bounded_task_range": _bounded_task_range(scope, depth_preset),
+        "expected_entities": entities,
+        "expected_constraints": [dict(requirement) for requirement in requirements],
+        "expected_modalities": expected_modalities,
+        "required_angles": _required_angles_for_requirements(question, requirements),
+        "forbidden_angles": _forbidden_angles_for_question(question),
+        "forbidden_internal_implementation_terms": _forbidden_internal_terms(),
+        "expected_report_shape": _expected_report_shape(requirements),
+        "language": _fixture_question_language(question),
+        "oracle_requirement_count": len(requirement_map),
+        "oracle_generation_basis": {
+            "inputs": [
+                "original_question",
+                "user_constraints",
+                "depth_preset",
+                "visual_preference",
+                "budget_cap",
+                "provided_sources",
+                "provided_images",
+            ],
+            "excluded_inputs": [
+                "planner_output",
+                "class_template_inventory",
+                "generated_angles",
+                "generated_tasks",
+            ],
+        },
+    }
+
+
+def _oracle_requirement_records(
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for index, requirement in enumerate(requirements, start=1):
+        requirement_type = str(requirement.get("requirement_type") or "requirement")
+        records.append(
+            {
+                "requirement_id": str(requirement.get("requirement_id") or f"req_{index:03d}"),
+                "prompt_span": requirement.get("prompt_span"),
+                "prompt_text": requirement.get("prompt_text"),
+                "requirement_text": requirement.get("requirement_text"),
+                "requirement_type": requirement_type,
+                "expected_entities": _string_list(requirement.get("expected_entities")),
+                "expected_modalities": _expected_modalities_for_requirement(requirement_type),
+                "source_quality_constraints": _source_quality_constraints(requirement),
+                "geography_constraints": _constraint_text_if_type(requirement, "geography"),
+                "time_constraints": _constraint_text_if_type(requirement, "time_range"),
+                "output_shape_constraints": _constraint_text_if_type(requirement, "deliverable_shape"),
+                "expected_coverage": "full",
+                "explicit": bool(requirement.get("explicit")),
+                "inferred": not bool(requirement.get("explicit")),
+                "inferred_reason": requirement.get("inferred_reason"),
+                "non_negotiable": bool(requirement.get("non_negotiable")),
+            }
+        )
+    return records
+
+
+def _expected_modalities_for_requirement(requirement_type: str) -> list[str]:
+    if requirement_type == "visual_modality":
+        return ["visual"]
+    return ["text"]
+
+
+def _source_quality_constraints(requirement: Mapping[str, Any]) -> list[str]:
+    if str(requirement.get("requirement_type") or "") != "source_quality":
+        return []
+    return ["official", "regulatory", "primary"]
+
+
+def _constraint_text_if_type(requirement: Mapping[str, Any], requirement_type: str) -> list[str]:
+    if str(requirement.get("requirement_type") or "") != requirement_type:
+        return []
+    return [str(requirement.get("prompt_text") or requirement.get("requirement_text") or "")]
+
+
+def _bounded_task_range(scope: str, depth_preset: str) -> dict[str, Any]:
+    if scope == "broad":
+        if depth_preset == "deep":
+            return {"min": 40, "max": 80, "depth_preset": depth_preset}
+        if depth_preset == "exhaustive":
+            return {"min": 80, "max": 100, "depth_preset": depth_preset}
+        return {"min": 20, "max": 40, "depth_preset": depth_preset}
+    return {"min": 6, "max": 12, "depth_preset": depth_preset}
+
+
+def _required_angles_for_requirements(
+    question: str,
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    subject = _fixture_subject_phrase(
+        question,
+        _fixture_extract_domain_entities(question, requirements),
+    )
+    records = [{"angle_requirement": "source baseline", "subject": subject}]
+    for requirement in requirements:
+        requirement_type = str(requirement.get("requirement_type") or "")
+        if requirement_type == "visual_modality":
+            records.append({"angle_requirement": "visual evidence", "subject": subject})
+        elif requirement_type == "source_quality":
+            records.append({"angle_requirement": "official/regulatory sources", "subject": subject})
+        elif requirement_type == "time_range":
+            records.append({"angle_requirement": "current/recent evidence", "subject": subject})
+        elif requirement_type == "geography":
+            records.append({"angle_requirement": "requested geography", "subject": subject})
+        elif requirement_type == "safety_risk":
+            records.append({"angle_requirement": "safety risk/failure modes", "subject": subject})
+        elif requirement_type == "deliverable_shape":
+            records.append({"angle_requirement": "requested report shape", "subject": subject})
+    records.append({"angle_requirement": "counter-evidence and caveats", "subject": subject})
+    return records
+
+
+def _forbidden_angles_for_question(question: str) -> list[str]:
+    if _fixture_is_software_implementation_question(question, []):
+        return ["generic market scan", "unrequested policy/legal detour"]
+    return [
+        "Codex runner architecture",
+        "semantic planner implementation",
+        "local fixture/template inventory",
+        "generic report wrapper",
+    ]
+
+
+def _forbidden_internal_terms() -> list[str]:
+    return [
+        "technical_api",
+        "product_market",
+        "visual_style",
+        "policy_risk",
+        "implementation_architecture",
+        "heuristic_template_planner",
+        "local deterministic template",
+        "fixture_semantic_candidate_response_for_validation_tests",
+    ]
+
+
+def _expected_report_shape(requirements: Sequence[Mapping[str, Any]]) -> list[str]:
+    shapes = []
+    for requirement in requirements:
+        if str(requirement.get("requirement_type") or "") == "deliverable_shape":
+            text = str(requirement.get("prompt_text") or requirement.get("requirement_text") or "")
+            shapes.append(text or "requested synthesized deliverable")
+    return shapes or ["source-backed synthesized report"]
+
+
+def _oracle_content_hash(oracle: Mapping[str, Any]) -> str:
+    payload = {
+        key: value
+        for key, value in dict(oracle).items()
+        if key not in {"oracle_content_hash", "created_at", "locked_at"}
+    }
+    return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+
+
+def _structured_semantic_reviewer_response(
+    *,
+    raw_request: Mapping[str, Any],
+    raw_request_hash: str,
+    adapter_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(adapter_response, Mapping):
+        raise SemanticPlannerAdapterUnavailable("semantic reviewer response is not an object")
+    raw_response = dict(adapter_response)
+    raw_response.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    raw_response.setdefault("artifact_type", "semantic_reviewer_raw_response")
+    raw_response.setdefault("reviewer_adapter", CODEX_SEMANTIC_REVIEWER_ADAPTER_NAME)
+    raw_response.setdefault("prompt_version", CODEX_SEMANTIC_REVIEWER_PROMPT_VERSION)
+    raw_response.setdefault("semantic_release_eligible", False)
+    raw_response["provenance"] = _validate_codex_semantic_role_provenance(
+        raw_request_hash=raw_request_hash,
+        provenance=raw_response.get("provenance"),
+        role_label="semantic reviewer",
+    )
+    if not isinstance(raw_response.get("semantic_plan_review"), Mapping):
+        review_fields = {
+            key: raw_response.get(key)
+            for key in (
+                "semantic_fit_score",
+                "score_dimensions",
+                "prd_score_dimensions",
+                "blockers",
+                "warnings",
+                "substitute_implementation_check",
+                "verdict",
+                "final_verdict",
+            )
+            if key in raw_response
+        }
+        if review_fields:
+            raw_response["semantic_plan_review"] = review_fields
+    if not isinstance(raw_response.get("semantic_plan_review"), Mapping):
+        raise SemanticPlannerAdapterUnavailable(
+            "semantic reviewer adapter response is missing semantic_plan_review"
+        )
+    return raw_response
+
+
+def _deterministic_review_raw_response(
+    *,
+    request: Mapping[str, Any],
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+    raw_request_hash: str,
+    unavailable_reason: str | None,
+) -> dict[str, Any]:
+    review = _deterministic_semantic_review(
+        question=str(request.get("original_question") or ""),
+        plan=plan,
+        oracle=oracle,
+        adapter_available=False,
+        adapter_unavailable_reason=unavailable_reason,
+    )
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_reviewer_raw_response",
+        "reviewer_adapter": "deterministic_semantic_reviewer_fixture_non_release",
+        "prompt_version": "deterministic-p3-sp3-review-fixture",
+        "semantic_release_eligible": False,
+        "semantic_plan_review": review,
+        "provenance": {
+            "reviewer_adapter": "deterministic_semantic_reviewer_fixture_non_release",
+            "prompt_version": "deterministic-p3-sp3-review-fixture",
+            "model_or_surface": "local-deterministic-non-release-fixture",
+            "child_session_id": None,
+            "session_id": None,
+            "session_id_unavailable_reason": (
+                unavailable_reason
+                or "No independent Codex reviewer adapter was configured."
+            ),
+            "raw_request_hash": raw_request_hash,
+            "non_release_fixture": True,
+            "adapter_invocation_kind": "local_deterministic_fixture",
+        },
+    }
+
+
+def _semantic_plan_review_from_raw_response(
+    *,
+    run_path: Path,
+    question: str,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+    raw_request_path: Path,
+    raw_response_path: Path,
+    raw_request_hash: str,
+    raw_response_hash: str,
+    raw_response: Mapping[str, Any],
+    timestamp: str,
+) -> dict[str, Any]:
+    raw_review = raw_response.get("semantic_plan_review")
+    adapter_review = dict(raw_review) if isinstance(raw_review, Mapping) else {}
+    deterministic = _deterministic_semantic_review(
+        question=question,
+        plan=plan,
+        oracle=oracle,
+        adapter_available=not _provenance_is_non_release_fixture(raw_response.get("provenance")),
+        adapter_unavailable_reason=None,
+    )
+    review = {**deterministic, **adapter_review}
+    review["schema_version"] = SEMANTIC_PLANNER_SCHEMA_VERSION
+    review["artifact_type"] = "semantic_plan_review"
+    review["run_id"] = run_path.name
+    review["created_at"] = timestamp
+    review["planner_mode"] = plan.planner_mode
+    review["semantic_release_eligible"] = False
+    review["semantic_expectation_oracle_path"] = SEMANTIC_EXPECTATION_ORACLE_FILENAME
+    review["semantic_expectation_oracle_hash"] = _sha256_file(
+        run_path / SEMANTIC_EXPECTATION_ORACLE_FILENAME
+    )
+    review["semantic_plan_candidate_hash"] = raw_response.get(
+        "semantic_plan_candidate_hash"
+    ) or _read_review_request_plan_hash(raw_request_path)
+    review["oracle_hash"] = review["semantic_expectation_oracle_hash"]
+    review["oracle_content_hash"] = oracle.get("oracle_content_hash")
+    review["reviewer_raw_request_path"] = str(raw_request_path)
+    review["reviewer_raw_response_path"] = str(raw_response_path)
+    review["reviewer_raw_request_hash"] = raw_request_hash
+    review["reviewer_raw_response_hash"] = raw_response_hash
+    review["parsed_response_hash"] = _sha256_text(
+        json.dumps(adapter_review or deterministic, sort_keys=True, ensure_ascii=True)
+    )
+    reviewer_provenance = dict(raw_response.get("provenance") or {})
+    reviewer_provenance.setdefault("reviewer_adapter", raw_response.get("reviewer_adapter"))
+    reviewer_provenance.setdefault("prompt_version", raw_response.get("prompt_version"))
+    reviewer_provenance.setdefault("raw_request_path", str(raw_request_path))
+    reviewer_provenance.setdefault("raw_response_path", str(raw_response_path))
+    reviewer_provenance.setdefault("raw_request_hash", raw_request_hash)
+    reviewer_provenance.setdefault("raw_response_hash", raw_response_hash)
+    review["reviewer_provenance"] = reviewer_provenance
+    review["reviewer_surface"] = reviewer_provenance.get("model_or_surface")
+    review["reviewer_prompt_version"] = reviewer_provenance.get("prompt_version")
+    review["reviewer_independence"] = _reviewer_independence_from_artifacts(
+        plan=plan,
+        oracle=oracle,
+        reviewer_provenance=reviewer_provenance,
+    )
+    review["substitute_implementation_check"] = _semantic_substitute_implementation_check(
+        plan=plan,
+        oracle=oracle,
+    )
+    review["non_negotiable_coverage_complete"] = _non_negotiable_coverage_complete(
+        plan=plan,
+        oracle=oracle,
+    )
+    blockers = _merge_blockers(
+        deterministic.get("blockers"),
+        adapter_review.get("blockers"),
+    )
+    if review["reviewer_independence"].get("independent") is not True:
+        blockers.append(
+            {
+                "code": "reviewer_or_oracle_provenance_not_independent",
+                "message": "Oracle, planner, and reviewer provenance must be independent.",
+            }
+        )
+    if review["substitute_implementation_check"].get("passed") is not True:
+        blockers.append(
+            {
+                "code": "substitute_implementation_check_failed",
+                "message": "Plan appears to substitute internal implementation or generic template work.",
+            }
+        )
+    if review["non_negotiable_coverage_complete"] is not True:
+        blockers.append(
+            {
+                "code": "non_negotiable_coverage_incomplete",
+                "message": "Every non-negotiable oracle requirement must be covered or explicitly user-waived.",
+            }
+        )
+    if _provenance_is_non_release_fixture(reviewer_provenance):
+        blockers.append(
+            {
+                "code": "non_release_reviewer_fixture",
+                "message": "Local deterministic reviewer fixtures cannot make a plan release-eligible.",
+            }
+        )
+    if _provenance_is_non_release_fixture(oracle.get("oracle_provenance")):
+        blockers.append(
+            {
+                "code": "non_release_oracle_fixture",
+                "message": "Local deterministic oracle fixtures cannot make a plan release-eligible.",
+            }
+        )
+    review["blockers"] = _dedupe_blockers(blockers)
+    warnings = []
+    if isinstance(deterministic.get("warnings"), list):
+        warnings.extend(deterministic["warnings"])
+    if isinstance(adapter_review.get("warnings"), list):
+        warnings.extend(adapter_review["warnings"])
+    review["warnings"] = warnings
+    score = _numeric_score(review.get("semantic_fit_score"))
+    if score is None:
+        score = _numeric_score(deterministic.get("semantic_fit_score"))
+    if score is None:
+        score = 0.0
+    if _has_forbidden_internal_leakage(plan=plan, oracle=oracle):
+        score = min(score, 6.0)
+    if review["blockers"]:
+        score = min(score, 8.9)
+    review["semantic_fit_score"] = round(score, 2)
+    review["score_dimensions"] = _score_dimensions(review)
+    review["prd_score_dimensions"] = review["score_dimensions"]
+    verdict = "pass" if semantic_review_release_eligible(review) else "release_ineligible"
+    review["verdict"] = verdict
+    review["final_verdict"] = verdict
+    review["semantic_release_eligible"] = verdict == "pass"
+    return review
+
+
+def _validate_codex_semantic_role_provenance(
+    *,
+    raw_request_hash: str,
+    provenance: Any,
+    role_label: str,
+) -> dict[str, Any]:
+    if not isinstance(provenance, Mapping):
+        raise SemanticPlannerAdapterUnavailable(f"{role_label} response is missing provenance")
+    normalized = dict(provenance)
+    if str(normalized.get("adapter_invocation_kind") or "") != CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND:
+        raise SemanticPlannerAdapterUnavailable(
+            f"{role_label} response must record adapter_invocation_kind={CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND}"
+        )
+    if str(normalized.get("raw_request_hash") or "") != raw_request_hash:
+        raise SemanticPlannerAdapterUnavailable(
+            f"{role_label} response provenance does not match the raw request hash"
+        )
+    adapter_command = normalized.get("adapter_command")
+    if adapter_command:
+        command_parts = (
+            shlex.split(adapter_command)
+            if isinstance(adapter_command, str)
+            else [str(part) for part in adapter_command]
+        )
+        validate_codex_semantic_adapter_command(command_parts)
+    identity_fields = (
+        "child_session_id",
+        "session_id",
+        "raw_response_id",
+        "codex_event_id",
+        "response_id",
+    )
+    if not any(str(normalized.get(field) or "").strip() for field in identity_fields):
+        raise SemanticPlannerAdapterUnavailable(
+            f"{role_label} response lacks Codex raw response identity"
+        )
+    return normalized
+
+
+def _read_review_request_plan_hash(path: Path) -> str | None:
+    payload = _read_optional_json(path)
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("semantic_plan_candidate_hash")
+    return str(value) if value else None
+
+
+def _deterministic_semantic_review(
+    *,
+    question: str,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+    adapter_available: bool,
+    adapter_unavailable_reason: str | None,
+) -> dict[str, Any]:
+    plan_payload = plan.to_dict()
+    candidate_validation = validate_semantic_candidate_plan(
+        original_question=question,
+        plan=plan_payload,
+    )
+    blockers: list[dict[str, Any]] = []
+    for failure in _list(candidate_validation.get("failures")):
+        if isinstance(failure, Mapping):
+            blockers.append(
+                {
+                    "code": str(failure.get("code") or "candidate_validation_failed"),
+                    "message": "Candidate plan failed structural semantic validation.",
+                    "details": dict(failure),
+                }
+            )
+    if plan.planner_mode != PLANNER_MODE_CODEX_SEMANTIC:
+        blockers.append(
+            {
+                "code": "release_ineligible_planner_mode",
+                "planner_mode": plan.planner_mode,
+                "message": "Only codex_semantic plans can pass independent semantic review.",
+            }
+        )
+    if not adapter_available:
+        blockers.append(
+            {
+                "code": "reviewer_adapter_unavailable",
+                "message": adapter_unavailable_reason
+                or "No independent semantic reviewer adapter was configured.",
+            }
+        )
+    if _oracle_omits_material_requirements(oracle):
+        blockers.append({"code": "oracle_requirement_map_missing_or_incomplete"})
+    if not _plan_covers_oracle_requirements(plan=plan, oracle=oracle):
+        blockers.append({"code": "oracle_requirement_coverage_incomplete"})
+    if _has_forbidden_internal_leakage(plan=plan, oracle=oracle):
+        blockers.append({"code": "forbidden_internal_implementation_leakage"})
+    substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+    dimensions = {
+        "intent_preservation": 9.5 if candidate_validation.get("ok") else 6.0,
+        "required_entities_constraints": (
+            9.5 if _plan_covers_oracle_requirements(plan=plan, oracle=oracle) else 5.5
+        ),
+        "angle_relevance_diversity": 9.2 if len(plan.angles) >= 5 or not plan.broad_question else 6.5,
+        "modality_visual_routing": 9.5 if _modalities_match_oracle(plan=plan, oracle=oracle) else 5.0,
+        "forbidden_drift_avoidance": 9.5 if substitute.get("passed") else 4.0,
+        "executable_bounded_tasks": 9.4 if plan.bounded_tasks else 4.0,
+    }
+    score = min(dimensions.values())
+    if blockers:
+        score = min(score, 8.9)
+    if _has_forbidden_internal_leakage(plan=plan, oracle=oracle):
+        score = min(score, 6.0)
+    return {
+        "semantic_fit_score": round(score, 2),
+        "blockers": _dedupe_blockers(blockers),
+        "warnings": [],
+        "checked_prompt_categories": sorted(
+            {
+                str(record.get("requirement_type") or "")
+                for record in _list(oracle.get("oracle_requirement_map"))
+                if isinstance(record, Mapping)
+            }
+        ),
+        "score_dimensions": dimensions,
+        "prd_score_dimensions": dimensions,
+        "substitute_implementation_check": substitute,
+        "non_negotiable_coverage_complete": _non_negotiable_coverage_complete(
+            plan=plan,
+            oracle=oracle,
+        ),
+        "verdict": "pass" if not blockers and score >= SEMANTIC_FIT_SCORE_THRESHOLD else "release_ineligible",
+        "candidate_validation": candidate_validation,
+    }
+
+
+def _score_dimensions(review: Mapping[str, Any]) -> dict[str, float]:
+    raw = review.get("score_dimensions") or review.get("prd_score_dimensions")
+    if isinstance(raw, Mapping):
+        output = {}
+        for key in (
+            "intent_preservation",
+            "required_entities_constraints",
+            "angle_relevance_diversity",
+            "modality_visual_routing",
+            "forbidden_drift_avoidance",
+            "executable_bounded_tasks",
+        ):
+            value = _numeric_score(raw.get(key))
+            output[key] = round(value if value is not None else 0.0, 2)
+        return output
+    return {
+        "intent_preservation": 0.0,
+        "required_entities_constraints": 0.0,
+        "angle_relevance_diversity": 0.0,
+        "modality_visual_routing": 0.0,
+        "forbidden_drift_avoidance": 0.0,
+        "executable_bounded_tasks": 0.0,
+    }
+
+
+def _numeric_score(value: Any) -> float | None:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score):
+        return None
+    return score
+
+
+def _merge_blockers(*values: Any) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, Mapping):
+                blockers.append(dict(item))
+            elif isinstance(item, str):
+                blockers.append({"code": item})
+    return blockers
+
+
+def _dedupe_blockers(blockers: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for blocker in blockers:
+        code = str(blocker.get("code") or json.dumps(dict(blocker), sort_keys=True))
+        if code in seen:
+            continue
+        seen.add(code)
+        output.append(dict(blocker))
+    return output
+
+
+def _oracle_omits_material_requirements(oracle: Mapping[str, Any]) -> bool:
+    requirement_map = oracle.get("oracle_requirement_map")
+    return not isinstance(requirement_map, list) or not requirement_map
+
+
+def _plan_covers_oracle_requirements(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> bool:
+    coverage_by_id = {
+        str(record.get("requirement_id") or ""): record
+        for record in plan.requirement_coverage_map
+        if isinstance(record, Mapping)
+    }
+    for requirement in _list(oracle.get("oracle_requirement_map")):
+        if not isinstance(requirement, Mapping):
+            return False
+        requirement_id = str(requirement.get("requirement_id") or "")
+        if not requirement_id:
+            return False
+        coverage = coverage_by_id.get(requirement_id)
+        if not isinstance(coverage, Mapping):
+            return False
+        if coverage.get("coverage_status") != "covered":
+            return False
+        if requirement.get("non_negotiable") is True:
+            if not _string_list(coverage.get("covered_by_angle_ids")):
+                return False
+            if not _string_list(coverage.get("covered_by_task_ids")):
+                return False
+    return True
+
+
+def _modalities_match_oracle(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> bool:
+    expected = {str(item) for item in _string_list(oracle.get("expected_modalities"))}
+    if "visual" not in expected:
+        return True
+    return any(angle.route != "text_only" for angle in plan.angles) and any(
+        str(task.get("route") or "") != "text_only" for task in plan.bounded_tasks
+    )
+
+
+def _non_negotiable_coverage_complete(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> bool:
+    return _plan_covers_oracle_requirements(plan=plan, oracle=oracle)
+
+
+def _has_forbidden_internal_leakage(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> bool:
+    forbidden = _string_list(oracle.get("forbidden_internal_implementation_terms"))
+    if not forbidden:
+        forbidden = _forbidden_internal_terms()
+    text = _plan_executable_review_text(plan)
+    return any(term.lower() in text for term in forbidden)
+
+
+def _semantic_substitute_implementation_check(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> dict[str, Any]:
+    text = _plan_executable_review_text(plan)
+    forbidden_angles = [item.lower() for item in _string_list(oracle.get("forbidden_angles"))]
+    leakage_terms = [
+        term
+        for term in _string_list(oracle.get("forbidden_internal_implementation_terms"))
+        if term.lower() in text
+    ]
+    forbidden_angle_hits = [term for term in forbidden_angles if term and term in text]
+    generic_hits = [
+        phrase
+        for phrase in (
+            "generic report wrapper",
+            "local deterministic template",
+            "primary source discovery only",
+        )
+        if phrase in text
+    ]
+    passed = not leakage_terms and not forbidden_angle_hits and not generic_hits
+    return {
+        "passed": passed,
+        "checked": True,
+        "forbidden_internal_implementation_terms_found": leakage_terms,
+        "forbidden_angle_terms_found": forbidden_angle_hits,
+        "generic_wrapper_terms_found": generic_hits,
+        "blocked_reason": None if passed else "substitute_or_forbidden_implementation_detected",
+    }
+
+
+def _plan_executable_review_text(plan: SemanticPlan) -> str:
+    values: list[Any] = [
+        plan.intent_summary,
+        plan.domain_entities,
+        plan.constraints,
+    ]
+    for angle in plan.angles:
+        values.extend(
+            [
+                angle.title,
+                angle.research_question,
+                angle.why_this_angle_matters,
+                angle.included_scope,
+                angle.expected_source_types,
+                angle.expected_visual_targets,
+                angle.expected_artifacts,
+                angle.search_queries,
+                angle.success_criteria,
+                angle.report_section,
+                angle.risk_or_contradiction_checks,
+            ]
+        )
+    for task in plan.bounded_tasks:
+        if not isinstance(task, Mapping):
+            continue
+        values.extend(
+            [
+                task.get("query"),
+                task.get("source_policy"),
+                task.get("expected_source_types"),
+                task.get("expected_visual_targets"),
+                task.get("expected_artifacts"),
+                task.get("success_criteria"),
+                task.get("done_condition"),
+            ]
+        )
+    return json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
+
+
+def _reviewer_independence_from_artifacts(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+    reviewer_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    planner = dict(plan.planner_provenance or {})
+    oracle_provenance = dict(oracle.get("oracle_provenance") or oracle.get("provenance") or {})
+    reverse_fit = {
+        "plan_visible_to_oracle": oracle.get("plan_visible_to_oracle"),
+        "used_production_planner_output": oracle.get("used_production_planner_output"),
+        "used_hidden_template_class": oracle.get("used_hidden_template_class"),
+        "used_fixed_angle_inventory": oracle.get("used_fixed_angle_inventory"),
+    }
+    planner_ids = _provenance_identity_set(planner)
+    oracle_ids = _provenance_identity_set(oracle_provenance)
+    reviewer_ids = _provenance_identity_set(reviewer_provenance)
+    oracle_planner_shared = bool(planner_ids & oracle_ids)
+    reviewer_planner_shared = bool(planner_ids & reviewer_ids)
+    reviewer_oracle_shared = bool(oracle_ids & reviewer_ids)
+    missing = []
+    for label, provenance in (
+        ("planner", planner),
+        ("oracle", oracle_provenance),
+        ("reviewer", reviewer_provenance),
+    ):
+        if not _provenance_has_required_raw_artifacts(provenance):
+            missing.append(label)
+    reverse_fit_detected = any(value is not False for value in reverse_fit.values())
+    independent = (
+        plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC
+        and not missing
+        and not oracle_planner_shared
+        and not reviewer_planner_shared
+        and not reviewer_oracle_shared
+        and not reverse_fit_detected
+        and not _provenance_is_non_release_fixture(oracle_provenance)
+        and not _provenance_is_non_release_fixture(reviewer_provenance)
+    )
+    return {
+        "independent": independent,
+        "oracle_planner_shared_provenance": oracle_planner_shared,
+        "reviewer_planner_shared_provenance": reviewer_planner_shared,
+        "reviewer_oracle_shared_provenance": reviewer_oracle_shared,
+        "missing_required_provenance": missing,
+        "reverse_fit_detected": reverse_fit_detected,
+        "reverse_fit_fields": reverse_fit,
+        "planner_identity": sorted(planner_ids),
+        "oracle_identity": sorted(oracle_ids),
+        "reviewer_identity": sorted(reviewer_ids),
+        "status": "passed" if independent else "failed",
+    }
+
+
+def _provenance_identity_set(provenance: Mapping[str, Any]) -> set[str]:
+    identities = set()
+    for field in (
+        "child_session_id",
+        "session_id",
+        "raw_response_id",
+        "codex_event_id",
+        "response_id",
+        "adapter_invocation_id",
+    ):
+        value = provenance.get(field)
+        if isinstance(value, str) and value.strip():
+            identities.add(f"{field}:{value.strip()}")
+    return identities
+
+
+def _provenance_has_required_raw_artifacts(provenance: Mapping[str, Any]) -> bool:
+    return bool(
+        str(provenance.get("raw_request_hash") or "").strip()
+        and str(provenance.get("raw_response_hash") or "").strip()
+        and (
+            str(provenance.get("child_session_id") or provenance.get("session_id") or "").strip()
+            or str(provenance.get("session_id_unavailable_reason") or "").strip()
+        )
+    )
+
+
+def _provenance_is_non_release_fixture(provenance: Any) -> bool:
+    return isinstance(provenance, Mapping) and (
+        provenance.get("non_release_fixture") is True
+        or str(provenance.get("adapter_invocation_kind") or "") == "local_deterministic_fixture"
+    )
+
+
 def _parse_codex_exec_json_output(stdout: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     text = (stdout or "").strip()
     if not text:
@@ -1076,7 +2440,11 @@ def _semantic_adapter_payload_from_value(value: Any) -> dict[str, Any] | None:
 def _is_semantic_adapter_response_payload(value: Mapping[str, Any]) -> bool:
     return (
         "candidate_plan" in value
+        or "expectation_oracle" in value
+        or "semantic_plan_review" in value
         or value.get("artifact_type") == "semantic_planner_raw_response"
+        or value.get("artifact_type") == "semantic_oracle_raw_response"
+        or value.get("artifact_type") == "semantic_reviewer_raw_response"
     )
 
 
@@ -2605,6 +3973,8 @@ def write_semantic_integrity_artifacts(
     routing: Sequence[Mapping[str, Any]] | None = None,
     search_tasks: Sequence[Mapping[str, Any]] | None = None,
     created_at: str | None = None,
+    locked_oracle: Mapping[str, Any] | None = None,
+    semantic_review: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     """Write P3-SP1 semantic integrity schema stubs for one run."""
 
@@ -2631,11 +4001,11 @@ def write_semantic_integrity_artifacts(
     request_payload.setdefault("artifact_type", "semantic_planner_raw_request")
     request_payload["run_id"] = run_path.name
     request_payload["created_at"] = timestamp
-    request_payload.setdefault("question", question)
     if not plan.raw_request_payload:
+        request_payload.setdefault("question", question)
         request_payload.setdefault("question_scope", _question_scope(question, plan))
-    request_payload.setdefault("template_use", _template_use(plan))
-    request_payload.setdefault("provenance", _planner_provenance(plan))
+        request_payload.setdefault("template_use", _template_use(plan))
+        request_payload.setdefault("provenance", _planner_provenance(plan))
 
     response_payload = dict(plan.raw_response_payload) if plan.raw_response_payload else {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
@@ -2652,9 +4022,10 @@ def write_semantic_integrity_artifacts(
     response_payload.setdefault("artifact_type", "semantic_planner_raw_response")
     response_payload["run_id"] = run_path.name
     response_payload["created_at"] = timestamp
-    response_payload.setdefault("semantic_plan", plan.to_dict())
-    response_payload.setdefault("diagnostics", dict(plan.diagnostics or {}))
-    response_payload.setdefault("provenance", _planner_provenance(plan))
+    if not plan.raw_response_payload:
+        response_payload.setdefault("semantic_plan", plan.to_dict())
+        response_payload.setdefault("diagnostics", dict(plan.diagnostics or {}))
+        response_payload.setdefault("provenance", _planner_provenance(plan))
     _write_json(raw_request_path, request_payload)
     _write_json(raw_response_path, response_payload)
     raw_request_hash = _sha256_file(raw_request_path)
@@ -2670,21 +4041,64 @@ def write_semantic_integrity_artifacts(
         raw_request_hash=raw_request_hash,
         raw_response_hash=raw_response_hash,
     )
-    oracle_requirement_map = _oracle_requirement_map(plan)
+    oracle_requirement_map = (
+        [
+            dict(record)
+            for record in _list(locked_oracle.get("oracle_requirement_map"))
+            if isinstance(record, Mapping)
+        ]
+        if isinstance(locked_oracle, Mapping)
+        else _oracle_requirement_map(plan)
+    )
     requirement_coverage_map = _requirement_coverage_map(plan)
-    semantic_fit_score = _release_ineligible_semantic_fit_score(plan)
+    semantic_fit_score = (
+        semantic_review.get("semantic_fit_score")
+        if isinstance(semantic_review, Mapping)
+        else _release_ineligible_semantic_fit_score(plan)
+    )
+    review_payload = (
+        dict(semantic_review)
+        if isinstance(semantic_review, Mapping)
+        else {
+            **base,
+            "artifact_type": "semantic_plan_review",
+            "semantic_fit_score": semantic_fit_score,
+            "blockers": _semantic_review_blockers(plan),
+            "warnings": [],
+            "reviewer_independence": _reviewer_independence(plan),
+            "substitute_implementation_check": _substitute_implementation_check(plan),
+            "final_verdict": "release_ineligible",
+            "verdict": "release_ineligible",
+            "prd_score_dimensions": _score_dimensions({}),
+        }
+    )
+    review_payload.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    review_payload.setdefault("run_id", run_path.name)
+    review_payload.setdefault("created_at", timestamp)
+    review_payload.setdefault("planner_mode", plan.planner_mode)
+    review_payload.setdefault("semantic_release_eligible", plan.semantic_release_eligible)
 
-    artifacts = {
-        SEMANTIC_EXPECTATION_ORACLE_FILENAME: {
+    oracle_payload = (
+        dict(locked_oracle)
+        if isinstance(locked_oracle, Mapping)
+        else {
             **base,
             "artifact_type": "semantic_expectation_oracle",
             "oracle_requirement_map": oracle_requirement_map,
             "locked_before_plan_visible": plan.planner_mode == PLANNER_MODE_CODEX_SEMANTIC,
             "reverse_fit_risk": plan.planner_mode != PLANNER_MODE_CODEX_SEMANTIC,
-        },
+        }
+    )
+    oracle_payload.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
+    oracle_payload.setdefault("run_id", run_path.name)
+    oracle_payload.setdefault("created_at", timestamp)
+
+    artifacts = {
+        SEMANTIC_EXPECTATION_ORACLE_FILENAME: oracle_payload,
         SEMANTIC_PLAN_FILENAME: {
             **base,
             "artifact_type": "semantic_plan",
+            "semantic_release_eligible": plan.semantic_release_eligible,
             "semantic_plan": plan.to_dict(),
             "intent_summary": plan.intent_summary,
             "domain_entities": list(plan.domain_entities),
@@ -2695,20 +4109,25 @@ def write_semantic_integrity_artifacts(
             "bounded_tasks": list(plan.bounded_tasks),
             "planner_provenance": dict(plan.planner_provenance),
             "parsed_response_hash": _planner_provenance(plan).get("parsed_response_hash"),
+            "reviewed_candidate_hash": (
+                semantic_review.get("semantic_plan_candidate_artifact_hash")
+                or semantic_review.get("semantic_plan_candidate_hash")
+                if isinstance(semantic_review, Mapping)
+                else None
+            ),
             "angles": [angle.to_dict() for angle in plan.angles],
             "requirement_coverage_map": requirement_coverage_map,
             "routing_count": len(routing or []),
             "search_task_count": len(search_tasks or []),
         },
-        SEMANTIC_PLAN_REVIEW_FILENAME: {
+        SEMANTIC_PLAN_REVIEW_FILENAME: review_payload,
+        SEMANTIC_REQUIREMENT_WAIVERS_FILENAME: {
             **base,
-            "artifact_type": "semantic_plan_review",
-            "semantic_fit_score": semantic_fit_score,
-            "blockers": _semantic_review_blockers(plan),
-            "warnings": [],
-            "reviewer_independence": _reviewer_independence(plan),
-            "substitute_implementation_check": _substitute_implementation_check(plan),
-            "final_verdict": "release_ineligible",
+            "artifact_type": "semantic_requirement_waivers",
+            "waivers": [],
+            "explicit_user_confirmation_required_before_fanout": True,
+            "reviewer_acceptance_required": True,
+            "status": "no_waivers",
         },
         SEMANTIC_PLAN_DELTA_FILENAME: {
             **base,
@@ -2719,6 +4138,18 @@ def write_semantic_integrity_artifacts(
             "oracle_requirement_map": oracle_requirement_map,
             "reviewer_independence": _reviewer_independence(plan),
             "substitute_implementation_check": _substitute_implementation_check(plan),
+            "locked_oracle_hash": (
+                locked_oracle.get("oracle_content_hash")
+                if isinstance(locked_oracle, Mapping)
+                else None
+            ),
+            "required_trace_events_before_rematerialization": [
+                "semantic_delta_request_created",
+                "semantic_delta_review_requested",
+                "semantic_delta_approved",
+                "semantic_plan_rematerialized",
+            ],
+            "disallowed_repair_categories": list(SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES),
         },
         SEMANTIC_MATERIALIZATION_DIFF_FILENAME: {
             **base,
@@ -2783,6 +4214,7 @@ def semantic_integrity_artifact_filenames() -> tuple[str, ...]:
         SEMANTIC_EXPECTATION_ORACLE_FILENAME,
         SEMANTIC_PLAN_FILENAME,
         SEMANTIC_PLAN_REVIEW_FILENAME,
+        SEMANTIC_REQUIREMENT_WAIVERS_FILENAME,
         SEMANTIC_PLAN_DELTA_FILENAME,
         SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
     )
@@ -3904,7 +5336,7 @@ def _integrity_base_payload(
         "run_id": run_path.name,
         "created_at": created_at,
         "planner_mode": plan.planner_mode,
-        "semantic_release_eligible": False,
+        "semantic_release_eligible": plan.semantic_release_eligible,
         "status": plan.status,
         "question_scope": _question_scope(question, plan),
         "raw_request_path": str(raw_request_path),
@@ -3914,10 +5346,11 @@ def _integrity_base_payload(
         "parsed_response_hash": _planner_provenance(plan).get("parsed_response_hash"),
         "provenance": _planner_provenance(plan),
         "template_use": _template_use(plan),
-        "session_id": None,
-        "session_id_unavailable_reason": _planner_provenance(plan)[
+        "session_id": _planner_provenance(plan).get("session_id")
+        or _planner_provenance(plan).get("child_session_id"),
+        "session_id_unavailable_reason": _planner_provenance(plan).get(
             "session_id_unavailable_reason"
-        ],
+        ),
     }
 
 
@@ -4078,6 +5511,26 @@ def _semantic_release_status(
             failures.append({"code": "semantic_review_blockers_present", "count": len(blockers)})
         if substitute_check.get("passed") is not True:
             failures.append({"code": "substitute_implementation_check_failed"})
+        if not isinstance(review, Mapping):
+            failures.append({"code": "semantic_plan_review_missing"})
+        else:
+            if review.get("verdict") != "pass" and review.get("final_verdict") != "pass":
+                failures.append({"code": "semantic_review_verdict_not_pass"})
+            if review.get("non_negotiable_coverage_complete") is not True:
+                failures.append({"code": "non_negotiable_coverage_incomplete"})
+            independence = review.get("reviewer_independence")
+            if not isinstance(independence, Mapping) or independence.get("independent") is not True:
+                failures.append({"code": "reviewer_independence_failed"})
+            if not str(review.get("reviewer_raw_request_path") or "").strip():
+                failures.append({"code": "reviewer_raw_request_path_missing"})
+            if not str(review.get("reviewer_raw_response_path") or "").strip():
+                failures.append({"code": "reviewer_raw_response_path_missing"})
+            if not str(review.get("oracle_hash") or review.get("semantic_expectation_oracle_hash") or "").strip():
+                failures.append({"code": "review_oracle_hash_missing"})
+        failures.extend(_semantic_oracle_release_failures(run_path))
+        failures.extend(_semantic_ordering_proof_failures(run_path))
+        failures.extend(_semantic_waiver_release_failures(run_path))
+        failures.extend(_semantic_delta_release_failures(run_path))
     else:
         if semantic_fit_score is not None:
             try:
@@ -4095,10 +5548,299 @@ def _semantic_release_status(
         "planner_mode": planner_mode or "unknown",
         "semantic_release_eligible": semantic_release_eligible,
         "semantic_fit_score": semantic_fit_score,
+        "review_verdict": (
+            review.get("verdict") or review.get("final_verdict")
+            if isinstance(review, Mapping)
+            else None
+        ),
         "review_blocker_count": len(blockers),
         "substitute_implementation_check_passed": substitute_check.get("passed"),
         "failures": failures,
     }
+
+
+def _semantic_oracle_release_failures(run_path: Path) -> list[dict[str, Any]]:
+    oracle = _read_optional_json(run_path / SEMANTIC_EXPECTATION_ORACLE_FILENAME)
+    failures: list[dict[str, Any]] = []
+    if not isinstance(oracle, Mapping):
+        return [{"code": "semantic_expectation_oracle_missing"}]
+    for field in _semantic_oracle_required_fields():
+        if field not in oracle:
+            failures.append({"code": "semantic_oracle_missing_required_field", "field": field})
+    requirement_map = oracle.get("oracle_requirement_map")
+    if not isinstance(requirement_map, list) or not requirement_map:
+        failures.append({"code": "oracle_requirement_map_missing_or_empty"})
+    for field in (
+        "plan_visible_to_oracle",
+        "used_production_planner_output",
+        "used_hidden_template_class",
+        "used_fixed_angle_inventory",
+    ):
+        if oracle.get(field) is not False:
+            failures.append({"code": "semantic_oracle_reverse_fit_field_invalid", "field": field})
+    provenance = oracle.get("oracle_provenance") or oracle.get("provenance")
+    if not isinstance(provenance, Mapping):
+        failures.append({"code": "semantic_oracle_provenance_missing"})
+    elif not _provenance_has_required_raw_artifacts(provenance):
+        failures.append({"code": "semantic_oracle_provenance_incomplete"})
+    if _provenance_is_non_release_fixture(provenance):
+        failures.append({"code": "semantic_oracle_non_release_fixture"})
+    return failures
+
+
+def _semantic_ordering_proof_failures(run_path: Path) -> list[dict[str, Any]]:
+    trace_file = run_path / "run_trace.jsonl"
+    if not trace_file.exists():
+        return [{"code": "semantic_ordering_trace_missing"}]
+    try:
+        records = [
+            json.loads(line)
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except json.JSONDecodeError:
+        return [{"code": "semantic_ordering_trace_invalid_json"}]
+    required = [
+        "semantic_oracle_request_created",
+        "semantic_oracle_locked",
+        "semantic_planner_request_created",
+        "semantic_plan_created",
+        "semantic_reviewer_request_created",
+        "semantic_review_completed",
+    ]
+    expected_semantic_indexes = {
+        event: index for index, event in enumerate(required, start=1)
+    }
+    first_by_event: dict[str, tuple[int, Mapping[str, Any]]] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            continue
+        event_type = str(record.get("event_type") or "")
+        if event_type in required and event_type not in first_by_event:
+            first_by_event[event_type] = (index, record)
+    failures: list[dict[str, Any]] = []
+    missing = [event for event in required if event not in first_by_event]
+    if missing:
+        failures.append({"code": "semantic_ordering_events_missing", "missing_events": missing})
+        return failures
+    indexes = [first_by_event[event][0] for event in required]
+    if indexes != sorted(indexes):
+        failures.append(
+            {
+                "code": "semantic_ordering_events_out_of_order",
+                "event_indexes": dict(zip(required, indexes)),
+            }
+        )
+    semantic_indexes: list[int] = []
+    for event in required:
+        record = first_by_event[event][1]
+        semantic_index = record.get("semantic_event_index")
+        order_validation = record.get("order_validation")
+        order_index = (
+            order_validation.get("semantic_event_index")
+            if isinstance(order_validation, Mapping)
+            else None
+        )
+        order_required = (
+            order_validation.get("required_order")
+            if isinstance(order_validation, Mapping)
+            else None
+        )
+        order_current_event = (
+            order_validation.get("current_event")
+            if isinstance(order_validation, Mapping)
+            else None
+        )
+        expected_index = expected_semantic_indexes[event]
+        if order_required != required or order_current_event != event:
+            failures.append(
+                {
+                    "code": "semantic_ordering_order_validation_invalid",
+                    "event": event,
+                }
+            )
+        if (
+            not isinstance(semantic_index, int)
+            or isinstance(semantic_index, bool)
+            or semantic_index != expected_index
+        ):
+            failures.append(
+                {
+                    "code": "semantic_ordering_event_index_invalid",
+                    "event": event,
+                    "semantic_event_index": semantic_index,
+                    "expected_semantic_event_index": expected_index,
+                }
+            )
+        else:
+            semantic_indexes.append(semantic_index)
+        if order_index != semantic_index:
+            failures.append(
+                {
+                    "code": "semantic_ordering_event_index_mismatch",
+                    "event": event,
+                    "semantic_event_index": semantic_index,
+                    "order_validation_index": order_index,
+                }
+            )
+    if len(semantic_indexes) == len(required) and semantic_indexes != sorted(semantic_indexes):
+        failures.append(
+            {
+                "code": "semantic_ordering_event_indexes_not_monotonic",
+                "semantic_event_indexes": dict(zip(required, semantic_indexes)),
+            }
+        )
+    semantic_timestamps: list[datetime] = []
+    raw_semantic_timestamps: dict[str, Any] = {}
+    for event in required:
+        record = first_by_event[event][1]
+        raw_timestamp = record.get("timestamp")
+        raw_semantic_timestamps[event] = raw_timestamp
+        parsed_timestamp = _parse_semantic_trace_timestamp(raw_timestamp)
+        if parsed_timestamp is None:
+            failures.append(
+                {
+                    "code": "semantic_ordering_event_timestamp_invalid",
+                    "event": event,
+                    "timestamp": raw_timestamp,
+                }
+            )
+        else:
+            semantic_timestamps.append(parsed_timestamp)
+    if len(semantic_timestamps) == len(required):
+        for previous, current in zip(semantic_timestamps, semantic_timestamps[1:]):
+            if not previous < current:
+                failures.append(
+                    {
+                        "code": "semantic_ordering_event_timestamps_not_strictly_increasing",
+                        "semantic_event_timestamps": raw_semantic_timestamps,
+                    }
+                )
+                break
+    for event in required:
+        record = first_by_event[event][1]
+        artifact_hashes = record.get("artifact_hashes")
+        if not isinstance(artifact_hashes, Mapping) or not artifact_hashes:
+            failures.append({"code": "semantic_ordering_event_missing_hashes", "event": event})
+            continue
+        artifact_paths = record.get("semantic_artifact_paths")
+        if isinstance(artifact_paths, Mapping):
+            for key, expected_hash in artifact_hashes.items():
+                raw_path = artifact_paths.get(key)
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                path = Path(raw_path)
+                if not path.is_absolute():
+                    path = run_path / path
+                if path.exists() and _sha256_file(path) != expected_hash:
+                    if (
+                        event == "semantic_plan_created"
+                        and key == "semantic_plan"
+                        and _semantic_plan_reviewed_candidate_hash(path) == expected_hash
+                    ):
+                        continue
+                    failures.append(
+                        {
+                            "code": "semantic_ordering_hash_mismatch",
+                            "event": event,
+                            "artifact": key,
+                        }
+                    )
+    return failures
+
+
+def _semantic_plan_reviewed_candidate_hash(path: Path) -> str | None:
+    payload = _read_optional_json(path)
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("reviewed_candidate_hash")
+    return str(value) if value else None
+
+
+def _parse_semantic_trace_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _semantic_waiver_release_failures(run_path: Path) -> list[dict[str, Any]]:
+    path = run_path / SEMANTIC_REQUIREMENT_WAIVERS_FILENAME
+    if not path.exists():
+        return []
+    payload = _read_optional_json(path)
+    if not isinstance(payload, Mapping):
+        return [{"code": "semantic_requirement_waivers_invalid"}]
+    waivers = payload.get("waivers")
+    if not isinstance(waivers, list) or not waivers:
+        return []
+    failures = []
+    for index, waiver in enumerate(waivers, start=1):
+        if not isinstance(waiver, Mapping):
+            failures.append({"code": "semantic_requirement_waiver_not_object", "index": index})
+            continue
+        if waiver.get("explicit_user_confirmation") is not True:
+            failures.append({"code": "semantic_requirement_waiver_missing_user_confirmation", "index": index})
+        if waiver.get("reviewer_accepted") is not True:
+            failures.append({"code": "semantic_requirement_waiver_missing_reviewer_acceptance", "index": index})
+    return failures
+
+
+def _semantic_delta_release_failures(run_path: Path) -> list[dict[str, Any]]:
+    delta = _read_optional_json(run_path / SEMANTIC_PLAN_DELTA_FILENAME)
+    if not isinstance(delta, Mapping) or delta.get("delta_applied") is not True:
+        return []
+    failures: list[dict[str, Any]] = []
+    repair_categories = set(_string_list(delta.get("repair_categories")))
+    disallowed = repair_categories & set(SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES)
+    if disallowed:
+        failures.append(
+            {
+                "code": "semantic_delta_disallowed_repair_category",
+                "repair_categories": sorted(disallowed),
+            }
+        )
+    if delta.get("reviewer_approved") is not True:
+        failures.append({"code": "semantic_delta_reviewer_approval_missing"})
+    if not str(delta.get("locked_oracle_hash") or "").strip():
+        failures.append({"code": "semantic_delta_locked_oracle_hash_missing"})
+    trace_failures = _semantic_delta_trace_failures(run_path)
+    failures.extend(trace_failures)
+    return failures
+
+
+def _semantic_delta_trace_failures(run_path: Path) -> list[dict[str, Any]]:
+    trace_file = run_path / "run_trace.jsonl"
+    if not trace_file.exists():
+        return [{"code": "semantic_delta_trace_missing"}]
+    try:
+        event_types = [
+            str(json.loads(line).get("event_type") or "")
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except json.JSONDecodeError:
+        return [{"code": "semantic_delta_trace_invalid_json"}]
+    required = [
+        "semantic_delta_request_created",
+        "semantic_delta_review_requested",
+        "semantic_delta_approved",
+        "semantic_plan_rematerialized",
+    ]
+    missing = [event for event in required if event not in event_types]
+    return (
+        [{"code": "semantic_delta_trace_events_missing", "missing_events": missing}]
+        if missing
+        else []
+    )
 
 
 def _sha256_file(path: Path) -> str:

@@ -131,6 +131,7 @@ def record_stage_trace(
     timestamp: str | None = None,
     output_preview: str | None = None,
     failure_category: str | None = None,
+    extra_fields: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Append one public-safe stage trace record and link it from the status payload."""
 
@@ -157,6 +158,8 @@ def record_stage_trace(
         if failure_category is not None
         else classify_failure(status_payload),
     }
+    if extra_fields:
+        record.update(dict(extra_fields))
     validation = validate_trace_record(record)
     if not validation.valid:
         raise TraceError(json.dumps(validation.to_dict(), sort_keys=True))

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -23,7 +25,9 @@ from deepresearch.search_handoff import prepare_run  # noqa: E402
 from deepresearch.semantic_planner import (  # noqa: E402
     ALLOWED_EVIDENCE_NEEDS,
     CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
+    CODEX_SEMANTIC_ORACLE_COMMAND_ENV,
     CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
+    CODEX_SEMANTIC_REVIEWER_COMMAND_ENV,
     PLANNER_MODE_BLOCKED,
     PLANNER_MODE_CODEX_SEMANTIC,
     PLANNER_MODE_FIXTURE,
@@ -137,6 +141,13 @@ class SemanticPlannerTests(unittest.TestCase):
             if line.strip()
         ]
 
+    def parse_timestamp(self, value: str) -> datetime:
+        raw = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
     def codex_adapter_response(
         self,
         request: dict,
@@ -206,16 +217,28 @@ class SemanticPlannerTests(unittest.TestCase):
             "comparative_analysis",
             "counter_evidence",
         )
+        angle_focus = {
+            "primary_source": ("baseline primary evidence", "baseline source dossier"),
+            "official_source": ("official regulatory records", "official records matrix"),
+            "visual_observation": ("image chart figure inspection", "visual evidence table"),
+            "recent_change": ("recent 2026 timeline changes", "recent-change timeline"),
+            "comparative_analysis": ("jurisdiction comparison implications", "comparison matrix"),
+            "counter_evidence": ("counter evidence caveats", "counter-evidence register"),
+        }
         for angle_index in range(1, angle_count + 1):
             angle_id = f"angle_{angle_index:03d}"
             route = "visual_required" if angle_index in visual_angle_indexes else "text_only"
             visual_targets = [f"{question} image evidence"] if route != "text_only" else []
             evidence_need = evidence_needs[(angle_index - 1) % len(evidence_needs)]
+            focus_text, artifact_name = angle_focus[evidence_need]
+            expected_artifacts = [artifact_name, f"adapter evidence notes {angle_index}"]
             angles.append(
                 {
                     "angle_id": angle_id,
                     "title": f"{question} adapter angle {angle_index}",
-                    "research_question": f"What evidence answers {question} for angle {angle_index}?",
+                    "research_question": (
+                        f"Which {focus_text} are required for the requested subject?"
+                    ),
                     "why_this_angle_matters": f"Angle {angle_index} covers a distinct part of {question}.",
                     "included_scope": [question],
                     "excluded_scope": ["Do not substitute a local template inventory."],
@@ -223,7 +246,7 @@ class SemanticPlannerTests(unittest.TestCase):
                     "evidence_need": evidence_need,
                     "expected_source_types": source_types,
                     "expected_visual_targets": visual_targets,
-                    "expected_artifacts": ["source matrix", "adapter evidence notes"],
+                    "expected_artifacts": expected_artifacts,
                     "search_queries": [f"{question} adapter evidence {angle_index}"],
                     "success_criteria": [
                         f"Findings must directly address {question}.",
@@ -234,7 +257,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 }
             )
             for _ in range(tasks_per_angle):
-                expected_artifacts = ["source matrix", "adapter evidence notes"]
+                expected_artifacts = [artifact_name, f"adapter evidence notes {angle_index}"]
                 success_criteria = [
                     f"Task must preserve the subject: {question}.",
                     "Task must produce source-backed findings.",
@@ -339,12 +362,158 @@ class SemanticPlannerTests(unittest.TestCase):
             },
         }
 
+    def oracle_adapter_response(
+        self,
+        request: dict,
+        *,
+        question_scope: str = "broad",
+        requirement_types: tuple[str, ...] = ("subject",),
+        **_adapter_kwargs: object,
+    ) -> dict:
+        question = request["original_question"]
+        requirements = []
+        for index, requirement_type in enumerate(requirement_types, start=1):
+            prompt_text = {
+                "subject": question,
+                "source_quality": "official primary sources",
+                "visual_modality": "images",
+                "time_range": "2026",
+                "geography": "Korea",
+                "deliverable_shape": "table",
+            }.get(requirement_type, requirement_type)
+            start = question.find(prompt_text)
+            requirements.append(
+                {
+                    "requirement_id": f"req_{index:03d}",
+                    "prompt_span": {
+                        "start": start if start >= 0 else None,
+                        "end": start + len(prompt_text) if start >= 0 else None,
+                    },
+                    "prompt_text": prompt_text,
+                    "requirement_text": prompt_text,
+                    "requirement_type": requirement_type,
+                    "expected_entities": [question],
+                    "expected_modalities": (
+                        ["visual"] if requirement_type == "visual_modality" else ["text"]
+                    ),
+                    "source_quality_constraints": (
+                        ["official", "regulatory", "primary"]
+                        if requirement_type == "source_quality"
+                        else []
+                    ),
+                    "geography_constraints": (
+                        ["Korea"] if requirement_type == "geography" else []
+                    ),
+                    "time_constraints": (
+                        ["2026"] if requirement_type == "time_range" else []
+                    ),
+                    "output_shape_constraints": (
+                        ["table"] if requirement_type == "deliverable_shape" else []
+                    ),
+                    "expected_coverage": "full",
+                    "explicit": True,
+                    "inferred": False,
+                    "inferred_reason": None,
+                    "non_negotiable": True,
+                }
+            )
+        expected_modalities = ["text"]
+        if "visual_modality" in requirement_types:
+            expected_modalities.append("visual")
+        return {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "artifact_type": "semantic_oracle_raw_response",
+            "oracle_adapter": "codex_native_semantic_expectation_oracle",
+            "prompt_version": "p3-sp3-oracle-v1",
+            "semantic_release_eligible": False,
+            "model_or_surface": "codex-oracle-test-double",
+            "provenance": {
+                "adapter_invocation_id": "oracle-test-invocation-001",
+                "adapter_invocation_kind": CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
+                "raw_response_id": "oracle-test-response-001",
+                "raw_request_hash": request["raw_request_hash"],
+                "model_or_surface": "codex-oracle-test-double",
+                "child_session_id": "codex-child-oracle-test-001",
+            },
+            "expectation_oracle": {
+                "oracle_requirement_map": requirements,
+                "question_scope": question_scope,
+                "bounded_task_range": {
+                    "min": 20 if question_scope == "broad" else 6,
+                    "max": 40 if question_scope == "broad" else 12,
+                    "depth_preset": request["depth_preset"],
+                },
+                "expected_entities": [
+                    {"name": question, "type": "question_subject", "evidence": question}
+                ],
+                "expected_constraints": requirements,
+                "expected_modalities": expected_modalities,
+                "required_angles": [
+                    {"angle_requirement": "source baseline", "subject": question},
+                    {"angle_requirement": "counter-evidence and caveats", "subject": question},
+                ],
+                "forbidden_angles": [
+                    "Codex runner architecture",
+                    "semantic planner implementation",
+                    "generic report wrapper",
+                ],
+                "forbidden_internal_implementation_terms": [
+                    "technical_api",
+                    "product_market",
+                    "visual_style",
+                    "policy_risk",
+                    "heuristic_template_planner",
+                    "local deterministic template",
+                ],
+                "expected_report_shape": (
+                    ["table"] if "deliverable_shape" in requirement_types else ["report"]
+                ),
+                "language": "en",
+            },
+        }
+
+    def reviewer_adapter_response(self, request: dict) -> dict:
+        return {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "artifact_type": "semantic_reviewer_raw_response",
+            "reviewer_adapter": "codex_native_semantic_fit_reviewer",
+            "prompt_version": "p3-sp3-reviewer-v1",
+            "semantic_release_eligible": False,
+            "model_or_surface": "codex-reviewer-test-double",
+            "provenance": {
+                "adapter_invocation_id": "reviewer-test-invocation-001",
+                "adapter_invocation_kind": CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
+                "raw_response_id": "reviewer-test-response-001",
+                "raw_request_hash": request["raw_request_hash"],
+                "model_or_surface": "codex-reviewer-test-double",
+                "child_session_id": "codex-child-reviewer-test-001",
+            },
+            "semantic_plan_review": {
+                "semantic_fit_score": 9.6,
+                "score_dimensions": {
+                    "intent_preservation": 9.6,
+                    "required_entities_constraints": 9.5,
+                    "angle_relevance_diversity": 9.4,
+                    "modality_visual_routing": 9.5,
+                    "forbidden_drift_avoidance": 9.7,
+                    "executable_bounded_tasks": 9.5,
+                },
+                "blockers": [],
+                "warnings": [],
+                "substitute_implementation_check": {"passed": True},
+                "non_negotiable_coverage_complete": True,
+                "verdict": "pass",
+            },
+        }
+
     def prepare_with_codex_adapter(
         self,
         question: str,
         *,
         stdout_format: str = "json",
         response_mutator: object | None = None,
+        oracle_configured: bool = True,
+        reviewer_configured: bool = True,
         **adapter_kwargs: object,
     ) -> tuple[dict, dict]:
         captured: dict[str, dict] = {}
@@ -364,26 +533,33 @@ class SemanticPlannerTests(unittest.TestCase):
             self.assertTrue(text)
             self.assertGreater(timeout, 0)
             request = json.loads(input)
-            captured["request"] = dict(request)
-            response = self.codex_adapter_response(request, **adapter_kwargs)
-            if callable(response_mutator):
+            artifact_type = request.get("artifact_type")
+            if artifact_type == "semantic_oracle_raw_request":
+                response = self.oracle_adapter_response(request, **adapter_kwargs)
+            elif artifact_type == "semantic_reviewer_raw_request":
+                response = self.reviewer_adapter_response(request)
+            else:
+                captured["request"] = dict(request)
+                response = self.codex_adapter_response(request, **adapter_kwargs)
+            if artifact_type == "semantic_planner_raw_request" and callable(response_mutator):
                 response = response_mutator(response)
             if stdout_format == "jsonl":
+                role = str(artifact_type or "semantic")
                 stdout = "\n".join(
                     [
                         json.dumps(
                             {
-                                "id": "codex-event-001",
+                                "id": f"{role}-event-001",
                                 "type": "session.started",
-                                "session_id": "codex-session-jsonl-001",
+                                "session_id": f"{role}-session-jsonl-001",
                             },
                             sort_keys=True,
                         ),
                         json.dumps(
                             {
-                                "id": "codex-event-002",
+                                "id": f"{role}-event-002",
                                 "type": "message",
-                                "session_id": "codex-session-jsonl-001",
+                                "session_id": f"{role}-session-jsonl-001",
                                 "response": response,
                             },
                             sort_keys=True,
@@ -394,13 +570,16 @@ class SemanticPlannerTests(unittest.TestCase):
                 stdout = json.dumps(response, sort_keys=True)
             return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
+        env = {CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "codex exec --json"}
+        if oracle_configured:
+            env[CODEX_SEMANTIC_ORACLE_COMMAND_ENV] = "codex exec --json"
+        if reviewer_configured:
+            env[CODEX_SEMANTIC_REVIEWER_COMMAND_ENV] = "codex exec --json"
+
         with mock.patch(
             "deepresearch.semantic_planner.subprocess.run",
             side_effect=fake_run,
-        ), mock.patch.dict(
-            "os.environ",
-            {CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "codex exec --json"},
-        ):
+        ), mock.patch.dict("os.environ", env):
             result = prepare_run(question=question, runs_dir=self.temp_runs_dir())
         return result, captured["request"]
 
@@ -410,6 +589,7 @@ class SemanticPlannerTests(unittest.TestCase):
             question=fixture["question"],
             runs_dir=self.temp_runs_dir(),
             angles=[angle.title for angle in fallback_plan.angles],
+            _allow_release_ineligible_materialization_for_tests=True,
         )
         return Path(result["run_dir"])
 
@@ -497,7 +677,7 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertFalse(review["semantic_release_eligible"])
         self.assertNotEqual(review.get("semantic_fit_score"), SEMANTIC_FIT_SCORE_THRESHOLD)
         self.assertEqual(review["final_verdict"], "release_ineligible")
-        self.assertFalse(review["substitute_implementation_check"]["passed"])
+        self.assertTrue(review["blockers"])
 
     def assert_validation_common_integrity_fields(self, validation: dict, source: dict) -> None:
         common_fields = (
@@ -860,7 +1040,7 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("irrelevant_visual_tasks_for_text_only_question", codes)
         self.assertIn("irrelevant_visual_expected_evidence_for_text_question", codes)
 
-    def test_explicit_angle_input_continues_to_work(self) -> None:
+    def test_explicit_angle_input_blocks_before_materialization_by_default(self) -> None:
         result = prepare_run(
             question="Research the product market and compare checkout UI.",
             runs_dir=self.temp_runs_dir(),
@@ -873,25 +1053,19 @@ class SemanticPlannerTests(unittest.TestCase):
         run_dir = Path(result["run_dir"])
         evidence = self.load_json(run_dir / "evidence.json")
 
+        self.assertEqual(result["status"], "blocked_semantic_review_failed")
         self.assertEqual(evidence["semantic_planner"]["source"], "manual_angles")
         self.assertEqual(evidence["semantic_planner"]["planner_mode"], PLANNER_MODE_MANUAL_ANGLES)
         self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
+        self.assertEqual(evidence["semantic_angles"], [])
+        self.assertEqual(evidence["search_tasks"], [])
+        self.assertFalse((run_dir / "search_tasks.json").exists())
+        self.assertFalse((run_dir / "visual_tasks.json").exists())
+        self.assertFalse((run_dir / "research_tasks.json").exists())
         validation = self.load_json(run_dir / "semantic_planner_validation.json")
         self.assert_release_ineligible_semantic_validation(
             validation,
             planner_mode=PLANNER_MODE_MANUAL_ANGLES,
-        )
-        self.assertEqual(
-            [angle["title"] for angle in evidence["semantic_angles"]],
-            [
-                "official API docs and release notes",
-                "checkout UI screenshot comparison",
-                "market report and competitor benchmark posts",
-            ],
-        )
-        self.assertEqual(
-            [task["route"] for task in evidence["search_tasks"]],
-            ["text_only", "visual_required", "visual_optional"],
         )
 
     def test_route_override_preserves_heuristic_fanout_and_overrides_routes(self) -> None:
@@ -901,6 +1075,7 @@ class SemanticPlannerTests(unittest.TestCase):
             runs_dir=self.temp_runs_dir(),
             angles=[angle.title for angle in fallback_plan.angles],
             route="text_only",
+            _allow_release_ineligible_materialization_for_tests=True,
         )
         run_dir = Path(result["run_dir"])
         evidence = self.load_json(run_dir / "evidence.json")
@@ -955,6 +1130,238 @@ class SemanticPlannerTests(unittest.TestCase):
         for token in forbidden:
             self.assertNotIn(token, request_text)
 
+    def test_oracle_is_locked_before_planner_request_with_trace_hashes(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+        oracle_request = self.load_json(
+            run_dir / "semantic_oracle_raw" / "oracle_request.json"
+        )
+        planner_request = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_request.json"
+        )
+        oracle = self.load_json(run_dir / "semantic_expectation_oracle.json")
+        trace = self.read_jsonl(run_dir / "run_trace.jsonl")
+        events = [record["event_type"] for record in trace]
+
+        self.assertLess(
+            events.index("semantic_oracle_request_created"),
+            events.index("semantic_planner_request_created"),
+        )
+        self.assertLess(
+            events.index("semantic_oracle_locked"),
+            events.index("semantic_planner_request_created"),
+        )
+        expected_semantic_indexes = {
+            "semantic_oracle_request_created": 1,
+            "semantic_oracle_locked": 2,
+            "semantic_planner_request_created": 3,
+            "semantic_plan_created": 4,
+            "semantic_reviewer_request_created": 5,
+            "semantic_review_completed": 6,
+        }
+        by_event = {record["event_type"]: record for record in trace}
+        for event, expected_index in expected_semantic_indexes.items():
+            with self.subTest(event=event):
+                self.assertEqual(
+                    by_event[event]["semantic_event_index"],
+                    expected_index,
+                )
+                self.assertEqual(
+                    by_event[event]["order_validation"]["semantic_event_index"],
+                    expected_index,
+                )
+        self.assertLess(
+            by_event["semantic_oracle_request_created"]["semantic_event_index"],
+            by_event["semantic_planner_request_created"]["semantic_event_index"],
+        )
+        self.assertLess(
+            by_event["semantic_oracle_locked"]["semantic_event_index"],
+            by_event["semantic_planner_request_created"]["semantic_event_index"],
+        )
+        self.assertLess(
+            self.parse_timestamp(by_event["semantic_oracle_request_created"]["timestamp"]),
+            self.parse_timestamp(by_event["semantic_planner_request_created"]["timestamp"]),
+        )
+        self.assertLess(
+            self.parse_timestamp(by_event["semantic_oracle_locked"]["timestamp"]),
+            self.parse_timestamp(by_event["semantic_planner_request_created"]["timestamp"]),
+        )
+        semantic_timestamps = [
+            self.parse_timestamp(by_event[event]["timestamp"])
+            for event in expected_semantic_indexes
+        ]
+        self.assertEqual(semantic_timestamps, sorted(semantic_timestamps))
+        self.assertEqual(len(set(semantic_timestamps)), len(semantic_timestamps))
+        self.assertEqual(oracle_request["original_question"], question)
+        self.assertEqual(planner_request["original_question"], question)
+        oracle_request_text = json.dumps(oracle_request, ensure_ascii=False).lower()
+        forbidden_reverse_fit = (
+            "candidate_plan",
+            "semantic_plan",
+            "planner_output",
+            "technical_api",
+            "product_market",
+            "visual_style",
+            "implementation_architecture",
+        )
+        for token in forbidden_reverse_fit:
+            self.assertNotIn(token, oracle_request_text)
+        self.assertFalse(oracle["plan_visible_to_oracle"])
+        self.assertFalse(oracle["used_production_planner_output"])
+        self.assertFalse(oracle["used_hidden_template_class"])
+        self.assertFalse(oracle["used_fixed_angle_inventory"])
+
+        oracle_hash = hashlib.sha256(
+            (run_dir / "semantic_expectation_oracle.json").read_bytes()
+        ).hexdigest()
+        planner_request_hash = hashlib.sha256(
+            (run_dir / "semantic_planner_raw" / "planner_request.json").read_bytes()
+        ).hexdigest()
+        self.assertEqual(
+            by_event["semantic_oracle_locked"]["artifact_hashes"][
+                "semantic_expectation_oracle"
+            ],
+            oracle_hash,
+        )
+        self.assertEqual(
+            by_event["semantic_planner_request_created"]["artifact_hashes"][
+                "semantic_planner_raw_request"
+            ],
+            planner_request_hash,
+        )
+
+    def test_missing_independent_reviewer_blocks_before_handoff_materialization(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+            reviewer_configured=False,
+        )
+        run_dir = Path(result["run_dir"])
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+        trace = self.read_jsonl(run_dir / "run_trace.jsonl")
+
+        self.assertEqual(result["status"], "blocked_semantic_review_failed")
+        self.assertFalse((run_dir / "search_tasks.json").exists())
+        self.assertFalse((run_dir / "visual_tasks.json").exists())
+        self.assertFalse((run_dir / "research_tasks.json").exists())
+        blocker_codes = {blocker["code"] for blocker in review["blockers"]}
+        self.assertIn("reviewer_adapter_unavailable", blocker_codes)
+        self.assertIn("non_release_reviewer_fixture", blocker_codes)
+        events = [record["event_type"] for record in trace]
+        for event in (
+            "semantic_oracle_request_created",
+            "semantic_oracle_locked",
+            "semantic_planner_request_created",
+            "semantic_plan_created",
+            "semantic_reviewer_request_created",
+            "semantic_review_completed",
+        ):
+            self.assertIn(event, events)
+
+    def test_fabricated_eligible_artifacts_fail_without_trace_ordering(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+        (run_dir / "run_trace.jsonl").unlink()
+        evidence = self.load_json(run_dir / "evidence.json")
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+
+        validation = semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=search_tasks,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        semantic_codes = {
+            failure["code"]
+            for failure in validation["semantic_status"]["failures"]
+        }
+        self.assertIn("semantic_ordering_trace_missing", semantic_codes)
+
+    def test_fabricated_trace_order_fails_without_monotonic_semantic_event_index(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+        trace_path = run_dir / "run_trace.jsonl"
+        records = self.read_jsonl(trace_path)
+        for record in records:
+            if record.get("event_type") == "semantic_oracle_locked":
+                record["semantic_event_index"] = 3
+                record["order_validation"]["semantic_event_index"] = 3
+                break
+        trace_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        evidence = self.load_json(run_dir / "evidence.json")
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+
+        validation = semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=search_tasks,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        semantic_codes = {
+            failure["code"]
+            for failure in validation["semantic_status"]["failures"]
+        }
+        self.assertIn("semantic_ordering_event_index_invalid", semantic_codes)
+
+    def test_fabricated_trace_order_fails_without_strict_semantic_timestamps(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+        trace_path = run_dir / "run_trace.jsonl"
+        records = self.read_jsonl(trace_path)
+        shared_timestamp = records[0]["timestamp"]
+        for record in records:
+            if str(record.get("event_type", "")).startswith("semantic_"):
+                record["timestamp"] = shared_timestamp
+        trace_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        evidence = self.load_json(run_dir / "evidence.json")
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+
+        validation = semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=search_tasks,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        semantic_codes = {
+            failure["code"]
+            for failure in validation["semantic_status"]["failures"]
+        }
+        self.assertIn(
+            "semantic_ordering_event_timestamps_not_strictly_increasing",
+            semantic_codes,
+        )
+
     def test_codex_semantic_accepts_structured_adapter_response_with_raw_provenance(self) -> None:
         question = "Research coastal microgrid outage recovery using official source records"
         result, adapter_request = self.prepare_with_codex_adapter(
@@ -967,7 +1374,7 @@ class SemanticPlannerTests(unittest.TestCase):
         raw_response = self.load_json(run_dir / "semantic_planner_raw" / "planner_response.json")
 
         self.assertEqual(semantic_plan["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
-        self.assertFalse(semantic_plan["semantic_release_eligible"])
+        self.assertTrue(semantic_plan["semantic_release_eligible"])
         self.assertEqual(semantic_plan["question_scope"], "broad")
         self.assertGreaterEqual(len(semantic_plan["angles"]), 5)
         self.assertLessEqual(len(semantic_plan["angles"]), 8)
@@ -1013,7 +1420,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertEqual(
             semantic_plan["planner_provenance"]["adapter_invocation"]["codex_event_id"],
-            "codex-event-002",
+            "semantic_planner_raw_request-event-002",
         )
         self.assertEqual(
             semantic_plan["planner_provenance"]["raw_response_hash"],
@@ -1029,6 +1436,8 @@ class SemanticPlannerTests(unittest.TestCase):
             plan=semantic_plan,
         )
         self.assertTrue(validation["ok"], validation)
+        persisted_validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assertTrue(persisted_validation["ok"], persisted_validation)
 
     def test_codex_semantic_unavailable_blocks_without_local_template_fallback(self) -> None:
         question = "Research adapter unavailable behavior without manual angles"
@@ -1558,11 +1967,11 @@ class SemanticPlannerTests(unittest.TestCase):
         semantic_plan = plan_artifact["semantic_plan"]
 
         self.assertEqual(evidence["semantic_planner"]["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
-        self.assertFalse(evidence["semantic_planner"]["semantic_release_eligible"])
-        self.assert_codex_candidate_release_ineligible(validation)
+        self.assertTrue(evidence["semantic_planner"]["semantic_release_eligible"])
+        self.assertTrue(validation["ok"], validation)
         self.assertEqual(
             evidence["semantic_planner"]["status"],
-            "candidate_codex_semantic_release_ineligible",
+            "semantic_review_passed",
         )
         text = json.dumps(semantic_plan, ensure_ascii=False).lower()
         self.assertIn(question.lower(), text)
@@ -1615,8 +2024,9 @@ class SemanticPlannerTests(unittest.TestCase):
             plan=semantic_plan,
         )
         self.assertTrue(candidate_validation["ok"], candidate_validation)
-        self.assertFalse(review["substitute_implementation_check"]["passed"])
-        self.assertNotEqual(review.get("semantic_fit_score"), SEMANTIC_FIT_SCORE_THRESHOLD)
+        self.assertTrue(review["substitute_implementation_check"]["passed"])
+        self.assertGreaterEqual(review.get("semantic_fit_score"), SEMANTIC_FIT_SCORE_THRESHOLD)
+        self.assertEqual(review["verdict"], "pass")
 
     def test_codex_deepresearch_planner_architecture_prompt_uses_codex_semantic_candidate_tasks(self) -> None:
         question = (
@@ -1631,9 +2041,9 @@ class SemanticPlannerTests(unittest.TestCase):
         semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
         raw_response = self.load_json(run_dir / "semantic_planner_raw" / "planner_response.json")
 
-        self.assertEqual(result["semantic_planning_status"], "candidate_codex_semantic_release_ineligible")
+        self.assertEqual(result["semantic_planning_status"], "semantic_review_passed")
         self.assertEqual(semantic_plan["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
-        self.assertFalse(semantic_plan["semantic_release_eligible"])
+        self.assertTrue(semantic_plan["semantic_release_eligible"])
         self.assertEqual(
             raw_response["provenance"]["adapter_invocation_kind"],
             CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,

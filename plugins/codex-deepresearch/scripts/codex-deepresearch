@@ -293,6 +293,9 @@ def run_prepare(args: argparse.Namespace) -> int:
             suite_id=args.suite_id,
             prompt_hash=args.prompt_hash,
             original_question=args.original_question,
+            _allow_release_ineligible_materialization_for_tests=(
+                args.allow_release_ineligible_materialization_for_tests
+            ),
         )
     except BudgetEstimateError as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True, allow_nan=False), file=sys.stderr)
@@ -336,6 +339,9 @@ def run_invoke(args: argparse.Namespace) -> int:
         suite_id=args.suite_id,
         prompt_hash=args.prompt_hash,
         original_question=args.original_question,
+        _allow_release_ineligible_materialization_for_tests=(
+            args.allow_release_ineligible_materialization_for_tests
+        ),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok") is True else 2
@@ -1713,6 +1719,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat a missing codex exec binary as blocked preflight before orchestration.",
     )
+    invoke.add_argument(
+        "--allow-release-ineligible-materialization-for-tests",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     add_release_validation_identity_args(invoke)
     invoke.set_defaults(func=run_invoke)
 
@@ -1804,6 +1815,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-budget",
         action="store_true",
         help="Confirm execution for deep and exhaustive budget presets.",
+    )
+    prepare.add_argument(
+        "--allow-release-ineligible-materialization-for-tests",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     add_release_validation_identity_args(prepare)
     prepare.set_defaults(func=run_prepare)

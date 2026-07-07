@@ -46,6 +46,7 @@ TEST_MANUAL_ANGLES = ("primary source discovery",)
 
 def prepare_run(*args, **kwargs):
     kwargs.setdefault("angles", list(TEST_MANUAL_ANGLES))
+    kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
     return prepare_search_handoff_run(*args, **kwargs)
 
 
@@ -1151,13 +1152,21 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(ingest["status"], "ingested")
 
         records = read_trace_records(run_dir / "run_trace.jsonl")
-        self.assertEqual([record["stage"] for record in records], ["planning", "ingest"])
+        lifecycle_records = [
+            record
+            for record in records
+            if not str(record.get("event_type", "")).startswith("semantic_")
+        ]
+        self.assertEqual(
+            [record["stage"] for record in lifecycle_records],
+            ["planning", "ingest"],
+        )
         same_second = "2026-06-22T00:00:01Z"
         self.set_status_timestamps(run_dir / "status.json", same_second)
         self.set_status_timestamps(run_dir / "ingest_status.json", same_second)
-        records[0]["timestamp"] = same_second
+        lifecycle_records[0]["timestamp"] = same_second
         (run_dir / "run_trace.jsonl").write_text(
-            json.dumps(records[0]) + "\n",
+            json.dumps(lifecycle_records[0]) + "\n",
             encoding="utf-8",
         )
         run_steps_path(run_dir).unlink()

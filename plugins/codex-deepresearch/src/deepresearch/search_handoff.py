@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
@@ -32,11 +34,19 @@ from .run_state import begin_stage, skipped_stage_status
 from .semantic_planner import (
     BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
     PLANNER_MODE_MANUAL_ANGLES,
+    SEMANTIC_EXPECTATION_ORACLE_FILENAME,
+    SEMANTIC_PLAN_FILENAME,
+    SEMANTIC_PLAN_REVIEW_FILENAME,
     SEMANTIC_PLANNER_SCHEMA_VERSION,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
+    build_codex_semantic_raw_request,
     plan_semantic_angles,
+    semantic_plan_with_review_result,
+    semantic_review_release_eligible,
     write_semantic_integrity_artifacts,
+    write_semantic_expectation_oracle,
     write_semantic_planner_validation,
+    write_semantic_plan_review,
 )
 from .trace import record_stage_trace
 
@@ -84,6 +94,7 @@ def prepare_run(
     user_constraints: Sequence[str] | None = None,
     provided_sources: Sequence[Mapping[str, Any]] | None = None,
     provided_images: Sequence[Mapping[str, Any]] | None = None,
+    _allow_release_ineligible_materialization_for_tests: bool = False,
 ) -> dict[str, Any]:
     """Create a run directory and the Codex search handoff artifacts."""
 
@@ -126,35 +137,179 @@ def prepare_run(
             "with codex-native search"
         )
 
-    semantic_plan = plan_semantic_angles(
+    now = _utc_now()
+    run_dir = _create_unique_run_dir(Path(runs_dir), now)
+    run_id = run_dir.name
+    begin_stage(run_dir, "planning", run_id=run_id, started_at=now)
+    budget_cap = {
+        "budget_preset": budget_preset,
+        "max_results": max_results,
+        "max_sources": max_sources or config.budget.max_sources,
+        "max_images": max_images if max_images is not None else config.budget.max_images,
+        "max_subagents": max_subagents
+        or max_agents
+        or config.budget.max_concurrent_codex_subagents,
+        "max_cost_usd": max_cost_usd,
+    }
+    locked_oracle = write_semantic_expectation_oracle(
+        run_dir=run_dir,
         question=normalized_question,
-        explicit_angles=_effective_explicit_angles_for_route(
-            angles=angles,
-            route=route,
-        ),
         user_constraints=user_constraints,
         depth_preset=budget_preset,
         visual_preference=route,
-        budget_cap={
-            "budget_preset": budget_preset,
-            "max_results": max_results,
-            "max_sources": max_sources or config.budget.max_sources,
-            "max_images": max_images if max_images is not None else config.budget.max_images,
-            "max_subagents": max_subagents
-            or max_agents
-            or config.budget.max_concurrent_codex_subagents,
-            "max_cost_usd": max_cost_usd,
-        },
+        budget_cap=budget_cap,
         provided_sources=provided_sources,
         provided_images=provided_images,
+        created_at=now,
+    )
+    _record_semantic_artifact_trace(
+        run_dir,
+        event_type="semantic_oracle_request_created",
+        semantic_event_index=1,
+        artifact_paths={
+            "semantic_oracle_raw_request": "semantic_oracle_raw/oracle_request.json",
+        },
+        timestamp=_semantic_event_timestamp(now, 1),
+        status="semantic_oracle_request_created",
+    )
+    _record_semantic_artifact_trace(
+        run_dir,
+        event_type="semantic_oracle_locked",
+        semantic_event_index=2,
+        artifact_paths={
+            "semantic_oracle_raw_response": "semantic_oracle_raw/oracle_response.json",
+            "semantic_expectation_oracle": SEMANTIC_EXPECTATION_ORACLE_FILENAME,
+        },
+        timestamp=_semantic_event_timestamp(now, 2),
+        status="semantic_oracle_locked",
+    )
+
+    explicit_angles = _effective_explicit_angles_for_route(angles=angles, route=route)
+    planner_raw_request = None
+    if explicit_angles is None:
+        planner_raw_request = build_codex_semantic_raw_request(
+            question=normalized_question,
+            user_constraints=user_constraints,
+            depth_preset=budget_preset,
+            visual_preference=route,
+            budget_cap=budget_cap,
+            provided_sources=provided_sources,
+            provided_images=provided_images,
+            run_id=run_id,
+            created_at=now,
+        )
+        planner_raw_dir = run_dir / "semantic_planner_raw"
+        planner_raw_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(planner_raw_dir / "planner_request.json", planner_raw_request)
+        _record_semantic_artifact_trace(
+            run_dir,
+            event_type="semantic_planner_request_created",
+            semantic_event_index=3,
+            artifact_paths={
+                "semantic_planner_raw_request": "semantic_planner_raw/planner_request.json",
+            },
+            timestamp=_semantic_event_timestamp(now, 3),
+            status="semantic_planner_request_created",
+        )
+
+    semantic_plan = plan_semantic_angles(
+        question=normalized_question,
+        explicit_angles=explicit_angles,
+        user_constraints=user_constraints,
+        depth_preset=budget_preset,
+        visual_preference=route,
+        budget_cap=budget_cap,
+        provided_sources=provided_sources,
+        provided_images=provided_images,
+        raw_request_payload=planner_raw_request,
     )
     if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
-        return _prepare_blocked_semantic_planner_run(
+        return _finalize_blocked_semantic_run(
             normalized_question=normalized_question,
             config=config,
             semantic_plan=semantic_plan,
-            runs_dir=Path(runs_dir),
+            run_dir=run_dir,
+            locked_oracle=locked_oracle,
+            semantic_review=None,
             release_identity=release_identity,
+            status=semantic_plan.status,
+        )
+    semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+        run_dir=run_dir,
+        question=normalized_question,
+        plan=semantic_plan,
+        routing=[],
+        search_tasks=[],
+        created_at=now,
+        locked_oracle=locked_oracle,
+    )
+    pre_review_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+    _record_semantic_artifact_trace(
+        run_dir,
+        event_type="semantic_plan_created",
+        semantic_event_index=4,
+        artifact_paths={
+            "semantic_plan": SEMANTIC_PLAN_FILENAME,
+            "semantic_planner_raw_response": "semantic_planner_raw/planner_response.json",
+        },
+        timestamp=_semantic_event_timestamp(now, 4),
+        status="semantic_plan_created",
+    )
+    semantic_review = write_semantic_plan_review(
+        run_dir=run_dir,
+        question=normalized_question,
+        plan=semantic_plan,
+        oracle=locked_oracle,
+        created_at=now,
+    )
+    semantic_review["semantic_plan_candidate_artifact_hash"] = pre_review_semantic_plan_hash
+    _write_json(run_dir / SEMANTIC_PLAN_REVIEW_FILENAME, semantic_review)
+    _record_semantic_artifact_trace(
+        run_dir,
+        event_type="semantic_reviewer_request_created",
+        semantic_event_index=5,
+        artifact_paths={
+            "semantic_reviewer_raw_request": "semantic_reviewer_raw/reviewer_request.json",
+        },
+        timestamp=_semantic_event_timestamp(now, 5),
+        status="semantic_reviewer_request_created",
+    )
+    semantic_plan = semantic_plan_with_review_result(semantic_plan, semantic_review)
+    semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+        run_dir=run_dir,
+        question=normalized_question,
+        plan=semantic_plan,
+        routing=[],
+        search_tasks=[],
+        created_at=now,
+        locked_oracle=locked_oracle,
+        semantic_review=semantic_review,
+    )
+    _record_semantic_artifact_trace(
+        run_dir,
+        event_type="semantic_review_completed",
+        semantic_event_index=6,
+        artifact_paths={
+            "semantic_reviewer_raw_response": "semantic_reviewer_raw/reviewer_response.json",
+            "semantic_plan_review": SEMANTIC_PLAN_REVIEW_FILENAME,
+        },
+        timestamp=_semantic_event_timestamp(now, 6),
+        status="semantic_review_completed",
+    )
+    if (
+        not semantic_review_release_eligible(semantic_review)
+        and not _allow_release_ineligible_materialization_for_tests
+    ):
+        return _finalize_blocked_semantic_run(
+            normalized_question=normalized_question,
+            config=config,
+            semantic_plan=semantic_plan,
+            run_dir=run_dir,
+            locked_oracle=locked_oracle,
+            semantic_review=semantic_review,
+            release_identity=release_identity,
+            status="blocked_semantic_review_failed",
+            semantic_integrity_artifacts=semantic_integrity_artifacts,
         )
     decisions = []
     for semantic_angle in semantic_plan.angles:
@@ -173,26 +328,27 @@ def prepare_run(
         _routing_record(decision, index, semantic_angle=semantic_plan.angles[index - 1])
         for index, decision in enumerate(decisions, start=1)
     ]
-    now = _utc_now()
-    budget_estimate = estimate_budget(
-        question=normalized_question,
-        config=config,
-        routing=routing,
-        max_results=max_results,
-        codex_runner=codex_runner,
-        caps=BudgetCaps(
-            max_sources=max_sources,
-            max_images=max_images,
-            max_subagents=max_subagents,
-            max_agents=max_agents,
-            max_cost_usd=max_cost_usd,
-        ),
-        confirmation_provided=confirm_budget,
-        generated_at=now,
-    )
-    run_dir = _create_unique_run_dir(Path(runs_dir), now)
-    run_id = run_dir.name
-    begin_stage(run_dir, "planning", run_id=run_id, started_at=now)
+    try:
+        budget_estimate = estimate_budget(
+            question=normalized_question,
+            config=config,
+            routing=routing,
+            max_results=max_results,
+            codex_runner=codex_runner,
+            caps=BudgetCaps(
+                max_sources=max_sources,
+                max_images=max_images,
+                max_subagents=max_subagents,
+                max_agents=max_agents,
+                max_cost_usd=max_cost_usd,
+            ),
+            confirmation_provided=confirm_budget,
+            generated_at=now,
+        )
+    except Exception:
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        raise
     routing = _apply_budget_image_allocations(
         routing,
         budget_estimate["planned_search"]["route_image_allocations"],
@@ -364,6 +520,8 @@ def prepare_run(
         routing=routing,
         search_tasks=search_tasks,
         created_at=now,
+        locked_oracle=locked_oracle,
+        semantic_review=semantic_review,
     )
     status["artifacts"].update(semantic_integrity_artifacts)
     semantic_validation = write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
@@ -577,6 +735,159 @@ def _prepare_blocked_semantic_planner_run(
     }
 
 
+def _finalize_blocked_semantic_run(
+    *,
+    normalized_question: str,
+    config: Any,
+    semantic_plan: Any,
+    run_dir: Path,
+    locked_oracle: Mapping[str, Any] | None,
+    semantic_review: Mapping[str, Any] | None,
+    release_identity: Mapping[str, Any],
+    status: str,
+    semantic_integrity_artifacts: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    now = _utc_now()
+    run_id = run_dir.name
+    budget = _budget_to_evidence(config.budget_preset, config.budget)
+    evidence = {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "created_at": now,
+        "question": normalized_question,
+        "mode": config.mode,
+        "search_provider": config.search_provider,
+        "vlm_provider": config.vlm_provider,
+        "routing": [],
+        "semantic_planner": {
+            "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+            "question_class": semantic_plan.question_class,
+            "broad_question": semantic_plan.broad_question,
+            "source": semantic_plan.source,
+            "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
+            "intent_summary": getattr(semantic_plan, "intent_summary", ""),
+            "domain_entities": list(getattr(semantic_plan, "domain_entities", [])),
+            "constraints": list(getattr(semantic_plan, "constraints", [])),
+            "question_scope": getattr(semantic_plan, "question_scope", ""),
+            "decomposition_strategy": getattr(semantic_plan, "decomposition_strategy", ""),
+            "requirement_coverage_map": list(
+                getattr(semantic_plan, "requirement_coverage_map", [])
+            ),
+            "negative_scope": list(getattr(semantic_plan, "negative_scope", [])),
+            "bounded_tasks": list(getattr(semantic_plan, "bounded_tasks", [])),
+            "planner_provenance": dict(getattr(semantic_plan, "planner_provenance", {}) or {}),
+            "model_or_surface": getattr(semantic_plan, "model_or_surface", ""),
+            "original_question": getattr(semantic_plan, "original_question", ""),
+            "language": getattr(semantic_plan, "language", ""),
+            "planner_mode": semantic_plan.planner_mode,
+            "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+            "status": semantic_plan.status,
+            "diagnostics": dict(semantic_plan.diagnostics or {}),
+        },
+        "semantic_angles": [],
+        "search_tasks": [],
+        "budget": budget,
+        "sources": [],
+        "images": [],
+        "claims": [],
+        "handoff": {
+            "schema_version": HANDOFF_SCHEMA_VERSION,
+            "status": status,
+            "search_results_path": None,
+            "visual_observations_path": None,
+        },
+    }
+    apply_release_validation_identity(evidence, release_identity)
+    _write_json(run_dir / "evidence.json", evidence)
+    artifacts = dict(semantic_integrity_artifacts or {})
+    if not artifacts:
+        artifacts.update(
+            write_semantic_integrity_artifacts(
+                run_dir=run_dir,
+                question=normalized_question,
+                plan=semantic_plan,
+                routing=[],
+                search_tasks=[],
+                created_at=now,
+                locked_oracle=locked_oracle,
+                semantic_review=semantic_review,
+            )
+        )
+    semantic_validation = write_semantic_planner_validation(
+        run_dir=run_dir,
+        evidence=evidence,
+    )
+    semantic_planning = _prepare_semantic_planning_summary(
+        semantic_plan=semantic_plan,
+        validation=semantic_validation,
+    )
+    status_payload = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "run_id": run_id,
+        "status": status,
+        "semantic_planning_status": semantic_plan.status,
+        "planner_mode": semantic_plan.planner_mode,
+        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "created_at": now,
+        "question": normalized_question,
+        "mode": config.mode,
+        "search_provider": config.search_provider,
+        "vlm_provider": config.vlm_provider,
+        "next_step": "Fix the semantic planner/reviewer failure before search handoff or fan-out.",
+        "artifacts": {
+            "evidence": str(run_dir / "evidence.json"),
+            "status": str(run_dir / "status.json"),
+            "semantic_planner_validation": str(
+                run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+            ),
+            **artifacts,
+        },
+        "semantic_planning": semantic_planning,
+        "diagnostics": {
+            "semantic_planning": semantic_planning["user_visible_diagnostic"],
+        },
+        "validation": validate_artifacts(evidence_path=run_dir / "evidence.json").to_dict(),
+    }
+    apply_release_validation_identity(status_payload, release_identity)
+    record_stage_trace(
+        run_dir,
+        stage="planning",
+        agent_role="semantic_reviewer",
+        status_payload=status_payload,
+        prompt_summary="Review semantic plan against locked expectation oracle before handoff materialization.",
+        tool_call_summary="Semantic review failed or planner was unavailable; no search, visual, or research task artifacts were written.",
+        event_type=(
+            "semantic_planner_blocked"
+            if status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+            else status
+        ),
+        timestamp=now,
+    )
+    _write_json(run_dir / "status.json", status_payload)
+    return {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "status": status_payload["status"],
+        "artifacts": {
+            "evidence": str(run_dir / "evidence.json"),
+            "status": str(run_dir / "status.json"),
+            "run_trace": str(run_dir / "run_trace.jsonl"),
+            "run_steps": str(run_dir / "run_steps.json"),
+            "semantic_planner_validation": str(
+                run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+            ),
+            **artifacts,
+        },
+        "planner_mode": semantic_plan.planner_mode,
+        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_planning_status": semantic_plan.status,
+        "semantic_planning": semantic_planning,
+        "diagnostics": dict(status_payload["diagnostics"]),
+        **release_identity,
+    }
+
+
 def _prepare_semantic_planning_summary(
     *,
     semantic_plan: Any,
@@ -593,6 +904,12 @@ def _prepare_semantic_planning_summary(
         for failure in failures
         if isinstance(failure, Mapping) and failure.get("code")
     ] if isinstance(failures, list) else []
+    semantic_status = validation.get("semantic_status")
+    review_verdict = None
+    semantic_fit_score = None
+    if isinstance(semantic_status, Mapping):
+        review_verdict = semantic_status.get("review_verdict")
+        semantic_fit_score = semantic_status.get("semantic_fit_score")
     return {
         "schema_version": "codex-deepresearch.semantic-planning-summary.v0",
         "status": str(getattr(semantic_plan, "status", "unknown") or "unknown"),
@@ -602,9 +919,66 @@ def _prepare_semantic_planning_summary(
         ),
         "validation_ok": validation.get("ok"),
         "failure_codes": failure_codes,
+        "semantic_fit_score": semantic_fit_score,
+        "review_verdict": review_verdict or diagnostics.get("semantic_review_verdict"),
         "fallback_kind": diagnostics.get("fallback_kind"),
         "user_visible_diagnostic": diagnostics.get("user_visible_diagnostic"),
     }
+
+
+def _record_semantic_artifact_trace(
+    run_dir: Path,
+    *,
+    event_type: str,
+    semantic_event_index: int,
+    artifact_paths: Mapping[str, str],
+    timestamp: str,
+    status: str,
+) -> None:
+    hashes: dict[str, str] = {}
+    for key, relative_path in artifact_paths.items():
+        path = run_dir / relative_path
+        if path.exists():
+            hashes[key] = _sha256_file(path)
+    status_payload = {
+        "run_id": run_dir.name,
+        "status": status,
+        "artifacts": {
+            key: str(run_dir / relative_path)
+            for key, relative_path in artifact_paths.items()
+        },
+    }
+    record_stage_trace(
+        run_dir,
+        stage="planning",
+        agent_role="semantic_gate",
+        status_payload=status_payload,
+        prompt_summary="Record semantic oracle/planner/reviewer ordering proof.",
+        tool_call_summary=f"Recorded {event_type} with artifact hashes.",
+        event_type=event_type,
+        timestamp=timestamp,
+        extra_fields={
+            "semantic_event_index": semantic_event_index,
+            "artifact_hashes": hashes,
+            "semantic_artifact_paths": dict(artifact_paths),
+            "order_validation": {
+                "required_order": [
+                    "semantic_oracle_request_created",
+                    "semantic_oracle_locked",
+                    "semantic_planner_request_created",
+                    "semantic_plan_created",
+                    "semantic_reviewer_request_created",
+                    "semantic_review_completed",
+                ],
+                "current_event": event_type,
+                "semantic_event_index": semantic_event_index,
+            },
+        },
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    return sha256(path.read_bytes()).hexdigest()
 
 
 def build_release_validation_identity(
@@ -1363,3 +1737,17 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _semantic_event_timestamp(run_created_at: str, semantic_event_index: int) -> str:
+    raw = run_created_at.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        base = datetime.fromisoformat(raw)
+    except ValueError:
+        base = datetime.now(timezone.utc).replace(microsecond=0)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    timestamp = base.astimezone(timezone.utc) + timedelta(milliseconds=semantic_event_index)
+    return timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")

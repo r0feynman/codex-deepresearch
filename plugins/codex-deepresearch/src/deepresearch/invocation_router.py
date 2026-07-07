@@ -190,6 +190,7 @@ def run_skill_invocation(
     suite_id: str | None = None,
     prompt_hash: str | None = None,
     original_question: str | None = None,
+    _allow_release_ineligible_materialization_for_tests: bool = False,
 ) -> dict[str, Any]:
     """Route one ``$deep-research`` skill invocation to an explicit mode."""
 
@@ -274,6 +275,9 @@ def run_skill_invocation(
             suite_id=release_identity.get("suite_id"),
             prompt_hash=release_identity.get("prompt_hash"),
             original_question=release_identity.get("original_question"),
+            _allow_release_ineligible_materialization_for_tests=(
+                _allow_release_ineligible_materialization_for_tests
+            ),
         )
     except (BudgetEstimateError, ConfigResolutionError, SearchHandoffError, OSError) as exc:
         return _blocked_preflight_with_status_dir(

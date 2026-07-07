@@ -16,7 +16,18 @@ RUNNER = ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresear
 PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
-from deepresearch import enforce_guardrails, fetch_claims, ingest_run, prepare_run, validate_artifacts
+from deepresearch import (
+    enforce_guardrails,
+    fetch_claims,
+    ingest_run,
+    prepare_run as prepare_search_handoff_run,
+    validate_artifacts,
+)
+
+
+def prepare_run(*args, **kwargs):
+    kwargs.setdefault("_allow_release_ineligible_materialization_for_tests", True)
+    return prepare_search_handoff_run(*args, **kwargs)
 
 
 fetch_claims_module = importlib.import_module("deepresearch.fetch_claims")
