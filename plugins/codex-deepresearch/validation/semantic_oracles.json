@@ -8,7 +8,7 @@
     "requires_semantic_plan_review": true
   },
   "oracles": {
-    "holdout-fixture-001": {
+    "holdout-independent-001": {
       "categories": [
         "korean",
         "visual",
@@ -33,11 +33,11 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "34141feb10a3f2c6ab15bc0561393a63fedefe287fec600941a19e19012c0d98",
-      "prompt_id": "holdout-fixture-001",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "1b784ae745638735fb2cb600803c828f14a29b6dfb299dedbeada081fb08e6fc",
+      "prompt_id": "holdout-independent-001",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -63,7 +63,7 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-002": {
+    "holdout-independent-002": {
       "categories": [
         "korean",
         "visual",
@@ -88,11 +88,11 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "de8f7034e2cd94455b8c62cd18afb3cb9c11ed17672854bb1ebf275842348eb1",
-      "prompt_id": "holdout-fixture-002",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "0658f02254b6724a98f12f5e53f2c47dad77d8971cbb9bcf29b867bc61b57b3f",
+      "prompt_id": "holdout-independent-002",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -118,7 +118,7 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-003": {
+    "holdout-independent-003": {
       "categories": [
         "korean",
         "official_regulatory_source_quality",
@@ -143,11 +143,11 @@
         "official_or_regulatory_sources",
         "disambiguate_non_software_or_domain_meaning"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "4e55504d250269254e4440cd85dec6ca5f3a1ba3048346e945c6563310fd1844",
-      "prompt_id": "holdout-fixture-003",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "4b4cbdf54bc52fe3927fdfa8a62d85987583dcde3e0b3de486ccebc98136c666",
+      "prompt_id": "holdout-independent-003",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -173,7 +173,7 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-004": {
+    "holdout-independent-004": {
       "categories": [
         "korean",
         "official_regulatory_source_quality",
@@ -198,11 +198,11 @@
         "official_or_regulatory_sources",
         "disambiguate_non_software_or_domain_meaning"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "9b066a000e1ecb71660eaa62f520cbce967739424c4fff4417fb447fe7e5c7d2",
-      "prompt_id": "holdout-fixture-004",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "d2ea39093cbd3e141d4ce81efcfbecb71b9b725eedfab3279dd41b07af4cc283",
+      "prompt_id": "holdout-independent-004",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -228,7 +228,7 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-005": {
+    "holdout-independent-005": {
       "categories": [
         "visual",
         "official_regulatory_source_quality",
@@ -252,11 +252,11 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "13406a76618d5942ddadd0a23b61b647a1c6022589f40ca5505fa08abc59fae6",
-      "prompt_id": "holdout-fixture-005",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "7a163f6ab112539d35a3687530a74c5dc83dff90b5891424142eefabcec9e6eb",
+      "prompt_id": "holdout-independent-005",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -282,61 +282,7 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-006": {
-      "categories": [
-        "ambiguous_domain",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources",
-        "disambiguate_non_software_or_domain_meaning"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "07b7e2d7b9b850d4b9f9ed4a0e5e35a27ce0dee18cfd68e42eb8243de3055a6c",
-      "prompt_id": "holdout-fixture-006",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-007": {
+    "holdout-independent-006": {
       "categories": [
         "visual",
         "official_regulatory_source_quality",
@@ -360,11 +306,11 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "98aae77138dfaa05e2b9791b2e40de211b43934f2799fbd2fb4acd2c886e0cf6",
-      "prompt_id": "holdout-fixture-007",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "6e739a9e3cd4f8650403db0b27fe098a96473f961772f988111ce929892cf79d",
+      "prompt_id": "holdout-independent-006",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -390,7 +336,115 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-008": {
+    "holdout-independent-007": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "ea3b0311062ca8cd52326174aa3f6af1826431ee7aba102f655c95799b417b0a",
+      "prompt_id": "holdout-independent-007",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-independent-008": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "52cc33fad292e9f73d3fbc17b06fcb36b29cb39fe778c7d0fab9a7736d584657",
+      "prompt_id": "holdout-independent-008",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-independent-009": {
       "categories": [
         "ambiguous_domain",
         "official_regulatory_source_quality",
@@ -414,11 +468,11 @@
         "official_or_regulatory_sources",
         "disambiguate_non_software_or_domain_meaning"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "549f7d71bb6c5b4002837246ae47869d75c33d3daf583ad73f5021f8625e5bfb",
-      "prompt_id": "holdout-fixture-008",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "7e743f2028c26d2b050877c76b1a9c5f115484afc4c8815ca07837bb14e3b3d9",
+      "prompt_id": "holdout-independent-009",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -444,7 +498,61 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-009": {
+    "holdout-independent-010": {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "3ac72ff29dfb652e73e6b30eb01a27929ac129b497ee1deae25427d71c12beb3",
+      "prompt_id": "holdout-independent-010",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-independent-011": {
       "categories": [
         "software_implementation",
         "official_regulatory_source_quality"
@@ -465,13 +573,13 @@
         "public_safe_sources",
         "source_backed_claims",
         "official_or_regulatory_sources",
-        "current_official_software_documentation"
+        "official_implementation_documentation"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "fef9cef1b3b717aa3a58234431fe1745b3e5c7b3e29b5796c826f71f9f00d73e",
-      "prompt_id": "holdout-fixture-009",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "bc6ba1554300a7bfe275a48b8fbda15ce451b27ae1e725efb681be7ed6a3a3c4",
+      "prompt_id": "holdout-independent-011",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -497,68 +605,16 @@
         "preserve_original_question_intent": true
       }
     },
-    "holdout-fixture-010": {
+    "holdout-independent-012": {
       "categories": [
         "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text",
-        "visual"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "a4fba46fc12850e0e84b4b9e37563218d793a7cf62f910437d1b7133f67dcce1",
-      "prompt_id": "holdout-fixture-010",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-011": {
-      "categories": [
         "software_implementation",
         "official_regulatory_source_quality"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
       "expected_modalities": [
-        "text"
+        "text",
+        "visual"
       ],
       "expected_plan_contract": {
         "bounded_tasks_required": true,
@@ -572,67 +628,13 @@
         "public_safe_sources",
         "source_backed_claims",
         "official_or_regulatory_sources",
-        "current_official_software_documentation"
+        "official_implementation_documentation"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "1632423b357e6d55d1d9c5fb038758b8bdd2703e3a99346b32f63788e274967b",
-      "prompt_id": "holdout-fixture-011",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "3f2d7ebdd359af0948d17a04601e9f23fdf4802e158440f68032405b17939cf4",
+      "prompt_id": "holdout-independent-012",
       "public_safe": true,
-      "release_counted": false,
-      "route": "text_only",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-012": {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text",
-        "visual"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "a9bef41eb03b48e5863aacd339ffd0ec707b595e316e4e10aaa6c1e69da0bfba",
-      "prompt_id": "holdout-fixture-012",
-      "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {

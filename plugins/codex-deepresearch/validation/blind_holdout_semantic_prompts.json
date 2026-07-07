@@ -1,11 +1,17 @@
 {
   "created_for_issue": 133,
-  "implementation_freeze": {
-    "record_type": "fixture_safe_timestamp",
-    "release_eligible": false,
-    "timestamp": "2026-07-07T00:00:00Z"
+  "denominator_rules": {
+    "blocked_and_failed_runs_count_as_failures": true,
+    "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+    "release_counted_prompt_count": 12
   },
-  "name": "Fixture-Safe Blind Holdout Flow",
+  "implementation_freeze": {
+    "commit": "495d336b58410373811441147d33952047fb590a",
+    "record_type": "merge_commit",
+    "release_eligible": true,
+    "timestamp": "2026-07-07T06:30:13Z"
+  },
+  "name": "Independent Blind Holdout Release Manifest",
   "prompts": [
     {
       "categories": [
@@ -15,12 +21,13 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-001",
-      "oracle_hash": "5ca18802211d274fe8255dfeea9f9eeb6b2ace4bf01d6adb2daf2b142e84efdd",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-001",
-      "prompt": "한국 해양 안전 표지판 이미지와 공식 항로 안전 지침을 비교해줘.",
+      "id": "holdout-independent-001",
+      "oracle_hash": "cbcc7c22a2e03457fd6c851644b2a34cf7184efe4bc399fa5805c9a22e5cb250",
+      "oracle_path": "semantic_oracles.json#holdout-independent-001",
+      "prompt": "한국 국가건강검진 결과표의 혈압과 혈당 판정 이미지 예시와 국민건강보험공단 및 질병관리청의 공식 판정 기준을 비교해줘.",
+      "prompt_hash": "1b784ae745638735fb2cb600803c828f14a29b6dfb299dedbeada081fb08e6fc",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required"
     },
     {
@@ -31,12 +38,13 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-002",
-      "oracle_hash": "92954853b405ba82c5618b73d427d6cbba38684e8b900fc180971fab2a9a0135",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-002",
-      "prompt": "한국 어린이 통학버스 안전 규정과 공식 안내 이미지의 차이를 조사해줘.",
+      "id": "holdout-independent-002",
+      "oracle_hash": "3ad069ca2e6289f7ba7194d8b07691f1e848005b2da3d530808f508bd9d14c3a",
+      "oracle_path": "semantic_oracles.json#holdout-independent-002",
+      "prompt": "한국 KC 전파인증 마크가 표시된 제품 사진과 국립전파연구원의 공식 인증 조회 및 표시 기준을 비교해줘.",
+      "prompt_hash": "0658f02254b6724a98f12f5e53f2c47dad77d8971cbb9bcf29b867bc61b57b3f",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required"
     },
     {
@@ -47,12 +55,13 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-003",
-      "oracle_hash": "2ff185cfd9bf1561d0284ff5b99ba4c84feba2ebce58faf753cb1bba8b46c8a6",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-003",
-      "prompt": "테스트라는 말이 농산물 잔류농약 검사에서 의미하는 기준과 공식 발표 자료를 비교해줘.",
+      "id": "holdout-independent-003",
+      "oracle_hash": "786bcb0ce03750bcc4ba60b731bfe0b49b78180378f047ff1f2c8a3fccdb82aa",
+      "oracle_path": "semantic_oracles.json#holdout-independent-003",
+      "prompt": "모델이라는 용어가 기상청 태풍 진로 예측에서 쓰일 때, 예보 모델 검증 기준과 공식 발표자료의 한계를 조사해줘.",
+      "prompt_hash": "4b4cbdf54bc52fe3927fdfa8a62d85987583dcde3e0b3de486ccebc98136c666",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only"
     },
     {
@@ -63,12 +72,13 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-004",
-      "oracle_hash": "f298c6a13fc3234bdff62b7afffaf782c5ddf1671b1bd71206174eada182597b",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-004",
-      "prompt": "구현이라는 표현이 공원 녹지계획 실행 문서에서 쓰일 때 책임기관과 예산 지표를 조사해줘.",
+      "id": "holdout-independent-004",
+      "oracle_hash": "14cea128953cd4713dbe3da3a18b9225dd729810567888c324c7a7251fadea22",
+      "oracle_path": "semantic_oracles.json#holdout-independent-004",
+      "prompt": "배포라는 표현이 의약품 안전성 서한 배포 맥락에서 쓰일 때, 식약처와 제약사의 책임 범위 및 공식 공지 절차를 비교해줘.",
+      "prompt_hash": "d2ea39093cbd3e141d4ce81efcfbecb71b9b725eedfab3279dd41b07af4cc283",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only"
     },
     {
@@ -78,28 +88,14 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-005",
-      "oracle_hash": "50a56ef9a5486d28746d06ac9ff105a73a86ea299887c3af424e570fe2b45321",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-005",
-      "prompt": "Compare public dam safety inspection diagrams and official regulator guidance, separating visual observations from text claims.",
+      "id": "holdout-independent-005",
+      "oracle_hash": "7b87a1032ba5d7168e73b44e72360d58dcc9822d3bd9334470bf0aa9f3061ea0",
+      "oracle_path": "semantic_oracles.json#holdout-independent-005",
+      "prompt": "Compare OSHA forklift load-capacity plate images with official powered industrial truck training and labeling requirements, separating plate observations from legal requirements.",
+      "prompt_hash": "7a163f6ab112539d35a3687530a74c5dc83dff90b5891424142eefabcec9e6eb",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required"
-    },
-    {
-      "categories": [
-        "ambiguous_domain",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-006",
-      "oracle_hash": "9bb6c7a4350566bba7dfadbd358aa442125c57976110f6932dffe7a6598cfdec",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-006",
-      "prompt": "Research model governance in insurance actuarial filings without treating model as a software deployment term.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only"
     },
     {
       "categories": [
@@ -108,12 +104,45 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-007",
-      "oracle_hash": "deb70b57b221bf48d854cb8dd83c9be8a535d9250f027efd465cb31b6d269b3d",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-007",
-      "prompt": "Compare public storm-surge evacuation map images and emergency-management guidance.",
+      "id": "holdout-independent-006",
+      "oracle_hash": "3aff41395d5dcc2a14c1cf8be0a257a8b8a73adba146de345e1e7675dbee5882",
+      "oracle_path": "semantic_oracles.json#holdout-independent-006",
+      "prompt": "Compare official aircraft de-icing holdover-time table images with FAA and Transport Canada guidance, noting which claims require tabular visual evidence.",
+      "prompt_hash": "6e739a9e3cd4f8650403db0b27fe098a96473f961772f988111ce929892cf79d",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-007",
+      "oracle_hash": "033572d8302f3bf79c239d0e7e8da7890dc51cec5a7cf49b181fe8601b089920",
+      "oracle_path": "semantic_oracles.json#holdout-independent-007",
+      "prompt": "Compare medical-device Unique Device Identification label images with FDA UDI database guidance, distinguishing label fields from regulatory obligations.",
+      "prompt_hash": "ea3b0311062ca8cd52326174aa3f6af1826431ee7aba102f655c95799b417b0a",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-008",
+      "oracle_hash": "84b99659648410d38a720855fa317645ca95436a005bbd87f7740e4c397b3271",
+      "oracle_path": "semantic_oracles.json#holdout-independent-008",
+      "prompt": "Compare public beach water-quality dashboard screenshots with official recreational-water sampling thresholds and advisory criteria from state or local agencies.",
+      "prompt_hash": "52cc33fad292e9f73d3fbc17b06fcb36b29cb39fe778c7d0fab9a7736d584657",
+      "public_safe": true,
+      "release_counted": true,
       "route": "visual_required"
     },
     {
@@ -123,12 +152,29 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-008",
-      "oracle_hash": "5ce52626f611ee5f34ab4564a4ae2d27b4bd996da41b6890078a31d1300c76c0",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-008",
-      "prompt": "Research architecture review requirements in public library renovation grants, not software architecture.",
+      "id": "holdout-independent-009",
+      "oracle_hash": "e66cce466f0a7af55c71098d5a380182f9fec5be1d1c14bcb9591b3410b4c3c7",
+      "oracle_path": "semantic_oracles.json#holdout-independent-009",
+      "prompt": "Research migration in bird flyway conservation plans, not database migration, using official wildlife agency sources and monitoring reports.",
+      "prompt_hash": "7e743f2028c26d2b050877c76b1a9c5f115484afc4c8815ca07837bb14e3b3d9",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-010",
+      "oracle_hash": "964aec85d0cc97c2b780ce2b72557c5e46b1e607effdd45d89e7ee4f1a8837e3",
+      "oracle_path": "semantic_oracles.json#holdout-independent-010",
+      "prompt": "Research deployment in humanitarian relief logistics, not software deployment, using UN/OCHA documents and government situation reports as source-quality constraints.",
+      "prompt_hash": "3ac72ff29dfb652e73e6b30eb01a27929ac129b497ee1deae25427d71c12beb3",
+      "public_safe": true,
+      "release_counted": true,
       "route": "text_only"
     },
     {
@@ -137,66 +183,50 @@
         "official_regulatory_source_quality"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-009",
-      "oracle_hash": "93ddb194dc1eb009027936814fd7f452035592b9dd32ac72248791024fe6e13d",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-009",
-      "prompt": "Research official guidance for secure webhook implementation and replay protection across public developer docs.",
+      "id": "holdout-independent-011",
+      "oracle_hash": "a9fbbbebf5dc908d88abeae73330176c809137ba46194b4fca95e11195e708a0",
+      "oracle_path": "semantic_oracles.json#holdout-independent-011",
+      "prompt": "Research official guidance for passkey and WebAuthn account-recovery implementation across platform documentation and security standards.",
+      "prompt_hash": "bc6ba1554300a7bfe275a48b8fbda15ce451b27ae1e725efb681be7ed6a3a3c4",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only"
     },
     {
       "categories": [
         "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-010",
-      "oracle_hash": "3181db06acd929b559f37d6dc304b3eb6961c05093779ca1b10aa7e2ff1d99df",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-010",
-      "prompt": "Compare public emergency-exit signage images and official workplace safety guidance.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required"
-    },
-    {
-      "categories": [
         "software_implementation",
         "official_regulatory_source_quality"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-011",
-      "oracle_hash": "c217291888dd581b9936348440ce324c5ce26203fb1070c1511261e114817767",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-011",
-      "prompt": "Research official implementation guidance for SAML single logout and failure modes across identity providers.",
+      "id": "holdout-independent-012",
+      "oracle_hash": "a17f8ca2c3f1ff46584900470ff9a78d5f0a16fdcb999b7d5254ebc3f6edd09c",
+      "oracle_path": "semantic_oracles.json#holdout-independent-012",
+      "prompt": "Compare cloud IAM policy-simulator warning screenshots with official least-privilege and policy-evaluation documentation from the cloud provider.",
+      "prompt_hash": "3f2d7ebdd359af0948d17a04601e9f23fdf4802e158440f68032405b17939cf4",
       "public_safe": true,
-      "release_counted": false,
-      "route": "text_only"
-    },
-    {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-012",
-      "oracle_hash": "4bea62175cd0a590f51d27244031b6d891b35383128c92c3b4b4407ae4f2cc17",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-012",
-      "prompt": "Compare public pedestrian-safety dashboard screenshots and official city traffic-safety metrics.",
-      "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required"
     }
   ],
   "public_safe": true,
   "release_gate_ready": false,
   "schema_version": "codex-deepresearch.semantic-blind-holdout-manifest.v0",
+  "selection_checks": {
+    "distinctive_keyword_scan_found_matches": false,
+    "exact_prompt_string_scan_found_matches": false,
+    "known_manifest_overlap_detected": false,
+    "selected_after_implementation_freeze": true
+  },
   "selector_provenance": {
-    "independent": false,
-    "reason": "Live independent reviewer selection is not available in public tests; this manifest exercises the flow but cannot satisfy release readiness.",
+    "audit_artifact_hash": "a9e62790210cd17796faa2c410e080bbaac2c364ca05e2817cabf547a18318d8",
+    "audit_artifact_path": "blind_holdout_selector_audit.json",
+    "independence_evidence": "Selected by an independent review subagent after freeze commit 495d336b58410373811441147d33952047fb590a; the selector did not edit files; exact prompt strings and distinctive terms were absent from the frozen tree; candidate prompts were screened against semantic_regression_prompts.json and public_beta_semantic_prompts.json for intent overlap. Release signoff is not ready because the raw selector transcript was not captured.",
+    "independent": true,
+    "max_char5_similarity_to_known_manifests": 0.217,
     "release_eligible": false,
-    "selector": "fixture_safe_non_release_selector"
+    "release_ineligible_reason": "raw_selector_transcript_missing",
+    "selected_at_utc": "2026-07-07T06:34:28Z",
+    "selector": "codex_independent_reviewer_current_session"
   }
 }

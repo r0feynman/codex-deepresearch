@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -33,6 +35,7 @@ from .public_beta_validation import public_beta_prompt_hash
 from .run_state import begin_stage, skipped_stage_status
 from .semantic_planner import (
     BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+    CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV,
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_EXPECTATION_ORACLE_FILENAME,
     SEMANTIC_PLAN_FILENAME,
@@ -70,6 +73,23 @@ RELEASE_VALIDATION_IDENTITY_FIELDS = (
 
 class SearchHandoffError(ValueError):
     """Raised when search handoff preparation or ingestion cannot continue."""
+
+
+@contextmanager
+def _default_semantic_adapter_disabled_for_fixture_runs(enabled: bool):
+    if not enabled:
+        with nullcontext():
+            yield
+        return
+    previous = os.environ.get(CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV)
+    os.environ[CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV, None)
+        else:
+            os.environ[CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV] = previous
 
 
 def prepare_run(
@@ -161,18 +181,21 @@ def prepare_run(
         or config.budget.max_concurrent_codex_subagents,
         "max_cost_usd": max_cost_usd,
     }
-    locked_oracle = write_semantic_expectation_oracle(
-        run_dir=run_dir,
-        question=normalized_question,
-        user_constraints=user_constraints,
-        depth_preset=budget_preset,
-        visual_preference=route,
-        budget_cap=budget_cap,
-        provided_sources=provided_sources,
-        provided_images=provided_images,
-        created_at=now,
-        manifest_oracle_binding=release_identity,
-    )
+    with _default_semantic_adapter_disabled_for_fixture_runs(
+        _allow_release_ineligible_materialization_for_tests
+    ):
+        locked_oracle = write_semantic_expectation_oracle(
+            run_dir=run_dir,
+            question=normalized_question,
+            user_constraints=user_constraints,
+            depth_preset=budget_preset,
+            visual_preference=route,
+            budget_cap=budget_cap,
+            provided_sources=provided_sources,
+            provided_images=provided_images,
+            created_at=now,
+            manifest_oracle_binding=release_identity,
+        )
     _record_semantic_artifact_trace(
         run_dir,
         event_type="semantic_oracle_request_created",
@@ -223,17 +246,20 @@ def prepare_run(
             status="semantic_planner_request_created",
         )
 
-    semantic_plan = plan_semantic_angles(
-        question=normalized_question,
-        explicit_angles=explicit_angles,
-        user_constraints=user_constraints,
-        depth_preset=budget_preset,
-        visual_preference=route,
-        budget_cap=budget_cap,
-        provided_sources=provided_sources,
-        provided_images=provided_images,
-        raw_request_payload=planner_raw_request,
-    )
+    with _default_semantic_adapter_disabled_for_fixture_runs(
+        _allow_release_ineligible_materialization_for_tests
+    ):
+        semantic_plan = plan_semantic_angles(
+            question=normalized_question,
+            explicit_angles=explicit_angles,
+            user_constraints=user_constraints,
+            depth_preset=budget_preset,
+            visual_preference=route,
+            budget_cap=budget_cap,
+            provided_sources=provided_sources,
+            provided_images=provided_images,
+            raw_request_payload=planner_raw_request,
+        )
     if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
         return _finalize_blocked_semantic_run(
             normalized_question=normalized_question,
@@ -266,14 +292,17 @@ def prepare_run(
         timestamp=_semantic_event_timestamp(now, 4),
         status="semantic_plan_created",
     )
-    semantic_review = write_semantic_plan_review(
-        run_dir=run_dir,
-        question=normalized_question,
-        plan=semantic_plan,
-        oracle=locked_oracle,
-        created_at=now,
-        manifest_oracle_binding=release_identity,
-    )
+    with _default_semantic_adapter_disabled_for_fixture_runs(
+        _allow_release_ineligible_materialization_for_tests
+    ):
+        semantic_review = write_semantic_plan_review(
+            run_dir=run_dir,
+            question=normalized_question,
+            plan=semantic_plan,
+            oracle=locked_oracle,
+            created_at=now,
+            manifest_oracle_binding=release_identity,
+        )
     semantic_review["semantic_plan_candidate_artifact_hash"] = pre_review_semantic_plan_hash
     _write_json(run_dir / SEMANTIC_PLAN_REVIEW_FILENAME, semantic_review)
     _record_semantic_artifact_trace(
@@ -557,9 +586,62 @@ def prepare_run(
         validation=semantic_validation,
     )
     status["semantic_planning"] = semantic_planning
+    status["semantic_release_eligible"] = semantic_planning["semantic_release_eligible"]
     if semantic_planning["semantic_release_eligible"] is not True:
         status["diagnostics"] = {
             "semantic_planning": semantic_planning["user_visible_diagnostic"],
+        }
+    if (
+        semantic_validation.get("ok") is not True
+        and not _allow_release_ineligible_materialization_for_tests
+    ):
+        blocked_status = "blocked_semantic_planner_validation_failed"
+        evidence["handoff"]["status"] = blocked_status
+        status["status"] = blocked_status
+        status["next_step"] = "Fix semantic planner validation failures before search handoff or fan-out."
+        status["diagnostics"] = {
+            "semantic_planning": semantic_planning["user_visible_diagnostic"],
+            "failure_codes": semantic_planning["failure_codes"],
+        }
+        _write_json(run_dir / "evidence.json", evidence)
+        record_stage_trace(
+            run_dir,
+            stage="planning",
+            agent_role="semantic_validator",
+            status_payload=status,
+            prompt_summary="Validate semantic plan before search handoff materialization proceeds.",
+            tool_call_summary="Semantic planner validation failed; search handoff and fan-out were blocked.",
+            event_type=blocked_status,
+            timestamp=now,
+        )
+        _write_json(run_dir / "status.json", status)
+        return {
+            "schema_version": HANDOFF_SCHEMA_VERSION,
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "status": blocked_status,
+            "artifacts": {
+                "evidence": str(run_dir / "evidence.json"),
+                "search_tasks": str(run_dir / "search_tasks.json"),
+                "search_results": str(run_dir / "search_results.jsonl"),
+                "visual_tasks": str(run_dir / "visual_tasks.json"),
+                "visual_observations": str(run_dir / "visual_observations.jsonl"),
+                "status": str(run_dir / "status.json"),
+                "run_trace": str(run_dir / "run_trace.jsonl"),
+                "run_steps": str(run_dir / "run_steps.json"),
+                "budget_estimate": str(run_dir / "budget_estimate.json"),
+                "semantic_planner_validation": str(
+                    run_dir / SEMANTIC_PLANNER_VALIDATION_FILENAME
+                ),
+                **semantic_integrity_artifacts,
+            },
+            "budget_estimate": status["budget_estimate"],
+            "planner_mode": semantic_plan.planner_mode,
+            "semantic_release_eligible": semantic_planning["semantic_release_eligible"],
+            "semantic_planning_status": blocked_status,
+            "semantic_planning": semantic_planning,
+            "diagnostics": dict(status["diagnostics"]),
+            **release_identity,
         }
 
     validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
@@ -615,7 +697,7 @@ def prepare_run(
         },
         "budget_estimate": status["budget_estimate"],
         "planner_mode": semantic_plan.planner_mode,
-        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_release_eligible": semantic_planning["semantic_release_eligible"],
         "semantic_planning_status": semantic_plan.status,
         "semantic_planning": semantic_planning,
         **({"diagnostics": dict(status["diagnostics"])} if "diagnostics" in status else {}),
@@ -714,6 +796,7 @@ def _prepare_blocked_semantic_planner_run(
         validation=semantic_validation,
     )
     status["semantic_planning"] = semantic_planning
+    status["semantic_release_eligible"] = semantic_planning["semantic_release_eligible"]
     status["diagnostics"] = {
         "semantic_planning": semantic_planning["user_visible_diagnostic"],
     }
@@ -754,7 +837,7 @@ def _prepare_blocked_semantic_planner_run(
         "status": status["status"],
         "artifacts": artifacts,
         "planner_mode": semantic_plan.planner_mode,
-        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_release_eligible": semantic_planning["semantic_release_eligible"],
         "semantic_planning_status": semantic_plan.status,
         "semantic_planning": semantic_planning,
         "diagnostics": dict(status["diagnostics"]),
@@ -854,7 +937,7 @@ def _finalize_blocked_semantic_run(
         "status": status,
         "semantic_planning_status": semantic_plan.status,
         "planner_mode": semantic_plan.planner_mode,
-        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_release_eligible": semantic_planning["semantic_release_eligible"],
         "created_at": now,
         "question": normalized_question,
         "mode": config.mode,
@@ -907,7 +990,7 @@ def _finalize_blocked_semantic_run(
             **artifacts,
         },
         "planner_mode": semantic_plan.planner_mode,
-        "semantic_release_eligible": semantic_plan.semantic_release_eligible,
+        "semantic_release_eligible": semantic_planning["semantic_release_eligible"],
         "semantic_planning_status": semantic_plan.status,
         "semantic_planning": semantic_planning,
         "diagnostics": dict(status_payload["diagnostics"]),
@@ -941,9 +1024,7 @@ def _prepare_semantic_planning_summary(
         "schema_version": "codex-deepresearch.semantic-planning-summary.v0",
         "status": str(getattr(semantic_plan, "status", "unknown") or "unknown"),
         "planner_mode": str(getattr(semantic_plan, "planner_mode", "unknown") or "unknown"),
-        "semantic_release_eligible": bool(
-            getattr(semantic_plan, "semantic_release_eligible", False)
-        ),
+        "semantic_release_eligible": bool(validation.get("semantic_release_eligible")),
         "validation_ok": validation.get("ok"),
         "failure_codes": failure_codes,
         "semantic_fit_score": semantic_fit_score,

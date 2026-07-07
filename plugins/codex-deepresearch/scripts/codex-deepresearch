@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import sys
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +18,23 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PLUGIN_ROOT.parents[1]
 PLUGIN_SRC = PLUGIN_ROOT / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
+
+CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV = (
+    "CODEX_DEEPRESEARCH_ENABLE_DEFAULT_SEMANTIC_ADAPTER"
+)
+
+
+@contextmanager
+def default_semantic_adapter_enabled():
+    previous = os.environ.get(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV)
+    os.environ[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV, None)
+        else:
+            os.environ[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = previous
 
 from deepresearch import (
     AutomatedVisualE2EError,
@@ -280,35 +299,41 @@ def run_validate_evidence(args: argparse.Namespace) -> int:
 
 def run_prepare(args: argparse.Namespace) -> int:
     try:
-        result = prepare_run(
-            question=args.question,
-            runs_dir=resolve_repo_path(args.runs_dir),
-            mode=args.mode,
-            search_provider=args.search_provider,
-            vlm_provider=args.vlm_provider,
-            budget_preset=args.budget,
-            freshness_requirement=args.freshness_requirement,
-            route=None if args.route == "auto" else args.route,
-            angles=args.angle,
-            max_results=args.max_results,
-            max_sources=args.max_sources,
-            max_images=args.max_images,
-            max_subagents=args.max_subagents,
-            max_agents=args.max_agents,
-            max_cost_usd=args.max_cost_usd,
-            codex_runner=args.codex_runner,
-            confirm_budget=args.confirm_budget,
-            prompt_id=args.prompt_id,
-            suite_id=args.suite_id,
-            prompt_hash=args.prompt_hash,
-            original_question=args.original_question,
-            manifest_oracle_hash=args.manifest_oracle_hash,
-            manifest_oracle_path=args.manifest_oracle_path,
-            manifest_oracle_fragment_id=args.manifest_oracle_fragment_id,
-            _allow_release_ineligible_materialization_for_tests=(
-                args.allow_release_ineligible_materialization_for_tests
-            ),
+        semantic_adapter_context = (
+            default_semantic_adapter_enabled()
+            if not args.angle
+            else nullcontext()
         )
+        with semantic_adapter_context:
+            result = prepare_run(
+                question=args.question,
+                runs_dir=resolve_repo_path(args.runs_dir),
+                mode=args.mode,
+                search_provider=args.search_provider,
+                vlm_provider=args.vlm_provider,
+                budget_preset=args.budget,
+                freshness_requirement=args.freshness_requirement,
+                route=None if args.route == "auto" else args.route,
+                angles=args.angle,
+                max_results=args.max_results,
+                max_sources=args.max_sources,
+                max_images=args.max_images,
+                max_subagents=args.max_subagents,
+                max_agents=args.max_agents,
+                max_cost_usd=args.max_cost_usd,
+                codex_runner=args.codex_runner,
+                confirm_budget=args.confirm_budget,
+                prompt_id=args.prompt_id,
+                suite_id=args.suite_id,
+                prompt_hash=args.prompt_hash,
+                original_question=args.original_question,
+                manifest_oracle_hash=args.manifest_oracle_hash,
+                manifest_oracle_path=args.manifest_oracle_path,
+                manifest_oracle_fragment_id=args.manifest_oracle_fragment_id,
+                _allow_release_ineligible_materialization_for_tests=(
+                    args.allow_release_ineligible_materialization_for_tests
+                ),
+            )
     except BudgetEstimateError as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True, allow_nan=False), file=sys.stderr)
         return 2

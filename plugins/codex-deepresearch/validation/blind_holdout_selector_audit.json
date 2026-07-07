@@ -1,0 +1,40 @@
+{
+  "audit_type": "independent_selector_audit",
+  "auditor": "codex_adversarial_review_subagent",
+  "created_at": "2026-07-07T06:34:28Z",
+  "implementation_freeze": {
+    "commit": "495d336b58410373811441147d33952047fb590a",
+    "record_type": "merge_commit",
+    "timestamp": "2026-07-07T06:30:13Z"
+  },
+  "limitations": [
+    "This artifact records the selector audit evidence used by the release validator; it is not a raw transcript of the original prompt-selection session.",
+    "Release signoff remains blocked until raw_selector_transcript_path and raw_selector_transcript_hash point to an independently captured selector transcript."
+  ],
+  "manifest_path": "blind_holdout_semantic_prompts.json",
+  "prompt_count": 12,
+  "prompt_ids": [
+    "holdout-independent-001",
+    "holdout-independent-002",
+    "holdout-independent-003",
+    "holdout-independent-004",
+    "holdout-independent-005",
+    "holdout-independent-006",
+    "holdout-independent-007",
+    "holdout-independent-008",
+    "holdout-independent-009",
+    "holdout-independent-010",
+    "holdout-independent-011",
+    "holdout-independent-012"
+  ],
+  "release_eligible": false,
+  "schema_version": "codex-deepresearch.semantic-blind-holdout-selector-audit.v0",
+  "selection_checks": {
+    "distinctive_keyword_scan_found_matches": false,
+    "exact_prompt_string_scan_found_matches": false,
+    "known_manifest_overlap_detected": false,
+    "oracle_hashes_verified": true,
+    "selected_after_implementation_freeze": true
+  },
+  "selector_independent": true
+}

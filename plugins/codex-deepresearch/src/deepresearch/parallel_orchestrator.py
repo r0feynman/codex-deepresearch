@@ -34,6 +34,7 @@ from .search_handoff import (
 )
 from .semantic_planner import (
     BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+    SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
     write_semantic_materialization_diff,
     write_semantic_planner_validation,
@@ -142,6 +143,7 @@ RETRY_SAFE_FAILURES = {
     CODEX_CHILD_MODEL_CAPACITY,
     "invalid_shard",
     "invalid_release_search_handoff",
+    "invalid_release_visual_handoff",
     "missing_shard",
 }
 TASK_STATES = (
@@ -1540,6 +1542,8 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     release_identity = release_validation_identity_from_payload(evidence)
     child_search_handoff_records: list[dict[str, Any]] = []
     child_search_handoff_rejections: list[dict[str, Any]] = []
+    child_visual_observation_records: list[dict[str, Any]] = []
+    release_visual_image_records: list[dict[str, Any]] = []
 
     evidence.setdefault("sources", [])
     evidence.setdefault("images", [])
@@ -1619,8 +1623,25 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
                 failed_tasks.append(_task_failure_record(task))
                 continue
         shard = _read_json(shard_path)
+        if release_identity and str(task.get("last_adapter") or "") == "codex-exec":
+            visual_sidecar_status = _release_validation_child_visual_sidecar_status(
+                task=task,
+                shard=shard,
+                shard_path=shard_path,
+            )
+            if not visual_sidecar_status["valid"]:
+                task["state"] = "failed"
+                task["failure_category"] = "invalid_release_visual_handoff"
+                task["child_failure_code"] = CODEX_CHILD_RELEASE_HANDOFF_INVALID
+                task["last_error"] = _release_validation_child_visual_handoff_message(
+                    visual_sidecar_status
+                )
+                task["release_visual_handoff_validation"] = visual_sidecar_status
+                failed_tasks.append(_task_failure_record(task))
+                continue
         id_map: dict[str, str] = {}
         new_claims = 0
+        task_image_records: list[dict[str, Any]] = []
         for source in _list(shard.get("sources")):
             key = _source_key(source)
             old_id = str(source.get("id") or "")
@@ -1665,6 +1686,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             image_copy["id"] = new_id
             image_by_hash[key] = new_id
             evidence["images"].append(image_copy)
+            task_image_records.append(dict(image_copy))
             id_map[old_id] = new_id
 
         for claim in _list(shard.get("claims")):
@@ -1718,6 +1740,14 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
                     for rejection in sidecar_status.get("rejections", [])
                     if isinstance(rejection, Mapping)
                 )
+                release_visual_image_records.extend(task_image_records)
+                child_visual_observation_records.extend(
+                    _release_validation_child_visual_observations(
+                        task=task,
+                        shard_path=shard_path,
+                        image_id_map=id_map,
+                    )
+                )
         else:
             task["state"] = "discarded"
             task["discard_reason"] = "dedupe_or_no_mergeable_claims"
@@ -1727,6 +1757,12 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         _write_release_validation_search_results(
             run_dir,
             child_search_handoff_records,
+        )
+        _write_release_validation_visual_handoffs(
+            run_dir=run_dir,
+            tasks=tasks,
+            image_records=release_visual_image_records,
+            visual_observations=child_visual_observation_records,
         )
     _write_json(evidence_path, evidence)
     validation = validate_artifacts(evidence_path=evidence_path)
@@ -2018,6 +2054,7 @@ def _release_validation_search_result(
         "prompt_hash": _string_value(record, "prompt_hash"),
         "handoff_artifact": "search_results.jsonl",
     }
+    result.update(_semantic_task_search_result_lineage(task))
     optional_values = {
         "freshness_requirement": record.get("freshness_requirement"),
         "published_at": record.get("published_at"),
@@ -2034,6 +2071,15 @@ def _release_validation_search_result(
             dict(raw_metadata) if isinstance(raw_metadata, Mapping) else raw_metadata
         )
     return result, None
+
+
+def _semantic_task_search_result_lineage(task: Mapping[str, Any]) -> dict[str, Any]:
+    lineage: dict[str, Any] = {}
+    for field in SEMANTIC_BOUNDED_TASK_ALIGNMENT_FIELDS:
+        lineage[f"{SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX}{field}"] = (
+            copy.deepcopy(task.get(field))
+        )
+    return lineage
 
 
 def _release_child_field_present(record: Mapping[str, Any], field: str) -> bool:
@@ -2069,6 +2115,438 @@ def _write_release_validation_search_results(
         "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
+
+
+def _release_validation_child_visual_observations(
+    *,
+    task: Mapping[str, Any],
+    shard_path: Path,
+    image_id_map: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    sidecar = shard_path.parent / "visual_observations.jsonl"
+    if not sidecar.exists():
+        return []
+    observations: list[dict[str, Any]] = []
+    for index, record in enumerate(_read_jsonl(sidecar), start=1):
+        if not isinstance(record, Mapping):
+            continue
+        observation = _with_task_angle_metadata(record, task)
+        old_image_id = str(observation.get("evidence_image_id") or "")
+        if old_image_id in image_id_map:
+            new_image_id = image_id_map[old_image_id]
+            observation["image_id"] = new_image_id
+            observation["evidence_image_id"] = new_image_id
+            observation["linked_candidate_id"] = _release_validation_candidate_id(new_image_id)
+            observation["linked_fetch_id"] = _release_validation_fetch_id(new_image_id)
+            observation["raw_child_evidence_image_id"] = old_image_id
+        if "observation_id" not in observation:
+            observation["observation_id"] = (
+                f"obs_{task.get('id')}_{index:03d}"
+            )
+        observation.setdefault("handoff_artifact", "visual_observations.jsonl")
+        observations.append(observation)
+    return observations
+
+
+def _release_validation_child_visual_sidecar_status(
+    *,
+    task: Mapping[str, Any],
+    shard: Mapping[str, Any],
+    shard_path: Path,
+) -> dict[str, Any]:
+    images = [image for image in _list(shard.get("images")) if isinstance(image, Mapping)]
+    if not images:
+        return {"valid": True, "required": False, "reason": None, "records": 0}
+    if not _task_requests_visual_evidence(task):
+        return {"valid": True, "required": False, "reason": None, "records": 0}
+    sidecar = shard_path.parent / "visual_observations.jsonl"
+    if not sidecar.exists():
+        return {
+            "valid": False,
+            "required": True,
+            "reason": "missing_child_visual_observations",
+            "path": str(sidecar),
+            "image_count": len(images),
+            "records": 0,
+        }
+    records = [
+        record for record in _read_jsonl(sidecar) if isinstance(record, Mapping)
+    ]
+    if not records:
+        return {
+            "valid": False,
+            "required": True,
+            "reason": "empty_child_visual_observations",
+            "path": str(sidecar),
+            "image_count": len(images),
+            "records": 0,
+        }
+    image_ids = {
+        str(image.get("id") or "").strip()
+        for image in images
+        if str(image.get("id") or "").strip()
+    }
+    observed_image_ids = {
+        str(record.get("evidence_image_id") or "").strip()
+        for record in records
+        if str(record.get("evidence_image_id") or "").strip()
+    }
+    missing_image_ids = sorted(image_ids - observed_image_ids)
+    if missing_image_ids:
+        return {
+            "valid": False,
+            "required": True,
+            "reason": "child_visual_observations_missing_image_refs",
+            "path": str(sidecar),
+            "image_count": len(images),
+            "records": len(records),
+            "missing_image_ids": missing_image_ids,
+        }
+    invalid_records = [
+        {
+            "record_index": index,
+            "reason": reason,
+        }
+        for index, record in enumerate(records, start=1)
+        if (
+            reason := _release_validation_child_visual_observation_invalid_reason(record)
+        )
+    ]
+    if invalid_records:
+        return {
+            "valid": False,
+            "required": True,
+            "reason": "child_visual_observations_not_release_grade",
+            "path": str(sidecar),
+            "image_count": len(images),
+            "records": len(records),
+            "invalid_records": invalid_records,
+        }
+    return {
+        "valid": True,
+        "required": True,
+        "reason": None,
+        "path": str(sidecar),
+        "image_count": len(images),
+        "records": len(records),
+    }
+
+
+def _release_validation_child_visual_observation_invalid_reason(
+    record: Mapping[str, Any],
+) -> str | None:
+    if not str(record.get("evidence_image_id") or "").strip():
+        return "evidence_image_id_missing"
+    if not str(record.get("candidate_id") or "").strip():
+        return "candidate_id_missing"
+    if not str(record.get("fetch_id") or "").strip():
+        return "fetch_id_missing"
+    if record.get("provider") != "codex-interactive":
+        return "provider_must_be_codex_interactive"
+    if record.get("analysis_provider") not in (None, "codex-interactive"):
+        return "analysis_provider_must_be_codex_interactive"
+    if record.get("provider_kind") != "vlm":
+        return "provider_kind_must_be_vlm"
+    if record.get("provider_mode") != "real":
+        return "provider_mode_must_be_real"
+    if record.get("observation_status") != "analyzed":
+        return "observation_status_must_be_analyzed"
+    if record.get("policy_decision") != "allowed":
+        return "policy_decision_must_be_allowed"
+    if record.get("external_vlm_call") is True:
+        return "external_vlm_call_must_not_be_true"
+    if record.get("hidden_codex_api_call") is True or record.get("codex_native_api_call") is True:
+        return "hidden_codex_api_marker_forbidden"
+    if not (
+        record.get("codex_interactive_handoff") is True
+        or record.get("handoff_artifact") == "visual_observations.jsonl"
+    ):
+        return "codex_interactive_handoff_missing"
+    provenance = record.get("provider_provenance")
+    if not isinstance(provenance, Mapping):
+        return "provider_provenance_missing"
+    if provenance.get("provider") != "codex-interactive":
+        return "provider_provenance_provider_must_be_codex_interactive"
+    if provenance.get("provider_kind") != "vlm":
+        return "provider_provenance_kind_must_be_vlm"
+    if provenance.get("provider_mode") != "real":
+        return "provider_provenance_mode_must_be_real"
+    if provenance.get("external_vlm_call") is True:
+        return "provider_provenance_external_vlm_call_must_not_be_true"
+    if (
+        provenance.get("hidden_codex_api_call") is True
+        or provenance.get("codex_native_api_call") is True
+    ):
+        return "provider_provenance_hidden_codex_api_marker_forbidden"
+    if not (
+        provenance.get("codex_interactive_handoff") is True
+        or provenance.get("handoff_artifact") == "visual_observations.jsonl"
+    ):
+        return "provider_provenance_codex_interactive_handoff_missing"
+    if not _release_visual_text_items(record.get("observations")) and not _release_visual_text_items(record.get("inferences")):
+        return "observations_or_inferences_missing"
+    return None
+
+
+def _release_visual_text_items(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _release_validation_child_visual_handoff_message(
+    status: Mapping[str, Any],
+) -> str:
+    reason = str(status.get("reason") or "invalid_child_visual_observations")
+    path = str(status.get("path") or "")
+    if path:
+        return f"{reason}: {path}"
+    return reason
+
+
+def _write_release_validation_visual_handoffs(
+    *,
+    run_dir: Path,
+    tasks: Sequence[Mapping[str, Any]],
+    image_records: Sequence[Mapping[str, Any]],
+    visual_observations: Sequence[Mapping[str, Any]],
+) -> None:
+    visual_tasks = [task for task in tasks if _task_requests_visual_evidence(task)]
+    if not visual_tasks and not image_records and not visual_observations:
+        return
+    _write_release_validation_visual_search_plan(run_dir, visual_tasks)
+    _write_release_validation_visual_candidates(run_dir, image_records)
+    _write_release_validation_image_fetch_status(run_dir, image_records)
+    if visual_observations:
+        _write_jsonl_records(run_dir / "visual_observations.jsonl", visual_observations)
+    else:
+        (run_dir / "visual_observations.jsonl").touch()
+
+
+def _task_requests_visual_evidence(task: Mapping[str, Any]) -> bool:
+    try:
+        if int(task.get("max_images") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(task.get("route") or "") in {"visual_optional", "visual_required"}
+
+
+def _write_release_validation_visual_search_plan(
+    run_dir: Path,
+    tasks: Sequence[Mapping[str, Any]],
+) -> None:
+    path = run_dir / "visual_search_plan.json"
+    if path.exists():
+        return
+    now = _utc_now()
+    _write_json(
+        path,
+        {
+            "schema_version": PARALLEL_SCHEMA_VERSION,
+            "run_id": run_dir.name,
+            "created_at": now,
+            "status": "release_child_visual_handoff_materialized",
+            "provider": "codex-native",
+            "provider_mode": "real",
+            "tasks": [
+                _release_validation_visual_task_record(task)
+                for task in tasks
+            ],
+        },
+    )
+
+
+def _release_validation_visual_task_record(task: Mapping[str, Any]) -> dict[str, Any]:
+    task_id = str(
+        task.get("semantic_plan_task_id")
+        or task.get("task_id")
+        or task.get("id")
+        or ""
+    )
+    record = {
+        "task_id": task_id,
+        "semantic_plan_task_id": task_id,
+        "angle_id": task.get("angle_id"),
+        "route": task.get("route"),
+        "visual_tasks": list(task.get("expected_visual_targets") or []),
+        "max_images": task.get("max_images"),
+        "provider": "codex-native",
+        "provider_mode": "real",
+        "handoff_artifact": "visual_search_plan.json",
+    }
+    if task.get("semantic_plan_hash"):
+        record["semantic_plan_hash"] = str(task.get("semantic_plan_hash"))
+    if task.get("approved_delta_id"):
+        record["approved_delta_id"] = str(task.get("approved_delta_id"))
+    elif record.get("semantic_plan_hash"):
+        record["approved_delta_id"] = "base_plan"
+    return record
+
+
+def _write_release_validation_visual_candidates(
+    run_dir: Path,
+    image_records: Sequence[Mapping[str, Any]],
+) -> None:
+    records = [
+        _release_validation_visual_candidate_record(image, index=index)
+        for index, image in enumerate(image_records, start=1)
+    ]
+    _write_jsonl_records(run_dir / "visual_candidates.jsonl", records)
+
+
+def _release_validation_visual_candidate_record(
+    image: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    image_id = str(image.get("id") or f"image_{index:03d}")
+    candidate_id = _release_validation_candidate_id(image_id)
+    record = _release_validation_image_lineage_record(image)
+    record.update(
+        {
+            "candidate_id": candidate_id,
+            "image_id": image_id,
+            "evidence_image_id": image_id,
+            "source_id": image.get("source_id"),
+            "page_url": image.get("page_url"),
+            "image_url": image.get("image_url"),
+            "origin": image.get("origin"),
+            "content_hash": image.get("content_hash"),
+            "candidate_status": "selected",
+            "provider": "codex-native",
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "provider_run_id": image.get("provider_run_id") or image.get("task_id"),
+            "search_provider": "codex-native",
+            "codex_native_handoff": True,
+            "policy_decision": image.get("policy_decision") or "allowed",
+            "policy_flags": list(image.get("policy_flags") or []),
+            "handoff_artifact": "visual_candidates.jsonl",
+            "provider_provenance": _release_validation_visual_acquisition_provenance(
+                handoff_artifact="visual_candidates.jsonl"
+            ),
+        }
+    )
+    return {key: value for key, value in record.items() if value not in (None, "", [])}
+
+
+def _write_release_validation_image_fetch_status(
+    run_dir: Path,
+    image_records: Sequence[Mapping[str, Any]],
+) -> None:
+    records = [
+        _release_validation_image_fetch_status_record(image, index=index)
+        for index, image in enumerate(image_records, start=1)
+    ]
+    _write_jsonl_records(run_dir / "image_fetch_status.jsonl", records)
+
+
+def _release_validation_image_fetch_status_record(
+    image: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    image_id = str(image.get("id") or f"image_{index:03d}")
+    candidate_id = _release_validation_candidate_id(image_id)
+    fetch_id = _release_validation_fetch_id(image_id)
+    record = _release_validation_image_lineage_record(image)
+    record.update(
+        {
+            "fetch_id": fetch_id,
+            "candidate_id": candidate_id,
+            "image_id": image_id,
+            "evidence_image_id": image_id,
+            "source_id": image.get("source_id"),
+            "page_url": image.get("page_url"),
+            "image_url": image.get("image_url"),
+            "local_artifact_path": image.get("local_artifact_path"),
+            "mime_type": image.get("mime_type"),
+            "retrieval_status": "fetched",
+            "fetch_status": "fetched",
+            "policy_decision": image.get("policy_decision") or "allowed",
+            "policy_flags": list(image.get("policy_flags") or []),
+            "provider": "codex-native",
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "provider_run_id": image.get("provider_run_id") or image.get("task_id"),
+            "search_provider": "codex-native",
+            "codex_native_handoff": True,
+            "handoff_artifact": "image_fetch_status.jsonl",
+            "provider_provenance": _release_validation_visual_acquisition_provenance(
+                handoff_artifact="image_fetch_status.jsonl"
+            ),
+        }
+    )
+    return {key: value for key, value in record.items() if value not in (None, "", [])}
+
+
+def _release_validation_image_lineage_record(
+    image: Mapping[str, Any],
+) -> dict[str, Any]:
+    task_id = str(
+        image.get("semantic_plan_task_id")
+        or image.get("task_id")
+        or image.get("source_task_id")
+        or ""
+    )
+    return {
+        "task_id": task_id,
+        "semantic_plan_task_id": task_id,
+        "semantic_plan_hash": image.get("semantic_plan_hash"),
+        "approved_delta_id": image.get("approved_delta_id"),
+        "angle_id": image.get("angle_id"),
+        "route": image.get("route"),
+    }
+
+
+def _release_validation_candidate_id(image_id: str) -> str:
+    return f"cand_{image_id}"
+
+
+def _release_validation_fetch_id(image_id: str) -> str:
+    return f"fetch_{image_id}"
+
+
+def _release_validation_visual_acquisition_provenance(
+    *,
+    handoff_artifact: str,
+) -> dict[str, Any]:
+    return {
+        "provider": "codex-native",
+        "provider_kind": "web_image_search",
+        "provider_mode": "real",
+        "search_provider": "codex-native",
+        "codex_native_handoff": True,
+        "handoff_artifact": handoff_artifact,
+        "external_network_call": False,
+    }
+
+
+def _write_jsonl_records(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    merged: list[dict[str, Any]] = [
+        dict(record) for record in _read_jsonl(path) if isinstance(record, Mapping)
+    ] if path.exists() else []
+    seen = {_jsonl_record_identity(record) for record in merged}
+    for record in records:
+        record_copy = dict(record)
+        identity = _jsonl_record_identity(record_copy)
+        if identity in seen:
+            continue
+        merged.append(record_copy)
+        seen.add(identity)
+    path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in merged),
+        encoding="utf-8",
+    )
+
+
+def _jsonl_record_identity(record: Mapping[str, Any]) -> tuple[str, str]:
+    for field in ("candidate_id", "fetch_id", "observation_id", "image_id", "id"):
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            return field, value.strip()
+    return "record", json.dumps(dict(record), sort_keys=True)
 
 
 def _read_jsonl(path: Path) -> list[Any]:
@@ -2674,10 +3152,6 @@ def _maybe_retry_capacity_failure(
         CODEX_CHILD_RELEASE_HANDOFF_INVALID,
     }
     if attempt_record.get("child_failure_code") not in retryable_child_failure_codes:
-        task["state"] = "failed"
-        _set_latest_attempt_retry_decision(task, "do_not_retry")
-        return {"retry_decision": "do_not_retry", "should_retry": False}
-    if attempt_record.get("timeout") is True:
         task["state"] = "failed"
         _set_latest_attempt_retry_decision(task, "do_not_retry")
         return {"retry_decision": "do_not_retry", "should_retry": False}
@@ -4213,8 +4687,17 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "describe images. Each image record must reference a source_id present in the same shard, use "
             "origin `image_search` or `page_image`, set local_artifact_path to a placeholder under "
             f"`{EVIDENCE_SHARDS_DIRNAME}/<task_id>/` when the child has not downloaded the binary, set "
-            "analysis_provider `codex-interactive`, analysis_status `skipped`, and leave observations and "
-            "inferences empty for later runner VLM analysis. Do not use user-uploaded, manual, login-walled, "
+            "analysis_provider `codex-interactive`, and do not fabricate VLM-derived analysis. If the shard "
+            "includes image records, write release-grade visual observation records to visual_observations.jsonl "
+            "that reference each image_id and describe only what the public image/page evidence directly supports; "
+            "the raw child visual observation record itself must include non-empty `evidence_image_id`, "
+            "`candidate_id`, and `fetch_id` fields before parent merge, with `evidence_image_id` matching "
+            "the shard image id being analyzed. "
+            "each observation must set provider `codex-interactive`, provider_kind `vlm`, provider_mode `real`, "
+            "analysis_provider `codex-interactive`, observation_status `analyzed`, policy_decision `allowed`, "
+            "codex_interactive_handoff true, handoff_artifact `visual_observations.jsonl`, and provider_provenance "
+            "with the same Codex-interactive VLM handoff fields. "
+            "otherwise do not include the image. Do not use user-uploaded, manual, login-walled, "
             "paywalled, CAPTCHA-gated, DRM-restricted, or robots-disallowed images. "
         )
     release_identity = release_validation_identity_from_payload(task)
@@ -4973,6 +5456,17 @@ def _with_task_angle_metadata(
 ) -> dict[str, Any]:
     enriched = dict(record)
     defaults = {
+        "task_id": task.get("id"),
+        "semantic_plan_task_id": (
+            task.get("semantic_plan_task_id")
+            or task.get("task_id")
+            or task.get("id")
+        ),
+        "semantic_plan_hash": task.get("semantic_plan_hash"),
+        "approved_delta_id": (
+            task.get("approved_delta_id")
+            or ("base_plan" if task.get("semantic_plan_hash") else None)
+        ),
         "angle_id": task.get("angle_id"),
         "route": task.get("route"),
         "source_task_id": task.get("id"),
@@ -5086,6 +5580,9 @@ def _task_failure_record(task: Mapping[str, Any]) -> dict[str, Any]:
     release_validation = task.get("release_search_handoff_validation")
     if isinstance(release_validation, Mapping):
         record["release_search_handoff_validation"] = copy.deepcopy(release_validation)
+    visual_validation = task.get("release_visual_handoff_validation")
+    if isinstance(visual_validation, Mapping):
+        record["release_visual_handoff_validation"] = copy.deepcopy(visual_validation)
     validation = task.get("validation")
     if isinstance(validation, Mapping):
         record["validation"] = copy.deepcopy(validation)

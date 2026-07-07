@@ -25,6 +25,8 @@ from deepresearch.search_handoff import prepare_run  # noqa: E402
 from deepresearch.semantic_planner import (  # noqa: E402
     ALLOWED_EVIDENCE_NEEDS,
     CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
+    CODEX_SEMANTIC_ADAPTER_WORKDIR_ENV,
+    CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV,
     CODEX_SEMANTIC_ORACLE_COMMAND_ENV,
     CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
     CODEX_SEMANTIC_REVIEWER_COMMAND_ENV,
@@ -34,6 +36,8 @@ from deepresearch.semantic_planner import (  # noqa: E402
     PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_FIT_SCORE_THRESHOLD,
+    SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
+    SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX,
     SemanticPlannerAdapterUnavailable,
     build_semantic_materialization_diff,
     heuristic_template_planner,
@@ -41,6 +45,8 @@ from deepresearch.semantic_planner import (  # noqa: E402
     validate_semantic_candidate_plan,
     validate_codex_semantic_adapter_provenance,
     write_semantic_materialization_diff,
+    write_semantic_planner_validation,
+    _semantic_adapter_command,
 )
 
 
@@ -124,6 +130,14 @@ SEMANTIC_FIXTURES = [
 
 
 class SemanticPlannerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        codex_path_patch = mock.patch(
+            "deepresearch.semantic_planner.shutil.which",
+            return_value=None,
+        )
+        codex_path_patch.start()
+        self.addCleanup(codex_path_patch.stop)
+
     def temp_runs_dir(self) -> Path:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -250,6 +264,10 @@ class SemanticPlannerTests(unittest.TestCase):
                     "query": task["query"],
                     "freshness_requirement": task["freshness_requirement"],
                     "source_policy": task["source_policy"],
+                    **{
+                        f"{SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX}{field}": task.get(field)
+                        for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS
+                    },
                     "approved_delta_id": "base_plan",
                 }
                 for index, task in enumerate(search_tasks, start=1)
@@ -332,6 +350,77 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(diff["duplicate_semantic_task_ids"], [])
         self.assertEqual(diff["dropped_search_obligations"], [])
         self.assertEqual(diff["dropped_visual_obligations"], [])
+
+    def test_semantic_materialization_diff_allows_executed_search_query_to_differ_from_semantic_lineage(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        records = self.read_jsonl(run_dir / "search_results.jsonl")
+        records[0]["query"] = "provider executed a narrower web search query"
+        records[0]["freshness_requirement"] = "latest"
+        self.write_jsonl(run_dir / "search_results.jsonl", records)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertTrue(diff["valid"], diff)
+        search_check = next(
+            check for check in diff["artifact_checks"] if check["artifact"] == "search_results"
+        )
+        self.assertIn("semantic_task_query", search_check["compared_fields"])
+        self.assertIn(
+            "semantic_task_freshness_requirement",
+            search_check["compared_fields"],
+        )
+        self.assertFalse(
+            [
+                mismatch
+                for mismatch in diff["field_mismatches"]
+                if mismatch["artifact"] == "search_results"
+            ],
+            diff,
+        )
+
+    def test_semantic_materialization_diff_rejects_missing_or_mismatched_search_result_semantic_lineage(self) -> None:
+        cases = (
+            ("missing_query", "semantic_task_query", "field_missing"),
+            (
+                "mismatched_freshness",
+                "semantic_task_freshness_requirement",
+                "field_mismatch",
+            ),
+        )
+        for case_name, expected_field, expected_code in cases:
+            with self.subTest(case_name=case_name):
+                run_dir = self.write_semantic_materialization_fixture(visual=False)
+                records = self.read_jsonl(run_dir / "search_results.jsonl")
+                if case_name == "missing_query":
+                    records[0].pop("semantic_task_query")
+                else:
+                    records[0]["semantic_task_freshness_requirement"] = "wrong semantic freshness"
+                self.write_jsonl(run_dir / "search_results.jsonl", records)
+
+                diff = build_semantic_materialization_diff(
+                    run_dir=run_dir,
+                    require_research_tasks=True,
+                    require_downstream=True,
+                )
+
+                self.assertFalse(diff["valid"], diff)
+                self.assertTrue(
+                    any(
+                        mismatch["artifact"] == "search_results"
+                        and mismatch["field"] == expected_field
+                        and mismatch["semantic_field"]
+                        == expected_field.removeprefix(
+                            SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX
+                        )
+                        and mismatch["code"] == expected_code
+                        for mismatch in diff["field_mismatches"]
+                    ),
+                    diff,
+                )
 
     def test_semantic_materialization_diff_rejects_field_mismatch(self) -> None:
         run_dir = self.write_semantic_materialization_fixture(visual=False)
@@ -865,9 +954,11 @@ class SemanticPlannerTests(unittest.TestCase):
         response_mutator: object | None = None,
         oracle_configured: bool = True,
         reviewer_configured: bool = True,
+        command_env_configured: bool = True,
+        default_codex_available: bool = False,
         **adapter_kwargs: object,
     ) -> tuple[dict, dict]:
-        captured: dict[str, dict] = {}
+        captured = {"commands": []}
 
         def fake_run(
             command: list[str],
@@ -879,6 +970,7 @@ class SemanticPlannerTests(unittest.TestCase):
             timeout: float,
         ) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[:3], ["codex", "exec", "--json"])
+            captured["commands"].append(list(command))
             self.assertFalse(check)
             self.assertTrue(capture_output)
             self.assertTrue(text)
@@ -958,18 +1050,30 @@ class SemanticPlannerTests(unittest.TestCase):
                 stdout = json.dumps(response, sort_keys=True)
             return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-        env = {CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "codex exec --json"}
-        if oracle_configured:
+        env = {}
+        if command_env_configured:
+            env[CODEX_SEMANTIC_PLANNER_COMMAND_ENV] = "codex exec --json"
+        if command_env_configured and oracle_configured:
             env[CODEX_SEMANTIC_ORACLE_COMMAND_ENV] = "codex exec --json"
-        if reviewer_configured:
+        if command_env_configured and reviewer_configured:
             env[CODEX_SEMANTIC_REVIEWER_COMMAND_ENV] = "codex exec --json"
-
+        if default_codex_available:
+            env[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = "1"
         with mock.patch(
             "deepresearch.semantic_planner.subprocess.run",
             side_effect=fake_run,
-        ), mock.patch.dict("os.environ", env):
+        ), mock.patch.dict(
+            "os.environ",
+            env,
+            clear=not command_env_configured,
+        ), mock.patch(
+            "deepresearch.semantic_planner.shutil.which",
+            return_value="codex" if default_codex_available else None,
+        ):
             result = prepare_run(question=question, runs_dir=self.temp_runs_dir())
-        return result, captured["request"]
+        request = dict(captured["request"])
+        request["_commands"] = list(captured["commands"])
+        return result, request
 
     def prepare_fixture(self, fixture: dict) -> Path:
         fallback_plan = heuristic_template_planner(question=fixture["question"])
@@ -1114,6 +1218,76 @@ class SemanticPlannerTests(unittest.TestCase):
             planner_mode=PLANNER_MODE_MANUAL_ANGLES,
         )
 
+    def test_validation_failure_demotes_persisted_semantic_release_eligibility(self) -> None:
+        run_dir = self.temp_runs_dir() / "planner-validation-demotion"
+        evidence = {
+            "run_id": run_dir.name,
+            "question": "Compare market, policy, implementation, release, and UI visual evidence.",
+            "semantic_planner": {
+                "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+                "semantic_release_eligible": True,
+                "question_class": "product_market",
+                "broad_question": True,
+                "expected_evidence_needs": [
+                    "primary_source",
+                    "comparative_analysis",
+                    "pricing_or_limits",
+                    "user_workflow",
+                    "visual_example",
+                    "visual_observation",
+                ],
+            },
+            "semantic_angles": [
+                {
+                    "id": "angle_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "evidence_need": "visual_example",
+                }
+            ],
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "semantic_release_eligible": True,
+                "semantic_plan": {"semantic_release_eligible": True},
+            },
+        )
+        self.write_json(
+            run_dir / "status.json",
+            {
+                "semantic_release_eligible": True,
+                "semantic_planning": {
+                    "semantic_release_eligible": True,
+                    "validation_ok": True,
+                    "failure_codes": [],
+                },
+            },
+        )
+
+        validation = write_semantic_planner_validation(
+            run_dir=run_dir,
+            evidence=evidence,
+            tasks=[],
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertFalse(validation["semantic_release_eligible"])
+        self.assertTrue(validation["declared_semantic_release_eligible"])
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("broad_question_angle_count_out_of_range", failure_codes)
+        persisted_evidence = self.load_json(run_dir / "evidence.json")
+        persisted_plan = self.load_json(run_dir / "semantic_plan.json")
+        persisted_status = self.load_json(run_dir / "status.json")
+        self.assertFalse(persisted_evidence["semantic_release_eligible"])
+        self.assertFalse(persisted_evidence["semantic_planner"]["semantic_release_eligible"])
+        self.assertFalse(persisted_plan["semantic_release_eligible"])
+        self.assertFalse(persisted_plan["semantic_plan"]["semantic_release_eligible"])
+        self.assertFalse(persisted_status["semantic_release_eligible"])
+        self.assertFalse(persisted_status["semantic_planning"]["semantic_release_eligible"])
+        self.assertFalse(persisted_status["semantic_planning"]["validation_ok"])
+
     def test_codex_semantic_validation_rejects_non_finite_fit_score(self) -> None:
         question = "How does the public transit fare cap affect downtown commuters?"
         cases = (
@@ -1167,7 +1341,8 @@ class SemanticPlannerTests(unittest.TestCase):
 
                 self.assertFalse(validation["ok"], validation)
                 self.assertEqual(validation["planner_mode"], "codex_semantic")
-                self.assertTrue(validation["semantic_release_eligible"])
+                self.assertFalse(validation["semantic_release_eligible"])
+                self.assertTrue(validation["declared_semantic_release_eligible"])
                 codes = {failure["code"] for failure in validation["failures"]}
                 self.assertIn("semantic_fit_score_missing_or_non_finite", codes)
 
@@ -1517,6 +1692,61 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         for token in forbidden:
             self.assertNotIn(token, request_text)
+
+    def test_default_codex_semantic_adapter_commands_use_schemas_when_env_absent(self) -> None:
+        question = "Research lunar habitat material tests using official images and source records"
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            command_env_configured=False,
+            default_codex_available=True,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        run_dir = Path(result["run_dir"])
+
+        self.assertEqual(result["status"], "awaiting_search_results")
+        self.assertTrue(result["semantic_release_eligible"])
+        captured_commands = adapter_request["_commands"]
+        self.assertEqual(len(captured_commands), 3)
+        raw_artifacts = (
+            run_dir / "semantic_planner_raw" / "planner_response.json",
+            run_dir / "semantic_oracle_raw" / "oracle_response.json",
+            run_dir / "semantic_reviewer_raw" / "reviewer_response.json",
+        )
+        expected_schema_files = ("planner.json", "oracle.json", "reviewer.json")
+        for raw_artifact, schema_file, captured_command in zip(
+            raw_artifacts,
+            expected_schema_files,
+            captured_commands,
+        ):
+            with self.subTest(raw_artifact=raw_artifact.name):
+                raw_response = self.load_json(raw_artifact)
+                redacted_command = raw_response["provenance"]["adapter_command"]
+                self.assertEqual(redacted_command[:3], ["codex", "exec", "--json"])
+                self.assertIn("--output-schema", redacted_command)
+                self.assertIn(
+                    f"semantic_adapter_schemas/{schema_file}",
+                    redacted_command[redacted_command.index("--output-schema") + 1],
+                )
+                self.assertIn("--output-schema", captured_command)
+                self.assertIn("Return only JSON matching the provided schema", captured_command[-1])
+
+        planner_command = next(
+            command
+            for command in captured_commands
+            if "planner.json" in command[command.index("--output-schema") + 1]
+        )
+        self.assertIn(
+            "semantically, not by keyword or fixed template",
+            planner_command[-1],
+        )
+
+        reviewer_response = self.load_json(
+            run_dir / "semantic_reviewer_raw" / "reviewer_response.json"
+        )
+        self.assertTrue(
+            reviewer_response["semantic_plan_review"]["non_negotiable_coverage_complete"]
+        )
 
     def test_oracle_is_locked_before_planner_request_with_trace_hashes(self) -> None:
         question = "Research lunar habitat material tests using official images and source records"
@@ -2090,7 +2320,8 @@ class SemanticPlannerTests(unittest.TestCase):
 
     def test_codex_semantic_unavailable_blocks_without_local_template_fallback(self) -> None:
         question = "Research adapter unavailable behavior without manual angles"
-        result = prepare_run(question=question, runs_dir=self.temp_runs_dir())
+        with mock.patch("deepresearch.semantic_planner.shutil.which", return_value=None):
+            result = prepare_run(question=question, runs_dir=self.temp_runs_dir())
         run_dir = Path(result["run_dir"])
         evidence = self.load_json(run_dir / "evidence.json")
         raw_request = self.load_json(run_dir / "semantic_planner_raw" / "planner_request.json")
@@ -2130,6 +2361,75 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(result["planner_mode"], PLANNER_MODE_BLOCKED)
         self.assertEqual(raw_response["failure_category"], "adapter_unavailable")
         self.assertIn("planner service unavailable", raw_response["blocked_reason"])
+
+    def test_default_codex_semantic_adapter_command_uses_plugin_schema(self) -> None:
+        with mock.patch(
+            "deepresearch.semantic_planner.shutil.which",
+            return_value="/usr/local/bin/codex",
+        ), mock.patch.dict(
+            "os.environ",
+            {
+                CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV: "1",
+                CODEX_SEMANTIC_ADAPTER_WORKDIR_ENV: str(ROOT),
+                CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "",
+            },
+            clear=False,
+        ):
+            command = _semantic_adapter_command(
+                command_env=CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
+                role_label="semantic planner",
+            )
+
+        self.assertIsNotNone(command)
+        assert command is not None
+        self.assertEqual(command[:3], ["/usr/local/bin/codex", "exec", "--json"])
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertIn("--output-schema", command)
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        self.assertTrue(schema_path.exists())
+        self.assertEqual(schema_path.name, "planner.json")
+        self.assertIn("semantically, not by keyword or fixed template", command[-1])
+
+    def test_default_codex_semantic_adapter_command_returns_none_without_codex(self) -> None:
+        with mock.patch(
+            "deepresearch.semantic_planner.shutil.which",
+            return_value=None,
+        ), mock.patch.dict(
+            "os.environ",
+            {
+                CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV: "1",
+                CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "",
+            },
+            clear=False,
+        ):
+            command = _semantic_adapter_command(
+                command_env=CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
+                role_label="semantic planner",
+            )
+
+        self.assertIsNone(command)
+
+    def test_default_codex_semantic_adapter_command_can_be_disabled_for_tests(self) -> None:
+        with mock.patch(
+            "deepresearch.semantic_planner.shutil.which",
+            return_value="/usr/local/bin/codex",
+        ), mock.patch.dict(
+            "os.environ",
+            {
+                CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV: "1",
+                "CODEX_DEEPRESEARCH_DISABLE_DEFAULT_SEMANTIC_ADAPTER": "1",
+                CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "",
+            },
+            clear=False,
+        ):
+            command = _semantic_adapter_command(
+                command_env=CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
+                role_label="semantic planner",
+            )
+
+        self.assertIsNone(command)
 
     def test_codex_semantic_rejects_non_codex_adapter_command(self) -> None:
         with mock.patch(
@@ -2536,12 +2836,13 @@ class SemanticPlannerTests(unittest.TestCase):
     def test_visual_route_override_without_angles_blocks_when_adapter_unavailable(self) -> None:
         for route in ("visual_required", "visual_optional"):
             with self.subTest(route=route):
-                result = prepare_run(
-                    question="Find image evidence for a public product interface",
-                    runs_dir=self.temp_runs_dir(),
-                    route=route,
-                    budget_preset="standard",
-                )
+                with mock.patch("deepresearch.semantic_planner.shutil.which", return_value=None):
+                    result = prepare_run(
+                        question="Find image evidence for a public product interface",
+                        runs_dir=self.temp_runs_dir(),
+                        route=route,
+                        budget_preset="standard",
+                    )
                 run_dir = Path(result["run_dir"])
                 evidence = self.load_json(run_dir / "evidence.json")
 

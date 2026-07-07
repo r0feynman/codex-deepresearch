@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import copy
 import os
 import re
 import shlex
@@ -52,7 +53,18 @@ CODEX_SEMANTIC_REVIEWER_COMMAND_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_COMM
 CODEX_SEMANTIC_PLANNER_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"
 CODEX_SEMANTIC_ORACLE_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_TIMEOUT_SECONDS"
 CODEX_SEMANTIC_REVIEWER_TIMEOUT_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_TIMEOUT_SECONDS"
+CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV = (
+    "CODEX_DEEPRESEARCH_ENABLE_DEFAULT_SEMANTIC_ADAPTER"
+)
+CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV = (
+    "CODEX_DEEPRESEARCH_DISABLE_DEFAULT_SEMANTIC_ADAPTER"
+)
+CODEX_SEMANTIC_ADAPTER_WORKDIR_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_ADAPTER_WORKDIR"
 CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND = "codex_exec_json"
+CODEX_SEMANTIC_ADAPTER_SCHEMA_DIRNAME = "semantic_adapter_schemas"
+CODEX_SEMANTIC_PLANNER_SCHEMA_FILENAME = "planner.json"
+CODEX_SEMANTIC_ORACLE_SCHEMA_FILENAME = "oracle.json"
+CODEX_SEMANTIC_REVIEWER_SCHEMA_FILENAME = "reviewer.json"
 SEMANTIC_FIT_SCORE_THRESHOLD = 9.0
 SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES = (
     "failed_semantic_fit",
@@ -104,6 +116,11 @@ SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
     "max_sources",
     "max_images",
 )
+SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX = "semantic_task_"
+SEMANTIC_MATERIALIZATION_SEARCH_RESULT_ALIGNMENT_FIELD_MAP = {
+    field: f"{SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX}{field}"
+    for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS
+}
 SEMANTIC_MATERIALIZATION_JSON_ARTIFACTS = {
     "research_tasks": "research_tasks.json",
     "search_tasks": "search_tasks.json",
@@ -662,16 +679,17 @@ def invoke_codex_semantic_planner_adapter(
 ) -> Mapping[str, Any] | None:
     """Invoke the configured Codex-native semantic planner boundary.
 
-    The default path is intentionally unavailable unless a Codex exec JSON
-    command is configured. Production code must not synthesize codex_semantic
-    output locally or accept arbitrary subprocesses as Codex-native provenance.
+    Production code must not synthesize codex_semantic output locally or accept
+    arbitrary subprocesses as Codex-native provenance. When the user has not
+    supplied an explicit command, the installed plugin invokes the local Codex
+    CLI with a checked JSON schema.
     """
 
-    command_text = os.environ.get(CODEX_SEMANTIC_PLANNER_COMMAND_ENV, "").strip()
-    if not command_text:
-        return None
-    command = shlex.split(command_text)
-    if not command:
+    command = _semantic_adapter_command(
+        command_env=CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
+        role_label="semantic planner",
+    )
+    if command is None:
         return None
     command_boundary = validate_codex_semantic_adapter_command(command)
     timeout_seconds = float(os.environ.get(CODEX_SEMANTIC_PLANNER_TIMEOUT_ENV, "300"))
@@ -1370,11 +1388,8 @@ def _invoke_codex_semantic_json_adapter(
     timeout_env: str,
     role_label: str,
 ) -> Mapping[str, Any] | None:
-    command_text = os.environ.get(command_env, "").strip()
-    if not command_text:
-        return None
-    command = shlex.split(command_text)
-    if not command:
+    command = _semantic_adapter_command(command_env=command_env, role_label=role_label)
+    if command is None:
         return None
     command_boundary = validate_codex_semantic_adapter_command(command)
     timeout_seconds = float(os.environ.get(timeout_env, "300"))
@@ -1403,6 +1418,133 @@ def _invoke_codex_semantic_json_adapter(
     payload = dict(payload)
     payload["provenance"] = provenance
     return payload
+
+
+def _semantic_adapter_command(
+    *,
+    command_env: str,
+    role_label: str,
+) -> list[str] | None:
+    command_text = os.environ.get(command_env, "").strip()
+    if command_text:
+        command = shlex.split(command_text)
+        return command or None
+    return _default_codex_semantic_adapter_command(role_label=role_label)
+
+
+def _default_codex_semantic_adapter_command(*, role_label: str) -> list[str] | None:
+    if _semantic_adapter_env_flag_enabled(CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV):
+        return None
+    if not _semantic_adapter_env_flag_enabled(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV):
+        return None
+    codex_binary = shutil.which("codex")
+    if not codex_binary:
+        return None
+    schema_path = _semantic_adapter_schema_path(role_label)
+    if not schema_path.exists():
+        raise SemanticPlannerAdapterUnavailable(
+            f"Codex {role_label} output schema is missing: {schema_path}"
+        )
+    return [
+        codex_binary,
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "-C",
+        str(_semantic_adapter_workdir()),
+        "--output-schema",
+        str(schema_path),
+        _semantic_adapter_prompt(role_label),
+    ]
+
+
+def _semantic_adapter_schema_path(role_label: str) -> Path:
+    filename_by_role = {
+        "semantic planner": CODEX_SEMANTIC_PLANNER_SCHEMA_FILENAME,
+        "semantic oracle": CODEX_SEMANTIC_ORACLE_SCHEMA_FILENAME,
+        "semantic reviewer": CODEX_SEMANTIC_REVIEWER_SCHEMA_FILENAME,
+    }
+    filename = filename_by_role.get(role_label)
+    if not filename:
+        raise SemanticPlannerAdapterUnavailable(f"Unknown semantic adapter role: {role_label}")
+    return (
+        Path(__file__).resolve().parents[2]
+        / "validation"
+        / CODEX_SEMANTIC_ADAPTER_SCHEMA_DIRNAME
+        / filename
+    )
+
+
+def _semantic_adapter_workdir() -> Path:
+    configured = os.environ.get(CODEX_SEMANTIC_ADAPTER_WORKDIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    try:
+        return Path.cwd().resolve()
+    except OSError:
+        return Path(__file__).resolve().parents[2]
+
+
+def _semantic_adapter_prompt(role_label: str) -> str:
+    if role_label == "semantic planner":
+        return (
+            "You are the Codex DeepResearch semantic planner. Read the JSON request from stdin. "
+            "Return only JSON matching the provided schema. Decompose the original user question "
+            "semantically, not by keyword or fixed template. Use this canonical requirement id "
+            "scheme exactly in requirement_coverage_map: req_001 main user subject/domain/entity "
+            "scope; req_002 required source quality and official/primary evidence constraints; "
+            "req_003 requested analysis/comparison/output shape; req_004 modality, geography, time, "
+            "and scope filters that change what evidence is needed; req_005 caveats, contradiction "
+            "checks, freshness/currentness, limits, and unknowns. Always include req_001 through "
+            "req_005 exactly once, in order. Mark each coverage_status covered and cover every id "
+            "with at least one angle and one task. For broad questions produce 5 to 8 angles and "
+            "20 to 40 bounded_tasks; every angle must have at least two executable bounded_tasks. "
+            "For narrow questions produce 6 to 12 bounded_tasks. Every bounded_task must have "
+            "max_sources as an integer from 1 to 5. Text-only tasks must have max_images=0. "
+            "Visual-required or visual-optional tasks must have max_images from 1 to 3 and "
+            "non-empty expected_visual_targets. Do not copy angle titles as task queries. Make "
+            "every task executable with source policy, concrete success criteria, expected artifacts, "
+            "and done_condition. Preserve the user intent, language, domain, modality, geography/time "
+            "constraints, and requested deliverable. Do not drift into Codex internals unless the user "
+            "asked about Codex."
+        )
+    if role_label == "semantic oracle":
+        return (
+            "You are the Codex DeepResearch independent semantic expectation oracle. Read the JSON "
+            "request from stdin. Return only JSON matching the provided schema. Build the oracle only "
+            "from the original user question and request constraints; do not inspect or infer from any "
+            "planner output. Use this canonical requirement id scheme exactly in oracle_requirement_map: "
+            "req_001 main user subject/domain/entity scope; req_002 required source quality and "
+            "official/primary evidence constraints; req_003 requested analysis/comparison/output shape; "
+            "req_004 modality, geography, time, and scope filters that change what evidence is needed; "
+            "req_005 caveats, contradiction checks, freshness/currentness, limits, and unknowns. Always "
+            "include req_001 through req_005 exactly once, in order. Capture explicit and justified "
+            "inferred requirements, including source-quality needs, modality needs, geography/time "
+            "constraints, report shape, forbidden drift, and expected task range. For broad questions "
+            "set bounded_task_range min at least 20 and max at most 40; for narrow questions set min "
+            "at least 6 and max at most 12."
+        )
+    if role_label == "semantic reviewer":
+        return (
+            "You are the Codex DeepResearch independent semantic fit reviewer. Read the JSON request "
+            "from stdin. Return only JSON matching the provided schema. Compare the semantic plan only "
+            "against the locked expectation oracle and original question. Fail plans that use keyword/"
+            "template substitution, drift to another domain, omit source-quality/modality/geography/time/"
+            "deliverable constraints, reverse-fit to a generated plan, or have non-executable bounded "
+            "tasks. Require all req_001 through req_005 non-negotiable requirements to be covered by "
+            "valid angle ids and task ids. Require broad plans to have 5-8 angles, 20-40 bounded tasks, "
+            "at least two tasks per angle, and no task query that merely copies an angle title. Require "
+            "every bounded task to have max_sources 1-5 and visual tasks to have max_images 1-3 with "
+            "concrete visual targets. Return semantic_fit_score >=9 and verdict pass only when there are "
+            "no blockers and non_negotiable_coverage_complete is true."
+        )
+    raise SemanticPlannerAdapterUnavailable(f"Unknown semantic adapter role: {role_label}")
+
+
+def _semantic_adapter_env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _semantic_oracle_raw_request(
@@ -1918,12 +2060,25 @@ def _semantic_plan_review_from_raw_response(
     review["reviewer_raw_request_hash"] = raw_request_artifact_hash
     review["reviewer_raw_response_artifact_hash"] = raw_response_hash
     review["reviewer_raw_response_hash"] = raw_response_hash
+    review["raw_request_path"] = str(raw_request_path)
+    review["raw_response_path"] = str(raw_response_path)
+    review["raw_request_content_hash"] = raw_request_content_hash
+    review["raw_request_artifact_hash"] = raw_request_artifact_hash
+    review["raw_request_hash"] = raw_request_artifact_hash
+    review["raw_response_artifact_hash"] = raw_response_hash
+    review["raw_response_hash"] = raw_response_hash
+    review["question_scope"] = _question_scope(question, plan)
+    review["template_use"] = _template_use(plan)
     review["parsed_response_hash"] = _sha256_text(
         json.dumps(adapter_review or deterministic, sort_keys=True, ensure_ascii=True)
     )
     reviewer_provenance = dict(raw_response.get("provenance") or {})
     reviewer_provenance.setdefault("reviewer_adapter", raw_response.get("reviewer_adapter"))
     reviewer_provenance.setdefault("prompt_version", raw_response.get("prompt_version"))
+    reviewer_provenance.setdefault("planner_mode", plan.planner_mode)
+    reviewer_provenance.setdefault("planner_source", plan.source)
+    reviewer_provenance.setdefault("raw_request_required", True)
+    reviewer_provenance.setdefault("raw_response_required", True)
     adapter_raw_request_hash = reviewer_provenance.get("raw_request_hash")
     reviewer_provenance["raw_request_path"] = str(raw_request_path)
     reviewer_provenance["raw_response_path"] = str(raw_response_path)
@@ -1936,6 +2091,13 @@ def _semantic_plan_review_from_raw_response(
     reviewer_provenance["raw_response_artifact_hash"] = raw_response_hash
     reviewer_provenance["raw_response_hash"] = raw_response_hash
     review["reviewer_provenance"] = reviewer_provenance
+    review["provenance"] = reviewer_provenance
+    review["session_id"] = reviewer_provenance.get("session_id") or reviewer_provenance.get(
+        "child_session_id"
+    )
+    review["session_id_unavailable_reason"] = reviewer_provenance.get(
+        "session_id_unavailable_reason"
+    )
     _apply_manifest_oracle_binding(review, raw_response)
     review["reviewer_surface"] = reviewer_provenance.get("model_or_surface")
     review["reviewer_prompt_version"] = reviewer_provenance.get("prompt_version")
@@ -2014,6 +2176,9 @@ def _semantic_plan_review_from_raw_response(
     review["verdict"] = verdict
     review["final_verdict"] = verdict
     review["semantic_release_eligible"] = verdict == "pass"
+    reviewer_provenance["semantic_release_eligible"] = review["semantic_release_eligible"]
+    review["reviewer_provenance"] = reviewer_provenance
+    review["provenance"] = reviewer_provenance
     return review
 
 
@@ -4110,6 +4275,11 @@ def write_semantic_planner_validation(
         report_status=report_status,
     )
     _write_json(run_path / SEMANTIC_PLANNER_VALIDATION_FILENAME, artifact)
+    if artifact.get("ok") is not True:
+        _demote_persisted_semantic_release_eligibility(
+            run_path=run_path,
+            validation=artifact,
+        )
     return artifact
 
 
@@ -4225,6 +4395,62 @@ def write_semantic_integrity_artifacts(
     review_payload.setdefault("created_at", timestamp)
     review_payload.setdefault("planner_mode", plan.planner_mode)
     review_payload.setdefault("semantic_release_eligible", plan.semantic_release_eligible)
+    review_payload.setdefault("question_scope", base["question_scope"])
+    review_payload.setdefault(
+        "raw_request_path",
+        review_payload.get("reviewer_raw_request_path") or base["raw_request_path"],
+    )
+    review_payload.setdefault(
+        "raw_response_path",
+        review_payload.get("reviewer_raw_response_path") or base["raw_response_path"],
+    )
+    review_payload.setdefault(
+        "raw_request_hash",
+        review_payload.get("reviewer_raw_request_artifact_hash")
+        or review_payload.get("reviewer_raw_request_hash")
+        or base["raw_request_hash"],
+    )
+    review_payload.setdefault(
+        "raw_response_hash",
+        review_payload.get("reviewer_raw_response_artifact_hash")
+        or review_payload.get("reviewer_raw_response_hash")
+        or base["raw_response_hash"],
+    )
+    review_payload.setdefault(
+        "raw_request_content_hash",
+        review_payload.get("reviewer_raw_request_content_hash"),
+    )
+    review_payload.setdefault(
+        "raw_request_artifact_hash",
+        review_payload.get("reviewer_raw_request_artifact_hash")
+        or review_payload.get("reviewer_raw_request_hash"),
+    )
+    review_payload.setdefault(
+        "raw_response_artifact_hash",
+        review_payload.get("reviewer_raw_response_artifact_hash")
+        or review_payload.get("reviewer_raw_response_hash"),
+    )
+    review_provenance = dict(
+        review_payload.get("provenance")
+        or review_payload.get("reviewer_provenance")
+        or base["provenance"]
+    )
+    review_provenance.setdefault("planner_mode", plan.planner_mode)
+    review_provenance.setdefault("planner_source", plan.source)
+    review_provenance.setdefault("raw_request_required", True)
+    review_provenance.setdefault("raw_response_required", True)
+    review_provenance["semantic_release_eligible"] = plan.semantic_release_eligible
+    review_payload.setdefault("reviewer_provenance", review_provenance)
+    review_payload["provenance"] = review_provenance
+    review_payload.setdefault("template_use", base["template_use"])
+    review_payload.setdefault(
+        "session_id",
+        review_provenance.get("session_id") or review_provenance.get("child_session_id"),
+    )
+    review_payload.setdefault(
+        "session_id_unavailable_reason",
+        review_provenance.get("session_id_unavailable_reason"),
+    )
 
     oracle_payload = (
         dict(locked_oracle)
@@ -4565,7 +4791,12 @@ def build_semantic_materialization_diff(
                 approved_delta_id=approved_delta_id,
                 required=require_downstream and bool(expected_ids),
                 compare_fields=artifact == "search_results",
-                require_all_fields=False,
+                compare_field_map=(
+                    SEMANTIC_MATERIALIZATION_SEARCH_RESULT_ALIGNMENT_FIELD_MAP
+                    if artifact == "search_results"
+                    else None
+                ),
+                require_all_fields=artifact == "search_results",
                 allow_duplicate_task_ids=True,
             )
         )
@@ -4731,6 +4962,9 @@ def build_semantic_materialization_diff(
         "approved_delta_id": approved_delta_id,
         "approved_delta": approved_delta,
         "compared_fields": list(SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS),
+        "search_result_semantic_compared_fields": list(
+            SEMANTIC_MATERIALIZATION_SEARCH_RESULT_ALIGNMENT_FIELD_MAP.values()
+        ),
         "planned_task_count": len(plan_task_ids),
         "materialized_counts": {
             str(check["artifact"]): check.get("materialized_count", 0)
@@ -4849,6 +5083,7 @@ def _materialization_collection_check(
     required: bool,
     compare_fields: bool,
     allow_duplicate_task_ids: bool,
+    compare_field_map: Mapping[str, str] | None = None,
     require_all_fields: bool = True,
 ) -> dict[str, Any]:
     expected = list(dict.fromkeys(str(task_id) for task_id in expected_task_ids if task_id))
@@ -4949,6 +5184,7 @@ def _materialization_collection_check(
                     task_id=task_id,
                     expected=bounded_task,
                     actual=record,
+                    field_map=compare_field_map,
                     require_all_fields=require_all_fields,
                 )
             )
@@ -4987,6 +5223,13 @@ def _materialization_collection_check(
         "extra_task_ids": extra,
         "duplicate_semantic_task_ids": duplicate_task_ids,
         "field_mismatches": field_mismatches,
+        "compared_fields": (
+            list((compare_field_map or {}).values())
+            if compare_fields and compare_field_map
+            else list(SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS)
+            if compare_fields
+            else []
+        ),
         "lineage_failures": lineage_failures,
         "lineage_join_fields": [
             "semantic_plan_hash",
@@ -5017,11 +5260,13 @@ def _semantic_materialization_field_mismatches(
     task_id: str,
     expected: Mapping[str, Any],
     actual: Mapping[str, Any],
+    field_map: Mapping[str, str] | None = None,
     require_all_fields: bool = True,
 ) -> list[dict[str, Any]]:
     mismatches: list[dict[str, Any]] = []
     for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
-        if field not in actual:
+        actual_field = field_map.get(field, field) if field_map else field
+        if actual_field not in actual:
             if not require_all_fields:
                 continue
             mismatches.append(
@@ -5029,7 +5274,8 @@ def _semantic_materialization_field_mismatches(
                     "artifact": artifact,
                     "record_index": record_index,
                     "task_id": task_id,
-                    "field": field,
+                    "field": actual_field,
+                    "semantic_field": field,
                     "code": "field_missing",
                     "expected": _semantic_materialization_value(expected, field),
                     "actual": None,
@@ -5037,14 +5283,19 @@ def _semantic_materialization_field_mismatches(
             )
             continue
         expected_value = _semantic_materialization_value(expected, field)
-        actual_value = _semantic_materialization_value(actual, field)
+        actual_value = _semantic_materialization_value(
+            actual,
+            actual_field,
+            semantic_field=field,
+        )
         if expected_value != actual_value:
             mismatches.append(
                 {
                     "artifact": artifact,
                     "record_index": record_index,
                     "task_id": task_id,
-                    "field": field,
+                    "field": actual_field,
+                    "semantic_field": field,
                     "code": "field_mismatch",
                     "expected": expected_value,
                     "actual": actual_value,
@@ -5053,23 +5304,29 @@ def _semantic_materialization_field_mismatches(
     return mismatches
 
 
-def _semantic_materialization_value(record: Mapping[str, Any], field: str) -> Any:
+def _semantic_materialization_value(
+    record: Mapping[str, Any],
+    field: str,
+    *,
+    semantic_field: str | None = None,
+) -> Any:
+    comparison_field = semantic_field or field
     value = record.get(field)
-    if field in {
+    if comparison_field in {
         "expected_source_types",
         "expected_visual_targets",
         "expected_artifacts",
         "success_criteria",
     }:
         return _string_list(value)
-    if field == "source_policy":
+    if comparison_field == "source_policy":
         return _normalize_mapping_value(value)
-    if field in {"max_sources", "max_images"}:
+    if comparison_field in {"max_sources", "max_images"}:
         try:
             return max(0, int(value or 0))
         except (TypeError, ValueError):
             return 0
-    if field in {"query", "route", "freshness_requirement", "done_condition"}:
+    if comparison_field in {"query", "route", "freshness_requirement", "done_condition"}:
         return str(value or "")
     return value
 
@@ -5195,7 +5452,9 @@ def semantic_planner_validation(
         )
 
     planner_mode = str(planner_metadata.get("planner_mode") or "")
-    semantic_release_eligible = bool(planner_metadata.get("semantic_release_eligible"))
+    declared_semantic_release_eligible = bool(
+        planner_metadata.get("semantic_release_eligible")
+    )
     semantic_status = _semantic_release_status(
         run_path=run_path,
         planner_metadata=planner_metadata,
@@ -5205,12 +5464,19 @@ def semantic_planner_validation(
     covered_needs = [
         need for need in expected_needs if need in evidence_need_counts
     ]
+    semantic_release_eligible = declared_semantic_release_eligible and not failures
+    semantic_status = dict(semantic_status)
+    semantic_status["semantic_release_eligible"] = semantic_release_eligible
+    semantic_status["declared_semantic_release_eligible"] = (
+        declared_semantic_release_eligible
+    )
     artifact = {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "fixture_id": str(planner_metadata.get("fixture_id") or run_path.name),
         "run_id": str(evidence.get("run_id") or run_path.name),
         "planner_mode": planner_mode or "unknown",
         "semantic_release_eligible": semantic_release_eligible,
+        "declared_semantic_release_eligible": declared_semantic_release_eligible,
         "semantic_status": semantic_status,
         "question_class": question_class,
         "broad_question": broad_question,
@@ -5246,6 +5512,64 @@ def semantic_planner_validation(
     }
     artifact.update(_semantic_common_integrity_fields(run_path))
     return artifact
+
+
+def _demote_persisted_semantic_release_eligibility(
+    *,
+    run_path: Path,
+    validation: Mapping[str, Any],
+) -> None:
+    failure_codes = [
+        str(failure.get("code"))
+        for failure in _list(validation.get("failures"))
+        if isinstance(failure, Mapping) and failure.get("code")
+    ]
+    demotion = {
+        "semantic_release_eligible": False,
+        "semantic_release_ineligible_reason": "semantic_planner_validation_failed",
+        "semantic_planner_validation_ok": False,
+        "semantic_planner_validation_failure_codes": failure_codes,
+    }
+    _demote_json_artifact_semantic_release(run_path / "evidence.json", demotion)
+    _demote_json_artifact_semantic_release(run_path / SEMANTIC_PLAN_FILENAME, demotion)
+    _demote_json_artifact_semantic_release(run_path / "status.json", demotion)
+
+
+def _demote_json_artifact_semantic_release(path: Path, demotion: Mapping[str, Any]) -> None:
+    payload = _read_optional_json(path)
+    if not isinstance(payload, dict):
+        return
+    changed = False
+    for key, value in demotion.items():
+        if payload.get(key) != value:
+            payload[key] = copy.deepcopy(value)
+            changed = True
+    semantic_planner = payload.get("semantic_planner")
+    if isinstance(semantic_planner, dict):
+        for key, value in demotion.items():
+            if semantic_planner.get(key) != value:
+                semantic_planner[key] = copy.deepcopy(value)
+                changed = True
+    semantic_plan = payload.get("semantic_plan")
+    if isinstance(semantic_plan, dict):
+        for key, value in demotion.items():
+            if semantic_plan.get(key) != value:
+                semantic_plan[key] = copy.deepcopy(value)
+                changed = True
+    semantic_planning = payload.get("semantic_planning")
+    if isinstance(semantic_planning, dict):
+        if semantic_planning.get("semantic_release_eligible") is not False:
+            semantic_planning["semantic_release_eligible"] = False
+            changed = True
+        if semantic_planning.get("validation_ok") is not False:
+            semantic_planning["validation_ok"] = False
+            changed = True
+        failure_codes = list(demotion.get("semantic_planner_validation_failure_codes") or [])
+        if semantic_planning.get("failure_codes") != failure_codes:
+            semantic_planning["failure_codes"] = failure_codes
+            changed = True
+    if changed:
+        _write_json(path, payload)
 
 
 def question_mentions_visual_evidence(question: str) -> bool:
@@ -6233,6 +6557,12 @@ def _integrity_base_payload(
     raw_request_hash: str,
     raw_response_hash: str,
 ) -> dict[str, Any]:
+    provenance = _planner_provenance(plan)
+    provenance.setdefault("planner_mode", plan.planner_mode)
+    provenance.setdefault("planner_source", plan.source)
+    provenance.setdefault("raw_request_required", True)
+    provenance.setdefault("raw_response_required", True)
+    provenance["semantic_release_eligible"] = plan.semantic_release_eligible
     return {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "run_id": run_path.name,
@@ -6245,14 +6575,11 @@ def _integrity_base_payload(
         "raw_response_path": str(raw_response_path),
         "raw_request_hash": raw_request_hash,
         "raw_response_hash": raw_response_hash,
-        "parsed_response_hash": _planner_provenance(plan).get("parsed_response_hash"),
-        "provenance": _planner_provenance(plan),
+        "parsed_response_hash": provenance.get("parsed_response_hash"),
+        "provenance": provenance,
         "template_use": _template_use(plan),
-        "session_id": _planner_provenance(plan).get("session_id")
-        or _planner_provenance(plan).get("child_session_id"),
-        "session_id_unavailable_reason": _planner_provenance(plan).get(
-            "session_id_unavailable_reason"
-        ),
+        "session_id": provenance.get("session_id") or provenance.get("child_session_id"),
+        "session_id_unavailable_reason": provenance.get("session_id_unavailable_reason"),
     }
 
 
