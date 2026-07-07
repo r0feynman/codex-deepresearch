@@ -88,6 +88,32 @@ SEMANTIC_COMMON_INTEGRITY_FIELDS = (
     "session_id",
     "session_id_unavailable_reason",
 )
+SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
+    "query",
+    "route",
+    "freshness_requirement",
+    "source_policy",
+    "expected_source_types",
+    "expected_visual_targets",
+    "expected_artifacts",
+    "success_criteria",
+    "done_condition",
+    "max_sources",
+    "max_images",
+)
+SEMANTIC_MATERIALIZATION_JSON_ARTIFACTS = {
+    "research_tasks": "research_tasks.json",
+    "search_tasks": "search_tasks.json",
+    "visual_tasks": "visual_tasks.json",
+    "visual_search_plan": "visual_search_plan.json",
+}
+SEMANTIC_MATERIALIZATION_JSONL_ARTIFACTS = {
+    "search_results": "search_results.jsonl",
+    "visual_candidates": "visual_candidates.jsonl",
+    "image_fetch_status": "image_fetch_status.jsonl",
+    "visual_observations": "visual_observations.jsonl",
+    "subagent_assignments": "subagent_assignments.jsonl",
+}
 
 ALLOWED_EVIDENCE_NEEDS = (
     "official_source",
@@ -4258,6 +4284,760 @@ def semantic_integrity_artifact_filenames() -> tuple[str, ...]:
         SEMANTIC_PLAN_DELTA_FILENAME,
         SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
     )
+
+
+def write_semantic_materialization_diff(
+    *,
+    run_dir: str | Path,
+    require_research_tasks: bool = True,
+    require_downstream: bool = False,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Write the semantic plan to task-artifact materialization diff."""
+
+    run_path = Path(run_dir)
+    diff = build_semantic_materialization_diff(
+        run_dir=run_path,
+        require_research_tasks=require_research_tasks,
+        require_downstream=require_downstream,
+        created_at=created_at,
+    )
+    _write_json(run_path / SEMANTIC_MATERIALIZATION_DIFF_FILENAME, diff)
+    return diff
+
+
+def build_semantic_materialization_diff(
+    *,
+    run_dir: str | Path,
+    require_research_tasks: bool = True,
+    require_downstream: bool = False,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Validate exact semantic bounded-task materialization.
+
+    Pre-fanout callers can set ``require_downstream=False`` so search results,
+    visual records, and assignment JSONL files are reported but not required.
+    Release gates set it to true and therefore require complete downstream
+    task-set coverage.
+    """
+
+    run_path = Path(run_dir)
+    generated_at = created_at or _utc_now_from_run(run_path)
+    plan_path = run_path / SEMANTIC_PLAN_FILENAME
+    plan_artifact = _read_optional_json(plan_path)
+    plan_hash = _sha256_file(plan_path) if plan_path.exists() else None
+    semantic_plan = _semantic_plan_mapping(plan_artifact)
+    bounded_tasks = _semantic_plan_bounded_tasks(semantic_plan, plan_artifact)
+    plan_task_ids, duplicate_plan_task_ids = _semantic_task_ids_with_duplicates(
+        bounded_tasks
+    )
+    bounded_by_id = {
+        task_id: task
+        for task_id, task in zip(plan_task_ids, bounded_tasks)
+        if task_id and task_id not in duplicate_plan_task_ids
+    }
+    visual_obligation_task_ids = [
+        task_id
+        for task_id in plan_task_ids
+        if task_id in bounded_by_id
+        and _semantic_task_has_visual_obligation(bounded_by_id[task_id])
+    ]
+    approved_delta = _approved_materialization_delta(run_path)
+    approved_delta_id = approved_delta.get("approved_delta_id") or "base_plan"
+
+    failures: list[dict[str, Any]] = []
+    if not isinstance(plan_artifact, Mapping):
+        failures.append(
+            {
+                "code": "semantic_plan_missing",
+                "artifact": SEMANTIC_PLAN_FILENAME,
+            }
+        )
+    if not bounded_tasks:
+        failures.append({"code": "semantic_plan_bounded_tasks_missing"})
+    if duplicate_plan_task_ids:
+        failures.append(
+            {
+                "code": "semantic_plan_duplicate_task_ids",
+                "task_ids": duplicate_plan_task_ids,
+            }
+        )
+
+    artifact_checks: list[dict[str, Any]] = []
+
+    research_records, research_present = _read_materialization_json_records(
+        run_path / "research_tasks.json"
+    )
+    artifact_checks.append(
+        _materialization_collection_check(
+            artifact="research_tasks",
+            path=run_path / "research_tasks.json",
+            present=research_present,
+            records=research_records,
+            expected_task_ids=plan_task_ids,
+            bounded_by_id=bounded_by_id,
+            plan_hash=plan_hash,
+            approved_delta_id=approved_delta_id,
+            required=require_research_tasks,
+            compare_fields=True,
+            allow_duplicate_task_ids=False,
+        )
+    )
+
+    search_records, search_present = _read_materialization_json_records(
+        run_path / "search_tasks.json"
+    )
+    artifact_checks.append(
+        _materialization_collection_check(
+            artifact="search_tasks",
+            path=run_path / "search_tasks.json",
+            present=search_present,
+            records=search_records,
+            expected_task_ids=plan_task_ids,
+            bounded_by_id=bounded_by_id,
+            plan_hash=plan_hash,
+            approved_delta_id=approved_delta_id,
+            required=True,
+            compare_fields=True,
+            allow_duplicate_task_ids=False,
+        )
+    )
+
+    evidence = _read_optional_json(run_path / "evidence.json")
+    evidence_search_tasks = (
+        evidence.get("search_tasks")
+        if isinstance(evidence, Mapping) and isinstance(evidence.get("search_tasks"), list)
+        else []
+    )
+    artifact_checks.append(
+        _materialization_collection_check(
+            artifact="evidence.search_tasks",
+            path=run_path / "evidence.json",
+            present=bool(evidence_search_tasks),
+            records=list(evidence_search_tasks),
+            expected_task_ids=plan_task_ids,
+            bounded_by_id=bounded_by_id,
+            plan_hash=plan_hash,
+            approved_delta_id=approved_delta_id,
+            required=True,
+            compare_fields=True,
+            allow_duplicate_task_ids=False,
+        )
+    )
+
+    visual_records, visual_present = _read_materialization_json_records(
+        run_path / "visual_tasks.json"
+    )
+    artifact_checks.append(
+        _materialization_collection_check(
+            artifact="visual_tasks",
+            path=run_path / "visual_tasks.json",
+            present=visual_present,
+            records=visual_records,
+            expected_task_ids=visual_obligation_task_ids,
+            bounded_by_id=bounded_by_id,
+            plan_hash=plan_hash,
+            approved_delta_id=approved_delta_id,
+            required=bool(visual_obligation_task_ids),
+            compare_fields=True,
+            allow_duplicate_task_ids=False,
+        )
+    )
+
+    visual_plan_records, visual_plan_present = _read_materialization_json_records(
+        run_path / "visual_search_plan.json"
+    )
+    artifact_checks.append(
+        _materialization_collection_check(
+            artifact="visual_search_plan",
+            path=run_path / "visual_search_plan.json",
+            present=visual_plan_present,
+            records=visual_plan_records,
+            expected_task_ids=visual_obligation_task_ids,
+            bounded_by_id=bounded_by_id,
+            plan_hash=plan_hash,
+            approved_delta_id=approved_delta_id,
+            required=require_downstream and bool(visual_obligation_task_ids),
+            compare_fields=False,
+            allow_duplicate_task_ids=False,
+        )
+    )
+
+    for artifact, filename in SEMANTIC_MATERIALIZATION_JSONL_ARTIFACTS.items():
+        records, present = _read_materialization_jsonl_records(run_path / filename)
+        expected_ids = (
+            visual_obligation_task_ids
+            if artifact
+            in {"visual_candidates", "image_fetch_status", "visual_observations"}
+            else plan_task_ids
+        )
+        artifact_checks.append(
+            _materialization_collection_check(
+                artifact=artifact,
+                path=run_path / filename,
+                present=present,
+                records=records,
+                expected_task_ids=expected_ids,
+                bounded_by_id=bounded_by_id,
+                plan_hash=plan_hash,
+                approved_delta_id=approved_delta_id,
+                required=require_downstream and bool(expected_ids),
+                compare_fields=artifact == "search_results",
+                require_all_fields=False,
+                allow_duplicate_task_ids=True,
+            )
+        )
+
+    evidence_images = (
+        evidence.get("images")
+        if isinstance(evidence, Mapping) and isinstance(evidence.get("images"), list)
+        else []
+    )
+    if evidence_images or (require_downstream and visual_obligation_task_ids):
+        artifact_checks.append(
+            _materialization_collection_check(
+                artifact="evidence.images",
+                path=run_path / "evidence.json",
+                present=bool(evidence_images),
+                records=list(evidence_images),
+                expected_task_ids=visual_obligation_task_ids,
+                bounded_by_id=bounded_by_id,
+                plan_hash=plan_hash,
+                approved_delta_id=approved_delta_id,
+                required=require_downstream and bool(visual_obligation_task_ids),
+                compare_fields=False,
+                require_all_fields=False,
+                allow_duplicate_task_ids=True,
+            )
+        )
+
+    missing_task_ids = _unique_sorted(
+        task_id
+        for check in artifact_checks
+        for task_id in check.get("missing_task_ids", [])
+        if check.get("required") is True
+    )
+    extra_task_ids = _unique_sorted(
+        task_id
+        for check in artifact_checks
+        for task_id in check.get("extra_task_ids", [])
+    )
+    duplicate_task_ids = _unique_sorted(
+        [*duplicate_plan_task_ids]
+        + [
+            task_id
+            for check in artifact_checks
+            for task_id in check.get("duplicate_semantic_task_ids", [])
+        ]
+    )
+    dropped_search_obligations = _unique_sorted(
+        set(plan_task_ids)
+        - set(
+            task_id
+            for check in artifact_checks
+            if check.get("artifact") in {"search_tasks", "evidence.search_tasks"}
+            for task_id in check.get("materialized_task_ids", [])
+        )
+    )
+    dropped_visual_obligations = _unique_sorted(
+        set(visual_obligation_task_ids)
+        - set(
+            task_id
+            for check in artifact_checks
+            if check.get("artifact") == "visual_tasks"
+            for task_id in check.get("materialized_task_ids", [])
+        )
+    )
+    field_mismatches = [
+        mismatch
+        for check in artifact_checks
+        for mismatch in check.get("field_mismatches", [])
+    ]
+    lineage_failures = [
+        failure
+        for check in artifact_checks
+        for failure in check.get("lineage_failures", [])
+    ]
+    missing_required_artifacts = [
+        str(check.get("artifact"))
+        for check in artifact_checks
+        if check.get("required") is True and check.get("present") is not True
+    ]
+    failed_artifacts = [
+        str(check.get("artifact"))
+        for check in artifact_checks
+        if check.get("valid") is not True and check.get("required") is True
+    ]
+
+    suppressible_task_set_differences = (
+        missing_task_ids
+        or extra_task_ids
+        or duplicate_task_ids
+        or dropped_search_obligations
+        or dropped_visual_obligations
+    )
+    materialization_differences = (
+        suppressible_task_set_differences
+        or field_mismatches
+        or lineage_failures
+        or missing_required_artifacts
+    )
+    approved_difference = bool(
+        suppressible_task_set_differences and approved_delta.get("valid") is True
+    )
+    if materialization_differences and not approved_difference:
+        failures.append(
+            {
+                "code": "semantic_materialization_difference",
+                "missing_task_ids": missing_task_ids,
+                "extra_task_ids": extra_task_ids,
+                "duplicate_semantic_task_ids": duplicate_task_ids,
+                "dropped_search_obligations": dropped_search_obligations,
+                "dropped_visual_obligations": dropped_visual_obligations,
+                "missing_required_artifacts": missing_required_artifacts,
+            }
+        )
+    if missing_required_artifacts:
+        failures.append(
+            {
+                "code": "semantic_materialization_missing_required_artifacts",
+                "artifacts": missing_required_artifacts,
+            }
+        )
+    if field_mismatches:
+        failures.append(
+            {
+                "code": "semantic_materialization_field_mismatch",
+                "count": len(field_mismatches),
+            }
+        )
+    if lineage_failures:
+        failures.append(
+            {
+                "code": "semantic_materialization_lineage_failure",
+                "count": len(lineage_failures),
+            }
+        )
+    if failed_artifacts and (not approved_difference or missing_required_artifacts):
+        failures.append(
+            {
+                "code": "semantic_materialization_artifact_check_failed",
+                "artifacts": failed_artifacts,
+            }
+        )
+
+    exact_task_set_equality = (
+        not missing_task_ids
+        and not extra_task_ids
+        and not duplicate_task_ids
+        and not dropped_search_obligations
+        and not dropped_visual_obligations
+    )
+    valid = not failures
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_materialization_diff",
+        "generated_at": generated_at,
+        "run_id": run_path.name,
+        "valid": valid,
+        "status": "valid" if valid else "failed",
+        "full_materialization_validation_implemented": True,
+        "require_research_tasks": require_research_tasks,
+        "require_downstream": require_downstream,
+        "semantic_plan_path": str(plan_path),
+        "semantic_plan_hash": plan_hash,
+        "approved_delta_id": approved_delta_id,
+        "approved_delta": approved_delta,
+        "compared_fields": list(SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS),
+        "planned_task_count": len(plan_task_ids),
+        "materialized_counts": {
+            str(check["artifact"]): check.get("materialized_count", 0)
+            for check in artifact_checks
+        },
+        "planned_task_ids": plan_task_ids,
+        "visual_obligation_task_ids": visual_obligation_task_ids,
+        "missing_task_ids": missing_task_ids,
+        "extra_task_ids": extra_task_ids,
+        "duplicate_semantic_task_ids": duplicate_task_ids,
+        "dropped_search_obligations": dropped_search_obligations,
+        "dropped_visual_obligations": dropped_visual_obligations,
+        "missing_required_artifacts": missing_required_artifacts,
+        "exact_task_set_equality": exact_task_set_equality,
+        "per_artifact_task_set_equality": {
+            str(check["artifact"]): check.get("task_set_equal") is True
+            for check in artifact_checks
+        },
+        "field_mismatches": field_mismatches,
+        "lineage_failures": lineage_failures,
+        "artifact_checks": artifact_checks,
+        "failures": failures,
+    }
+
+
+def _semantic_plan_mapping(plan_artifact: Any) -> Mapping[str, Any]:
+    if isinstance(plan_artifact, Mapping):
+        nested = plan_artifact.get("semantic_plan")
+        if isinstance(nested, Mapping):
+            return nested
+        return plan_artifact
+    return {}
+
+
+def _semantic_plan_bounded_tasks(
+    semantic_plan: Mapping[str, Any],
+    plan_artifact: Any,
+) -> list[Mapping[str, Any]]:
+    candidates: list[Any] = []
+    if isinstance(semantic_plan.get("bounded_tasks"), list):
+        candidates = list(semantic_plan.get("bounded_tasks") or [])
+    elif isinstance(plan_artifact, Mapping) and isinstance(
+        plan_artifact.get("bounded_tasks"),
+        list,
+    ):
+        candidates = list(plan_artifact.get("bounded_tasks") or [])
+    return [task for task in candidates if isinstance(task, Mapping)]
+
+
+def _semantic_task_ids_with_duplicates(
+    tasks: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], list[str]]:
+    task_ids: list[str] = []
+    counts: Counter[str] = Counter()
+    for task in tasks:
+        task_id = _semantic_record_task_id(task)
+        if task_id:
+            task_ids.append(task_id)
+            counts[task_id] += 1
+    duplicates = sorted(task_id for task_id, count in counts.items() if count > 1)
+    return task_ids, duplicates
+
+
+def _semantic_task_has_visual_obligation(task: Mapping[str, Any]) -> bool:
+    route = str(task.get("route") or "")
+    if route in {"visual_required", "visual_optional"}:
+        return True
+    if _string_list(task.get("expected_visual_targets")):
+        return True
+    try:
+        return int(task.get("max_images") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _read_materialization_json_records(path: Path) -> tuple[list[Mapping[str, Any]], bool]:
+    payload = _read_optional_json(path)
+    if not isinstance(payload, Mapping):
+        return [], path.exists()
+    records = payload.get("tasks")
+    if not isinstance(records, list):
+        records = payload.get("records")
+    if not isinstance(records, list):
+        records = payload.get("plans")
+    if not isinstance(records, list):
+        return [], True
+    return [record for record in records if isinstance(record, Mapping)], True
+
+
+def _read_materialization_jsonl_records(path: Path) -> tuple[list[Mapping[str, Any]], bool]:
+    if not path.exists():
+        return [], False
+    records: list[Mapping[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, Mapping):
+                records.append(payload)
+    except (OSError, json.JSONDecodeError):
+        return [], True
+    return records, True
+
+
+def _materialization_collection_check(
+    *,
+    artifact: str,
+    path: Path,
+    present: bool,
+    records: Sequence[Mapping[str, Any]],
+    expected_task_ids: Sequence[str],
+    bounded_by_id: Mapping[str, Mapping[str, Any]],
+    plan_hash: str | None,
+    approved_delta_id: str,
+    required: bool,
+    compare_fields: bool,
+    allow_duplicate_task_ids: bool,
+    require_all_fields: bool = True,
+) -> dict[str, Any]:
+    expected = list(dict.fromkeys(str(task_id) for task_id in expected_task_ids if task_id))
+    materialized_task_ids: list[str] = []
+    lineage_failures: list[dict[str, Any]] = []
+    field_mismatches: list[dict[str, Any]] = []
+
+    for index, record in enumerate(records, start=1):
+        task_id = _semantic_record_task_id(record)
+        if not task_id:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "code": "semantic_plan_task_id_missing",
+                }
+            )
+            continue
+        materialized_task_ids.append(task_id)
+        bounded_task = bounded_by_id.get(task_id)
+        if not isinstance(bounded_task, Mapping):
+            continue
+        expected_angle_id = str(bounded_task.get("angle_id") or "")
+        actual_angle_id = str(record.get("angle_id") or "")
+        if not actual_angle_id:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "angle_id_missing",
+                    "expected": expected_angle_id,
+                    "actual": None,
+                }
+            )
+        elif expected_angle_id and actual_angle_id != expected_angle_id:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "angle_id_mismatch",
+                    "expected": expected_angle_id,
+                    "actual": actual_angle_id,
+                }
+            )
+        actual_plan_hash = record.get("semantic_plan_hash")
+        if not isinstance(actual_plan_hash, str) or not actual_plan_hash.strip():
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "semantic_plan_hash_missing",
+                    "expected": plan_hash,
+                    "actual": None,
+                }
+            )
+        elif plan_hash and actual_plan_hash.strip() != plan_hash:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "semantic_plan_hash_mismatch",
+                    "expected": plan_hash,
+                    "actual": actual_plan_hash.strip(),
+                }
+            )
+        actual_delta_id = record.get("approved_delta_id")
+        if not isinstance(actual_delta_id, str) or not actual_delta_id.strip():
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "approved_delta_id_missing",
+                    "expected": approved_delta_id,
+                    "actual": None,
+                }
+            )
+        elif actual_delta_id.strip() != approved_delta_id:
+            lineage_failures.append(
+                {
+                    "artifact": artifact,
+                    "record_index": index,
+                    "task_id": task_id,
+                    "code": "approved_delta_id_mismatch",
+                    "expected": approved_delta_id,
+                    "actual": actual_delta_id.strip(),
+                }
+            )
+        if compare_fields:
+            field_mismatches.extend(
+                _semantic_materialization_field_mismatches(
+                    artifact=artifact,
+                    record_index=index,
+                    task_id=task_id,
+                    expected=bounded_task,
+                    actual=record,
+                    require_all_fields=require_all_fields,
+                )
+            )
+
+    counts = Counter(materialized_task_ids)
+    duplicate_task_ids = (
+        []
+        if allow_duplicate_task_ids
+        else sorted(task_id for task_id, count in counts.items() if count > 1)
+    )
+    unique_materialized = list(dict.fromkeys(materialized_task_ids))
+    missing = sorted(set(expected) - set(unique_materialized))
+    extra = sorted(set(unique_materialized) - set(expected))
+    task_set_equal = not missing and not extra and not duplicate_task_ids
+    if required and not present:
+        task_set_equal = False
+    valid = (
+        (not required or present)
+        and task_set_equal
+        and not field_mismatches
+        and not lineage_failures
+    )
+    return {
+        "artifact": artifact,
+        "path": str(path),
+        "required": required,
+        "present": present,
+        "valid": valid,
+        "task_set_equal": task_set_equal,
+        "planned_task_ids": expected,
+        "materialized_task_ids": unique_materialized,
+        "planned_count": len(expected),
+        "materialized_count": len(unique_materialized),
+        "record_count": len(records),
+        "missing_task_ids": missing,
+        "extra_task_ids": extra,
+        "duplicate_semantic_task_ids": duplicate_task_ids,
+        "field_mismatches": field_mismatches,
+        "lineage_failures": lineage_failures,
+        "lineage_join_fields": [
+            "semantic_plan_hash",
+            "semantic_plan_task_id",
+            "angle_id",
+            "approved_delta_id",
+        ],
+        "joinable_lineage": {
+            "semantic_plan_hash": plan_hash,
+            "approved_delta_id": approved_delta_id,
+            "task_id_join": bool(plan_hash and bounded_by_id),
+        },
+    }
+
+
+def _semantic_record_task_id(record: Mapping[str, Any]) -> str:
+    for field in ("semantic_plan_task_id", "task_id", "search_task_id", "id"):
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _semantic_materialization_field_mismatches(
+    *,
+    artifact: str,
+    record_index: int,
+    task_id: str,
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+    require_all_fields: bool = True,
+) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
+    for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
+        if field not in actual:
+            if not require_all_fields:
+                continue
+            mismatches.append(
+                {
+                    "artifact": artifact,
+                    "record_index": record_index,
+                    "task_id": task_id,
+                    "field": field,
+                    "code": "field_missing",
+                    "expected": _semantic_materialization_value(expected, field),
+                    "actual": None,
+                }
+            )
+            continue
+        expected_value = _semantic_materialization_value(expected, field)
+        actual_value = _semantic_materialization_value(actual, field)
+        if expected_value != actual_value:
+            mismatches.append(
+                {
+                    "artifact": artifact,
+                    "record_index": record_index,
+                    "task_id": task_id,
+                    "field": field,
+                    "code": "field_mismatch",
+                    "expected": expected_value,
+                    "actual": actual_value,
+                }
+            )
+    return mismatches
+
+
+def _semantic_materialization_value(record: Mapping[str, Any], field: str) -> Any:
+    value = record.get(field)
+    if field in {
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "success_criteria",
+    }:
+        return _string_list(value)
+    if field == "source_policy":
+        return _normalize_mapping_value(value)
+    if field in {"max_sources", "max_images"}:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+    if field in {"query", "route", "freshness_requirement", "done_condition"}:
+        return str(value or "")
+    return value
+
+
+def _normalize_mapping_value(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return json.loads(json.dumps(value, sort_keys=True, ensure_ascii=True))
+
+
+def _unique_sorted(values: Any) -> list[str]:
+    return sorted({str(value) for value in values if str(value)})
+
+
+def _approved_materialization_delta(run_path: Path) -> dict[str, Any]:
+    delta = _read_optional_json(run_path / SEMANTIC_PLAN_DELTA_FILENAME)
+    if not isinstance(delta, Mapping) or delta.get("delta_applied") is not True:
+        return {
+            "valid": False,
+            "approved_delta_id": "base_plan",
+            "delta_applied": False,
+            "failures": [],
+        }
+    failures: list[str] = []
+    approved_delta_id = str(
+        delta.get("approved_delta_id")
+        or delta.get("delta_id")
+        or delta.get("new_semantic_plan_version_id")
+        or ""
+    ).strip()
+    if not approved_delta_id:
+        failures.append("approved_delta_id_missing")
+    if delta.get("reviewer_approved") is not True:
+        failures.append("reviewer_approved_missing")
+    if not (
+        delta.get("created_before_fanout") is True
+        or delta.get("approved_before_fanout") is True
+        or delta.get("semantic_plan_rematerialized_before_fanout") is True
+    ):
+        failures.append("approved_delta_not_recorded_before_fanout")
+    repair_categories = set(_string_list(delta.get("repair_categories")))
+    disallowed = repair_categories & set(SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES)
+    if disallowed:
+        failures.append("disallowed_repair_categories:" + ",".join(sorted(disallowed)))
+    return {
+        "valid": not failures,
+        "approved_delta_id": approved_delta_id or "unapproved_delta",
+        "delta_applied": True,
+        "failures": failures,
+    }
 
 
 def semantic_planner_validation(

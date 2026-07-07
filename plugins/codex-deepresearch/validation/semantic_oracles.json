@@ -1,0 +1,3329 @@
+{
+  "description": "Public-safe oracle fragments for registered #133 semantic validation prompts. Each manifest oracle_hash is the SHA-256 of its canonical JSON fragment under oracles[prompt_id]. Live release runs must still write per-run semantic_expectation_oracle.json artifacts with locked raw oracle request/response provenance.",
+  "hash_algorithm": "sha256(canonical-json, sort_keys=True, ensure_ascii=True)",
+  "oracle_contract": {
+    "requires_locked_oracle_before_planning": true,
+    "requires_materialization_diff": true,
+    "requires_release_report_artifacts": true,
+    "requires_semantic_plan_review": true
+  },
+  "oracles": {
+    "holdout-fixture-001": {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "34141feb10a3f2c6ab15bc0561393a63fedefe287fec600941a19e19012c0d98",
+      "prompt_id": "holdout-fixture-001",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-002": {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "de8f7034e2cd94455b8c62cd18afb3cb9c11ed17672854bb1ebf275842348eb1",
+      "prompt_id": "holdout-fixture-002",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-003": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "4e55504d250269254e4440cd85dec6ca5f3a1ba3048346e945c6563310fd1844",
+      "prompt_id": "holdout-fixture-003",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-004": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "9b066a000e1ecb71660eaa62f520cbce967739424c4fff4417fb447fe7e5c7d2",
+      "prompt_id": "holdout-fixture-004",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-005": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "13406a76618d5942ddadd0a23b61b647a1c6022589f40ca5505fa08abc59fae6",
+      "prompt_id": "holdout-fixture-005",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-006": {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "07b7e2d7b9b850d4b9f9ed4a0e5e35a27ce0dee18cfd68e42eb8243de3055a6c",
+      "prompt_id": "holdout-fixture-006",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-007": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "98aae77138dfaa05e2b9791b2e40de211b43934f2799fbd2fb4acd2c886e0cf6",
+      "prompt_id": "holdout-fixture-007",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-008": {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "549f7d71bb6c5b4002837246ae47869d75c33d3daf583ad73f5021f8625e5bfb",
+      "prompt_id": "holdout-fixture-008",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-009": {
+      "categories": [
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "fef9cef1b3b717aa3a58234431fe1745b3e5c7b3e29b5796c826f71f9f00d73e",
+      "prompt_id": "holdout-fixture-009",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-010": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "a4fba46fc12850e0e84b4b9e37563218d793a7cf62f910437d1b7133f67dcce1",
+      "prompt_id": "holdout-fixture-010",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-011": {
+      "categories": [
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "1632423b357e6d55d1d9c5fb038758b8bdd2703e3a99346b32f63788e274967b",
+      "prompt_id": "holdout-fixture-011",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "holdout-fixture-012": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Fixture-Safe Blind Holdout Flow",
+      "prompt_hash": "a9bef41eb03b48e5863aacd339ffd0ec707b595e316e4e10aaa6c1e69da0bfba",
+      "prompt_id": "holdout-fixture-012",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-001": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain",
+        "historical_failure"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "2fd66fc2e2724a94c2b094705b35918d2e79d68441b1df9f63078543a892f021",
+      "prompt_id": "pb-sem-001",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-002": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "0bb85df40499772486945b7c47b402a67ce86b76678db2605b497c92002055e7",
+      "prompt_id": "pb-sem-002",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-003": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "c5b7a778eca0e344ce285c3f9966dc9019db52d3726d3173df94d3368bcb28ec",
+      "prompt_id": "pb-sem-003",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-004": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "e11f2783d1793c30ad3c8009af1f50e7ced5fae139b4e7c4bacc9626902a59b5",
+      "prompt_id": "pb-sem-004",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-005": {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "180e5646c2cbcaf18ea996d293c0f81ba176e5617e989569d5c04cba24baaf4d",
+      "prompt_id": "pb-sem-005",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-006": {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "51ae21e344444283c0fb7ec6cc0a6db03285f2c31d9b97491ebcd1e18e3f7c36",
+      "prompt_id": "pb-sem-006",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-007": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "ce3f50ef96c2b60997bb02cb40fedd94b5a71cd93ab7598469bb39a102789d92",
+      "prompt_id": "pb-sem-007",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-008": {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "9bb89ac13d2b39f3c90f652c650e5140282d377997b9b101715f36c6da0fe587",
+      "prompt_id": "pb-sem-008",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-009": {
+      "categories": [
+        "official_regulatory_source_quality",
+        "policy_regulatory_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "b2a059ed720e495b7eb03840cd133a8f63385a3e2f6046ab3af15489aa563215",
+      "prompt_id": "pb-sem-009",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-010": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "d1983120dca14944b0f3ea45ca352e1c0eda14c6930ffd24151b95c065b396e8",
+      "prompt_id": "pb-sem-010",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-011": {
+      "categories": [
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "91de0993235f71ed8d416cd1e8c5731496c7ec744fb215b724c778e94aaa0c12",
+      "prompt_id": "pb-sem-011",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-012": {
+      "categories": [
+        "visual",
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "b8aa44b02d406be32b38a096907555cae7b0b479550c34962b24c8d54bc7de01",
+      "prompt_id": "pb-sem-012",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-013": {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "db9a252b27634154afa6e36951e2b47d30679275fad15b686477f7b7199c4417",
+      "prompt_id": "pb-sem-013",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-014": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "0c3544fef2a72b8409f855d19a6ad2bf7368b82517a2a26e34db5aa3a5bc98af",
+      "prompt_id": "pb-sem-014",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-015": {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "ad0a1b08175fc611799714d46306792b8b320f01979797fc710e4c93da3382e9",
+      "prompt_id": "pb-sem-015",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-016": {
+      "categories": [
+        "visual",
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "14cdf48c58fe6da0e53bceb5f20b1dcce190ae3dea2ff80c6716e341ac95ef8e",
+      "prompt_id": "pb-sem-016",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-017": {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "8335a09f1e62ad9f330dcc946b4b0098270c90ea4dc8d847b0a3345463591b74",
+      "prompt_id": "pb-sem-017",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-018": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "1ebd4dbc8be1356469607c7ecca916995a924d7892baf409abb31ba38e9484de",
+      "prompt_id": "pb-sem-018",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-019": {
+      "categories": [
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "03dce2a90bbef70efda80ae1e84c6c54727897b18971c66f0ea3c5621617b1ac",
+      "prompt_id": "pb-sem-019",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "pb-sem-020": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Public Beta Semantic Release Manifest",
+      "prompt_hash": "0dfebe049e63bd6de375723ff2e015fa82e5d9b8c011b961001835f1dbcdfd66",
+      "prompt_id": "pb-sem-020",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-001": {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "af2e080d8fc6041975cbb4a5eacb811774d715842153e5835c62646fccf30ddc",
+      "prompt_id": "sem-reg-001",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-002": {
+      "categories": [
+        "korean",
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "ee20ec2cf815f414df407fa3e6d4a104b7c5801d80895bc1ce3ca467097fc096",
+      "prompt_id": "sem-reg-002",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-003": {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "91008f5876cb5c39b4d0b132a673233a7e59ad45a4334bbb99bd82aa9f4281bd",
+      "prompt_id": "sem-reg-003",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-004": {
+      "categories": [
+        "korean",
+        "visual",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "45647452969c9689823db5c48e9db0b6ba630ffc6ef2c89007fb98831d223b8e",
+      "prompt_id": "sem-reg-004",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-005": {
+      "categories": [
+        "korean",
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "77602596ea5ad02cec685b89ba1b3cb4443d6a577b0fe079371dd8ad65dc47bf",
+      "prompt_id": "sem-reg-005",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-006": {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "2a7cea444719f7e8a94f6d06f027f438f6252873f1281fcbca7ccaae9e53c284",
+      "prompt_id": "sem-reg-006",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-007": {
+      "categories": [
+        "korean",
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "6ffcdef5ad798bef3ef038f85ee89db39271d4584693e114ed8a7e3201e29319",
+      "prompt_id": "sem-reg-007",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-008": {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "cfecc758c06aaccdc24638cabb36da85e4200820d99b52bb792052b7bb6bb007",
+      "prompt_id": "sem-reg-008",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-009": {
+      "categories": [
+        "korean",
+        "visual"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "9b82dfa9b5a04bcb754378b1471960e979578ce4f01ff068e6b751f00040dd66",
+      "prompt_id": "sem-reg-009",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-010": {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "04674200bc69e5c496248292f8fd1bb207317579e8c3a41aa930284b68bde01e",
+      "prompt_id": "sem-reg-010",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-011": {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "ec1f359b31c4f785902b945d4d5484f70e45704adeb792b1d24f27bf9a3eb2df",
+      "prompt_id": "sem-reg-011",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-012": {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "b95741870d51a6d1baa41c43f9ce6127fe94ddaacf289db7a98b9cbad8252d26",
+      "prompt_id": "sem-reg-012",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-013": {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "5ebfa3bc8b79d9be5dc4c142edd49da1bb8aaedd3778d0878543191b3e184716",
+      "prompt_id": "sem-reg-013",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-014": {
+      "categories": [
+        "visual",
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "0331c822bf62a5fd210134897bdfdfdc41eb68c466d763ed221d9db0ec650025",
+      "prompt_id": "sem-reg-014",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-015": {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "36a35d768223439cbac37571e100e5791184c393411e56173bbd2df213789fc1",
+      "prompt_id": "sem-reg-015",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-016": {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "a3b11c0b5b3f809449317bfeb55b66193e32bc937217c793881084b5242467be",
+      "prompt_id": "sem-reg-016",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-017": {
+      "categories": [
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "cdff5af8d640bad3f09bd7f81b61dc266783a9f003dadc1f3e53f8d340d77707",
+      "prompt_id": "sem-reg-017",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-018": {
+      "categories": [
+        "visual"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "0728208620eba62a90127c34e1d0499467f53b44faad29c9bdebfc880d2280e0",
+      "prompt_id": "sem-reg-018",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-019": {
+      "categories": [
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "e35cd6e2c45b818f119d4ccfad7aa64fe944f37cc5935015e6d7f5f23c4e3b48",
+      "prompt_id": "sem-reg-019",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-020": {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "604ed248b61710fa6cea2c6fbb24dc420875d0b81804c53aa0fcf56cc6f92746",
+      "prompt_id": "sem-reg-020",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-021": {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "469df7e5dd40d604a06660b185d868ab6fe3c312a2b64651a2939aa7a5ff132c",
+      "prompt_id": "sem-reg-021",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-022": {
+      "categories": [
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "79336a3b7d9ec59fa101015929473604056fb93856aee5be0e9415c29897d319",
+      "prompt_id": "sem-reg-022",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-023": {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "d3055b31bed0e9060a35a5c8b787a4708df9eebce3d1c851c1070ca6fe04a8a5",
+      "prompt_id": "sem-reg-023",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-024": {
+      "categories": [
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "fb63c33c5a043557c70bbb180251a3793e1f1b227f88fb03bb3bbd873c8786aa",
+      "prompt_id": "sem-reg-024",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-025": {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "42047ec74dde26beca11073292ed86d9a478e2b1c6be757ac33fc257ebcb9f46",
+      "prompt_id": "sem-reg-025",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-026": {
+      "categories": [
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "b6c9b2172293f245b5835b7d521a93e45142b40894d71d144bae8840f75bc4c5",
+      "prompt_id": "sem-reg-026",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-027": {
+      "categories": [
+        "software_implementation",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "3c1e669ee83adcd7a9001cb2034736adb7b4754b2e6f849719e947167f50cbb4",
+      "prompt_id": "sem-reg-027",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-028": {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "ad2b193ceaa646c2306106d8f6663f958cd442efb7b230ba050487d6c6729480",
+      "prompt_id": "sem-reg-028",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-029": {
+      "categories": [
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "disambiguate_non_software_or_domain_meaning"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "c4abc6ab1850fa4fa7844e4a14f562233244e9062b5e33fc11a2be3c17b30aa6",
+      "prompt_id": "sem-reg-029",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    },
+    "sem-reg-030": {
+      "categories": [
+        "software_implementation",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources",
+        "current_official_software_documentation"
+      ],
+      "manifest": "Semantic Planner Regression Manifest",
+      "prompt_hash": "273989fe80bab472ea441f1f3d90821c79f756d44c193086d7781843e93d0398",
+      "prompt_id": "sem-reg-030",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true
+      }
+    }
+  },
+  "public_safe": true,
+  "schema_version": "codex-deepresearch.semantic-oracle-bundle.v0"
+}

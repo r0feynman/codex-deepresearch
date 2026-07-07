@@ -35,10 +35,12 @@ from deepresearch.semantic_planner import (  # noqa: E402
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_FIT_SCORE_THRESHOLD,
     SemanticPlannerAdapterUnavailable,
+    build_semantic_materialization_diff,
     heuristic_template_planner,
     semantic_planner_validation,
     validate_semantic_candidate_plan,
     validate_codex_semantic_adapter_provenance,
+    write_semantic_materialization_diff,
 )
 
 
@@ -134,6 +136,16 @@ class SemanticPlannerTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(
+                json.dumps(record, sort_keys=True) + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+
     def read_jsonl(self, path: Path) -> list[dict]:
         return [
             json.loads(line)
@@ -147,6 +159,345 @@ class SemanticPlannerTests(unittest.TestCase):
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    def write_semantic_materialization_fixture(self, *, visual: bool = True) -> Path:
+        run_dir = self.temp_runs_dir() / "materialization"
+        run_dir.mkdir(parents=True)
+        route = "visual_required" if visual else "text_only"
+        tasks = [
+            {
+                "task_id": f"task_search_{index:03d}",
+                "angle_id": f"angle_{index:03d}",
+                "query": f"semantic materialization task {index}",
+                "route": route,
+                "freshness_requirement": "any",
+                "source_policy": {"decision": "allowed", "flags": []},
+                "expected_source_types": ["web"],
+                "expected_visual_targets": [f"visual target {index}"] if visual else [],
+                "expected_artifacts": ["source list"],
+                "success_criteria": ["Claims are source linked."],
+                "done_condition": "At least one supported claim is available.",
+                "max_sources": 3,
+                "max_images": 2 if visual else 0,
+            }
+            for index in range(1, 4)
+        ]
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "artifact_type": "semantic_plan",
+                "semantic_plan": {"bounded_tasks": tasks},
+            },
+        )
+        semantic_plan_hash = hashlib.sha256(
+            (run_dir / "semantic_plan.json").read_bytes()
+        ).hexdigest()
+        search_tasks = [
+            {
+                "id": task["task_id"],
+                "semantic_plan_task_id": task["task_id"],
+                "semantic_plan_hash": semantic_plan_hash,
+                "approved_delta_id": "base_plan",
+                **task,
+            }
+            for task in tasks
+        ]
+        research_tasks = [
+            {**task, "state": "merged", "output_shard_path": f"evidence_shards/{task['task_id']}/evidence_shard.json"}
+            for task in search_tasks
+        ]
+        visual_tasks = [
+            {**task, "visual_tasks": task["expected_visual_targets"], "status": "planned"}
+            for task in search_tasks
+            if task["route"] != "text_only"
+        ]
+        self.write_json(run_dir / "search_tasks.json", {"tasks": search_tasks})
+        self.write_json(run_dir / "research_tasks.json", {"tasks": research_tasks})
+        self.write_json(run_dir / "visual_tasks.json", {"tasks": visual_tasks})
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {"tasks": visual_tasks},
+        )
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "search_tasks": search_tasks,
+                "images": [
+                    {
+                        "id": f"img_{index:03d}",
+                        "task_id": task["task_id"],
+                        "semantic_plan_task_id": task["task_id"],
+                        "semantic_plan_hash": semantic_plan_hash,
+                        "angle_id": task["angle_id"],
+                        "route": task["route"],
+                        "approved_delta_id": "base_plan",
+                    }
+                    for index, task in enumerate(visual_tasks, start=1)
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "search_results.jsonl",
+            [
+                {
+                    "id": f"result_{index:03d}",
+                    "task_id": task["task_id"],
+                    "semantic_plan_task_id": task["task_id"],
+                    "semantic_plan_hash": semantic_plan_hash,
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "query": task["query"],
+                    "freshness_requirement": task["freshness_requirement"],
+                    "source_policy": task["source_policy"],
+                    "approved_delta_id": "base_plan",
+                }
+                for index, task in enumerate(search_tasks, start=1)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "subagent_assignments.jsonl",
+            [
+                {
+                    "assignment_id": f"assign_{index:03d}",
+                    "task_id": task["task_id"],
+                    "semantic_plan_task_id": task["task_id"],
+                    "semantic_plan_hash": semantic_plan_hash,
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "approved_delta_id": "base_plan",
+                }
+                for index, task in enumerate(search_tasks, start=1)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": f"cand_{index:03d}",
+                    "task_id": task["task_id"],
+                    "semantic_plan_task_id": task["task_id"],
+                    "semantic_plan_hash": semantic_plan_hash,
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "approved_delta_id": "base_plan",
+                }
+                for index, task in enumerate(visual_tasks, start=1)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": f"fetch_{index:03d}",
+                    "task_id": task["task_id"],
+                    "semantic_plan_task_id": task["task_id"],
+                    "semantic_plan_hash": semantic_plan_hash,
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "approved_delta_id": "base_plan",
+                }
+                for index, task in enumerate(visual_tasks, start=1)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{index:03d}",
+                    "task_id": task["task_id"],
+                    "semantic_plan_task_id": task["task_id"],
+                    "semantic_plan_hash": semantic_plan_hash,
+                    "angle_id": task["angle_id"],
+                    "route": task["route"],
+                    "approved_delta_id": "base_plan",
+                }
+                for index, task in enumerate(visual_tasks, start=1)
+            ],
+        )
+        return run_dir
+
+    def test_semantic_materialization_diff_validates_exact_task_sets(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        diff = write_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertTrue(diff["valid"], diff)
+        self.assertTrue(diff["full_materialization_validation_implemented"])
+        self.assertEqual(diff["missing_task_ids"], [])
+        self.assertEqual(diff["extra_task_ids"], [])
+        self.assertEqual(diff["duplicate_semantic_task_ids"], [])
+        self.assertEqual(diff["dropped_search_obligations"], [])
+        self.assertEqual(diff["dropped_visual_obligations"], [])
+
+    def test_semantic_materialization_diff_rejects_field_mismatch(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        payload = self.load_json(run_dir / "search_tasks.json")
+        payload["tasks"][0]["query"] = "rewritten downstream query"
+        self.write_json(run_dir / "search_tasks.json", payload)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"])
+        self.assertTrue(
+            any(mismatch["field"] == "query" for mismatch in diff["field_mismatches"]),
+            diff,
+        )
+
+    def test_semantic_materialization_diff_rejects_missing_extra_and_duplicate_tasks(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        research = self.load_json(run_dir / "research_tasks.json")
+        research["tasks"].pop()
+        self.write_json(run_dir / "research_tasks.json", research)
+        search = self.load_json(run_dir / "search_tasks.json")
+        search["tasks"].append({
+            **search["tasks"][0],
+            "task_id": "task_extra_999",
+            "semantic_plan_task_id": "task_extra_999",
+            "id": "task_extra_999",
+        })
+        search["tasks"].append(dict(search["tasks"][0]))
+        self.write_json(run_dir / "search_tasks.json", search)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"])
+        self.assertIn("task_search_003", diff["missing_task_ids"])
+        self.assertIn("task_extra_999", diff["extra_task_ids"])
+        self.assertIn("task_search_001", diff["duplicate_semantic_task_ids"])
+
+    def test_semantic_materialization_diff_rejects_dropped_visual_obligations_and_lineage_failures(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        self.write_json(run_dir / "visual_tasks.json", {"tasks": []})
+        assignments = self.read_jsonl(run_dir / "subagent_assignments.jsonl")
+        assignments[0].pop("angle_id")
+        self.write_jsonl(run_dir / "subagent_assignments.jsonl", assignments)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"])
+        self.assertEqual(
+            diff["dropped_visual_obligations"],
+            ["task_search_001", "task_search_002", "task_search_003"],
+        )
+        self.assertTrue(diff["lineage_failures"], diff)
+
+    def test_semantic_materialization_diff_rejects_missing_and_mismatched_lineage_hashes(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        search = self.load_json(run_dir / "search_tasks.json")
+        search["tasks"][0].pop("semantic_plan_hash")
+        search["tasks"][1]["semantic_plan_hash"] = "0" * 64
+        self.write_json(run_dir / "search_tasks.json", search)
+        assignments = self.read_jsonl(run_dir / "subagent_assignments.jsonl")
+        assignments[0].pop("approved_delta_id")
+        assignments[1]["approved_delta_id"] = "wrong_delta"
+        self.write_jsonl(run_dir / "subagent_assignments.jsonl", assignments)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"])
+        codes = {failure["code"] for failure in diff["lineage_failures"]}
+        self.assertIn("semantic_plan_hash_missing", codes)
+        self.assertIn("semantic_plan_hash_mismatch", codes)
+        self.assertIn("approved_delta_id_missing", codes)
+        self.assertIn("approved_delta_id_mismatch", codes)
+
+    def test_semantic_materialization_diff_requires_approved_delta_before_fanout(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        search = self.load_json(run_dir / "search_tasks.json")
+        search["tasks"].append({
+            **search["tasks"][0],
+            "task_id": "task_extra_999",
+            "semantic_plan_task_id": "task_extra_999",
+            "id": "task_extra_999",
+        })
+        self.write_json(run_dir / "search_tasks.json", search)
+
+        invalid = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+        self.assertFalse(invalid["valid"])
+
+        self.write_json(
+            run_dir / "semantic_plan_delta.json",
+            {
+                "delta_applied": True,
+                "approved_delta_id": "base_plan",
+                "reviewer_approved": True,
+                "created_before_fanout": True,
+                "repair_categories": [],
+            },
+        )
+        approved = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+        self.assertTrue(approved["valid"], approved)
+
+    def test_approved_delta_does_not_bypass_missing_required_downstream_artifacts(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        (run_dir / "search_results.jsonl").unlink()
+        self.write_json(
+            run_dir / "semantic_plan_delta.json",
+            {
+                "delta_applied": True,
+                "approved_delta_id": "base_plan",
+                "reviewer_approved": True,
+                "created_before_fanout": True,
+                "repair_categories": [],
+            },
+        )
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"])
+        self.assertIn("search_results", diff["missing_required_artifacts"])
+        self.assertTrue(
+            any(
+                failure["code"] == "semantic_materialization_missing_required_artifacts"
+                for failure in diff["failures"]
+            ),
+            diff,
+        )
+
+    def test_prepare_replaces_stub_materialization_diff_for_accepted_semantic_plan(self) -> None:
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            "Research public water system resilience with official records"
+        )
+        run_dir = Path(result["run_dir"])
+        diff = self.load_json(run_dir / "semantic_materialization_diff.json")
+
+        self.assertNotEqual(diff.get("status"), "stub_only")
+        self.assertTrue(diff["full_materialization_validation_implemented"])
+        self.assertTrue(diff["valid"], diff)
+        self.assertEqual(diff["missing_task_ids"], [])
+        self.assertEqual(diff["extra_task_ids"], [])
 
     def codex_adapter_response(
         self,

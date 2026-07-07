@@ -27,6 +27,10 @@ from deepresearch import (
     FreshSessionE2EError,
     DEFAULT_SANITIZED_REAL_VISUAL_INVOKE,
     DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
+    DEFAULT_BLIND_HOLDOUT_MANIFEST,
+    DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST,
+    DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
+    DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
     PublicBetaValidationError,
     SanitizedRealVisualE2EError,
     parse_scenario_run,
@@ -41,6 +45,7 @@ from deepresearch import (
     run_fresh_session_e2e,
     run_fresh_session_visual_e2e,
     run_public_beta_validation,
+    run_semantic_release_validation,
     run_sanitized_real_visual_e2e,
     run_skill_invocation,
     validate_artifacts,
@@ -936,6 +941,10 @@ def run_public_beta_validation_command(args: argparse.Namespace) -> int:
             prompt_runs=prompt_runs,
             gate_results=gate_results,
             completion_mode=normalize_public_beta_completion_mode(args.completion_mode),
+            manual_audit_manifest=resolve_repo_path(args.manual_audit_manifest)
+            if args.manual_audit_manifest
+            else None,
+            require_manual_trace_audits=args.require_manual_trace_audits,
         )
     except (PublicBetaValidationError, OSError, json.JSONDecodeError) as exc:
         results_path = getattr(exc, "results_path", None)
@@ -943,6 +952,53 @@ def run_public_beta_validation_command(args: argparse.Namespace) -> int:
             payload = json.loads(Path(results_path).read_text(encoding="utf-8"))
             print(json.dumps(payload, indent=2, sort_keys=True))
             if payload.get("status") == "blocked" and args.allow_blocked:
+                return 0
+            return 2
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if results_path:
+            print(f"Results: {results_path}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["status"] == "passed" else 2
+
+
+def run_semantic_release_validation_command(args: argparse.Namespace) -> int:
+    regression_runs = {}
+    public_beta_runs = {}
+    holdout_runs = {}
+    try:
+        for value in args.regression_run or []:
+            prompt_id, run_dir = parse_public_beta_run(value)
+            regression_runs[prompt_id] = resolve_repo_path(str(run_dir))
+        for value in args.public_beta_run or []:
+            prompt_id, run_dir = parse_public_beta_run(value)
+            public_beta_runs[prompt_id] = resolve_repo_path(str(run_dir))
+        for value in args.holdout_run or []:
+            prompt_id, run_dir = parse_public_beta_run(value)
+            holdout_runs[prompt_id] = resolve_repo_path(str(run_dir))
+        result = run_semantic_release_validation(
+            runs_dir=resolve_repo_path(args.runs_dir),
+            suite_id=args.suite_id,
+            clean=args.clean,
+            semantic_regression_manifest=resolve_repo_path(args.semantic_regression_manifest),
+            public_beta_semantic_manifest=resolve_repo_path(
+                args.public_beta_semantic_manifest
+            ),
+            blind_holdout_manifest=resolve_repo_path(args.blind_holdout_manifest),
+            manual_audit_manifest=resolve_repo_path(args.manual_audit_manifest)
+            if args.manual_audit_manifest
+            else None,
+            semantic_regression_runs=regression_runs,
+            public_beta_semantic_runs=public_beta_runs,
+            blind_holdout_runs=holdout_runs,
+        )
+    except (PublicBetaValidationError, OSError, json.JSONDecodeError) as exc:
+        results_path = getattr(exc, "results_path", None)
+        if results_path and Path(results_path).is_file():
+            payload = json.loads(Path(results_path).read_text(encoding="utf-8"))
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            if payload.get("status") in {"blocked", "failed"} and args.allow_blocked:
                 return 0
             return 2
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1294,6 +1350,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     public_beta.add_argument(
+        "--manual-audit-manifest",
+        help=(
+            "Optional manual trace audit manifest. Use with "
+            "--require-manual-trace-audits when claiming semantic release readiness."
+        ),
+    )
+    public_beta.add_argument(
+        "--require-manual-trace-audits",
+        action="store_true",
+        help="Fail semantic release report readiness unless valid manual trace audits are supplied.",
+    )
+    public_beta.add_argument(
         "--allow-blocked",
         action="store_true",
         help=(
@@ -1302,6 +1370,70 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     public_beta.set_defaults(func=run_public_beta_validation_command)
+
+    semantic_release = subparsers.add_parser(
+        "semantic-release-validation",
+        help=(
+            "Validate the #133 semantic regression, Public Beta semantic, blind "
+            "holdout, anti-overfit, and manual trace audit gates."
+        ),
+    )
+    semantic_release.add_argument(
+        "--runs-dir",
+        default="research-runs",
+        help="Directory for semantic release validation artifacts, relative to the repo root by default.",
+    )
+    semantic_release.add_argument(
+        "--suite-id",
+        default="semantic-release-validation",
+        help="Subdirectory name under --runs-dir for this validation suite.",
+    )
+    semantic_release.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove an existing suite directory before writing new artifacts.",
+    )
+    semantic_release.add_argument(
+        "--semantic-regression-manifest",
+        default=str(DEFAULT_SEMANTIC_REGRESSION_MANIFEST.relative_to(REPO_ROOT)),
+        help="30-prompt semantic regression manifest.",
+    )
+    semantic_release.add_argument(
+        "--public-beta-semantic-manifest",
+        default=str(DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST.relative_to(REPO_ROOT)),
+        help="20-run Public Beta semantic manifest.",
+    )
+    semantic_release.add_argument(
+        "--blind-holdout-manifest",
+        default=str(DEFAULT_BLIND_HOLDOUT_MANIFEST.relative_to(REPO_ROOT)),
+        help="Blind holdout manifest with selector/freeze provenance.",
+    )
+    semantic_release.add_argument(
+        "--manual-audit-manifest",
+        default=str(DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST.relative_to(REPO_ROOT)),
+        help="Manual trace audit manifest required for semantic release readiness.",
+    )
+    semantic_release.add_argument(
+        "--regression-run",
+        action="append",
+        help="Semantic regression run in the form prompt_id=run_dir. Repeat per prompt.",
+    )
+    semantic_release.add_argument(
+        "--public-beta-run",
+        action="append",
+        help="Public Beta semantic run in the form prompt_id=run_dir. Repeat per prompt.",
+    )
+    semantic_release.add_argument(
+        "--holdout-run",
+        action="append",
+        help="Blind holdout run in the form prompt_id=run_dir. Repeat per prompt.",
+    )
+    semantic_release.add_argument(
+        "--allow-blocked",
+        action="store_true",
+        help="Exit zero while still writing a failed/not-ready semantic release report.",
+    )
+    semantic_release.set_defaults(func=run_semantic_release_validation_command)
 
     resolve = subparsers.add_parser(
         "resolve-config",
