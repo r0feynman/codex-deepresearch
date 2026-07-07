@@ -18,6 +18,11 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch.public_beta_validation import (  # noqa: E402
     DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST,
+    DEFAULT_BLIND_HOLDOUT_MANIFEST,
+    DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST,
+    DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
+    DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+    SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME,
     EXTERNAL_GATE_REQUIREMENTS,
     PublicBetaValidationError,
     _AUTOMATED_VISUAL_REQUIRED_ACCEPTANCE,
@@ -26,9 +31,17 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     _FRESH_SESSION_REQUIRED_ACCEPTANCE,
     _FRESH_SESSION_VISUAL_REQUIRED_ACCEPTANCE,
     evaluate_public_beta_prompt_run,
+    load_blind_holdout_manifest,
+    load_manual_trace_audits,
     load_public_beta_prompt_manifest,
+    load_public_beta_semantic_manifest,
+    load_semantic_regression_manifest,
     run_public_beta_validation,
+    run_semantic_anti_overfit_scan,
+    run_semantic_release_validation,
+    semantic_manifest_execution_gate,
 )
+from deepresearch.semantic_planner import write_semantic_materialization_diff  # noqa: E402
 from deepresearch.visual_artifacts import visual_release_minimums  # noqa: E402
 
 
@@ -72,6 +85,84 @@ class PublicBetaValidationTests(unittest.TestCase):
             if line.strip()
         ]
 
+    def write_manual_trace_audit_manifest(
+        self,
+        root: Path,
+        *,
+        live: bool = True,
+        fixture_only: bool = False,
+    ) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        artifact_root = root / "manual_trace_artifacts"
+        chain_steps = [
+            "original_question",
+            "locked_oracle",
+            "semantic_plan",
+            "semantic_review",
+            "materialization_diff",
+            "research_tasks",
+            "search_tasks",
+            "visual_tasks",
+            "accepted_shards",
+            "final_report",
+        ]
+        audits = []
+        for index in range(1, 6):
+            audit_id = f"audit_{index:03d}"
+            route = "visual_required" if index <= 2 else "text_only"
+            categories = []
+            if index <= 2:
+                categories.extend(["korean", "visual"])
+            elif index == 3:
+                categories.append("korean")
+            else:
+                categories.append("policy_regulatory_domain")
+            chain_proof = {}
+            for step in chain_steps:
+                artifact_path = artifact_root / audit_id / f"{step}.json"
+                payload = {
+                    "audit_id": audit_id,
+                    "step": step,
+                    "status": "verified",
+                    "public_safe": True,
+                    "alignment_subject": "sanitized semantic trace audit fixture",
+                }
+                self.write_json(artifact_path, payload)
+                chain_proof[step] = {
+                    "status": "verified",
+                    "artifact_path": str(artifact_path.relative_to(root)),
+                    "artifact_hash": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                }
+            audits.append(
+                {
+                    "id": audit_id,
+                    "prompt_id": f"manual-audit-{index:03d}",
+                    "route": route,
+                    "public_safe": True,
+                    "release_eligible": live and not fixture_only,
+                    "fixture_only": fixture_only,
+                    "categories": categories,
+                    "risk_rank": index,
+                    "risk_rationale": "Selected as a high-risk semantic alignment trace.",
+                    "chain_proof": chain_proof,
+                }
+            )
+        manifest_path = root / "manual_trace_audits.json"
+        self.write_json(
+            manifest_path,
+            {
+                "schema_version": "codex-deepresearch.manual-trace-audits.v0",
+                "public_safe": True,
+                "live_release_audits_performed": live,
+                "risk_selection": {
+                    "hardest_highest_risk": True,
+                    "selection_rationale": "Covers highest-risk Korean, visual, and policy traces.",
+                },
+                "audits": audits,
+            },
+        )
+        return manifest_path
+
     def test_prompt_manifest_covers_public_safe_real_use_set(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         prompts = manifest["prompts"]
@@ -90,6 +181,347 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         self.assertTrue(
             all("automated_cli_real_provider_visual_e2e" not in prompt["gate_tags"] for prompt in visual_prompts)
+        )
+
+    def test_semantic_regression_manifest_covers_required_quotas(self) -> None:
+        manifest = load_semantic_regression_manifest(DEFAULT_SEMANTIC_REGRESSION_MANIFEST)
+        counts = manifest["category_counts"]
+
+        self.assertEqual(len(manifest["prompts"]), 30)
+        self.assertGreaterEqual(counts["korean"], 10)
+        self.assertGreaterEqual(counts["visual"], 8)
+        self.assertGreaterEqual(counts["policy_regulatory_domain"], 8)
+        self.assertGreaterEqual(counts["software_implementation"], 5)
+        self.assertGreaterEqual(counts["ambiguous_non_software"], 5)
+        self.assertTrue(all(prompt["release_counted"] is True for prompt in manifest["prompts"]))
+
+    def test_public_beta_semantic_manifest_covers_required_quotas_and_ev_failure(self) -> None:
+        manifest = load_public_beta_semantic_manifest(
+            DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST
+        )
+        counts = manifest["category_counts"]
+
+        self.assertEqual(len(manifest["prompts"]), 20)
+        self.assertGreaterEqual(counts["korean"], 8)
+        self.assertGreaterEqual(counts["visual"], 8)
+        self.assertGreaterEqual(counts["official_regulatory_source_quality"], 8)
+        self.assertGreaterEqual(counts["ambiguous_domain"], 5)
+        self.assertGreaterEqual(counts["non_software_domain"], 5)
+        self.assertTrue(
+            any(
+                "historical_failure" in prompt["categories"]
+                and "배터리 화재" in prompt["prompt"]
+                for prompt in manifest["prompts"]
+            )
+        )
+        self.assertTrue(all(prompt["oracle_hash_verified"] for prompt in manifest["prompts"]))
+
+    def test_semantic_manifest_rejects_wrong_oracle_hash(self) -> None:
+        temp = self.temp_dir()
+        manifest_path = temp / "public_beta_semantic_prompts.json"
+        oracle_path = temp / "semantic_oracles.json"
+        manifest = self.read_json(DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST)
+        oracles = self.read_json(
+            DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST.parent / "semantic_oracles.json"
+        )
+        manifest["prompts"][0]["oracle_hash"] = "0" * 64
+        self.write_json(manifest_path, manifest)
+        self.write_json(oracle_path, oracles)
+
+        with self.assertRaisesRegex(PublicBetaValidationError, "oracle_hash"):
+            load_public_beta_semantic_manifest(manifest_path)
+
+    def test_manual_trace_audit_gate_accepts_sanitized_live_audits(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(self.temp_dir())
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertTrue(gate["valid"], gate["failures"])
+        self.assertEqual(gate["audit_count"], 5)
+        self.assertGreaterEqual(gate["category_counts"]["korean"], 2)
+        self.assertGreaterEqual(gate["category_counts"]["visual"], 2)
+        self.assertEqual(
+            len(gate["audits"][0]["chain_steps_verified"]),
+            10,
+        )
+
+    def test_manual_trace_audit_gate_rejects_fixture_only_audits(self) -> None:
+        manifest_path = self.write_manual_trace_audit_manifest(
+            self.temp_dir(),
+            live=False,
+            fixture_only=True,
+        )
+
+        gate = load_manual_trace_audits(manifest_path)
+
+        self.assertFalse(gate["valid"])
+        self.assertIn("live_release_audits_not_performed", gate["failures"])
+        self.assertTrue(
+            any(failure.endswith(":fixture_only") for failure in gate["failures"]),
+            gate["failures"],
+        )
+
+    def test_semantic_manifest_execution_gate_requires_every_prompt_id(self) -> None:
+        manifest = load_semantic_regression_manifest(DEFAULT_SEMANTIC_REGRESSION_MANIFEST)
+        runs = [
+            {
+                "id": prompt["id"],
+                "status": "passed",
+                "terminal_status": "completed_parallel",
+                "metric_classification": "success",
+                "semantic_release_checks": {"valid": True},
+            }
+            for prompt in manifest["prompts"][:-1]
+        ]
+
+        gate = semantic_manifest_execution_gate(
+            manifest,
+            runs,
+            suite_label="semantic_regression_30",
+        )
+
+        self.assertFalse(gate["valid"])
+        self.assertEqual(gate["missing_prompt_ids"], [manifest["prompts"][-1]["id"]])
+        self.assertIn(
+            "missing_run_entries:" + manifest["prompts"][-1]["id"],
+            gate["failures"],
+        )
+
+    def test_semantic_manifest_execution_gate_counts_fixture_as_failure(self) -> None:
+        manifest = load_public_beta_semantic_manifest(
+            DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST
+        )
+        runs = []
+        for prompt in manifest["prompts"]:
+            runs.append(
+                {
+                    "id": prompt["id"],
+                    "status": "passed",
+                    "terminal_status": "completed_parallel",
+                    "metric_classification": "success",
+                    "semantic_release_checks": {"valid": True},
+                }
+            )
+        runs[0].update(
+            {
+                "terminal_status": "completed_fixture",
+                "metric_classification": "excluded_fixture",
+            }
+        )
+
+        gate = semantic_manifest_execution_gate(
+            manifest,
+            runs,
+            suite_label="public_beta_semantic_20",
+        )
+
+        self.assertFalse(gate["valid"])
+        self.assertEqual(gate["failed_prompt_count"], 1)
+        self.assertEqual(gate["runs"][0]["release_counted_status"], "denominator_failure")
+
+    def test_semantic_release_validation_fails_missing_runs_and_fixture_holdout(self) -> None:
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_semantic_release_validation(
+                runs_dir=self.temp_dir(),
+                suite_id="semantic-release-missing",
+                clean=True,
+                manual_audit_manifest=None,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(
+            Path(payload["artifacts"]["results"]).name,
+            SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME,
+        )
+        self.assertFalse(payload["semantic_suite_gates"]["semantic_regression_30"]["valid"])
+        self.assertEqual(
+            payload["semantic_suite_gates"]["semantic_regression_30"]["expected_prompt_count"],
+            30,
+        )
+        self.assertIn(
+            "selector_not_release_eligible",
+            payload["manifests"]["blind_holdout"]["selector_failures"],
+        )
+        self.assertIn(
+            "manual_trace_audit_manifest_not_supplied",
+            payload["manual_trace_audit_gate"]["failures"],
+        )
+
+    def test_semantic_release_validation_cli_reports_not_ready_without_artifacts(self) -> None:
+        runs_dir = self.temp_dir()
+
+        completed = subprocess.run(
+            [
+                str(RUNNER),
+                "semantic-release-validation",
+                "--runs-dir",
+                str(runs_dir),
+                "--suite-id",
+                "semantic-release-cli",
+                "--clean",
+                "--allow-blocked",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(payload["release_gate_ready"])
+        self.assertFalse(payload["semantic_suite_gates"]["blind_holdout_12"]["valid"])
+
+    def test_blind_holdout_fixture_flow_fails_release_readiness_honestly(self) -> None:
+        known = [
+            load_semantic_regression_manifest(DEFAULT_SEMANTIC_REGRESSION_MANIFEST),
+            load_public_beta_semantic_manifest(DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST),
+        ]
+        holdout = load_blind_holdout_manifest(
+            DEFAULT_BLIND_HOLDOUT_MANIFEST,
+            known_manifests=known,
+        )
+
+        self.assertFalse(holdout["release_gate_ready"])
+        self.assertIn("selector_not_release_eligible", holdout["failures"])
+        self.assertEqual(len(holdout["prompts"]), 12)
+        self.assertGreaterEqual(holdout["category_counts"]["korean"], 4)
+        self.assertGreaterEqual(holdout["category_counts"]["visual"], 4)
+        self.assertFalse(
+            any(failure.startswith("holdout_prompt_overlap") for failure in holdout["failures"])
+        )
+
+    def test_semantic_anti_overfit_default_scan_passes_current_tree(self) -> None:
+        scan = run_semantic_anti_overfit_scan()
+
+        self.assertEqual(scan["status"], "passed", scan["findings"])
+
+    def test_semantic_anti_overfit_scan_rejects_malicious_planner_file(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_bad.py"
+        holdout = load_blind_holdout_manifest(DEFAULT_BLIND_HOLDOUT_MANIFEST)
+        prompt = holdout["prompts"][0]["prompt"]
+        hash_value = holdout["prompts"][0]["prompt_hash"]
+        hash_symbol = "prompt" + "_hash"
+        plan_symbol = "expected" + "_plan"
+        branch_keyword = "i" + "f"
+        bounded_key = "bounded" + "_tasks"
+        bad.write_text(
+            "\n".join(
+                [
+                    f"HOLDOUT = {prompt!r}",
+                    f"{branch_keyword} {hash_symbol} == {hash_value!r}:",
+                    f"    {plan_symbol} = {{{bounded_key!r}: []}}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "known_holdout_string",
+            {finding["code"] for finding in scan["findings"]},
+        )
+        self.assertIn(
+            "prompt" + "_hash" + "_routing",
+            {finding["code"] for finding in scan["findings"]},
+        )
+        self.assertIn(
+            "canned" + "_expected" + "_plan",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
+    def test_semantic_release_report_lists_hashes_and_required_artifacts(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        runs_dir = self.temp_dir()
+        suite_id = "semantic-release-report"
+        prompt_runs = self.write_all_passing_prompt_runs(
+            manifest,
+            runs_dir=runs_dir / "prompt-runs",
+            suite_id=suite_id,
+        )
+
+        payload = run_public_beta_validation(
+            runs_dir=self.temp_dir(),
+            suite_id=suite_id,
+            clean=True,
+            prompt_runs=prompt_runs,
+        )
+
+        report = payload["semantic_release_report"]
+        self.assertTrue(report["valid"], report)
+        self.assertEqual(report["release_counted_run_count"], 20)
+        first = report["runs"][0]
+        for artifact in (
+            "semantic_expectation_oracle",
+            "semantic_plan",
+            "semantic_plan_review",
+            "semantic_materialization_diff",
+            "research_tasks",
+            "search_tasks",
+            "visual_tasks",
+            "subagent_assignments",
+            "report",
+        ):
+            self.assertIn(artifact, first["artifact_paths"])
+        self.assertRegex(
+            first["artifact_hashes"]["semantic_materialization_diff"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_semantic_release_report_requires_manual_trace_audits_when_enabled(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        runs_dir = self.temp_dir()
+        suite_id = "semantic-release-report-manual-audit-required"
+        prompt_runs = self.write_all_passing_prompt_runs(
+            manifest,
+            runs_dir=runs_dir / "prompt-runs",
+            suite_id=suite_id,
+        )
+
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_public_beta_validation(
+                runs_dir=self.temp_dir(),
+                suite_id=suite_id,
+                clean=True,
+                prompt_runs=prompt_runs,
+                manual_audit_manifest=None,
+                require_manual_trace_audits=True,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        manual_gate = payload["semantic_release_report"]["manual_trace_audit_gate"]
+        self.assertFalse(manual_gate["valid"])
+        self.assertIn("manual_trace_audit_manifest_not_supplied", manual_gate["failures"])
+        self.assertFalse(payload["release_gate_ready"])
+
+    def test_semantic_release_checks_require_materialization_diff_artifact(self) -> None:
+        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+        prompt = manifest["prompts"][0]
+        run_dir = self.write_text_run(
+            self.temp_dir() / "missing-diff",
+            prompt=prompt,
+            suite_id="missing-diff",
+            status="completed_parallel",
+        )
+        (run_dir / "semantic_materialization_diff.json").unlink()
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="missing-diff",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("semantic_materialization_diff", result["missing_artifacts"])
+        failures = result["semantic_release_checks"]["failures"]
+        self.assertTrue(
+            any(failure.get("check") == "required_semantic_artifact_present" for failure in failures),
+            failures,
         )
 
     def test_default_suite_records_blocked_runs_separately_from_failures(self) -> None:
@@ -1784,10 +2216,9 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(result["failure_category"], "artifact_handoff_failure")
         checks = result["codex_native_handoff_checks"]
         self.assertFalse(checks["valid"])
-        self.assertEqual(checks["codex_native_search_results"], 0)
         self.assertIn(
-            "search_results.jsonl lacks allowed Codex-native search handoff results "
-            "with matching prompt_id, suite_id, and prompt_hash",
+            "search_results.jsonl contains incomplete or non-release Codex-native "
+            "search handoff records for this prompt",
             checks["failures"],
         )
 
@@ -2465,6 +2896,87 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(Path(payload["artifacts"]["summary"]).is_file())
         self.assertFalse(payload["issue_75_completion_ready"])
 
+    def semantic_bounded_tasks(self, prompt: dict[str, Any]) -> list[dict[str, Any]]:
+        is_visual = prompt["route"] in {"visual_required", "visual_optional"}
+        return [
+            {
+                "task_id": f"task_search_{index:03d}",
+                "angle_id": f"angle_{index:03d}",
+                "query": f"{prompt['prompt']} bounded semantic task {index}",
+                "route": prompt["route"],
+                "freshness_requirement": "any",
+                "source_policy": {"decision": "allowed", "flags": []},
+                "expected_source_types": ["web"],
+                "expected_visual_targets": [f"visual target {index}"] if is_visual else [],
+                "expected_artifacts": ["source list", "supporting quotes"],
+                "success_criteria": ["Claims remain tied to source spans."],
+                "done_condition": "At least one source-backed claim is ready for synthesis.",
+                "max_sources": 3,
+                "max_images": 3 if is_visual else 0,
+            }
+            for index in range(1, 4)
+        ]
+
+    def search_task_from_bounded_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": task["task_id"],
+            "task_id": task["task_id"],
+            "semantic_plan_task_id": task["task_id"],
+            "semantic_plan_hash": "joinable-at-validation-time",
+            "angle_id": task["angle_id"],
+            "query": task["query"],
+            "route": task["route"],
+            "freshness_requirement": task["freshness_requirement"],
+            "source_policy": task["source_policy"],
+            "expected_source_types": task["expected_source_types"],
+            "expected_visual_targets": task["expected_visual_targets"],
+            "expected_artifacts": task["expected_artifacts"],
+            "success_criteria": task["success_criteria"],
+            "done_condition": task["done_condition"],
+            "max_sources": task["max_sources"],
+            "max_images": task["max_images"],
+            "provider": "codex-native",
+            "approved_delta_id": "base_plan",
+        }
+
+    def research_task_from_bounded_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **self.search_task_from_bounded_task(task),
+            "state": "merged",
+            "assigned_subagent_id": f"codex-exec-{task['task_id']}",
+            "output_shard_path": f"evidence_shards/{task['task_id']}/evidence_shard.json",
+        }
+
+    def visual_task_from_bounded_task(
+        self,
+        task: dict[str, Any],
+        *,
+        index: int,
+    ) -> dict[str, Any]:
+        return {
+            "id": f"task_visual_{index:03d}",
+            **self.search_task_from_bounded_task(task),
+            "visual_tasks": task["expected_visual_targets"],
+            "status": "planned",
+        }
+
+    def subagent_assignment_record(
+        self,
+        task: dict[str, Any],
+        *,
+        index: int,
+    ) -> dict[str, Any]:
+        return {
+            "assignment_id": f"assign_fixture_{index:03d}",
+            "task_id": task["task_id"],
+            "semantic_plan_task_id": task["task_id"],
+            "angle_id": task["angle_id"],
+            "route": task["route"],
+            "assigned_subagent_id": f"codex-exec-{task['task_id']}",
+            "adapter": "codex-exec",
+            "approved_delta_id": "base_plan",
+        }
+
     def write_text_run(
         self,
         run_dir: Path,
@@ -2521,6 +3033,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             run_dir / "run_status.json",
             run_status_payload,
         )
+        bounded_tasks = self.semantic_bounded_tasks(prompt)
+        search_tasks = [self.search_task_from_bounded_task(task) for task in bounded_tasks]
+        research_tasks = [self.research_task_from_bounded_task(task) for task in bounded_tasks]
         self.write_json(
             run_dir / "search_tasks.json",
             {
@@ -2533,19 +3048,50 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "execution_mode": "codex-plugin",
                 "runner_mode": "full-runner",
                 "created_at": timestamp,
+                "tasks": search_tasks,
+            },
+        )
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "status": "completed",
+                "tasks": research_tasks,
+            },
+        )
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.search-handoff.v0",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
                 "tasks": [
-                    {
-                        "id": "task_search_001",
-                        "query": prompt["prompt"],
-                        "route": prompt["route"],
-                        "provider": "codex-native",
-                    }
+                    self.visual_task_from_bounded_task(task, index=index)
+                    for index, task in enumerate(bounded_tasks, start=1)
+                    if task["route"] != "text_only"
                 ],
             },
         )
         self.write_jsonl(
             run_dir / "search_results.jsonl",
-            [self.codex_native_search_result(prompt, suite_id=suite_id)],
+            [
+                self.codex_native_search_result(
+                    prompt,
+                    suite_id=suite_id,
+                    task=task,
+                    rank=index,
+                )
+                for index, task in enumerate(bounded_tasks, start=1)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "subagent_assignments.jsonl",
+            [
+                self.subagent_assignment_record(task, index=index)
+                for index, task in enumerate(bounded_tasks, start=1)
+            ],
         )
         if status.startswith("completed"):
             evidence_payload = {
@@ -2575,7 +3121,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                     ],
                     "status": semantic_metadata["summary"]["status"],
                     "diagnostics": dict(semantic_metadata["diagnostics"]),
+                    "bounded_tasks": bounded_tasks,
                 }
+                evidence_payload["search_tasks"] = search_tasks
             self.write_json(
                 run_dir / "evidence.json",
                 evidence_payload,
@@ -2605,6 +3153,13 @@ class PublicBetaValidationTests(unittest.TestCase):
                     suite_id=suite_id,
                     timestamp=timestamp,
                     metadata=semantic_metadata,
+                    bounded_tasks=bounded_tasks,
+                )
+                write_semantic_materialization_diff(
+                    run_dir=run_dir,
+                    require_research_tasks=True,
+                    require_downstream=True,
+                    created_at=timestamp,
                 )
         return run_dir
 
@@ -2682,6 +3237,7 @@ class PublicBetaValidationTests(unittest.TestCase):
         suite_id: str,
         timestamp: str,
         metadata: dict[str, Any],
+        bounded_tasks: list[dict[str, Any]],
     ) -> None:
         generic_terms = {
             "and",
@@ -2766,6 +3322,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "status": metadata["summary"]["status"],
             "diagnostics": dict(metadata["diagnostics"]),
             "angles": angles,
+            "bounded_tasks": bounded_tasks,
         }
         question_scope = {
             "original_question": prompt["prompt"],
@@ -3362,6 +3919,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             "eligible",
             enabled=run_status == "completed_auto_visual",
         )
+        bounded_tasks = self.semantic_bounded_tasks(prompt)
+        search_tasks = [self.search_task_from_bounded_task(task) for task in bounded_tasks]
+        research_tasks = [self.research_task_from_bounded_task(task) for task in bounded_tasks]
         run_status_payload = {
             "schema_version": "codex-deepresearch.run-status.v0",
             "run_id": run_dir.name,
@@ -3407,24 +3967,56 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "execution_mode": "codex-plugin",
                 "runner_mode": "full-runner",
                 "created_at": timestamp,
+                "tasks": search_tasks,
+            },
+        )
+        self.write_json(
+            run_dir / "research_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
+                "status": "completed",
+                "tasks": research_tasks,
+            },
+        )
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.search-handoff.v0",
+                "run_id": run_dir.name,
+                "created_at": timestamp,
                 "tasks": [
-                    {
-                        "id": "task_search_001",
-                        "query": prompt["prompt"],
-                        "route": prompt["route"],
-                        "provider": "codex-native",
-                    }
+                    self.visual_task_from_bounded_task(task, index=index)
+                    for index, task in enumerate(bounded_tasks, start=1)
+                    if task["route"] != "text_only"
                 ],
             },
         )
         self.write_jsonl(
             run_dir / "search_results.jsonl",
-            [self.codex_native_search_result(prompt, suite_id=suite_id)],
+            [
+                self.codex_native_search_result(
+                    prompt,
+                    suite_id=suite_id,
+                    task=task,
+                    rank=index,
+                )
+                for index, task in enumerate(bounded_tasks, start=1)
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "subagent_assignments.jsonl",
+            [
+                self.subagent_assignment_record(task, index=index)
+                for index, task in enumerate(bounded_tasks, start=1)
+            ],
         )
         candidates = [
             self.visual_candidate_record(
                 index=index,
                 analyzed=release_grade and index <= analyzed_image_count,
+                task=bounded_tasks[(index - 1) % len(bounded_tasks)],
             )
             for index in range(1, candidate_count + 1)
         ] if release_grade else []
@@ -3450,12 +4042,18 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "id": image_id,
                     "candidate_id": candidate["candidate_id"],
                     "fetch_id": fetch["fetch_id"],
+                    "task_id": candidate["task_id"],
+                    "semantic_plan_task_id": candidate["task_id"],
+                    "angle_id": candidate["angle_id"],
+                    "route": candidate["route"],
+                    "plan_id": candidate["plan_id"],
                     "local_artifact_path": f"images/{image_id}.png",
                     "provider": candidate["provider"],
                     "provider_kind": candidate["provider_kind"],
                     "provider_mode": "real",
                     "provider_provenance": candidate["provider_provenance"],
                     "policy_decision": "allowed",
+                    "approved_delta_id": "base_plan",
                 }
             )
         cited_image_id = image_ids[0] if image_ids else "img_001"
@@ -3513,7 +4111,9 @@ class PublicBetaValidationTests(unittest.TestCase):
                 ],
                 "status": semantic_metadata["summary"]["status"],
                 "diagnostics": dict(semantic_metadata["diagnostics"]),
+                "bounded_tasks": bounded_tasks,
             }
+            evidence_payload["search_tasks"] = search_tasks
         self.write_json(run_dir / "evidence.json", evidence_payload)
         if semantic_metadata:
             self.write_semantic_release_artifacts(
@@ -3522,6 +4122,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 suite_id=suite_id,
                 timestamp=timestamp,
                 metadata=semantic_metadata,
+                bounded_tasks=bounded_tasks,
             )
         self.write_json(
             run_dir / "report_status.json",
@@ -3645,7 +4246,11 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "execution_mode": "codex-plugin",
                 "runner_mode": "full-runner",
                 "created_at": timestamp,
-                "tasks": [],
+                "tasks": [
+                    self.visual_task_from_bounded_task(task, index=index)
+                    for index, task in enumerate(bounded_tasks, start=1)
+                    if task["route"] != "text_only"
+                ],
             },
         )
         self.write_jsonl(
@@ -3668,6 +4273,13 @@ class PublicBetaValidationTests(unittest.TestCase):
             else "# Public-safe visual report\n"
         )
         (run_dir / "report.md").write_text(report, encoding="utf-8")
+        if semantic_metadata:
+            write_semantic_materialization_diff(
+                run_dir=run_dir,
+                require_research_tasks=True,
+                require_downstream=True,
+                created_at=timestamp,
+            )
         return run_dir
 
     def write_parallel_status(
@@ -3920,13 +4532,23 @@ class PublicBetaValidationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def visual_candidate_record(self, *, index: int = 1, analyzed: bool = True) -> dict[str, Any]:
+    def visual_candidate_record(
+        self,
+        *,
+        index: int = 1,
+        analyzed: bool = True,
+        task: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        task_id = task["task_id"] if task else "task_visual_001"
+        angle_id = task["angle_id"] if task else "angle_001"
+        route = task["route"] if task else "visual_required"
         return {
             "candidate_id": f"cand_real_{index:03d}",
-            "plan_id": "plan_task_visual_001_angle_001_visual_required",
-            "task_id": "task_visual_001",
-            "angle_id": "angle_001",
-            "route": "visual_required",
+            "plan_id": f"plan_{task_id}_{angle_id}_{route}",
+            "task_id": task_id,
+            "semantic_plan_task_id": task_id,
+            "angle_id": angle_id,
+            "route": route,
             "provider": "codex-native",
             "provider_kind": "web_image_search",
             "provider_mode": "real",
@@ -3946,6 +4568,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "origin": "image_search",
             "policy_decision": "allowed",
             "candidate_status": "analyzed" if analyzed else "selected",
+            "approved_delta_id": "base_plan",
         }
 
     def visual_fetch_record(
@@ -4045,21 +4668,26 @@ class PublicBetaValidationTests(unittest.TestCase):
         prompt: dict[str, Any],
         *,
         suite_id: str,
+        task: dict[str, Any] | None = None,
+        rank: int = 1,
     ) -> dict[str, Any]:
+        task = task or self.semantic_bounded_tasks(prompt)[0]
         return {
-            "id": f"search_{prompt['id']}",
-            "task_id": "task_search_001",
-            "angle_id": "angle_001",
-            "route": prompt["route"],
+            "id": f"search_{prompt['id']}_{rank:03d}",
+            "task_id": task["task_id"],
+            "semantic_plan_task_id": task["task_id"],
+            "angle_id": task["angle_id"],
+            "route": task["route"],
             "provider": "codex-native",
             "provider_mode": "real",
-            "query": prompt["prompt"],
+            "query": task["query"],
+            "freshness_requirement": task["freshness_requirement"],
+            "source_policy": task["source_policy"],
             "url": "https://example.com/public-beta-source",
             "title": "Public beta source",
             "snippet": "A public-safe source supports the validation prompt.",
             "result_type": "web",
-            "rank": 1,
-            "freshness_requirement": "any",
+            "rank": rank,
             "retrieval_status": "fetched",
             "policy_decision": "allowed",
             "policy_flags": [],
@@ -4070,6 +4698,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "language": "en",
             "region": "US",
             "handoff_artifact": "search_results.jsonl",
+            "approved_delta_id": "base_plan",
             "raw_provider_metadata": {},
         }
 

@@ -1834,6 +1834,79 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
         self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
 
+    def test_fixture_cli_smoke_materializes_non_release_tasks_after_blocked_prepare(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        prepare_result = subprocess.run(
+            [
+                str(RUNNER),
+                "prepare",
+                "Parallel orchestration validation",
+                "--runs-dir",
+                str(runs_dir),
+                "--route",
+                "text_only",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(prepare_result.returncode, 0, prepare_result.stderr)
+        run_dir = Path(json.loads(prepare_result.stdout)["run_dir"])
+        evidence_before = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence_before["search_tasks"], [])
+        self.assertEqual(
+            evidence_before["semantic_planner"]["status"],
+            "blocked_semantic_planner_unavailable",
+        )
+
+        orchestrate_result = subprocess.run(
+            [
+                str(RUNNER),
+                "orchestrate-parallel",
+                "--run",
+                str(run_dir),
+                "--adapter",
+                "fixture",
+                "--min-tasks",
+                "3",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(orchestrate_result.returncode, 0, orchestrate_result.stderr)
+        payload = json.loads(orchestrate_result.stdout)
+        self.assertEqual(payload["status"], "completed_fixture")
+        self.assertEqual(payload["accepted_shard_count"], 3)
+        self.assertTrue(payload["evidence_source"]["fixture_only"])
+        self.assertFalse(payload["evidence_source"]["real_use_e2e_eligible"])
+        evidence_after = self.load_json(run_dir / "evidence.json")
+        self.assertFalse(evidence_after["semantic_planner"]["semantic_release_eligible"])
+        fixture_materialization = evidence_after["semantic_planner"]["diagnostics"][
+            "fixture_materialization"
+        ]
+        self.assertEqual(
+            fixture_materialization["status"],
+            "materialized_non_release_fixture_tasks",
+        )
+        self.assertEqual(len(evidence_after["search_tasks"]), 3)
+        self.assertTrue(all(task["fixture_only"] for task in evidence_after["search_tasks"]))
+        self.assertTrue(
+            all(
+                task["semantic_release_eligible"] is False
+                for task in evidence_after["search_tasks"]
+            )
+        )
+        search_tasks = self.load_json(run_dir / "search_tasks.json")
+        self.assertTrue(search_tasks["fixture_only"])
+        self.assertFalse(search_tasks["semantic_release_eligible"])
+        materialization_diff = self.load_json(run_dir / "semantic_materialization_diff.json")
+        self.assertFalse(materialization_diff["valid"])
+        self.assertEqual(materialization_diff["status"], "failed")
+
     def test_codex_exec_success_status_is_completed_parallel(self) -> None:
         run_dir = self.prepare()
 

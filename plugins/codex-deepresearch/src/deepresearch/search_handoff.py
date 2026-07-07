@@ -45,6 +45,7 @@ from .semantic_planner import (
     semantic_review_release_eligible,
     write_semantic_integrity_artifacts,
     write_semantic_expectation_oracle,
+    write_semantic_materialization_diff,
     write_semantic_planner_validation,
     write_semantic_plan_review,
 )
@@ -522,6 +523,12 @@ def prepare_run(
         created_at=now,
         locked_oracle=locked_oracle,
         semantic_review=semantic_review,
+    )
+    write_semantic_materialization_diff(
+        run_dir=run_dir,
+        require_research_tasks=False,
+        require_downstream=False,
+        created_at=now,
     )
     status["artifacts"].update(semantic_integrity_artifacts)
     semantic_validation = write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
@@ -1616,9 +1623,13 @@ def _visual_task_from_search_task(search_task: Mapping[str, Any], index: int) ->
         "route": search_task["route"],
         "expected_visual_targets": list(search_task.get("expected_visual_targets") or []),
         "expected_artifacts": list(search_task.get("expected_artifacts") or []),
+        "expected_source_types": list(search_task.get("expected_source_types") or []),
         "success_criteria": list(search_task.get("success_criteria") or []),
         "done_condition": search_task.get("done_condition") or "",
+        "freshness_requirement": str(search_task.get("freshness_requirement") or "any"),
+        "source_policy": dict(search_task.get("source_policy") or {"decision": "allowed", "flags": []}),
         "visual_tasks": list(search_task.get("visual_tasks") or []),
+        "max_sources": int(search_task.get("max_sources") or search_task.get("max_results") or 0),
         "max_images": search_task["max_images"],
         "status": "planned",
     }

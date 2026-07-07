@@ -13,10 +13,15 @@ import hashlib
 import math
 import re
 import shutil
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .semantic_planner import (
+    SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+    build_semantic_materialization_diff,
+)
 from .visual_artifacts import (
     VISUAL_PROVIDER_STATUS_FILENAME,
     real_automatic_visual_release_counts,
@@ -26,11 +31,25 @@ from .visual_artifacts import (
 PUBLIC_BETA_PROMPT_MANIFEST_SCHEMA_VERSION = (
     "codex-deepresearch.public-beta-prompts.v0"
 )
+SEMANTIC_REGRESSION_MANIFEST_SCHEMA_VERSION = (
+    "codex-deepresearch.semantic-regression-manifest.v0"
+)
+PUBLIC_BETA_SEMANTIC_MANIFEST_SCHEMA_VERSION = (
+    "codex-deepresearch.public-beta-semantic-manifest.v0"
+)
+BLIND_HOLDOUT_MANIFEST_SCHEMA_VERSION = (
+    "codex-deepresearch.semantic-blind-holdout-manifest.v0"
+)
+MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION = (
+    "codex-deepresearch.manual-trace-audits.v0"
+)
 PUBLIC_BETA_VALIDATION_SCHEMA_VERSION = (
     "codex-deepresearch.public-beta-validation.v0"
 )
 PUBLIC_BETA_VALIDATION_RESULTS_FILENAME = "public_beta_validation_results.json"
 PUBLIC_BETA_VALIDATION_SUMMARY_FILENAME = "public_beta_validation_summary.md"
+SEMANTIC_RELEASE_REPORT_FILENAME = "semantic_release_report.json"
+SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME = "semantic_release_validation_results.json"
 PROVIDER_PROVENANCE_FILENAME = "provider_provenance.json"
 RUN_STATUS_SCHEMA_VERSION = "codex-deepresearch.run-status.v0"
 REPORT_STATUS_SCHEMA_VERSIONS = {
@@ -46,8 +65,58 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST = (
     PLUGIN_ROOT / "validation" / "public_beta_prompts.json"
 )
+DEFAULT_SEMANTIC_REGRESSION_MANIFEST = (
+    PLUGIN_ROOT / "validation" / "semantic_regression_prompts.json"
+)
+DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST = (
+    PLUGIN_ROOT / "validation" / "public_beta_semantic_prompts.json"
+)
+DEFAULT_BLIND_HOLDOUT_MANIFEST = (
+    PLUGIN_ROOT / "validation" / "blind_holdout_semantic_prompts.json"
+)
+DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST = (
+    PLUGIN_ROOT / "validation" / "manual_trace_audits.json"
+)
 
 VISUAL_ROUTES = {"visual_required", "visual_optional"}
+SEMANTIC_MANIFEST_DENOMINATOR_RULE = "release_counted_failure_unless_passed"
+SEMANTIC_REQUIRED_PUBLIC_BETA_CATEGORIES = {
+    "korean": 8,
+    "visual": 8,
+    "official_regulatory_source_quality": 8,
+    "ambiguous_domain": 5,
+    "non_software_domain": 5,
+    "historical_failure": 1,
+}
+SEMANTIC_REQUIRED_REGRESSION_CATEGORIES = {
+    "korean": 10,
+    "visual": 8,
+    "policy_regulatory_domain": 8,
+    "software_implementation": 5,
+    "ambiguous_non_software": 5,
+}
+SEMANTIC_REQUIRED_HOLDOUT_CATEGORIES = {
+    "korean": 4,
+    "visual": 4,
+    "official_regulatory_source_quality": 4,
+    "ambiguous_domain": 3,
+    "non_software_domain": 3,
+}
+MANUAL_TRACE_AUDIT_REQUIRED_CHAIN = (
+    "original_question",
+    "locked_oracle",
+    "semantic_plan",
+    "semantic_review",
+    "materialization_diff",
+    "research_tasks",
+    "search_tasks",
+    "visual_tasks",
+    "accepted_shards",
+    "final_report",
+)
+MANUAL_TRACE_AUDIT_MIN_COUNT = 5
+MANUAL_TRACE_AUDIT_MIN_KOREAN = 2
+MANUAL_TRACE_AUDIT_MIN_VISUAL = 2
 SEARCH_RESULT_ROUTES = {"text_only", "visual_required", "visual_optional"}
 RELEASE_SEARCH_RESULT_TYPES = {"web", "pdf", "image", "news", "academic", "manual"}
 RELEASE_SEARCH_RESULT_REQUIRED_FIELDS = (
@@ -92,6 +161,7 @@ SEMANTIC_RELEASE_REQUIRED_ARTIFACTS = (
     "semantic_plan",
     "semantic_plan_review",
     "semantic_planner_validation",
+    "semantic_materialization_diff",
 )
 SEMANTIC_RELEASE_REQUIRED_FIELD_SOURCES = (
     "run_status",
@@ -368,6 +438,8 @@ def run_public_beta_validation(
     prompt_runs: Mapping[str, str | Path] | None = None,
     gate_results: Mapping[str, str | Path] | None = None,
     completion_mode: str = DEFAULT_PUBLIC_BETA_COMPLETION_MODE,
+    manual_audit_manifest: str | Path | None = None,
+    require_manual_trace_audits: bool = False,
 ) -> dict[str, Any]:
     """Classify the Phase 3 Public Beta real-use validation set."""
 
@@ -383,6 +455,7 @@ def run_public_beta_validation(
     suite_dir.mkdir(parents=True)
     results_path = suite_dir / PUBLIC_BETA_VALIDATION_RESULTS_FILENAME
     summary_path = suite_dir / PUBLIC_BETA_VALIDATION_SUMMARY_FILENAME
+    semantic_report_path = suite_dir / SEMANTIC_RELEASE_REPORT_FILENAME
     generated_at = _utc_now()
 
     manifest_path = Path(prompt_manifest)
@@ -438,6 +511,13 @@ def run_public_beta_validation(
         current_generated_at=generated_at,
         current_runs=evaluated_runs,
     )
+    semantic_release_report = _semantic_release_report(
+        evaluated_runs=evaluated_runs,
+        report_path=semantic_report_path,
+        generated_at=generated_at,
+        manual_audit_manifest=manual_audit_manifest,
+        require_manual_trace_audits=require_manual_trace_audits,
+    )
     prompt_release_gate_ready = all(
         prompt_metrics[metric_id].get("release_gate_ready") is True
         for metric_id in required_gate_ids
@@ -451,7 +531,12 @@ def run_public_beta_validation(
         if external_gates_required
         else True
     )
-    release_gate_ready = prompt_release_gate_ready and external_release_gate_ready
+    semantic_report_ready = semantic_release_report["valid"]
+    release_gate_ready = (
+        prompt_release_gate_ready
+        and external_release_gate_ready
+        and semantic_report_ready
+    )
     external_gate_failed = any(
         result.get("status") == "failed"
         for result in external_gate_results.values()
@@ -503,6 +588,7 @@ def run_public_beta_validation(
             if external_gates_required
             else [],
             "external_gates_ready": external_release_gate_ready,
+            "semantic_release_report_ready": semantic_report_ready,
             "supplied_real_runs_ready": acceptance.get(
                 "all_prompt_runs_are_supplied_sanitized_real_runs",
                 False,
@@ -543,6 +629,7 @@ def run_public_beta_validation(
         "reliability": reliability,
         "prompt_metrics": prompt_metrics,
         "external_gate_results": external_gate_results,
+        "semantic_release_report": semantic_release_report,
         "acceptance": acceptance,
         "runs": evaluated_runs,
         "remaining_gaps": _remaining_gaps(
@@ -552,12 +639,15 @@ def run_public_beta_validation(
             required_gate_ids=required_gate_ids,
             external_gates_required=external_gates_required,
             reliability=reliability,
+            semantic_release_report=semantic_release_report,
         ),
         "artifacts": {
             "results": str(results_path.resolve()),
             "summary": str(summary_path.resolve()),
+            "semantic_release_report": str(semantic_report_path.resolve()),
         },
     }
+    _write_json(semantic_report_path, semantic_release_report)
     summary_path.write_text(_render_summary(results), encoding="utf-8")
     acceptance["summary_artifact_public_safe"] = _summary_is_public_safe(summary_path)
     results["acceptance"] = acceptance
@@ -569,6 +659,231 @@ def run_public_beta_validation(
             results_path=results_path,
         )
     return results
+
+
+def run_semantic_release_validation(
+    *,
+    runs_dir: str | Path,
+    suite_id: str = "semantic-release-validation",
+    clean: bool = False,
+    semantic_regression_manifest: str | Path = DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+    public_beta_semantic_manifest: str | Path = DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
+    blind_holdout_manifest: str | Path = DEFAULT_BLIND_HOLDOUT_MANIFEST,
+    manual_audit_manifest: str | Path | None = DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST,
+    semantic_regression_runs: Mapping[str, str | Path] | None = None,
+    public_beta_semantic_runs: Mapping[str, str | Path] | None = None,
+    blind_holdout_runs: Mapping[str, str | Path] | None = None,
+) -> dict[str, Any]:
+    """Validate the #133 semantic release suites as strict release-counted gates."""
+
+    root_runs_dir = Path(runs_dir)
+    suite_dir = root_runs_dir / suite_id
+    if suite_dir.exists():
+        if not clean:
+            raise PublicBetaValidationError(
+                f"suite directory already exists: {suite_dir}"
+            )
+        shutil.rmtree(suite_dir)
+    suite_dir.mkdir(parents=True)
+    results_path = suite_dir / SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME
+    generated_at = _utc_now()
+
+    regression_manifest = load_semantic_regression_manifest(semantic_regression_manifest)
+    public_semantic_manifest = load_public_beta_semantic_manifest(
+        public_beta_semantic_manifest
+    )
+    holdout_manifest = load_blind_holdout_manifest(
+        blind_holdout_manifest,
+        known_manifests=[regression_manifest, public_semantic_manifest],
+    )
+    regression_evaluated = _evaluate_semantic_manifest_prompt_runs(
+        regression_manifest,
+        semantic_regression_runs,
+        suite_id=suite_id,
+        validation_time=generated_at,
+    )
+    public_beta_evaluated = _evaluate_semantic_manifest_prompt_runs(
+        public_semantic_manifest,
+        public_beta_semantic_runs,
+        suite_id=suite_id,
+        validation_time=generated_at,
+    )
+    holdout_evaluated = _evaluate_semantic_manifest_prompt_runs(
+        holdout_manifest,
+        blind_holdout_runs,
+        suite_id=suite_id,
+        validation_time=generated_at,
+    )
+    suite_gates = {
+        "semantic_regression_30": semantic_manifest_execution_gate(
+            regression_manifest,
+            regression_evaluated,
+            suite_label="semantic_regression_30",
+            require_all_prompts_release_counted=True,
+        ),
+        "public_beta_semantic_20": semantic_manifest_execution_gate(
+            public_semantic_manifest,
+            public_beta_evaluated,
+            suite_label="public_beta_semantic_20",
+            require_all_prompts_release_counted=True,
+        ),
+        "blind_holdout_12": semantic_manifest_execution_gate(
+            holdout_manifest,
+            holdout_evaluated,
+            suite_label="blind_holdout_12",
+            require_all_prompts_release_counted=True,
+        ),
+    }
+    anti_overfit_scan = run_semantic_anti_overfit_scan(
+        holdout_manifest=blind_holdout_manifest
+    )
+    manual_trace_audit_gate = _manual_trace_audit_gate(
+        manual_audit_manifest,
+        required=True,
+    )
+    holdout_selector_ready = holdout_manifest.get("release_gate_ready") is True
+    valid = (
+        all(gate.get("valid") is True for gate in suite_gates.values())
+        and holdout_selector_ready
+        and anti_overfit_scan.get("valid") is True
+        and manual_trace_audit_gate.get("valid") is True
+    )
+    results = {
+        "schema_version": "codex-deepresearch.semantic-release-validation.v0",
+        "artifact_type": "semantic_release_validation_results",
+        "suite_id": suite_id,
+        "suite_dir": str(suite_dir.resolve()),
+        "generated_at": generated_at,
+        "status": "passed" if valid else "failed",
+        "valid": valid,
+        "release_gate_ready": valid,
+        "public_safe": True,
+        "denominator_rules": {
+            "semantic_regression_30_requires_100_percent_pass": True,
+            "public_beta_semantic_20_requires_100_percent_pass": True,
+            "blind_holdout_12_requires_100_percent_pass": True,
+            "fixture_manual_heuristic_release_ineligible_count_as_failures": True,
+            "missing_run_entries_fail_gate": True,
+        },
+        "manifests": {
+            "semantic_regression": {
+                "path": str(Path(semantic_regression_manifest).resolve()),
+                "prompt_count": len(regression_manifest["prompts"]),
+                "hash": _file_sha256(Path(semantic_regression_manifest)),
+            },
+            "public_beta_semantic": {
+                "path": str(Path(public_beta_semantic_manifest).resolve()),
+                "prompt_count": len(public_semantic_manifest["prompts"]),
+                "hash": _file_sha256(Path(public_beta_semantic_manifest)),
+            },
+            "blind_holdout": {
+                "path": str(Path(blind_holdout_manifest).resolve()),
+                "prompt_count": len(holdout_manifest["prompts"]),
+                "hash": _file_sha256(Path(blind_holdout_manifest)),
+                "selector_release_gate_ready": holdout_selector_ready,
+                "selector_failures": list(holdout_manifest.get("failures", [])),
+            },
+        },
+        "semantic_suite_gates": suite_gates,
+        "anti_overfit_scan": anti_overfit_scan,
+        "manual_trace_audit_gate": manual_trace_audit_gate,
+        "runs": {
+            "semantic_regression_30": regression_evaluated,
+            "public_beta_semantic_20": public_beta_evaluated,
+            "blind_holdout_12": holdout_evaluated,
+        },
+        "remaining_gaps": _semantic_release_validation_gaps(
+            suite_gates=suite_gates,
+            holdout_manifest=holdout_manifest,
+            anti_overfit_scan=anti_overfit_scan,
+            manual_trace_audit_gate=manual_trace_audit_gate,
+        ),
+        "artifacts": {
+            "results": str(results_path.resolve()),
+        },
+    }
+    _write_json(results_path, results)
+    if not valid:
+        raise PublicBetaValidationError(
+            f"semantic release validation failed; see {results_path}",
+            results_path=results_path,
+        )
+    return results
+
+
+def _evaluate_semantic_manifest_prompt_runs(
+    manifest: Mapping[str, Any],
+    prompt_runs: Mapping[str, str | Path] | None,
+    *,
+    suite_id: str,
+    validation_time: str,
+) -> list[dict[str, Any]]:
+    prompts = {
+        str(prompt.get("id")): prompt
+        for prompt in manifest.get("prompts", [])
+        if isinstance(prompt, Mapping) and prompt.get("id")
+    }
+    normalized_runs = _normalize_mapping(prompt_runs)
+    evaluated: list[dict[str, Any]] = []
+    for prompt_id in sorted(set(normalized_runs) - set(prompts)):
+        evaluated.append(
+            {
+                "id": prompt_id,
+                "prompt_id": prompt_id,
+                "status": "failed",
+                "terminal_status": "unknown_prompt_id",
+                "metric_classification": "included_failure",
+                "failure_category": "artifact_handoff_failure",
+                "failure_detail": "unknown semantic manifest prompt id",
+                "status_artifacts": {},
+                "semantic_release_checks": {"valid": False, "failures": []},
+            }
+        )
+    for prompt_id, run_dir in sorted(normalized_runs.items()):
+        prompt = prompts.get(prompt_id)
+        if prompt is None:
+            continue
+        evaluated.append(
+            evaluate_public_beta_prompt_run(
+                prompt,
+                run_dir,
+                suite_id=suite_id,
+                validation_time=validation_time,
+            )
+        )
+    return evaluated
+
+
+def _semantic_release_validation_gaps(
+    *,
+    suite_gates: Mapping[str, Mapping[str, Any]],
+    holdout_manifest: Mapping[str, Any],
+    anti_overfit_scan: Mapping[str, Any],
+    manual_trace_audit_gate: Mapping[str, Any],
+) -> list[str]:
+    gaps: list[str] = []
+    for gate_id, gate in sorted(suite_gates.items()):
+        if gate.get("valid") is not True:
+            failures = gate.get("failures")
+            detail = "; ".join(str(item) for item in failures) if isinstance(failures, list) else "not ready"
+            gaps.append(f"{gate_id} failed semantic suite gate: {detail}.")
+    if holdout_manifest.get("release_gate_ready") is not True:
+        failures = holdout_manifest.get("failures")
+        detail = "; ".join(str(item) for item in failures) if isinstance(failures, list) else "not ready"
+        gaps.append(f"blind holdout selector/provenance is not release-ready: {detail}.")
+    if anti_overfit_scan.get("valid") is not True:
+        gaps.append(
+            "semantic anti-overfit scan failed: "
+            + str(len(anti_overfit_scan.get("findings", [])))
+            + " finding(s)."
+        )
+    if manual_trace_audit_gate.get("valid") is not True:
+        failures = manual_trace_audit_gate.get("failures")
+        detail = "; ".join(str(item) for item in failures) if isinstance(failures, list) else "not ready"
+        gaps.append(f"manual trace audits are not release-ready: {detail}.")
+    if not gaps:
+        gaps.append("No remaining semantic release validation gaps were detected.")
+    return gaps
 
 
 def load_public_beta_prompt_manifest(path: str | Path) -> dict[str, Any]:
@@ -621,6 +936,781 @@ def load_public_beta_prompt_manifest(path: str | Path) -> dict[str, Any]:
             "public beta prompt manifest must contain at least 8 visual prompts"
         )
     return {"schema_version": manifest["schema_version"], "prompts": prompts, **manifest}
+
+
+def load_semantic_regression_manifest(
+    path: str | Path = DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+) -> dict[str, Any]:
+    """Load the oracle-backed 30-prompt semantic regression manifest."""
+
+    return _load_semantic_prompt_manifest(
+        path,
+        expected_schema=SEMANTIC_REGRESSION_MANIFEST_SCHEMA_VERSION,
+        min_prompts=30,
+        category_quotas=SEMANTIC_REQUIRED_REGRESSION_CATEGORIES,
+        manifest_kind="semantic regression",
+        require_release_counted=True,
+    )
+
+
+def load_public_beta_semantic_manifest(
+    path: str | Path = DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
+) -> dict[str, Any]:
+    """Load the pre-registered 20-run Public Beta semantic manifest."""
+
+    manifest = _load_semantic_prompt_manifest(
+        path,
+        expected_schema=PUBLIC_BETA_SEMANTIC_MANIFEST_SCHEMA_VERSION,
+        min_prompts=20,
+        category_quotas=SEMANTIC_REQUIRED_PUBLIC_BETA_CATEGORIES,
+        manifest_kind="public beta semantic",
+        require_release_counted=True,
+    )
+    historical = [
+        prompt
+        for prompt in manifest["prompts"]
+        if "historical_failure" in set(prompt.get("categories", []))
+        and re.search(r"(?i)ev|battery|fire|thermal", prompt.get("prompt", ""))
+    ]
+    if not historical:
+        raise PublicBetaValidationError(
+            "public beta semantic manifest must include an EV battery fire safety historical failure prompt"
+        )
+    return manifest
+
+
+def load_blind_holdout_manifest(
+    path: str | Path = DEFAULT_BLIND_HOLDOUT_MANIFEST,
+    *,
+    known_manifests: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Load blind holdout metadata and report honest release readiness."""
+
+    manifest_path = Path(path)
+    manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != BLIND_HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise PublicBetaValidationError(
+            "blind holdout manifest has unsupported schema_version"
+        )
+    prompts = manifest.get("prompts")
+    if not isinstance(prompts, list):
+        raise PublicBetaValidationError("blind holdout manifest prompts must be a list")
+    checked = _validate_semantic_prompt_entries(
+        manifest_path=manifest_path,
+        prompts=prompts,
+        min_prompts=12,
+        category_quotas=SEMANTIC_REQUIRED_HOLDOUT_CATEGORIES,
+        manifest_kind="blind holdout",
+        require_release_counted=False,
+    )
+    freeze = manifest.get("implementation_freeze")
+    selector = manifest.get("selector_provenance")
+    failures: list[str] = []
+    if not isinstance(freeze, Mapping) or not (
+        _non_empty_manifest_string(freeze.get("timestamp"))
+        or _non_empty_manifest_string(freeze.get("commit"))
+        or _non_empty_manifest_string(freeze.get("tag"))
+    ):
+        failures.append("implementation_freeze_missing")
+    if not isinstance(selector, Mapping):
+        failures.append("selector_provenance_missing")
+        selector = {}
+    elif selector.get("independent") is not True:
+        failures.append("selector_not_independent")
+    if selector.get("release_eligible") is not True:
+        failures.append("selector_not_release_eligible")
+    overlap_failures = _holdout_overlap_failures(
+        holdout_prompts=checked["prompts"],
+        known_manifests=known_manifests or [],
+    )
+    failures.extend(overlap_failures)
+    release_gate_ready = not failures
+    return {
+        **manifest,
+        "prompts": checked["prompts"],
+        "category_counts": checked["category_counts"],
+        "category_quotas": checked["category_quotas"],
+        "valid": release_gate_ready,
+        "release_gate_ready": release_gate_ready,
+        "failures": failures,
+    }
+
+
+def load_manual_trace_audits(
+    path: str | Path = DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST,
+) -> dict[str, Any]:
+    """Load and gate risk-based manual trace audits for semantic release."""
+
+    manifest_path = Path(path)
+    manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION:
+        raise PublicBetaValidationError(
+            "manual trace audit manifest has unsupported schema_version"
+        )
+    failures: list[str] = []
+    if manifest.get("public_safe") is not True:
+        failures.append("manifest_not_public_safe")
+    if manifest.get("live_release_audits_performed") is not True:
+        failures.append("live_release_audits_not_performed")
+    risk_selection = manifest.get("risk_selection")
+    if not isinstance(risk_selection, Mapping):
+        failures.append("risk_selection_missing")
+        risk_selection = {}
+    elif risk_selection.get("hardest_highest_risk") is not True:
+        failures.append("risk_selection_not_hardest_highest_risk")
+    audits = manifest.get("audits")
+    if not isinstance(audits, list):
+        raise PublicBetaValidationError("manual trace audit manifest audits must be a list")
+    checked_audits: list[dict[str, Any]] = []
+    category_counts: Counter[str] = Counter()
+    for index, audit in enumerate(audits, start=1):
+        if not isinstance(audit, Mapping):
+            raise PublicBetaValidationError("manual trace audit entries must be objects")
+        audit_id = str(audit.get("id") or f"audit_{index:03d}")
+        audit_failures = _manual_trace_audit_failures(
+            manifest_path=manifest_path,
+            audit=audit,
+            audit_id=audit_id,
+        )
+        failures.extend(audit_failures)
+        categories = audit.get("categories")
+        if isinstance(categories, list):
+            category_counts.update(
+                str(category)
+                for category in categories
+                if isinstance(category, str) and category.strip()
+            )
+        if audit.get("route") in VISUAL_ROUTES:
+            category_counts.update(["visual"])
+        checked_audits.append(
+            {
+                "id": audit_id,
+                "prompt_id": audit.get("prompt_id"),
+                "route": audit.get("route"),
+                "categories": list(categories) if isinstance(categories, list) else [],
+                "risk_rank": audit.get("risk_rank"),
+                "release_eligible": audit.get("release_eligible"),
+                "fixture_only": audit.get("fixture_only"),
+                "chain_steps_verified": [
+                    step
+                    for step in MANUAL_TRACE_AUDIT_REQUIRED_CHAIN
+                    if isinstance(audit.get("chain_proof"), Mapping)
+                    and isinstance(audit["chain_proof"].get(step), Mapping)
+                    and audit["chain_proof"][step].get("status") == "verified"
+                ],
+                "failures": audit_failures,
+            }
+        )
+    if len(audits) < MANUAL_TRACE_AUDIT_MIN_COUNT:
+        failures.append(
+            f"manual_trace_audit_count={len(audits)} < {MANUAL_TRACE_AUDIT_MIN_COUNT}"
+        )
+    korean_count = category_counts.get("korean", 0)
+    visual_count = category_counts.get("visual", 0)
+    if korean_count < MANUAL_TRACE_AUDIT_MIN_KOREAN:
+        failures.append(
+            f"manual_trace_korean_count={korean_count} < {MANUAL_TRACE_AUDIT_MIN_KOREAN}"
+        )
+    if visual_count < MANUAL_TRACE_AUDIT_MIN_VISUAL:
+        failures.append(
+            f"manual_trace_visual_count={visual_count} < {MANUAL_TRACE_AUDIT_MIN_VISUAL}"
+        )
+    valid = not failures
+    return {
+        **manifest,
+        "valid": valid,
+        "release_gate_ready": valid,
+        "status": "passed" if valid else "failed",
+        "manifest_path": str(manifest_path.resolve()),
+        "audit_count": len(audits),
+        "category_counts": dict(sorted(category_counts.items())),
+        "category_quotas": {
+            "korean": MANUAL_TRACE_AUDIT_MIN_KOREAN,
+            "visual": MANUAL_TRACE_AUDIT_MIN_VISUAL,
+        },
+        "required_chain": list(MANUAL_TRACE_AUDIT_REQUIRED_CHAIN),
+        "failures": failures,
+        "audits": checked_audits,
+    }
+
+
+def semantic_manifest_execution_gate(
+    manifest: Mapping[str, Any],
+    evaluated_runs: Sequence[Mapping[str, Any]],
+    *,
+    suite_label: str | None = None,
+    require_all_prompts_release_counted: bool = True,
+) -> dict[str, Any]:
+    """Require every release-counted semantic manifest prompt to pass exactly once."""
+
+    prompts = manifest.get("prompts")
+    if not isinstance(prompts, list):
+        raise PublicBetaValidationError("semantic manifest execution gate needs prompts")
+    label = suite_label or str(manifest.get("name") or "semantic_manifest")
+    prompt_ids = [
+        str(prompt.get("id"))
+        for prompt in prompts
+        if isinstance(prompt, Mapping) and prompt.get("id")
+    ]
+    non_release_counted = [
+        str(prompt.get("id"))
+        for prompt in prompts
+        if isinstance(prompt, Mapping) and prompt.get("release_counted") is not True
+    ]
+    if require_all_prompts_release_counted:
+        expected_ids = list(prompt_ids)
+    else:
+        expected_ids = [
+            str(prompt.get("id"))
+            for prompt in prompts
+            if isinstance(prompt, Mapping)
+            and prompt.get("release_counted") is True
+            and prompt.get("id")
+        ]
+    run_by_id: dict[str, Mapping[str, Any]] = {}
+    duplicate_ids: list[str] = []
+    for run in evaluated_runs:
+        if not isinstance(run, Mapping):
+            continue
+        run_id = run.get("id") or run.get("prompt_id")
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        if run_id in run_by_id:
+            duplicate_ids.append(run_id)
+        run_by_id[run_id] = run
+    expected_set = set(expected_ids)
+    run_ids = set(run_by_id)
+    missing_ids = sorted(expected_set - run_ids)
+    extra_ids = sorted(run_ids - expected_set)
+    run_results: list[dict[str, Any]] = []
+    for prompt_id in expected_ids:
+        run = run_by_id.get(prompt_id)
+        if run is None:
+            run_results.append(
+                {
+                    "prompt_id": prompt_id,
+                    "status": "missing",
+                    "release_counted_status": "denominator_failure",
+                    "semantic_release_ready": False,
+                    "failure_reason": "missing release-counted semantic run",
+                }
+            )
+            continue
+        ready, reason = _semantic_manifest_run_ready(run)
+        run_results.append(
+            {
+                "prompt_id": prompt_id,
+                "status": run.get("status"),
+                "terminal_status": run.get("terminal_status"),
+                "metric_classification": run.get("metric_classification"),
+                "release_counted_status": "passed"
+                if ready
+                else "denominator_failure",
+                "semantic_release_ready": ready,
+                "failure_reason": reason,
+                "artifact_paths": dict(run.get("status_artifacts", {}))
+                if isinstance(run.get("status_artifacts"), Mapping)
+                else dict(run.get("artifact_paths", {}))
+                if isinstance(run.get("artifact_paths"), Mapping)
+                else {},
+            }
+        )
+    failures: list[str] = []
+    if require_all_prompts_release_counted and non_release_counted:
+        failures.append(
+            "non_release_counted_prompt_ids:" + ",".join(sorted(non_release_counted))
+        )
+    if not expected_ids:
+        failures.append("no_release_counted_prompt_ids")
+    if duplicate_ids:
+        failures.append("duplicate_run_entries:" + ",".join(sorted(set(duplicate_ids))))
+    if extra_ids:
+        failures.append("unknown_run_entries:" + ",".join(extra_ids))
+    if missing_ids:
+        failures.append("missing_run_entries:" + ",".join(missing_ids))
+    denominator_failures = [
+        result["prompt_id"]
+        for result in run_results
+        if result.get("semantic_release_ready") is not True
+    ]
+    if denominator_failures:
+        failures.append("denominator_failures:" + ",".join(denominator_failures))
+    valid = not failures
+    return {
+        "schema_version": "codex-deepresearch.semantic-manifest-execution-gate.v0",
+        "suite_label": label,
+        "valid": valid,
+        "release_gate_ready": valid,
+        "denominator_rule": SEMANTIC_MANIFEST_DENOMINATOR_RULE,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": True,
+        "expected_prompt_count": len(expected_ids),
+        "represented_prompt_count": len(expected_set & run_ids),
+        "passed_prompt_count": sum(
+            1 for result in run_results if result.get("semantic_release_ready") is True
+        ),
+        "failed_prompt_count": sum(
+            1 for result in run_results if result.get("semantic_release_ready") is not True
+        ),
+        "missing_prompt_ids": missing_ids,
+        "duplicate_prompt_ids": sorted(set(duplicate_ids)),
+        "extra_prompt_ids": extra_ids,
+        "non_release_counted_prompt_ids": sorted(non_release_counted),
+        "failures": failures,
+        "runs": run_results,
+    }
+
+
+def run_semantic_anti_overfit_scan(
+    *,
+    repo_root: str | Path | None = None,
+    holdout_manifest: str | Path = DEFAULT_BLIND_HOLDOUT_MANIFEST,
+    scan_paths: Sequence[str | Path] | None = None,
+) -> dict[str, Any]:
+    """Scan planner-facing files for prompt-specific overfit hooks."""
+
+    root = Path(repo_root) if repo_root is not None else PLUGIN_ROOT.parents[1]
+    try:
+        holdout = load_blind_holdout_manifest(holdout_manifest)
+    except PublicBetaValidationError:
+        holdout = _read_json(holdout_manifest)
+    prompt_texts = [
+        str(prompt.get("prompt") or "")
+        for prompt in holdout.get("prompts", [])
+        if isinstance(prompt, Mapping)
+    ]
+    prompt_hashes = {_prompt_hash(prompt) for prompt in prompt_texts if prompt.strip()}
+    if scan_paths is None:
+        scan_paths = [
+            PLUGIN_ROOT / "src" / "deepresearch" / "semantic_planner.py",
+            PLUGIN_ROOT / "skills",
+            root / "tests",
+        ]
+    files = _semantic_scan_files(scan_paths)
+    findings: list[dict[str, Any]] = []
+    holdout_manifest_path = Path(holdout_manifest).resolve()
+    for path in files:
+        resolved = path.resolve()
+        if resolved == holdout_manifest_path:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        normalized = _normalize_prompt_text(text)
+        for prompt in prompt_texts:
+            if prompt and _normalize_prompt_text(prompt) in normalized:
+                findings.append(
+                    {
+                        "code": "known_holdout_string",
+                        "path": str(path),
+                        "detail": "holdout prompt text appears in scanned planner-facing files",
+                    }
+                )
+                break
+        for prompt_hash in prompt_hashes:
+            if prompt_hash and prompt_hash in text:
+                findings.append(
+                    {
+                        "code": "known_holdout_prompt_hash",
+                        "path": str(path),
+                        "detail": "holdout prompt hash appears in scanned planner-facing files",
+                    }
+                )
+                break
+        if re.search(
+            r"(?is)\b(if|elif)\b.{0,160}prompt_hash.{0,160}"
+            r"(semantic_plan|bounded_tasks|expected_plan|angle|route)",
+            text,
+        ):
+            findings.append(
+                {
+                    "code": "prompt_hash_routing",
+                    "path": str(path),
+                    "detail": "planner-facing file appears to branch semantic planning on prompt_hash",
+                }
+            )
+        if re.search(
+            r"(?i)\b(expected_plan|expected_bounded_tasks|canned_expected_plan|golden_semantic_plan)\b",
+            text,
+        ):
+            findings.append(
+                {
+                    "code": "canned_expected_plan",
+                    "path": str(path),
+                    "detail": "planner-facing file contains canned expected-plan marker",
+                }
+            )
+    return {
+        "schema_version": "codex-deepresearch.semantic-anti-overfit-scan.v0",
+        "valid": not findings,
+        "status": "passed" if not findings else "failed",
+        "scan_file_count": len(files),
+        "findings": findings,
+    }
+
+
+def _load_semantic_prompt_manifest(
+    path: str | Path,
+    *,
+    expected_schema: str,
+    min_prompts: int,
+    category_quotas: Mapping[str, int],
+    manifest_kind: str,
+    require_release_counted: bool,
+) -> dict[str, Any]:
+    manifest_path = Path(path)
+    manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != expected_schema:
+        raise PublicBetaValidationError(
+            f"{manifest_kind} manifest has unsupported schema_version"
+        )
+    prompts = manifest.get("prompts")
+    if not isinstance(prompts, list):
+        raise PublicBetaValidationError(f"{manifest_kind} manifest prompts must be a list")
+    checked = _validate_semantic_prompt_entries(
+        manifest_path=manifest_path,
+        prompts=prompts,
+        min_prompts=min_prompts,
+        category_quotas=category_quotas,
+        manifest_kind=manifest_kind,
+        require_release_counted=require_release_counted,
+    )
+    return {
+        **manifest,
+        "prompts": checked["prompts"],
+        "category_counts": checked["category_counts"],
+        "category_quotas": checked["category_quotas"],
+        "valid": True,
+    }
+
+
+def _validate_semantic_prompt_entries(
+    *,
+    manifest_path: Path,
+    prompts: Sequence[Any],
+    min_prompts: int,
+    category_quotas: Mapping[str, int],
+    manifest_kind: str,
+    require_release_counted: bool,
+) -> dict[str, Any]:
+    if len(prompts) < min_prompts:
+        raise PublicBetaValidationError(
+            f"{manifest_kind} manifest must contain at least {min_prompts} prompts"
+        )
+    seen: set[str] = set()
+    checked_prompts: list[dict[str, Any]] = []
+    category_counts: Counter[str] = Counter()
+    for prompt in prompts:
+        if not isinstance(prompt, Mapping):
+            raise PublicBetaValidationError(f"{manifest_kind} prompt entries must be objects")
+        prompt_id = prompt.get("id")
+        if not isinstance(prompt_id, str) or not prompt_id.strip():
+            raise PublicBetaValidationError(f"{manifest_kind} prompt entry needs id")
+        if prompt_id in seen:
+            raise PublicBetaValidationError(f"duplicate {manifest_kind} prompt id: {prompt_id}")
+        seen.add(prompt_id)
+        if prompt.get("route") not in {"text_only", "visual_required", "visual_optional"}:
+            raise PublicBetaValidationError(f"{manifest_kind} prompt {prompt_id} has invalid route")
+        if prompt.get("public_safe") is not True:
+            raise PublicBetaValidationError(f"{manifest_kind} prompt {prompt_id} must be public_safe=true")
+        if not _non_empty_manifest_string(prompt.get("prompt")):
+            raise PublicBetaValidationError(f"{manifest_kind} prompt {prompt_id} needs prompt text")
+        categories = prompt.get("categories")
+        if not isinstance(categories, list) or not all(
+            isinstance(category, str) and category.strip() for category in categories
+        ):
+            raise PublicBetaValidationError(f"{manifest_kind} prompt {prompt_id} needs categories")
+        category_counts.update(str(category) for category in categories)
+        if prompt.get("route") in VISUAL_ROUTES:
+            category_counts.update(["visual"])
+        if require_release_counted and prompt.get("release_counted") is not True:
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} must be release_counted=true"
+            )
+        if prompt.get("denominator_rule") != SEMANTIC_MANIFEST_DENOMINATOR_RULE:
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} has invalid denominator_rule"
+            )
+        oracle_path = prompt.get("oracle_path")
+        oracle_hash = prompt.get("oracle_hash")
+        if not _non_empty_manifest_string(oracle_path):
+            raise PublicBetaValidationError(f"{manifest_kind} prompt {prompt_id} needs oracle_path")
+        if not isinstance(oracle_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            oracle_hash,
+        ):
+            raise PublicBetaValidationError(f"{manifest_kind} prompt {prompt_id} needs sha256 oracle_hash")
+        expected_prompt_hash = _prompt_hash(str(prompt["prompt"]))
+        if prompt.get("prompt_hash") not in {None, expected_prompt_hash}:
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} prompt_hash does not match prompt text"
+            )
+        oracle_file, oracle_fragment = _semantic_oracle_fragment(
+            manifest_path,
+            str(oracle_path),
+            manifest_kind=manifest_kind,
+            prompt_id=prompt_id,
+        )
+        actual_oracle_hash = _canonical_json_sha256(oracle_fragment)
+        if actual_oracle_hash != oracle_hash:
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} oracle_hash does not match oracle fragment"
+            )
+        if oracle_fragment.get("prompt_id") != prompt_id:
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} oracle fragment prompt_id mismatch"
+            )
+        if oracle_fragment.get("prompt_hash") != expected_prompt_hash:
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} oracle fragment prompt_hash mismatch"
+            )
+        if oracle_fragment.get("route") != prompt.get("route"):
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} oracle fragment route mismatch"
+            )
+        if set(oracle_fragment.get("categories", [])) != set(categories):
+            raise PublicBetaValidationError(
+                f"{manifest_kind} prompt {prompt_id} oracle fragment categories mismatch"
+            )
+        checked = dict(prompt)
+        checked["prompt_hash"] = expected_prompt_hash
+        checked["oracle_hash_verified"] = True
+        checked["oracle_fragment_path"] = str(oracle_file.resolve())
+        checked_prompts.append(checked)
+    quota_failures = [
+        f"{category}={category_counts.get(category, 0)} < {minimum}"
+        for category, minimum in sorted(category_quotas.items())
+        if category_counts.get(category, 0) < minimum
+    ]
+    if quota_failures:
+        raise PublicBetaValidationError(
+            f"{manifest_kind} manifest misses category quota(s): "
+            + "; ".join(quota_failures)
+        )
+    return {
+        "prompts": checked_prompts,
+        "category_counts": dict(sorted(category_counts.items())),
+        "category_quotas": dict(sorted(category_quotas.items())),
+    }
+
+
+def _oracle_manifest_file(manifest_path: Path, oracle_path: str) -> Path:
+    raw_path = oracle_path.split("#", 1)[0]
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return path
+
+
+def _semantic_oracle_fragment(
+    manifest_path: Path,
+    oracle_path: str,
+    *,
+    manifest_kind: str,
+    prompt_id: str,
+) -> tuple[Path, Mapping[str, Any]]:
+    oracle_file = _oracle_manifest_file(manifest_path, oracle_path)
+    if not oracle_file.is_file():
+        raise PublicBetaValidationError(
+            f"{manifest_kind} prompt {prompt_id} oracle_path does not exist"
+        )
+    if "#" not in oracle_path:
+        raise PublicBetaValidationError(
+            f"{manifest_kind} prompt {prompt_id} oracle_path must name an oracle fragment"
+        )
+    fragment_id = oracle_path.split("#", 1)[1].strip()
+    if not fragment_id:
+        raise PublicBetaValidationError(
+            f"{manifest_kind} prompt {prompt_id} oracle_path fragment is empty"
+        )
+    bundle = _read_json(oracle_file)
+    if bundle.get("public_safe") is not True:
+        raise PublicBetaValidationError(
+            f"{manifest_kind} prompt {prompt_id} oracle bundle must be public_safe=true"
+        )
+    oracles = bundle.get("oracles")
+    if not isinstance(oracles, Mapping):
+        raise PublicBetaValidationError(
+            f"{manifest_kind} prompt {prompt_id} oracle bundle is missing oracles"
+        )
+    fragment = oracles.get(fragment_id)
+    if not isinstance(fragment, Mapping):
+        raise PublicBetaValidationError(
+            f"{manifest_kind} prompt {prompt_id} oracle fragment does not exist"
+        )
+    return oracle_file, fragment
+
+
+def _canonical_json_sha256(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _manual_trace_audit_gate(
+    audit_manifest: str | Path | None,
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    if audit_manifest is None:
+        if not required:
+            return {
+                "schema_version": MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION,
+                "status": "not_required",
+                "valid": True,
+                "release_gate_ready": True,
+                "required": False,
+                "failures": [],
+            }
+        return {
+            "schema_version": MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION,
+            "status": "not_supplied",
+            "valid": False,
+            "release_gate_ready": False,
+            "required": True,
+            "failures": ["manual_trace_audit_manifest_not_supplied"],
+        }
+    path = Path(audit_manifest)
+    if not path.exists():
+        return {
+            "schema_version": MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION,
+            "status": "not_supplied",
+            "valid": False,
+            "release_gate_ready": False,
+            "required": required,
+            "manifest_path": str(path.resolve()),
+            "failures": ["manual_trace_audit_manifest_missing"],
+        }
+    gate = load_manual_trace_audits(path)
+    gate["required"] = required
+    return gate
+
+
+def _manual_trace_audit_failures(
+    *,
+    manifest_path: Path,
+    audit: Mapping[str, Any],
+    audit_id: str,
+) -> list[str]:
+    failures: list[str] = []
+    if audit.get("public_safe") is not True:
+        failures.append(f"{audit_id}:not_public_safe")
+    if audit.get("release_eligible") is not True:
+        failures.append(f"{audit_id}:not_release_eligible")
+    if audit.get("fixture_only") is True:
+        failures.append(f"{audit_id}:fixture_only")
+    if audit.get("route") not in {"text_only", "visual_required", "visual_optional"}:
+        failures.append(f"{audit_id}:invalid_route")
+    categories = audit.get("categories")
+    if not isinstance(categories, list) or not all(
+        isinstance(category, str) and category.strip() for category in categories
+    ):
+        failures.append(f"{audit_id}:categories_missing")
+    risk_rank = audit.get("risk_rank")
+    if isinstance(risk_rank, bool) or not isinstance(risk_rank, int) or risk_rank < 1:
+        failures.append(f"{audit_id}:risk_rank_missing")
+    if not _non_empty_manifest_string(audit.get("risk_rationale")):
+        failures.append(f"{audit_id}:risk_rationale_missing")
+    chain = audit.get("chain_proof")
+    if not isinstance(chain, Mapping):
+        failures.append(f"{audit_id}:chain_proof_missing")
+        return failures
+    for step in MANUAL_TRACE_AUDIT_REQUIRED_CHAIN:
+        proof = chain.get(step)
+        if not isinstance(proof, Mapping):
+            failures.append(f"{audit_id}:{step}_proof_missing")
+            continue
+        if proof.get("status") != "verified":
+            failures.append(f"{audit_id}:{step}_not_verified")
+        raw_path = proof.get("artifact_path")
+        if not _non_empty_manifest_string(raw_path):
+            failures.append(f"{audit_id}:{step}_artifact_path_missing")
+            continue
+        artifact_path = Path(str(raw_path))
+        if not artifact_path.is_absolute():
+            artifact_path = manifest_path.parent / artifact_path
+        if not artifact_path.is_file():
+            failures.append(f"{audit_id}:{step}_artifact_missing")
+            continue
+        artifact_hash = proof.get("artifact_hash")
+        if not _sha256_hex_string(artifact_hash):
+            failures.append(f"{audit_id}:{step}_artifact_hash_missing")
+            continue
+        if _file_sha256(artifact_path) != str(artifact_hash):
+            failures.append(f"{audit_id}:{step}_artifact_hash_mismatch")
+    return failures
+
+
+def _semantic_manifest_run_ready(run: Mapping[str, Any]) -> tuple[bool, str | None]:
+    if run.get("release_counted") is False:
+        return False, "run is marked release-ineligible"
+    status = run.get("status")
+    if status != "passed":
+        return False, str(run.get("failure_detail") or status or "not passed")
+    terminal_status = str(run.get("terminal_status") or "")
+    if terminal_status in SEMANTIC_RELEASE_FAILURE_TERMINAL_STATUSES:
+        return False, f"{terminal_status} counts as a denominator failure"
+    if terminal_status not in PASS_TERMINAL_STATUSES:
+        return False, f"{terminal_status} is not a passing terminal status"
+    metric_classification = run.get("metric_classification")
+    if metric_classification not in {None, "success"}:
+        return False, f"{metric_classification} counts as a denominator failure"
+    semantic_checks = run.get("semantic_release_checks")
+    if isinstance(semantic_checks, Mapping):
+        if semantic_checks.get("valid") is not True:
+            return False, "semantic release checks did not pass"
+    elif run.get("semantic_release_ready") is not True:
+        return False, "semantic release checks are missing"
+    if run.get("semantic_release_ready") is False:
+        return False, "semantic release report row is not ready"
+    return True, None
+
+
+def _holdout_overlap_failures(
+    *,
+    holdout_prompts: Sequence[Mapping[str, Any]],
+    known_manifests: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    known_texts: set[str] = set()
+    known_hashes: set[str] = set()
+    for manifest in known_manifests:
+        prompts = manifest.get("prompts") if isinstance(manifest, Mapping) else None
+        if not isinstance(prompts, list):
+            continue
+        for prompt in prompts:
+            if not isinstance(prompt, Mapping):
+                continue
+            text = str(prompt.get("prompt") or "")
+            if text:
+                known_texts.add(_normalize_prompt_text(text))
+                known_hashes.add(_prompt_hash(text))
+    failures: list[str] = []
+    for prompt in holdout_prompts:
+        text = str(prompt.get("prompt") or "")
+        normalized = _normalize_prompt_text(text)
+        prompt_hash = _prompt_hash(text)
+        if normalized in known_texts or prompt_hash in known_hashes:
+            failures.append(
+                "holdout_prompt_overlap:" + str(prompt.get("id") or "<unknown>")
+            )
+    return failures
+
+
+def _semantic_scan_files(paths: Sequence[str | Path]) -> list[Path]:
+    files: list[Path] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            for child in path.rglob("*"):
+                if child.is_file() and child.suffix in {".py", ".md", ".json", ".txt"}:
+                    files.append(child)
+    return sorted(set(files))
+
+
+def _non_empty_manifest_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def evaluate_public_beta_prompt_run(
@@ -772,17 +1862,24 @@ def evaluate_public_beta_prompt_run(
         detail = "semantic planner release gate failed: " + "; ".join(
             failure["detail"] for failure in semantic_release_checks["failures"]
         )
-    if (
-        status == "passed"
-        and visual_release_checks is not None
-        and not visual_release_checks["valid"]
-    ):
-        status = "failed"
-        classification = "included_failure"
-        failure_category = _visual_failure_category(visual_release_checks["failures"])
-        detail = "visual prompt lacks release-grade evidence: " + "; ".join(
+    if visual_release_checks is not None and not visual_release_checks["valid"]:
+        visual_detail = "visual prompt lacks release-grade evidence: " + "; ".join(
             failure["detail"] for failure in visual_release_checks["failures"]
         )
+        visual_category = _visual_failure_category(visual_release_checks["failures"])
+        if status != "passed" and detail:
+            detail = detail + " | " + visual_detail
+            if failure_category == "artifact_handoff_failure":
+                failure_category = visual_category
+        elif status != "passed":
+            detail = visual_detail
+            if failure_category == "artifact_handoff_failure":
+                failure_category = visual_category
+        else:
+            detail = visual_detail
+            failure_category = visual_category
+        status = "failed"
+        classification = "included_failure"
 
     result = {
         "id": prompt["id"],
@@ -1537,6 +2634,175 @@ def _acceptance(
     }
 
 
+def _semantic_release_report(
+    *,
+    evaluated_runs: Sequence[Mapping[str, Any]],
+    report_path: Path,
+    generated_at: str,
+    manual_audit_manifest: str | Path | None = None,
+    require_manual_trace_audits: bool = False,
+) -> dict[str, Any]:
+    report_runs = [
+        _semantic_release_report_run(run)
+        for run in evaluated_runs
+        if isinstance(run, Mapping)
+    ]
+    missing_entries = [
+        str(run.get("id"))
+        for run in evaluated_runs
+        if not any(item.get("id") == run.get("id") for item in report_runs)
+    ]
+    manual_trace_audit_gate = _manual_trace_audit_gate(
+        manual_audit_manifest,
+        required=require_manual_trace_audits,
+    )
+    valid = (
+        not missing_entries
+        and bool(report_runs)
+        and all(run.get("semantic_release_ready") is True for run in report_runs)
+        and manual_trace_audit_gate.get("valid") is True
+    )
+    return {
+        "schema_version": "codex-deepresearch.semantic-release-report.v0",
+        "generated_at": generated_at,
+        "artifact_type": "semantic_release_report",
+        "report_path": str(report_path.resolve()),
+        "valid": valid,
+        "release_gate_ready": valid,
+        "denominator_rules": {
+            "fixture_manual_heuristic_release_ineligible_count_as_failures": True,
+            "blocked_and_failed_runs_count_as_failures": True,
+            "missing_run_entries_fail_gate": True,
+            "manual_trace_audits_required_when_claiming_semantic_readiness": True,
+        },
+        "manual_trace_audit_gate": manual_trace_audit_gate,
+        "release_counted_run_count": len(report_runs),
+        "ready_run_count": sum(
+            1 for run in report_runs if run.get("semantic_release_ready") is True
+        ),
+        "failed_run_count": sum(
+            1 for run in report_runs if run.get("semantic_release_ready") is not True
+        ),
+        "missing_run_entries": missing_entries,
+        "runs": report_runs,
+    }
+
+
+def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
+    status_artifacts = run.get("status_artifacts")
+    artifact_paths = status_artifacts if isinstance(status_artifacts, Mapping) else {}
+    artifact_hashes = {
+        name: _artifact_file_hash(path)
+        for name, path in sorted(artifact_paths.items())
+        if name
+        in {
+            "semantic_expectation_oracle",
+            "semantic_plan",
+            "semantic_plan_review",
+            "semantic_planner_validation",
+            "semantic_materialization_diff",
+            "research_tasks",
+            "search_tasks",
+            "visual_tasks",
+            "visual_search_plan",
+            "search_results",
+            "visual_candidates",
+            "image_fetch_status",
+            "visual_observations",
+            "subagent_assignments",
+            "run_trace",
+            "report",
+            "report_status",
+        }
+    }
+    semantic_checks = run.get("semantic_release_checks")
+    semantic_failures = (
+        semantic_checks.get("failures")
+        if isinstance(semantic_checks, Mapping)
+        and isinstance(semantic_checks.get("failures"), list)
+        else []
+    )
+    required_names = {
+        "semantic_expectation_oracle",
+        "semantic_plan",
+        "semantic_plan_review",
+        "semantic_planner_validation",
+        "semantic_materialization_diff",
+        "research_tasks",
+        "search_tasks",
+        "visual_tasks",
+        "search_results",
+        "subagent_assignments",
+        "run_trace",
+        "report",
+        "report_status",
+    }
+    if run.get("route") in VISUAL_ROUTES:
+        required_names.update(
+            {
+                "visual_provider_status",
+                "visual_search_plan",
+                "visual_candidates",
+                "image_fetch_status",
+                "visual_observations",
+            }
+        )
+    missing_required = sorted(
+        name for name in required_names if name not in artifact_paths
+    )
+    semantic_ready = (
+        run.get("status") == "passed"
+        and isinstance(semantic_checks, Mapping)
+        and semantic_checks.get("valid") is True
+        and not missing_required
+    )
+    failure_reason = run.get("failure_detail")
+    if not semantic_ready and not failure_reason:
+        if missing_required:
+            failure_reason = "missing semantic release artifact(s): " + ", ".join(
+                missing_required
+            )
+        elif semantic_failures:
+            failure_reason = "semantic release checks failed"
+        else:
+            failure_reason = str(run.get("status") or "not ready")
+    return {
+        "id": run.get("id"),
+        "prompt_id": run.get("id"),
+        "route": run.get("route"),
+        "status": run.get("status"),
+        "terminal_status": run.get("terminal_status"),
+        "metric_classification": run.get("metric_classification"),
+        "release_counted": True,
+        "release_counted_status": (
+            "passed" if semantic_ready else "denominator_failure"
+        ),
+        "semantic_release_ready": semantic_ready,
+        "semantic_release_check_valid": (
+            semantic_checks.get("valid") if isinstance(semantic_checks, Mapping) else None
+        ),
+        "holdout_or_regression_class": run.get("holdout_or_regression_class")
+        or "public_beta_semantic_manifest",
+        "artifact_paths": dict(sorted(artifact_paths.items())),
+        "artifact_hashes": artifact_hashes,
+        "failure_category": run.get("failure_category"),
+        "failure_reason": failure_reason,
+        "semantic_failures": semantic_failures,
+    }
+
+
+def _artifact_file_hash(path_value: Any) -> str | None:
+    if not isinstance(path_value, str) or not path_value.strip():
+        return None
+    path = Path(path_value)
+    try:
+        if path.is_file():
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return None
+
+
 def _remaining_gaps(
     *,
     evaluated_runs: Sequence[Mapping[str, Any]],
@@ -1545,6 +2811,7 @@ def _remaining_gaps(
     required_gate_ids: set[str],
     external_gates_required: bool,
     reliability: Mapping[str, Any],
+    semantic_release_report: Mapping[str, Any],
 ) -> list[str]:
     gaps: list[str] = []
     blocked = [run for run in evaluated_runs if run.get("status") == "blocked"]
@@ -1608,6 +2875,29 @@ def _remaining_gaps(
             "completed_real_parallel_stage_runs="
             f"{partial.get('completed_real_parallel_stage_runs')}."
         )
+    if semantic_release_report.get("valid") is not True:
+        failed_ids = [
+            str(run.get("id"))
+            for run in semantic_release_report.get("runs", [])
+            if isinstance(run, Mapping) and run.get("semantic_release_ready") is not True
+        ]
+        manual_gate = semantic_release_report.get("manual_trace_audit_gate")
+        manual_failures: list[str] = []
+        if isinstance(manual_gate, Mapping) and manual_gate.get("valid") is not True:
+            raw_failures = manual_gate.get("failures")
+            if isinstance(raw_failures, list):
+                manual_failures = [str(item) for item in raw_failures]
+        gaps.append(
+            "Semantic release report is not ready; failing or blocked release-counted "
+            "run ids: "
+            + (", ".join(failed_ids) if failed_ids else "<none recorded>")
+            + (
+                "; manual trace audit failures: " + "; ".join(manual_failures)
+                if manual_failures
+                else ""
+            )
+            + "."
+        )
     if not gaps:
         gaps.append("No remaining release-gate gaps were detected.")
     return gaps
@@ -1622,6 +2912,8 @@ def _render_summary(results: Mapping[str, Any]) -> str:
         f"Status: {results['status']}",
         f"Release gate ready: {str(results['release_gate_ready']).lower()}",
         f"Issue #75 completion ready: {str(results['issue_75_completion_ready']).lower()}",
+        "Semantic release report ready: "
+        f"{str(results.get('semantic_release_report', {}).get('valid') is True).lower()}",
         f"Completion mode: {results['completion_mode']}",
         f"Validation mode: {results['validation_mode']}",
         f"Public safe: {str(results['public_safe']).lower()}",
@@ -1758,16 +3050,20 @@ def _artifact_paths(run_dir: Path, *, route: str) -> dict[str, Path]:
     artifacts = {
         "run_status": run_dir / "run_status.json",
         "evidence": run_dir / "evidence.json",
+        "research_tasks": run_dir / "research_tasks.json",
         "search_tasks": run_dir / "search_tasks.json",
         "search_results": run_dir / "search_results.jsonl",
+        "visual_tasks": run_dir / "visual_tasks.json",
         "report": run_dir / "report.md",
         "report_status": run_dir / "report_status.json",
         "parallel_status": run_dir / "parallel_orchestration_status.json",
+        "subagent_assignments": run_dir / "subagent_assignments.jsonl",
         "run_trace": run_dir / "run_trace.jsonl",
         "semantic_expectation_oracle": run_dir / "semantic_expectation_oracle.json",
         "semantic_plan": run_dir / "semantic_plan.json",
         "semantic_plan_review": run_dir / "semantic_plan_review.json",
         "semantic_planner_validation": run_dir / "semantic_planner_validation.json",
+        "semantic_materialization_diff": run_dir / SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
     }
     if route in VISUAL_ROUTES:
         artifacts.update(
@@ -1789,7 +3085,18 @@ def _required_status_artifacts(
 ) -> list[str]:
     required = ["run_status"]
     if terminal_status in PASS_TERMINAL_STATUSES:
-        required.extend(["evidence", "search_tasks", "search_results", "report", "report_status"])
+        required.extend(
+            [
+                "evidence",
+                "research_tasks",
+                "search_tasks",
+                "search_results",
+                "visual_tasks",
+                "subagent_assignments",
+                "report",
+                "report_status",
+            ]
+        )
     if _requires_semantic_release_gate(prompt, terminal_status):
         required.extend(SEMANTIC_RELEASE_REQUIRED_ARTIFACTS)
     if prompt.get("route") in VISUAL_ROUTES:
@@ -2134,6 +3441,35 @@ def _semantic_release_checks(
     )
     failures.extend(trace_failures)
 
+    materialization_payload = required_payloads.get("semantic_materialization_diff")
+    if (
+        not isinstance(materialization_payload, Mapping)
+        or materialization_payload.get("valid") is not True
+    ):
+        failures.append(
+            {
+                "check": "semantic_materialization_diff",
+                "detail": "semantic_materialization_diff.valid is not true",
+            }
+        )
+    computed_materialization = build_semantic_materialization_diff(
+        run_dir=run_path,
+        require_research_tasks=True,
+        require_downstream=True,
+    )
+    if computed_materialization.get("valid") is not True:
+        failures.append(
+            {
+                "check": "semantic_materialization_diff",
+                "detail": "computed semantic materialization diff is not valid",
+                "failure_codes": [
+                    failure.get("code")
+                    for failure in computed_materialization.get("failures", [])
+                    if isinstance(failure, Mapping)
+                ],
+            }
+        )
+
     if _claims_eligible_codex_semantic(
         planner_sources=planner_sources,
         eligible_sources=eligible_sources,
@@ -2150,6 +3486,13 @@ def _semantic_release_checks(
         "semantic_codex_sources": codex_source_sources,
         "validation_ok": validation.get("ok") if isinstance(validation, Mapping) else None,
         "semantic_fit_score": review.get("semantic_fit_score") if isinstance(review, Mapping) else None,
+        "semantic_materialization_diff_valid": (
+            materialization_payload.get("valid")
+            if isinstance(materialization_payload, Mapping)
+            else None
+        ),
+        "computed_materialization_diff_valid": computed_materialization.get("valid"),
+        "computed_materialization_diff": computed_materialization,
         "failures": failures,
     }
 
@@ -2518,6 +3861,8 @@ def _semantic_artifact_integrity_failures(
 ) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     for artifact_name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
+        if artifact_name == "semantic_materialization_diff":
+            continue
         payload = artifacts.get(artifact_name)
         if not isinstance(payload, Mapping):
             continue
@@ -3568,6 +4913,13 @@ def _codex_native_handoff_checks(
             "search_results.jsonl contains hidden Codex-native API markers"
         )
     expected_hash = public_beta_prompt_hash(str(prompt.get("prompt") or ""))
+    identity_matched_results = [
+        record
+        for record in search_results
+        if record.get("prompt_id") == prompt.get("id")
+        and record.get("suite_id") == suite_id
+        and record.get("prompt_hash") == expected_hash
+    ]
     matching_codex_native_results = [
         record
         for record in codex_native_results
@@ -3575,6 +4927,16 @@ def _codex_native_handoff_checks(
         and record.get("suite_id") == suite_id
         and record.get("prompt_hash") == expected_hash
     ]
+    incomplete_identity_records = [
+        record
+        for record in identity_matched_results
+        if not _is_codex_native_search_result(record)
+    ]
+    if incomplete_identity_records:
+        failures.append(
+            "search_results.jsonl contains incomplete or non-release Codex-native "
+            "search handoff records for this prompt"
+        )
     if not matching_codex_native_results:
         failures.append(
             "search_results.jsonl lacks allowed Codex-native search handoff results "
@@ -4849,9 +6211,9 @@ def _handoff_artifact_mentions(
 
 def _claims_hidden_codex_api(record: Mapping[str, Any]) -> bool:
     return bool(
-        record.get("hidden_codex_api_call") is True
-        or record.get("codex_native_api_call") is True
-        or record.get("hidden_api_call") is True
+        "hidden_codex_api_call" in record
+        or "codex_native_api_call" in record
+        or "hidden_api_call" in record
     )
 
 

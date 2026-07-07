@@ -1,0 +1,202 @@
+{
+  "created_for_issue": 133,
+  "implementation_freeze": {
+    "record_type": "fixture_safe_timestamp",
+    "release_eligible": false,
+    "timestamp": "2026-07-07T00:00:00Z"
+  },
+  "name": "Fixture-Safe Blind Holdout Flow",
+  "prompts": [
+    {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-001",
+      "oracle_hash": "5ca18802211d274fe8255dfeea9f9eeb6b2ace4bf01d6adb2daf2b142e84efdd",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-001",
+      "prompt": "한국 해양 안전 표지판 이미지와 공식 항로 안전 지침을 비교해줘.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-002",
+      "oracle_hash": "92954853b405ba82c5618b73d427d6cbba38684e8b900fc180971fab2a9a0135",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-002",
+      "prompt": "한국 어린이 통학버스 안전 규정과 공식 안내 이미지의 차이를 조사해줘.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-003",
+      "oracle_hash": "2ff185cfd9bf1561d0284ff5b99ba4c84feba2ebce58faf753cb1bba8b46c8a6",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-003",
+      "prompt": "테스트라는 말이 농산물 잔류농약 검사에서 의미하는 기준과 공식 발표 자료를 비교해줘.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-004",
+      "oracle_hash": "f298c6a13fc3234bdff62b7afffaf782c5ddf1671b1bd71206174eada182597b",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-004",
+      "prompt": "구현이라는 표현이 공원 녹지계획 실행 문서에서 쓰일 때 책임기관과 예산 지표를 조사해줘.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-005",
+      "oracle_hash": "50a56ef9a5486d28746d06ac9ff105a73a86ea299887c3af424e570fe2b45321",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-005",
+      "prompt": "Compare public dam safety inspection diagrams and official regulator guidance, separating visual observations from text claims.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-006",
+      "oracle_hash": "9bb6c7a4350566bba7dfadbd358aa442125c57976110f6932dffe7a6598cfdec",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-006",
+      "prompt": "Research model governance in insurance actuarial filings without treating model as a software deployment term.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-007",
+      "oracle_hash": "deb70b57b221bf48d854cb8dd83c9be8a535d9250f027efd465cb31b6d269b3d",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-007",
+      "prompt": "Compare public storm-surge evacuation map images and emergency-management guidance.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "ambiguous_domain",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-008",
+      "oracle_hash": "5ce52626f611ee5f34ab4564a4ae2d27b4bd996da41b6890078a31d1300c76c0",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-008",
+      "prompt": "Research architecture review requirements in public library renovation grants, not software architecture.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-009",
+      "oracle_hash": "93ddb194dc1eb009027936814fd7f452035592b9dd32ac72248791024fe6e13d",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-009",
+      "prompt": "Research official guidance for secure webhook implementation and replay protection across public developer docs.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-010",
+      "oracle_hash": "3181db06acd929b559f37d6dc304b3eb6961c05093779ca1b10aa7e2ff1d99df",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-010",
+      "prompt": "Compare public emergency-exit signage images and official workplace safety guidance.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "software_implementation",
+        "official_regulatory_source_quality"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-011",
+      "oracle_hash": "c217291888dd581b9936348440ce324c5ce26203fb1070c1511261e114817767",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-011",
+      "prompt": "Research official implementation guidance for SAML single logout and failure modes across identity providers.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-fixture-012",
+      "oracle_hash": "4bea62175cd0a590f51d27244031b6d891b35383128c92c3b4b4407ae4f2cc17",
+      "oracle_path": "semantic_oracles.json#holdout-fixture-012",
+      "prompt": "Compare public pedestrian-safety dashboard screenshots and official city traffic-safety metrics.",
+      "public_safe": true,
+      "release_counted": false,
+      "route": "visual_required"
+    }
+  ],
+  "public_safe": true,
+  "release_gate_ready": false,
+  "schema_version": "codex-deepresearch.semantic-blind-holdout-manifest.v0",
+  "selector_provenance": {
+    "independent": false,
+    "reason": "Live independent reviewer selection is not available in public tests; this manifest exercises the flow but cannot satisfy release readiness.",
+    "release_eligible": false,
+    "selector": "fixture_safe_non_release_selector"
+  }
+}

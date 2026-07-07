@@ -1,0 +1,429 @@
+{
+  "created_for_issue": 133,
+  "description": "Thirty public-safe oracle-backed prompts for semantic planner regression gates. All entries are release-counted; non-passing paths remain denominator failures.",
+  "name": "Semantic Planner Regression Manifest",
+  "prompts": [
+    {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-001",
+      "oracle_hash": "58f71e88b8c6e51b47b9fd107ae4c86035eea024fe147fed3136b896fcfbc4a4",
+      "oracle_path": "semantic_oracles.json#sem-reg-001",
+      "prompt": "한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료를 비교해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-002",
+      "oracle_hash": "570c2ea0fb8bb66dac815b9a9040b0f35c07807d0fe70101547eb2622c6fe67d",
+      "oracle_path": "semantic_oracles.json#sem-reg-002",
+      "prompt": "한국 공공보건 포스터 이미지의 손씻기 지침 차이를 공식 출처와 함께 분석해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-003",
+      "oracle_hash": "8008370cc0762b882942cd56c48b271ba3faf6d55ec6cc406bb2c541b353eb66",
+      "oracle_path": "semantic_oracles.json#sem-reg-003",
+      "prompt": "테스트라는 표현이 식품 안전 검사 맥락에서 쓰일 때 공식 검사 기준을 조사해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
+        "visual",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-004",
+      "oracle_hash": "6ff8fc6ec8f9740b41136e63125c67da584fef9274f670a3292876e67082044c",
+      "oracle_path": "semantic_oracles.json#sem-reg-004",
+      "prompt": "건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional"
+    },
+    {
+      "categories": [
+        "korean",
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-005",
+      "oracle_hash": "2a18217823106e655eeddb3198dd015c0d1fa7ba2e6ceebeb7f159a5469b922b",
+      "oracle_path": "semantic_oracles.json#sem-reg-005",
+      "prompt": "한국 지하철 안전 픽토그램 이미지와 공식 행동요령의 차이를 분석해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-006",
+      "oracle_hash": "4ed830a667f0915612197cef517f08b23f16a674f68a8807be95b4e383d6dd02",
+      "oracle_path": "semantic_oracles.json#sem-reg-006",
+      "prompt": "국내 개인정보 영향평가 제도와 해외 규제기관 가이드를 비교해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-007",
+      "oracle_hash": "87576c00fca5dcc6d283c7a45dd797498364837e92d6bcb81cabb4f28da1456a",
+      "oracle_path": "semantic_oracles.json#sem-reg-007",
+      "prompt": "한국 학교 급식 알레르기 라벨 이미지와 공식 표시 규정을 비교해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-008",
+      "oracle_hash": "8e7e6db90ff3ad74182530eadf14272d52745439f442ce48b0454714eb448ade",
+      "oracle_path": "semantic_oracles.json#sem-reg-008",
+      "prompt": "구현이라는 표현이 탄소중립 정책 실행 계획에서 의미하는 책임기관과 지표를 조사해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
+        "visual"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-009",
+      "oracle_hash": "52e53e7a6430f43c75f5404aa8c53774daeda871bd1ba26c6a00eff9794e694b",
+      "oracle_path": "semantic_oracles.json#sem-reg-009",
+      "prompt": "공공 자전거 안전 안내판 이미지를 비교하고 공식 안전 수칙과 맞는지 확인해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "korean",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-010",
+      "oracle_hash": "cdc926bea0399f169911b1d9465a8832c7479abda442712808bc8d0b7f5eeb54",
+      "oracle_path": "semantic_oracles.json#sem-reg-010",
+      "prompt": "한국 감염병 위기경보 단계 기준을 공식 문서 중심으로 비교해줘.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-011",
+      "oracle_hash": "0157e50147cc380ce772c0eae7ccc53f1b08b2691345dacc7122028842121842",
+      "oracle_path": "semantic_oracles.json#sem-reg-011",
+      "prompt": "Compare OAuth device-flow implementation guidance across official provider documentation.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-012",
+      "oracle_hash": "6a2114774639d59c906fcb35b174fe6a45909a1b68cdae31cdd11d14abf60f16",
+      "oracle_path": "semantic_oracles.json#sem-reg-012",
+      "prompt": "Research cache invalidation implementation hazards for a Next.js migration using current official docs.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-013",
+      "oracle_hash": "dda1462c30b6c77ba04899104f385466cdb4d103b575029ef885d9f10760a35e",
+      "oracle_path": "semantic_oracles.json#sem-reg-013",
+      "prompt": "Compare browser extension permission implementation guidance from official browser vendor docs.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-014",
+      "oracle_hash": "f3cd57838ec23e3bedec3d475d8b3c3d6d728a5a3dd4eeadbc452e03ed7c9682",
+      "oracle_path": "semantic_oracles.json#sem-reg-014",
+      "prompt": "Compare API dashboard screenshots for rate-limit semantics and the official implementation docs behind them.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "software_implementation"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-015",
+      "oracle_hash": "f563d0826fe3e4adf8810ff9fcceeaa97aac235f09cf7c202a62b21ae96830e6",
+      "oracle_path": "semantic_oracles.json#sem-reg-015",
+      "prompt": "Research database migration rollback implementation patterns using official docs and incident writeups.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-016",
+      "oracle_hash": "42022d3cf4927ec48727e3ec1bd954bd277408d3ff6bc6a2ed25ce5c6a037ddd",
+      "oracle_path": "semantic_oracles.json#sem-reg-016",
+      "prompt": "Compare official flood-zone map images and textual guidance for homeowner risk communication.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-017",
+      "oracle_hash": "4f1569127789bc130af5828a6501b0d741693c64e3aa79cac64245e5bd187eb2",
+      "oracle_path": "semantic_oracles.json#sem-reg-017",
+      "prompt": "Research model validation in public epidemiology reports without confusing it with software deployment.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-018",
+      "oracle_hash": "24a3ecf0e3d5a6f95e72b8a2b3100b34b699450386c4bb41f4a752e2b602962d",
+      "oracle_path": "semantic_oracles.json#sem-reg-018",
+      "prompt": "Compare public recycling poster images and official municipal recycling rules.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-019",
+      "oracle_hash": "93da268182561a4abef1f0906024da4ed29f53e37fd66ad9b0908e4237fe39fd",
+      "oracle_path": "semantic_oracles.json#sem-reg-019",
+      "prompt": "Research testing requirements for drinking-water lead sampling, distinguishing lab testing from school IT systems.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-020",
+      "oracle_hash": "6d143f065a30db2b99f9559388533c4f66d6aeb7091f6c2bbad33abffe9a6caf",
+      "oracle_path": "semantic_oracles.json#sem-reg-020",
+      "prompt": "Compare public vaccine cold-chain chart images and official handling guidance.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-021",
+      "oracle_hash": "a98daf221082ffcd1ccfb8bf7fbcf922210202970a19b44a9bfce53184aec30a",
+      "oracle_path": "semantic_oracles.json#sem-reg-021",
+      "prompt": "Compare public wildfire evacuation maps and official emergency-management instructions.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-022",
+      "oracle_hash": "a5b476994ecc3ab07d3010c1b7f18983120a9a9cf17963015ce896c1b5b2e5b3",
+      "oracle_path": "semantic_oracles.json#sem-reg-022",
+      "prompt": "Research public aviation safety reporting categories using regulator sources and accident-board examples.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-023",
+      "oracle_hash": "06b6aa32cbb146d5db197a44840b0897825530853b47b06aa75ca7c2907a01d7",
+      "oracle_path": "semantic_oracles.json#sem-reg-023",
+      "prompt": "Compare public climate-risk dashboard screenshots and official methodology notes.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-024",
+      "oracle_hash": "38abe399a9c54179162e1d999885213ef220d11be2a1f600e26b5c5cf7783ae4",
+      "oracle_path": "semantic_oracles.json#sem-reg-024",
+      "prompt": "Research architecture review in hospital facility planning, not software architecture, using official planning guidance.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-025",
+      "oracle_hash": "c4d4692783a085da6d9b79bef7e0f2fa370501660584895208af1cf628b536ea",
+      "oracle_path": "semantic_oracles.json#sem-reg-025",
+      "prompt": "Compare official nutrition label images and public food-labeling rules for allergen disclosures.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-026",
+      "oracle_hash": "2bf599e4cb126057d6e817036b0b4d424c3eee1cb9aade660c0f97e18b56e6a8",
+      "oracle_path": "semantic_oracles.json#sem-reg-026",
+      "prompt": "Research public building-code egress requirements and cite official code or regulator sources.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "software_implementation",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-027",
+      "oracle_hash": "8353b6c7747bfcd2b1a704e6b4c3fd6baa7ecb057a3aa6942dd7cdceb98d5d2d",
+      "oracle_path": "semantic_oracles.json#sem-reg-027",
+      "prompt": "Research public software supply-chain attestation implementation guidance from official standards and vendor docs.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-028",
+      "oracle_hash": "9cd86be34ea675df564c62fd1c50fb033fd08f55d6ab24bb35ec5c5ed0e23cea",
+      "oracle_path": "semantic_oracles.json#sem-reg-028",
+      "prompt": "Compare public transit accessibility map images and official accessibility criteria.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "policy_regulatory_domain",
+        "ambiguous_non_software"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-029",
+      "oracle_hash": "35b1a7f61565eefac017ed44e3cd4fe6e83e310c07bae0b23e1c17fb7c993a46",
+      "oracle_path": "semantic_oracles.json#sem-reg-029",
+      "prompt": "Research model risk management in banking regulation, separating statistical model governance from ML software implementation.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "software_implementation",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "sem-reg-030",
+      "oracle_hash": "4070e54684756be2757ff5c7baf70ed102e9ce6f346452f0addd9f4d53b29289",
+      "oracle_path": "semantic_oracles.json#sem-reg-030",
+      "prompt": "Research public accessibility implementation guidance for form validation error messages using current official docs.",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    }
+  ],
+  "public_safe": true,
+  "schema_version": "codex-deepresearch.semantic-regression-manifest.v0"
+}

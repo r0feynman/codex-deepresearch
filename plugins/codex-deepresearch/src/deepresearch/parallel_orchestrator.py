@@ -33,7 +33,9 @@ from .search_handoff import (
     resolve_run_dir,
 )
 from .semantic_planner import (
+    BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
+    write_semantic_materialization_diff,
     write_semantic_planner_validation,
 )
 from .trace import TRACE_FAILURE_CATEGORIES, TRACE_SCHEMA_VERSION, append_trace_record, trace_path
@@ -666,6 +668,11 @@ def plan_research_tasks(
             tasks=existing,
             report_status=_read_optional_json(run_dir / "report_status.json"),
         )
+        write_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=False,
+        )
         return _tasks_payload(run_dir, existing, evidence=evidence, status="already_planned")
 
     planner_tasks = evidence.get("search_tasks")
@@ -787,6 +794,11 @@ def plan_research_tasks(
         release_validation_identity_from_payload(evidence),
     )
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, payload)
+    write_semantic_materialization_diff(
+        run_dir=run_dir,
+        require_research_tasks=True,
+        require_downstream=False,
+    )
     write_semantic_planner_validation(
         run_dir=run_dir,
         evidence=evidence,
@@ -1057,6 +1069,167 @@ def _nonnegative_int(value: Any) -> int:
     return max(0, parsed)
 
 
+def _materialize_fixture_tasks_for_blocked_semantic_smoke(
+    run_dir: Path,
+    *,
+    min_tasks: int,
+    max_tasks: int | None,
+) -> bool:
+    """Write explicit non-release fixture tasks for the no-network smoke path."""
+
+    if (run_dir / RESEARCH_TASKS_FILENAME).exists():
+        return False
+    evidence_path = run_dir / "evidence.json"
+    if not evidence_path.exists():
+        return False
+    evidence = _read_json(evidence_path)
+    existing_tasks = evidence.get("search_tasks")
+    if isinstance(existing_tasks, list) and existing_tasks:
+        return False
+    semantic_planner = evidence.get("semantic_planner")
+    if not isinstance(semantic_planner, Mapping):
+        return False
+    if (
+        semantic_planner.get("status") != BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+        or semantic_planner.get("semantic_release_eligible") is True
+    ):
+        return False
+    task_count = max(1, int(min_tasks or 1))
+    if max_tasks is not None:
+        task_count = min(task_count, max(1, int(max_tasks)))
+    now = _utc_now()
+    question = str(evidence.get("question") or "Parallel orchestration fixture smoke")
+    fixture_tasks = [
+        _fixture_search_task_for_blocked_semantic_smoke(
+            question=question,
+            index=index,
+            created_at=now,
+        )
+        for index in range(1, task_count + 1)
+    ]
+    evidence = dict(evidence)
+    semantic_planner = dict(semantic_planner)
+    diagnostics = dict(semantic_planner.get("diagnostics") or {})
+    diagnostics["fixture_materialization"] = {
+        "status": "materialized_non_release_fixture_tasks",
+        "adapter": "fixture",
+        "semantic_release_eligible": False,
+        "reason": (
+            "The semantic planner was blocked before handoff materialization; "
+            "fixture tasks were created only for no-network orchestration smoke validation."
+        ),
+        "task_count": task_count,
+    }
+    semantic_planner["diagnostics"] = diagnostics
+    semantic_planner["semantic_release_eligible"] = False
+    evidence["semantic_planner"] = semantic_planner
+    evidence["search_tasks"] = fixture_tasks
+    handoff = dict(evidence.get("handoff") or {})
+    handoff.update(
+        {
+            "status": "fixture_parallel_smoke_tasks_materialized",
+            "search_results_path": "search_results.jsonl",
+            "visual_observations_path": "visual_observations.jsonl",
+            "semantic_release_eligible": False,
+            "fixture_only": True,
+        }
+    )
+    evidence["handoff"] = handoff
+    apply_release_validation_identity(
+        evidence,
+        release_validation_identity_from_payload(evidence),
+    )
+    search_tasks_artifact = {
+        "schema_version": PARALLEL_SCHEMA_VERSION,
+        "run_id": str(evidence.get("run_id") or run_dir.name),
+        "created_at": now,
+        "question": question,
+        "status": "fixture_parallel_smoke_tasks_materialized",
+        "fixture_only": True,
+        "semantic_release_eligible": False,
+        "planner_mode": "blocked",
+        "tasks": fixture_tasks,
+    }
+    apply_release_validation_identity(
+        search_tasks_artifact,
+        release_validation_identity_from_payload(evidence),
+    )
+    _write_json(evidence_path, evidence)
+    _write_json(run_dir / "search_tasks.json", search_tasks_artifact)
+    if not (run_dir / "search_results.jsonl").exists():
+        (run_dir / "search_results.jsonl").write_text("", encoding="utf-8")
+    if not (run_dir / "visual_tasks.json").exists():
+        _write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": PARALLEL_SCHEMA_VERSION,
+                "run_id": str(evidence.get("run_id") or run_dir.name),
+                "created_at": now,
+                "status": "fixture_parallel_smoke_tasks_materialized",
+                "fixture_only": True,
+                "semantic_release_eligible": False,
+                "tasks": [],
+            },
+        )
+    if not (run_dir / "visual_observations.jsonl").exists():
+        (run_dir / "visual_observations.jsonl").write_text("", encoding="utf-8")
+    return True
+
+
+def _fixture_search_task_for_blocked_semantic_smoke(
+    *,
+    question: str,
+    index: int,
+    created_at: str,
+) -> dict[str, Any]:
+    task_id = f"task_fixture_smoke_{index:03d}"
+    angle_id = f"angle_fixture_smoke_{index:03d}"
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "angle_id": angle_id,
+        "angle": f"fixture smoke angle {index}",
+        "title": f"Fixture smoke task {index}",
+        "research_question": f"Fixture-only orchestration smoke task {index} for: {question}",
+        "question_context": (
+            "Release-ineligible fixture task created after semantic planner blockage "
+            "so the no-network parallel orchestrator smoke can run."
+        ),
+        "query": f"{question} fixture orchestration smoke task {index}",
+        "evidence_need": "fixture_parallel_smoke",
+        "expected_artifacts": ["fixture evidence shard"],
+        "expected_source_types": ["fixture"],
+        "expected_visual_targets": [],
+        "expected_evidence": ["fixture_parallel_smoke"],
+        "success_criteria": [
+            "Produce a schema-valid fixture shard for orchestration smoke only.",
+            "Do not mark this task or run as semantic release eligible.",
+        ],
+        "done_condition": "A deterministic fixture shard is written and marked non-release.",
+        "report_section": "Fixture Parallel Smoke",
+        "freshness_requirement": "not_applicable_fixture",
+        "modality": "text_only",
+        "route": "text_only",
+        "max_results": 1,
+        "max_sources": 1,
+        "visual_tasks": [],
+        "max_images": 0,
+        "source_policy": {
+            "decision": "fixture_only",
+            "flags": ["non_release", "semantic_planner_blocked"],
+        },
+        "created_at": created_at,
+        "fixture_only": True,
+        "semantic_release_eligible": False,
+        "planner_mode": "blocked",
+        "provenance": {
+            "adapter": "fixture",
+            "source": "blocked_semantic_planner_parallel_smoke",
+            "semantic_release_eligible": False,
+        },
+    }
+
+
 def run_parallel_orchestration(
     *,
     run: str | Path,
@@ -1141,6 +1314,13 @@ def _run_parallel_orchestration_started(
     confirm_exhaustive: bool,
     max_cost_usd: float | None,
 ) -> dict[str, Any]:
+    normalized_adapter = _normalize_adapter_name(adapter_name)
+    if normalized_adapter == "fixture":
+        _materialize_fixture_tasks_for_blocked_semantic_smoke(
+            run_dir,
+            min_tasks=min_tasks,
+            max_tasks=max_tasks,
+        )
     plan_research_tasks(
         run=run_dir,
         min_tasks=min_tasks,
@@ -1152,7 +1332,7 @@ def _run_parallel_orchestration_started(
     evidence = _read_json(run_dir / "evidence.json")
     tasks = _task_list(tasks_artifact)
     max_concurrent = int(tasks_artifact.get("max_concurrent_codex_subagents") or 1)
-    requested_adapter_name = _normalize_adapter_name(adapter_name)
+    requested_adapter_name = normalized_adapter
     adapter = _adapter(adapter_name, codex_exec_timeout_seconds=codex_exec_timeout_seconds)
     effective_codex_exec_timeout_seconds = (
         float(adapter.timeout_seconds)
@@ -1615,6 +1795,11 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     tasks_artifact["retry_summary"] = retry_summary
     _write_json(run_dir / RESEARCH_TASKS_FILENAME, tasks_artifact)
     _write_json(run_dir / MERGE_STATUS_FILENAME, merge_status)
+    write_semantic_materialization_diff(
+        run_dir=run_dir,
+        require_research_tasks=True,
+        require_downstream=True,
+    )
     return merge_status
 
 
