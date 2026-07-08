@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,7 +30,10 @@ from .search_handoff import (
     prepare_run,
     release_validation_identity_from_payload,
 )
-from .semantic_planner import BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+from .semantic_planner import (
+    BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+    CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV,
+)
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
@@ -66,6 +71,7 @@ DEFAULT_AUTOMATIC_VISUAL_PROVIDERS = (
 )
 MIN_COMPLETED_AUTO_VISUAL_CANDIDATES = 10
 MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES = 3
+_BLOCKED_SEMANTIC_STATUS_PREFIX = "blocked_semantic_"
 
 _QUICK_CHAT_MARKERS = (
     "quick answer",
@@ -74,6 +80,21 @@ _QUICK_CHAT_MARKERS = (
     "chat only",
     "chat-only",
 )
+
+
+@contextmanager
+def _default_semantic_adapter_enabled():
+    previous = os.environ.get(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV)
+    os.environ[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV, None)
+        else:
+            os.environ[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = previous
+
+
 _FULL_RUNNER_INTENT_MARKERS = (
     "instead run full pipeline",
     "instead run the full pipeline",
@@ -261,35 +282,41 @@ def run_skill_invocation(
         return preflight
 
     try:
-        prepared = prepare_run(
-            question=question,
-            runs_dir=Path(runs_dir),
-            mode="codex-plugin",
-            search_provider="codex-native",
-            budget_preset=budget_preset,
-            route=route,
-            angles=angles,
-            max_results=max_results,
-            max_sources=max_sources,
-            max_images=max_images,
-            max_subagents=max_subagents,
-            max_agents=max_agents,
-            max_cost_usd=max_cost_usd,
-            codex_runner="codex-exec",
-            confirm_budget=confirm_budget,
-            prompt_id=release_identity.get("prompt_id"),
-            suite_id=release_identity.get("suite_id"),
-            prompt_hash=release_identity.get("prompt_hash"),
-            original_question=release_identity.get("original_question"),
-            manifest_oracle_hash=release_identity.get("manifest_oracle_hash"),
-            manifest_oracle_path=release_identity.get("manifest_oracle_path"),
-            manifest_oracle_fragment_id=release_identity.get(
-                "manifest_oracle_fragment_id"
-            ),
-            _allow_release_ineligible_materialization_for_tests=(
-                _allow_release_ineligible_materialization_for_tests
-            ),
+        semantic_adapter_context = (
+            _default_semantic_adapter_enabled()
+            if angles is None and adapter_name != "fixture"
+            else nullcontext()
         )
+        with semantic_adapter_context:
+            prepared = prepare_run(
+                question=question,
+                runs_dir=Path(runs_dir),
+                mode="codex-plugin",
+                search_provider="codex-native",
+                budget_preset=budget_preset,
+                route=route,
+                angles=angles,
+                max_results=max_results,
+                max_sources=max_sources,
+                max_images=max_images,
+                max_subagents=max_subagents,
+                max_agents=max_agents,
+                max_cost_usd=max_cost_usd,
+                codex_runner="codex-exec",
+                confirm_budget=confirm_budget,
+                prompt_id=release_identity.get("prompt_id"),
+                suite_id=release_identity.get("suite_id"),
+                prompt_hash=release_identity.get("prompt_hash"),
+                original_question=release_identity.get("original_question"),
+                manifest_oracle_hash=release_identity.get("manifest_oracle_hash"),
+                manifest_oracle_path=release_identity.get("manifest_oracle_path"),
+                manifest_oracle_fragment_id=release_identity.get(
+                    "manifest_oracle_fragment_id"
+                ),
+                _allow_release_ineligible_materialization_for_tests=(
+                    _allow_release_ineligible_materialization_for_tests
+                ),
+            )
     except (BudgetEstimateError, ConfigResolutionError, SearchHandoffError, OSError) as exc:
         return _blocked_preflight_with_status_dir(
             invocation=normalized_invocation,
@@ -299,29 +326,38 @@ def run_skill_invocation(
         )
 
     run_dir = Path(prepared["run_dir"])
-    if prepared.get("status") == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+    prepared_status = str(prepared.get("status") or "")
+    if _is_blocked_semantic_prepare_status(prepared_status):
+        prepared_diagnostics = prepared.get("diagnostics")
+        diagnostics = (
+            dict(prepared_diagnostics)
+            if isinstance(prepared_diagnostics, Mapping)
+            else {}
+        )
+        semantic_diagnostic = diagnostics.get("semantic_planning")
+        actionable_cause = semantic_diagnostic or (
+            "Codex-native semantic planner is unavailable."
+            if prepared_status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+            else f"Semantic planning stopped with terminal status {prepared_status}."
+        )
+        diagnostics["actionable_cause"] = str(actionable_cause)
         status = _base_run_status(
             invocation=normalized_invocation,
             question=question,
             selected_mode="blocked",
             run_dir=run_dir,
-            status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+            status=prepared_status,
             ok=False,
             terminal=True,
             provenance={
-                "type": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+                "type": prepared_status,
                 "adapter": adapter_name,
                 "fixture_only": False,
                 "manual_handoff": False,
                 "real_child_execution": False,
                 "real_use_e2e_eligible": False,
             },
-            diagnostics={
-                "actionable_cause": prepared.get("diagnostics", {}).get(
-                    "semantic_planning",
-                    "Codex-native semantic planner is unavailable.",
-                )
-            },
+            diagnostics=diagnostics,
             artifacts=_artifact_paths(run_dir, prepared.get("artifacts")),
         )
         if isinstance(prepared.get("semantic_planning"), Mapping):
@@ -587,6 +623,10 @@ def run_skill_invocation(
         )
         status["visual_summary"] = _visual_summary(run_dir)
     return _write_run_status(run_dir, status)
+
+
+def _is_blocked_semantic_prepare_status(status: str) -> bool:
+    return status.startswith(_BLOCKED_SEMANTIC_STATUS_PREFIX)
 
 
 def select_invocation_mode(

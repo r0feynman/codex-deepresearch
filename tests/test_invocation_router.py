@@ -718,6 +718,121 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(trace[-1]["event_type"], "semantic_planner_blocked")
         self.assertEqual(trace[-1]["status"], "blocked_semantic_planner_unavailable")
 
+    def test_blocked_semantic_validation_failure_is_terminal_before_parallel(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        blocked_status = "blocked_semantic_planner_validation_failed"
+        semantic_diagnostic = "Semantic planner validation failed fixture."
+
+        def fake_prepare_run(*, question, runs_dir, **_kwargs):
+            run_dir = Path(runs_dir) / "blocked-semantic-validation"
+            run_dir.mkdir()
+            evidence_path = run_dir / "evidence.json"
+            status_path = run_dir / "status.json"
+            validation_path = run_dir / "semantic_planner_validation.json"
+            self.write_json(
+                evidence_path,
+                {
+                    "run_id": run_dir.name,
+                    "question": question,
+                    "semantic_planner": {
+                        "status": blocked_status,
+                        "planner_mode": "codex_semantic",
+                        "semantic_release_eligible": False,
+                        "diagnostics": {
+                            "user_visible_diagnostic": semantic_diagnostic,
+                        },
+                    },
+                },
+            )
+            self.write_json(
+                status_path,
+                {
+                    "run_id": run_dir.name,
+                    "status": blocked_status,
+                    "semantic_planning_status": blocked_status,
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": False,
+                },
+            )
+            self.write_json(
+                validation_path,
+                {
+                    "ok": False,
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": False,
+                },
+            )
+            return {
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "status": blocked_status,
+                "artifacts": {
+                    "evidence": str(evidence_path),
+                    "status": str(status_path),
+                    "semantic_planner_validation": str(validation_path),
+                },
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": False,
+                "semantic_planning_status": blocked_status,
+                "semantic_planning": {
+                    "status": blocked_status,
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": False,
+                    "validation_ok": False,
+                    "user_visible_diagnostic": semantic_diagnostic,
+                },
+                "diagnostics": {
+                    "semantic_planning": semantic_diagnostic,
+                    "failure_codes": ["semantic_release_ineligible"],
+                },
+            }
+
+        with (
+            mock.patch.object(
+                invocation_router,
+                "prepare_run",
+                side_effect=fake_prepare_run,
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.run_parallel_orchestration"
+            ) as parallel_mock,
+        ):
+            result = run_skill_invocation(
+                "$deep-research: investigate semantic validation failure routing",
+                runs_dir=runs_dir,
+                adapter_name="codex-exec",
+                route="text_only",
+                angles=["primary source discovery"],
+                budget_preset="quick",
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        parallel_mock.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["terminal_status"], blocked_status)
+        self.assertEqual(result["selected_mode"], "blocked")
+        self.assertEqual(result["status"], blocked_status)
+        self.assertEqual(result["provenance"]["type"], blocked_status)
+        self.assertEqual(
+            result["diagnostics"]["actionable_cause"],
+            semantic_diagnostic,
+        )
+        self.assertEqual(
+            result["diagnostics"]["failure_codes"],
+            ["semantic_release_ineligible"],
+        )
+        self.assertNotIn("parallel_orchestration_status", result["artifacts"])
+
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        self.assertFalse(run_status["ok"])
+        self.assertTrue(run_status["terminal"])
+        self.assertEqual(run_status["status"], blocked_status)
+        self.assertEqual(run_status["terminal_status"], blocked_status)
+        self.assertEqual(run_status["provenance"]["type"], blocked_status)
+        self.assertNotIn("parallel_orchestration_status", run_status["artifacts"])
+
     def test_visual_required_with_codex_worker_available_reaches_parallel_handoff(self) -> None:
         runs_dir = self.temp_runs_dir()
         parallel_called = False

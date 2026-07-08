@@ -40,6 +40,12 @@ PUBLIC_BETA_SEMANTIC_MANIFEST_SCHEMA_VERSION = (
 BLIND_HOLDOUT_MANIFEST_SCHEMA_VERSION = (
     "codex-deepresearch.semantic-blind-holdout-manifest.v0"
 )
+BLIND_HOLDOUT_SELECTOR_AUDIT_SCHEMA_VERSION = (
+    "codex-deepresearch.semantic-blind-holdout-selector-audit.v0"
+)
+BLIND_HOLDOUT_SELECTOR_TRANSCRIPT_SCHEMA_VERSION = (
+    "codex-deepresearch.semantic-blind-holdout-selector-transcript.v0"
+)
 MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION = (
     "codex-deepresearch.manual-trace-audits.v0"
 )
@@ -1019,6 +1025,14 @@ def load_blind_holdout_manifest(
         failures.append("selector_not_independent")
     if selector.get("release_eligible") is not True:
         failures.append("selector_not_release_eligible")
+    selector_audit = _blind_holdout_selector_audit_failures(
+        manifest_path=manifest_path,
+        selector=selector,
+        freeze=freeze if isinstance(freeze, Mapping) else {},
+        prompts=checked["prompts"],
+        selection_checks=manifest.get("selection_checks"),
+    )
+    failures.extend(selector_audit)
     overlap_failures = _holdout_overlap_failures(
         holdout_prompts=checked["prompts"],
         known_manifests=known_manifests or [],
@@ -1034,6 +1048,150 @@ def load_blind_holdout_manifest(
         "release_gate_ready": release_gate_ready,
         "failures": failures,
     }
+
+
+def _blind_holdout_selector_audit_failures(
+    *,
+    manifest_path: Path,
+    selector: Mapping[str, Any],
+    freeze: Mapping[str, Any],
+    prompts: Sequence[Mapping[str, Any]],
+    selection_checks: Any,
+) -> list[str]:
+    failures: list[str] = []
+    audit_path_value = str(selector.get("audit_artifact_path") or "").strip()
+    audit_hash_value = str(selector.get("audit_artifact_hash") or "").strip()
+    if not audit_path_value:
+        return ["selector_audit_artifact_path_missing"]
+    if not _sha256_hex_string(audit_hash_value):
+        failures.append("selector_audit_artifact_hash_invalid")
+    audit_path = (manifest_path.parent / audit_path_value).resolve()
+    try:
+        audit_path.relative_to(manifest_path.parent.resolve())
+    except ValueError:
+        failures.append("selector_audit_artifact_outside_manifest_dir")
+        return failures
+    if not audit_path.exists():
+        failures.append("selector_audit_artifact_missing")
+        return failures
+    if _sha256_hex_string(audit_hash_value) and _file_sha256(audit_path) != audit_hash_value:
+        failures.append("selector_audit_artifact_hash_mismatch")
+    try:
+        audit = _read_json(audit_path)
+    except (OSError, json.JSONDecodeError):
+        failures.append("selector_audit_artifact_unreadable")
+        return failures
+    if audit.get("schema_version") != BLIND_HOLDOUT_SELECTOR_AUDIT_SCHEMA_VERSION:
+        failures.append("selector_audit_schema_version_invalid")
+    if audit.get("release_eligible") is not True:
+        failures.append("selector_audit_not_release_eligible")
+    if audit.get("selector_independent") is not True:
+        failures.append("selector_audit_not_independent")
+    freeze_commit = str(freeze.get("commit") or "").strip()
+    audit_freeze = audit.get("implementation_freeze")
+    if freeze_commit and (
+        not isinstance(audit_freeze, Mapping)
+        or str(audit_freeze.get("commit") or "").strip() != freeze_commit
+    ):
+        failures.append("selector_audit_freeze_commit_mismatch")
+    prompt_ids = [str(prompt.get("id") or "") for prompt in prompts]
+    if audit.get("prompt_ids") != prompt_ids:
+        failures.append("selector_audit_prompt_ids_mismatch")
+    if audit.get("prompt_count") != len(prompt_ids):
+        failures.append("selector_audit_prompt_count_mismatch")
+    audit_checks = audit.get("selection_checks")
+    manifest_checks = selection_checks if isinstance(selection_checks, Mapping) else {}
+    if not isinstance(audit_checks, Mapping):
+        failures.append("selector_audit_selection_checks_missing")
+    else:
+        for field in (
+            "exact_prompt_string_scan_found_matches",
+            "distinctive_keyword_scan_found_matches",
+            "known_manifest_overlap_detected",
+            "selected_after_implementation_freeze",
+        ):
+            if audit_checks.get(field) != manifest_checks.get(field):
+                failures.append(f"selector_audit_selection_check_mismatch:{field}")
+        if audit_checks.get("oracle_hashes_verified") is not True:
+            failures.append("selector_audit_oracle_hashes_not_verified")
+    failures.extend(
+        _blind_holdout_selector_raw_transcript_failures(
+            manifest_path=manifest_path,
+            selector=selector,
+            freeze=freeze,
+            prompt_ids=prompt_ids,
+        )
+    )
+    return failures
+
+
+def _blind_holdout_selector_raw_transcript_failures(
+    *,
+    manifest_path: Path,
+    selector: Mapping[str, Any],
+    freeze: Mapping[str, Any],
+    prompt_ids: Sequence[str],
+) -> list[str]:
+    failures: list[str] = []
+    transcript_path_value = str(
+        selector.get("raw_selector_transcript_path") or ""
+    ).strip()
+    transcript_hash_value = str(
+        selector.get("raw_selector_transcript_hash") or ""
+    ).strip()
+    if not transcript_path_value:
+        return ["selector_raw_transcript_path_missing"]
+    if not _sha256_hex_string(transcript_hash_value):
+        failures.append("selector_raw_transcript_hash_invalid")
+    transcript_path = (manifest_path.parent / transcript_path_value).resolve()
+    try:
+        transcript_path.relative_to(manifest_path.parent.resolve())
+    except ValueError:
+        failures.append("selector_raw_transcript_outside_manifest_dir")
+        return failures
+    if not transcript_path.exists():
+        failures.append("selector_raw_transcript_missing")
+        return failures
+    if (
+        _sha256_hex_string(transcript_hash_value)
+        and _file_sha256(transcript_path) != transcript_hash_value
+    ):
+        failures.append("selector_raw_transcript_hash_mismatch")
+    try:
+        transcript = _read_json(transcript_path)
+    except (OSError, json.JSONDecodeError):
+        failures.append("selector_raw_transcript_unreadable")
+        return failures
+    if transcript.get("schema_version") != BLIND_HOLDOUT_SELECTOR_TRANSCRIPT_SCHEMA_VERSION:
+        failures.append("selector_raw_transcript_schema_version_invalid")
+    if transcript.get("artifact_type") != "blind_holdout_selector_raw_transcript":
+        failures.append("selector_raw_transcript_artifact_type_invalid")
+    if transcript.get("release_eligible") is not True:
+        failures.append("selector_raw_transcript_not_release_eligible")
+    if transcript.get("selector_independent") is not True:
+        failures.append("selector_raw_transcript_not_independent")
+    freeze_commit = str(freeze.get("commit") or "").strip()
+    transcript_freeze = transcript.get("implementation_freeze")
+    if freeze_commit and (
+        not isinstance(transcript_freeze, Mapping)
+        or str(transcript_freeze.get("commit") or "").strip() != freeze_commit
+    ):
+        failures.append("selector_raw_transcript_freeze_commit_mismatch")
+    raw_request = transcript.get("raw_request")
+    raw_response = transcript.get("raw_response")
+    if not isinstance(raw_request, Mapping):
+        failures.append("selector_raw_transcript_raw_request_missing")
+    if not isinstance(raw_response, Mapping):
+        failures.append("selector_raw_transcript_raw_response_missing")
+        return failures
+    selected_prompt_ids = raw_response.get("selected_prompt_ids")
+    if selected_prompt_ids != list(prompt_ids):
+        failures.append("selector_raw_transcript_prompt_ids_mismatch")
+    if raw_response.get("prompt_count") != len(prompt_ids):
+        failures.append("selector_raw_transcript_prompt_count_mismatch")
+    if raw_response.get("selection_completed") is not True:
+        failures.append("selector_raw_transcript_selection_not_completed")
+    return failures
 
 
 def load_manual_trace_audits(
@@ -4278,55 +4436,98 @@ def _semantic_artifact_integrity_failures(
     artifacts: Mapping[str, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
+    plan = artifacts.get("semantic_plan")
+    validation = artifacts.get("semantic_planner_validation")
+    semantic_plan = (
+        plan.get("semantic_plan")
+        if isinstance(plan, Mapping) and isinstance(plan.get("semantic_plan"), Mapping)
+        else {}
+    )
+    fallback_question_scope = _first_valid_semantic_question_scope(
+        plan.get("question_scope") if isinstance(plan, Mapping) else None,
+        validation.get("question_scope") if isinstance(validation, Mapping) else None,
+    )
+    fallback_template_use = _first_valid_semantic_template_use(
+        plan.get("template_use") if isinstance(plan, Mapping) else None,
+        validation.get("template_use") if isinstance(validation, Mapping) else None,
+    )
     for artifact_name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
         if artifact_name == "semantic_materialization_diff":
             continue
         payload = artifacts.get(artifact_name)
         if not isinstance(payload, Mapping):
             continue
+        question_scope = _semantic_artifact_question_scope(
+            artifact_name=artifact_name,
+            payload=payload,
+            fallback_question_scope=fallback_question_scope,
+        )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="question_scope",
-            invalid=not _valid_semantic_question_scope(payload.get("question_scope")),
+            invalid=not _valid_semantic_question_scope(question_scope),
         )
         for field in ("raw_request_path", "raw_response_path"):
             _append_semantic_artifact_failure_if(
                 failures,
                 artifact_name=artifact_name,
                 field=field,
-                invalid=not _non_empty_string(payload.get(field)),
+                invalid=not _non_empty_string(
+                    _semantic_artifact_common_field(
+                        payload,
+                        artifact_name=artifact_name,
+                        field=field,
+                    )
+                ),
             )
         for field in ("raw_request_hash", "raw_response_hash"):
             _append_semantic_artifact_failure_if(
                 failures,
                 artifact_name=artifact_name,
                 field=field,
-                invalid=not _sha256_hex_string(payload.get(field)),
+                invalid=not _sha256_hex_string(
+                    _semantic_artifact_common_field(
+                        payload,
+                        artifact_name=artifact_name,
+                        field=field,
+                    )
+                ),
             )
+        provenance = _semantic_artifact_provenance(
+            payload,
+            artifact_name=artifact_name,
+        )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="provenance",
-            invalid=not _valid_semantic_provenance(payload.get("provenance")),
+            invalid=not _valid_semantic_provenance(
+                provenance,
+                artifact_name=artifact_name,
+                payload=payload,
+            ),
+        )
+        template_use = _semantic_artifact_template_use(
+            artifact_name=artifact_name,
+            payload=payload,
+            fallback_template_use=fallback_template_use,
         )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="template_use",
-            invalid=not _valid_semantic_template_use(payload.get("template_use")),
+            invalid=not _valid_semantic_template_use(template_use),
         )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="session_id_unavailable_reason",
-            invalid=not _non_empty_string(payload.get("session_id_unavailable_reason")),
+            invalid=not _valid_semantic_session_availability(payload, provenance),
         )
 
     plan_angle_ids: set[str] = set()
-    plan = artifacts.get("semantic_plan")
     if isinstance(plan, Mapping):
-        semantic_plan = plan.get("semantic_plan")
         original_question = _semantic_original_question(plan, semantic_plan)
         _append_semantic_artifact_failure_if(
             failures,
@@ -4392,10 +4593,92 @@ def _semantic_artifact_integrity_failures(
             invalid=not _valid_oracle_requirement_map(
                 oracle.get("oracle_requirement_map"),
                 plan_angle_ids=plan_angle_ids,
+                requirement_coverage_map=(
+                    plan.get("requirement_coverage_map")
+                    if isinstance(plan, Mapping)
+                    else None
+                ),
             ),
         )
 
     return failures
+
+
+def _first_valid_semantic_question_scope(*values: Any) -> Mapping[str, Any] | None:
+    for value in values:
+        if isinstance(value, Mapping) and _valid_semantic_question_scope(value):
+            return value
+    return None
+
+
+def _first_valid_semantic_template_use(*values: Any) -> Mapping[str, Any] | None:
+    for value in values:
+        if isinstance(value, Mapping) and _valid_semantic_template_use(value):
+            return value
+    return None
+
+
+def _semantic_artifact_question_scope(
+    *,
+    artifact_name: str,
+    payload: Mapping[str, Any],
+    fallback_question_scope: Mapping[str, Any] | None,
+) -> Any:
+    value = payload.get("question_scope")
+    if _valid_semantic_question_scope(value):
+        return value
+    if (
+        artifact_name in {"semantic_expectation_oracle", "semantic_plan_review"}
+        and fallback_question_scope is not None
+    ):
+        return fallback_question_scope
+    return value
+
+
+def _semantic_artifact_template_use(
+    *,
+    artifact_name: str,
+    payload: Mapping[str, Any],
+    fallback_template_use: Mapping[str, Any] | None,
+) -> Any:
+    value = payload.get("template_use")
+    if _valid_semantic_template_use(value):
+        return value
+    if (
+        artifact_name in {"semantic_expectation_oracle", "semantic_plan_review"}
+        and fallback_template_use is not None
+    ):
+        return fallback_template_use
+    return value
+
+
+def _semantic_artifact_common_field(
+    payload: Mapping[str, Any],
+    *,
+    artifact_name: str,
+    field: str,
+) -> Any:
+    value = payload.get(field)
+    if value is not None:
+        return value
+    if artifact_name == "semantic_plan_review":
+        reviewer_field = f"reviewer_{field}"
+        return payload.get(reviewer_field)
+    return value
+
+
+def _semantic_artifact_provenance(
+    payload: Mapping[str, Any],
+    *,
+    artifact_name: str,
+) -> Any:
+    if artifact_name == "semantic_expectation_oracle":
+        return payload.get("provenance") or payload.get("oracle_provenance")
+    if artifact_name == "semantic_plan_review":
+        return payload.get("provenance") or payload.get("reviewer_provenance")
+    if artifact_name == "semantic_plan":
+        return payload.get("provenance") or payload.get("planner_provenance")
+    return payload.get("provenance")
 
 
 def _append_semantic_artifact_failure_if(
@@ -4432,15 +4715,55 @@ def _valid_semantic_question_scope(value: Any) -> bool:
     )
 
 
-def _valid_semantic_provenance(value: Any) -> bool:
+def _valid_semantic_provenance(
+    value: Any,
+    *,
+    artifact_name: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("non_release_fixture") is True:
+        return False
+    if not _semantic_provenance_has_codex_identity(value):
+        return False
+    if not (
+        _sha256_hex_string(value.get("raw_request_hash"))
+        and _sha256_hex_string(value.get("raw_response_hash"))
+    ):
+        return False
+    if artifact_name in {"semantic_plan", "semantic_planner_validation"}:
+        planner_mode = value.get("planner_mode") or payload.get("planner_mode")
+        planner_source = (
+            value.get("planner_source")
+            or payload.get("source")
+            or payload.get("planner_source")
+        )
+        return (
+            planner_mode == "codex_semantic"
+            and planner_source == "codex_semantic"
+            and value.get("raw_request_required") is True
+            and value.get("raw_response_required") is True
+        )
+    return True
+
+
+def _valid_semantic_session_availability(
+    payload: Mapping[str, Any],
+    provenance: Any,
+) -> bool:
+    if isinstance(provenance, Mapping) and _semantic_provenance_has_codex_identity(
+        provenance
+    ):
+        return True
+    if _semantic_provenance_has_codex_identity(payload):
+        return True
     return (
-        isinstance(value, Mapping)
-        and value.get("planner_mode") == "codex_semantic"
-        and value.get("planner_source") == "codex_semantic"
-        and value.get("raw_request_required") is True
-        and value.get("raw_response_required") is True
-        and _semantic_provenance_has_codex_identity(value)
-        and value.get("semantic_release_eligible") is True
+        _non_empty_string(payload.get("session_id_unavailable_reason"))
+        or (
+            isinstance(provenance, Mapping)
+            and _non_empty_string(provenance.get("session_id_unavailable_reason"))
+        )
     )
 
 
@@ -4488,6 +4811,7 @@ def _valid_oracle_requirement_map(
     value: Any,
     *,
     plan_angle_ids: set[str],
+    requirement_coverage_map: Any = None,
 ) -> bool:
     if (
         not isinstance(value, list)
@@ -4495,15 +4819,24 @@ def _valid_oracle_requirement_map(
         or not plan_angle_ids
     ):
         return False
+    coverage_by_requirement = _coverage_angle_ids_by_requirement(
+        requirement_coverage_map
+    )
     covered_angle_ids: set[str] = set()
     for requirement in value:
         if not _valid_oracle_requirement(requirement):
             return False
-        covered_angle_ids.update(
+        requirement_angle_ids = {
             str(angle_id).strip()
             for angle_id in requirement.get("covered_by_angle_ids", [])
             if _non_empty_string(angle_id)
-        )
+        }
+        if not requirement_angle_ids:
+            requirement_angle_ids = coverage_by_requirement.get(
+                str(requirement.get("requirement_id") or "").strip(),
+                set(),
+            )
+        covered_angle_ids.update(requirement_angle_ids)
     return (
         covered_angle_ids == plan_angle_ids
     )
@@ -4517,8 +4850,9 @@ def _valid_oracle_requirement(value: Any) -> bool:
         and (
             _non_empty_string(value.get("text"))
             or _non_empty_string(value.get("description"))
+            or _non_empty_string(value.get("requirement_text"))
+            or _non_empty_string(value.get("prompt_text"))
         )
-        and _non_empty_string_list(value.get("covered_by_angle_ids"))
     )
 
 
@@ -4561,7 +4895,6 @@ def _valid_semantic_angle(
         "angle_id",
         "title",
         "research_question",
-        "question_context",
         "evidence_need",
         "report_section",
     )
@@ -4574,12 +4907,9 @@ def _valid_semantic_angle(
 
     title = str(value["title"]).strip()
     research_question = str(value["research_question"]).strip()
-    question_context = str(value["question_context"]).strip()
     if _generic_or_original_semantic_text(title, original_question):
         return False
     if _generic_or_original_semantic_text(research_question, original_question):
-        return False
-    if _generic_or_original_semantic_text(question_context, original_question):
         return False
     combined_text = f"{title} {research_question}"
     if _semantic_placeholder_text(combined_text):
@@ -4667,7 +4997,7 @@ def _valid_requirement_coverage_map(
     for coverage in value:
         if not _valid_requirement_coverage(coverage):
             return False
-        covered_angle_ids.add(str(coverage["angle_id"]).strip())
+        covered_angle_ids.update(_coverage_angle_ids(coverage))
     return (
         covered_angle_ids == plan_angle_ids
     )
@@ -4678,9 +5008,34 @@ def _valid_requirement_coverage(value: Any) -> bool:
         return False
     return (
         _non_empty_string(value.get("requirement_id"))
-        and _non_empty_string(value.get("angle_id"))
+        and bool(_coverage_angle_ids(value))
         and _non_empty_string(value.get("coverage_status"))
     )
+
+
+def _coverage_angle_ids_by_requirement(value: Any) -> dict[str, set[str]]:
+    output: dict[str, set[str]] = {}
+    if not isinstance(value, list):
+        return output
+    for coverage in value:
+        if not isinstance(coverage, Mapping):
+            continue
+        requirement_id = str(coverage.get("requirement_id") or "").strip()
+        if not requirement_id:
+            continue
+        output.setdefault(requirement_id, set()).update(_coverage_angle_ids(coverage))
+    return output
+
+
+def _coverage_angle_ids(value: Mapping[str, Any]) -> set[str]:
+    angle_ids = {
+        str(angle_id).strip()
+        for angle_id in value.get("covered_by_angle_ids", [])
+        if _non_empty_string(angle_id)
+    }
+    if _non_empty_string(value.get("angle_id")):
+        angle_ids.add(str(value["angle_id"]).strip())
+    return angle_ids
 
 
 def _semantic_angle_ids(value: Any) -> set[str]:
@@ -4755,6 +5110,12 @@ def _semantic_planner_mode_sources(
         )
     for name, payload in artifacts.items():
         _add_string_source(sources, name, payload.get("planner_mode"))
+        if (
+            name == "semantic_expectation_oracle"
+            and name not in sources
+            and _oracle_release_support_artifact(payload)
+        ):
+            sources[name] = "codex_semantic"
         nested = payload.get("semantic_plan")
         if isinstance(nested, Mapping):
             _add_string_source(
@@ -4781,7 +5142,12 @@ def _semantic_release_eligible_sources(
             semantic_planner.get("semantic_release_eligible"),
         )
     for name, payload in artifacts.items():
-        _add_bool_source(sources, name, payload.get("semantic_release_eligible"))
+        if name == "semantic_expectation_oracle" and _oracle_release_support_artifact(
+            payload
+        ):
+            sources[name] = True
+        else:
+            _add_bool_source(sources, name, payload.get("semantic_release_eligible"))
         nested = payload.get("semantic_plan")
         if isinstance(nested, Mapping):
             _add_bool_source(
@@ -4815,6 +5181,29 @@ def _semantic_codex_source_sources(
                 nested.get("source"),
             )
     return sources
+
+
+def _oracle_release_support_artifact(payload: Mapping[str, Any]) -> bool:
+    if payload.get("artifact_type") != "semantic_expectation_oracle":
+        return False
+    for field in (
+        "plan_visible_to_oracle",
+        "used_production_planner_output",
+        "used_hidden_template_class",
+        "used_fixed_angle_inventory",
+    ):
+        if payload.get(field) is not False:
+            return False
+    provenance = payload.get("oracle_provenance") or payload.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    if provenance.get("non_release_fixture") is True:
+        return False
+    return (
+        _semantic_provenance_has_codex_identity(provenance)
+        and _sha256_hex_string(provenance.get("raw_request_hash") or payload.get("raw_request_hash"))
+        and _sha256_hex_string(provenance.get("raw_response_hash") or payload.get("raw_response_hash"))
+    )
 
 
 def _add_string_source(sources: dict[str, str], source: str, value: Any) -> None:
@@ -6121,8 +6510,8 @@ def _codex_interactive_observations(
     for observation in observations:
         if not _is_codex_interactive_vlm_observation(observation):
             continue
-        candidate_id = observation.get("candidate_id")
-        fetch_id = observation.get("fetch_id")
+        candidate_id = _observation_linked_candidate_id(observation)
+        fetch_id = _observation_linked_fetch_id(observation)
         image_id = observation.get("evidence_image_id")
         if not (
             isinstance(candidate_id, str)
@@ -6311,8 +6700,8 @@ def _has_real_report_cited_observation(
             continue
         if not _has_verifier_vote_link(observation, claim_id, verifier_vote_ids):
             continue
-        candidate_id = observation.get("candidate_id")
-        fetch_id = observation.get("fetch_id")
+        candidate_id = _observation_linked_candidate_id(observation)
+        fetch_id = _observation_linked_fetch_id(observation)
         if not isinstance(candidate_id, str) or not isinstance(fetch_id, str):
             continue
         candidate = candidates_by_id.get(candidate_id)
@@ -6331,6 +6720,14 @@ def _has_real_report_cited_observation(
             continue
         return True
     return False
+
+
+def _observation_linked_candidate_id(observation: Mapping[str, Any]) -> Any:
+    return observation.get("linked_candidate_id") or observation.get("candidate_id")
+
+
+def _observation_linked_fetch_id(observation: Mapping[str, Any]) -> Any:
+    return observation.get("linked_fetch_id") or observation.get("fetch_id")
 
 
 def _is_codex_interactive_vlm_observation(record: Mapping[str, Any]) -> bool:

@@ -354,6 +354,10 @@ def acquire_visual_candidates(
     image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
     visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
+    observations = _merge_visual_observation_records(
+        _read_jsonl(visual_observations_path),
+        selected,
+    )
     image_fetch_records = _image_fetch_records_from_candidates(candidate_records)
     provider_statuses = _provider_statuses_after_selection(
         provider_statuses=provider_statuses,
@@ -375,7 +379,7 @@ def acquire_visual_candidates(
         routes=routes,
         provider_names=active_provider_names,
         created_at=now,
-        selected_observations=len(selected),
+        selected_observations=len(observations),
         state="completed",
     )
     visual_status = (
@@ -414,14 +418,14 @@ def acquire_visual_candidates(
         provider_statuses=provider_statuses,
         candidate_records=candidate_records,
         image_fetch_records=image_fetch_records,
-        observations=selected,
+        observations=observations,
         created_at=now,
         actionable_cause=actionable_cause,
     )
     _write_json(visual_search_plan_path, visual_search_plan)
     _write_jsonl(visual_candidates_path, candidate_records)
     _write_jsonl(image_fetch_status_path, image_fetch_records)
-    _write_jsonl(visual_observations_path, selected)
+    _write_jsonl(visual_observations_path, observations)
     _write_json(visual_provider_status_path, visual_provider_status)
 
     candidate_counts = _candidate_counts(candidate_records)
@@ -571,6 +575,7 @@ def _acquire_with_page_image_extractor(
     core_candidates: list[Mapping[str, Any]] = []
     core_fetches: list[Mapping[str, Any]] = []
     core_observations: list[Mapping[str, Any]] = []
+    preexisting_observations = _read_jsonl(run_dir / "visual_observations.jsonl")
     core_provider_records: list[Mapping[str, Any]] = []
     core_status: Mapping[str, Any] | None = None
 
@@ -617,7 +622,10 @@ def _acquire_with_page_image_extractor(
 
     candidate_records = [*core_candidates, *page_candidates]
     image_fetch_records = [*core_fetches, *page_fetches]
-    observations = [item for item in core_observations if isinstance(item, Mapping)]
+    observations = _merge_visual_observation_records(
+        preexisting_observations,
+        [item for item in core_observations if isinstance(item, Mapping)],
+    )
     provider_statuses = _dedupe_provider_statuses(
         [*core_provider_records, *page_provider_records],
         provider_names=provider_names,
@@ -4714,6 +4722,61 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
             records.append(payload)
     return records
+
+
+def _merge_visual_observation_records(
+    existing: Sequence[Mapping[str, Any]],
+    additions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    index_by_key: dict[str, int] = {}
+    for record in [*existing, *additions]:
+        if not isinstance(record, Mapping):
+            continue
+        record_copy = dict(record)
+        key = _visual_observation_key(record_copy)
+        if not key or key not in index_by_key:
+            if key:
+                index_by_key[key] = len(merged)
+            merged.append(record_copy)
+            continue
+        current = dict(merged[index_by_key[key]])
+        for link_field in ("verifier_links", "report_links"):
+            current[link_field] = _merge_visual_observation_links(
+                current.get(link_field),
+                record_copy.get(link_field),
+            )
+        for field, value in record_copy.items():
+            if field in {"verifier_links", "report_links"}:
+                continue
+            if value not in (None, "", []):
+                current[field] = value
+        merged[index_by_key[key]] = current
+    return merged
+
+
+def _visual_observation_key(record: Mapping[str, Any]) -> str:
+    for field in ("evidence_image_id", "image_id", "id"):
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _merge_visual_observation_links(existing: Any, additions: Any) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in [
+        *([item for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []),
+        *([item for item in additions if isinstance(item, Mapping)] if isinstance(additions, list) else []),
+    ]:
+        record_copy = dict(record)
+        key = json.dumps(record_copy, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(record_copy)
+    return output
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

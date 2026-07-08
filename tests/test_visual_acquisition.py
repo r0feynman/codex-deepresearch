@@ -24,7 +24,10 @@ from deepresearch import (  # noqa: E402
 )
 from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
 from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
-from deepresearch.visual_acquisition import _BraveImageSearchResponse  # noqa: E402
+from deepresearch.visual_acquisition import (  # noqa: E402
+    _BraveImageSearchResponse,
+    _merge_visual_observation_records,
+)
 from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
 
 prepare_search_handoff_run = prepare_run
@@ -232,6 +235,53 @@ class VisualAcquisitionTests(unittest.TestCase):
             path.read_text(encoding="utf-8")
             for path in paths
             if path.exists()
+        )
+
+    def test_visual_observation_merge_preserves_existing_child_records_and_links(self) -> None:
+        merged = _merge_visual_observation_records(
+            [
+                {
+                    "observation_id": "obs_child_001",
+                    "evidence_image_id": "img_child_001",
+                    "provider": "codex-interactive",
+                    "verifier_links": [{"claim_id": "claim_001", "verifier_vote_id": "vote_001"}],
+                    "report_links": [{"claim_id": "claim_001", "citation_id": "img:img_child_001"}],
+                    "observations": ["child shard visual observation"],
+                }
+            ],
+            [
+                {
+                    "observation_id": "obs_new_001",
+                    "evidence_image_id": "img_new_001",
+                    "provider": "codex-interactive",
+                    "verifier_links": [],
+                    "report_links": [],
+                    "observations": ["new auto visual observation"],
+                },
+                {
+                    "observation_id": "obs_child_001_new",
+                    "evidence_image_id": "img_child_001",
+                    "provider": "codex-interactive",
+                    "verifier_links": [{"claim_id": "claim_002", "verifier_vote_id": "vote_002"}],
+                    "report_links": [{"claim_id": "claim_002", "citation_id": "img:img_child_001"}],
+                    "observations": ["updated child shard visual observation"],
+                },
+            ],
+        )
+
+        by_image = {record["evidence_image_id"]: record for record in merged}
+        self.assertEqual(set(by_image), {"img_child_001", "img_new_001"})
+        self.assertEqual(
+            {link["claim_id"] for link in by_image["img_child_001"]["verifier_links"]},
+            {"claim_001", "claim_002"},
+        )
+        self.assertEqual(
+            {link["claim_id"] for link in by_image["img_child_001"]["report_links"]},
+            {"claim_001", "claim_002"},
+        )
+        self.assertEqual(
+            by_image["img_child_001"]["observations"],
+            ["updated child shard visual observation"],
         )
 
     def prepared_visual_run_with_html_source(self) -> Path:

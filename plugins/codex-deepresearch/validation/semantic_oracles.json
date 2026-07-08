@@ -8,7 +8,61 @@
     "requires_semantic_plan_review": true
   },
   "oracles": {
-    "holdout-fixture-001": {
+    "holdout-independent-001": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "678af11f56d5d75083766ce8842f598f8735310e059735e3f1556877e7c1933b",
+      "prompt_id": "holdout-independent-001",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must preserve the Korean language, separate outbreak counts from vaccination coverage and surveillance effects, prioritize official public-health data, and avoid treating imported cases, domestic transmission, and reporting changes as the same phenomenon."
+      }
+    },
+    "holdout-independent-002": {
       "categories": [
         "korean",
         "visual",
@@ -33,11 +87,11 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "34141feb10a3f2c6ab15bc0561393a63fedefe287fec600941a19e19012c0d98",
-      "prompt_id": "holdout-fixture-001",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "f4b145614d7904415876dd4b41ba7ed013defb0ee492b9af095f39c1f9503d5c",
+      "prompt_id": "holdout-independent-002",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -60,10 +114,286 @@
           "angle_id",
           "approved_delta_id"
         ],
-        "preserve_original_question_intent": true
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must decompose official warning levels, map symbology, visual signage evidence, evacuation decision criteria, and limits of inference from static maps or generic hazard symbols."
       }
     },
-    "holdout-fixture-002": {
+    "holdout-independent-003": {
+      "categories": [
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "4c0676425ead5bb3da42391e48907bd8817461e6b9cf35aa340f3828b0e409be",
+      "prompt_id": "holdout-independent-003",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must preserve jurisdictional ambiguity, distinguish mandatory rules from voluntary or framework-based reporting, and split scope, timing, assurance, litigation status, and company applicability into separate evidence-backed questions."
+      }
+    },
+    "holdout-independent-004": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "08c3495f8e765d96c9fc6d3fa57924c8885fa85367778e21bd17db3d0652e718",
+      "prompt_id": "holdout-independent-004",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must separate rule interpretation from visual evidence, avoid deciding facts not visible in authenticated imagery, and handle ambiguity between law text, referee protocol, broadcast diagrams, and unverifiable social clips."
+      }
+    },
+    "holdout-independent-005": {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "485e9541a502c0a1ccc179f2dea78e20e167047b6bfa5d75aafeca5b596a3cf4",
+      "prompt_id": "holdout-independent-005",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must keep image observations separate from compositional conclusions, require official mission or peer-reviewed evidence for scientific interpretation, and avoid overreading photographs as chemical proof."
+      }
+    },
+    "holdout-independent-006": {
+      "categories": [
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "b6b3c7a18e21fc3a6d90a9f0102cf677a2484ae0c2ff7e3a42d79f1ae5e5ab5e",
+      "prompt_id": "holdout-independent-006",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must preserve legal-domain ambiguity, separate U.S. and EU authorities, distinguish proposed, final, stayed, and enforced obligations, and avoid converting consumer-policy summaries into legal advice."
+      }
+    },
+    "holdout-independent-007": {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "93c3ed35e971c7dd3a20f7aa21d98fd0e2d9beae44b4c730113106c9908a5381",
+      "prompt_id": "holdout-independent-007",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must maintain Korean output intent, separate rankings from scaled scores and sampling caveats, use official education data, and preserve uncertainty around pandemic-period comparability."
+      }
+    },
+    "holdout-independent-008": {
       "categories": [
         "korean",
         "visual",
@@ -88,11 +418,11 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "de8f7034e2cd94455b8c62cd18afb3cb9c11ed17672854bb1ebf275842348eb1",
-      "prompt_id": "holdout-fixture-002",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "8a9aea64749b9755b750231d06e1ce56145c94020e9e3a4d680339471afd284d",
+      "prompt_id": "holdout-independent-008",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -115,12 +445,68 @@
           "angle_id",
           "approved_delta_id"
         ],
-        "preserve_original_question_intent": true
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must distinguish restoration status, rerelease context, and critical reevaluation, while separating visual poster or still-image cues from claims requiring official catalog, festival, or archival text evidence."
       }
     },
-    "holdout-fixture-003": {
+    "holdout-independent-009": {
       "categories": [
-        "korean",
+        "visual",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "expected_modalities": [
+        "text",
+        "visual"
+      ],
+      "expected_plan_contract": {
+        "bounded_tasks_required": true,
+        "exact_task_set_equality_required": true,
+        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+        "independent_review_required": true,
+        "locked_oracle_before_planning": true,
+        "materialization_diff_required": true
+      },
+      "expected_source_policy": [
+        "public_safe_sources",
+        "source_backed_claims",
+        "official_or_regulatory_sources"
+      ],
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "991db26251fb35111889dbbd882da2a75faf30670099d390f3733619ebd93e1c",
+      "prompt_id": "holdout-independent-009",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional",
+      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
+      "semantic_alignment_expectations": {
+        "compare_materialized_task_fields": [
+          "query",
+          "route",
+          "freshness_requirement",
+          "source_policy",
+          "expected_source_types",
+          "expected_visual_targets",
+          "expected_artifacts",
+          "success_criteria",
+          "done_condition",
+          "max_sources",
+          "max_images"
+        ],
+        "downstream_lineage_fields": [
+          "semantic_plan_hash",
+          "semantic_plan_task_id",
+          "angle_id",
+          "approved_delta_id"
+        ],
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must decompose route accessibility into durable infrastructure, current outages, transfers, and map symbols, preserving timestamp sensitivity and not equating an accessible station icon with an accessible complete trip."
+      }
+    },
+    "holdout-independent-010": {
+      "categories": [
         "official_regulatory_source_quality",
         "ambiguous_domain",
         "non_software_domain"
@@ -140,14 +526,13 @@
       "expected_source_policy": [
         "public_safe_sources",
         "source_backed_claims",
-        "official_or_regulatory_sources",
-        "disambiguate_non_software_or_domain_meaning"
+        "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "4e55504d250269254e4440cd85dec6ca5f3a1ba3048346e945c6563310fd1844",
-      "prompt_id": "holdout-fixture-003",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "c7de0b24a95d395585766e6f664dd2b7bd54529c6efdc19645264cd23ff3630e",
+      "prompt_id": "holdout-independent-010",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -170,15 +555,16 @@
           "angle_id",
           "approved_delta_id"
         ],
-        "preserve_original_question_intent": true
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must separate wastewater trends from clinical case surveillance, account for lag and coverage differences, avoid individual medical inference, and preserve the distinction between early signal, confirmed outbreak, and public-health uncertainty."
       }
     },
-    "holdout-fixture-004": {
+    "holdout-independent-011": {
       "categories": [
-        "korean",
         "official_regulatory_source_quality",
         "ambiguous_domain",
-        "non_software_domain"
+        "non_software_domain",
+        "policy_regulatory_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
       "expected_modalities": [
@@ -195,14 +581,13 @@
       "expected_source_policy": [
         "public_safe_sources",
         "source_backed_claims",
-        "official_or_regulatory_sources",
-        "disambiguate_non_software_or_domain_meaning"
+        "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "9b066a000e1ecb71660eaa62f520cbce967739424c4fff4417fb447fe7e5c7d2",
-      "prompt_id": "holdout-fixture-004",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "20e2e0b60bc70cccee7f42df5738264e8bd59c5183ad07fef57673b72a1d8812",
+      "prompt_id": "holdout-independent-011",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
@@ -225,10 +610,11 @@
           "angle_id",
           "approved_delta_id"
         ],
-        "preserve_original_question_intent": true
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must preserve substance-specific distinctions, separate anti-doping rules from criminal legality or health guidance, account for thresholds and in-competition context, and avoid broad claims like 'banned' without rule evidence."
       }
     },
-    "holdout-fixture-005": {
+    "holdout-independent-012": {
       "categories": [
         "visual",
         "official_regulatory_source_quality",
@@ -252,12 +638,12 @@
         "source_backed_claims",
         "official_or_regulatory_sources"
       ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "13406a76618d5942ddadd0a23b61b647a1c6022589f40ca5505fa08abc59fae6",
-      "prompt_id": "holdout-fixture-005",
+      "manifest": "Independent Blind Holdout Release Manifest",
+      "prompt_hash": "17445dff22f33ca3734f3d81215326f0727fe8aa1b1562c97b527256c981d3e5",
+      "prompt_id": "holdout-independent-012",
       "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required",
+      "release_counted": true,
+      "route": "visual_optional",
       "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
       "semantic_alignment_expectations": {
         "compare_materialized_task_fields": [
@@ -279,383 +665,8 @@
           "angle_id",
           "approved_delta_id"
         ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-006": {
-      "categories": [
-        "ambiguous_domain",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources",
-        "disambiguate_non_software_or_domain_meaning"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "07b7e2d7b9b850d4b9f9ed4a0e5e35a27ce0dee18cfd68e42eb8243de3055a6c",
-      "prompt_id": "holdout-fixture-006",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-007": {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text",
-        "visual"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "98aae77138dfaa05e2b9791b2e40de211b43934f2799fbd2fb4acd2c886e0cf6",
-      "prompt_id": "holdout-fixture-007",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-008": {
-      "categories": [
-        "ambiguous_domain",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources",
-        "disambiguate_non_software_or_domain_meaning"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "549f7d71bb6c5b4002837246ae47869d75c33d3daf583ad73f5021f8625e5bfb",
-      "prompt_id": "holdout-fixture-008",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-009": {
-      "categories": [
-        "software_implementation",
-        "official_regulatory_source_quality"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources",
-        "current_official_software_documentation"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "fef9cef1b3b717aa3a58234431fe1745b3e5c7b3e29b5796c826f71f9f00d73e",
-      "prompt_id": "holdout-fixture-009",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-010": {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text",
-        "visual"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "a4fba46fc12850e0e84b4b9e37563218d793a7cf62f910437d1b7133f67dcce1",
-      "prompt_id": "holdout-fixture-010",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-011": {
-      "categories": [
-        "software_implementation",
-        "official_regulatory_source_quality"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources",
-        "current_official_software_documentation"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "1632423b357e6d55d1d9c5fb038758b8bdd2703e3a99346b32f63788e274967b",
-      "prompt_id": "holdout-fixture-011",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
-      }
-    },
-    "holdout-fixture-012": {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "expected_modalities": [
-        "text",
-        "visual"
-      ],
-      "expected_plan_contract": {
-        "bounded_tasks_required": true,
-        "exact_task_set_equality_required": true,
-        "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
-        "independent_review_required": true,
-        "locked_oracle_before_planning": true,
-        "materialization_diff_required": true
-      },
-      "expected_source_policy": [
-        "public_safe_sources",
-        "source_backed_claims",
-        "official_or_regulatory_sources"
-      ],
-      "manifest": "Fixture-Safe Blind Holdout Flow",
-      "prompt_hash": "a9bef41eb03b48e5863aacd339ffd0ec707b595e316e4e10aaa6c1e69da0bfba",
-      "prompt_id": "holdout-fixture-012",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required",
-      "schema_version": "codex-deepresearch.semantic-oracle-fragment.v0",
-      "semantic_alignment_expectations": {
-        "compare_materialized_task_fields": [
-          "query",
-          "route",
-          "freshness_requirement",
-          "source_policy",
-          "expected_source_types",
-          "expected_visual_targets",
-          "expected_artifacts",
-          "success_criteria",
-          "done_condition",
-          "max_sources",
-          "max_images"
-        ],
-        "downstream_lineage_fields": [
-          "semantic_plan_hash",
-          "semantic_plan_task_id",
-          "angle_id",
-          "approved_delta_id"
-        ],
-        "preserve_original_question_intent": true
+        "preserve_original_question_intent": true,
+        "selector_oracle_notes": "A good planner must separate visual map interpretation, tide-gauge observations, forecast wording, and causal attribution, using official sources while preserving uncertainty between immediate drivers and long-term sea-level or infrastructure context."
       }
     },
     "pb-sem-001": {

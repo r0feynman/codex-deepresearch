@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -365,22 +366,33 @@ def ingest_vision_observations(
     ]
 
     images_reused = 0
+    codex_handoff_provider_status: dict[str, Any] | None = None
     if normalized_images:
+        lineage_materialization = _materialize_codex_interactive_handoff_lineage(
+            run_dir,
+            normalized_images,
+        )
         phase3_observations = _phase3_observation_records(
             records,
             normalized_images,
             provider=normalized_provider,
             now=now,
         )
+        if automated_analysis is None:
+            codex_handoff_provider_status = _codex_interactive_handoff_provider_status(
+                phase3_observations,
+                created_at=now,
+                run_dir=run_dir,
+            )
         normalized_images, images_reused = _reuse_completed_images(
             evidence["images"],
             normalized_images,
         )
         new_ids = {image["id"] for image in normalized_images}
-        evidence["images"] = [
-            image
-            for image in evidence["images"]
-            if not (
+        kept_existing_images: list[Any] = []
+        replaced_image_ids: set[str] = set()
+        for image in evidence["images"]:
+            remove_image = (
                 isinstance(image, Mapping)
                 and (
                     image.get("id") in new_ids
@@ -390,17 +402,51 @@ def ingest_vision_observations(
                     )
                 )
             )
-        ] + normalized_images
-        _write_jsonl(visual_observations_path, phase3_observations)
+            if not remove_image:
+                kept_existing_images.append(image)
+                continue
+            image_id = (
+                _first_optional_string(image, "id") if isinstance(image, Mapping) else None
+            )
+            if image_id and image_id not in new_ids:
+                replaced_image_ids.add(image_id)
+        evidence["images"] = kept_existing_images + normalized_images
+        stale_visual_vote_evidence_refs = _prune_stale_image_refs_from_claim_votes(
+            evidence,
+            replaced_image_ids,
+        )
         if automated_analysis is not None:
             fetch_lineage_records_reconciled = _reconcile_openai_fetch_lineage(
                 run_dir,
                 phase3_observations,
             )
+        stale_visual_cleanup = _prune_visual_supports_without_current_observations(
+            evidence,
+            phase3_observations,
+            provider=normalized_provider,
+        )
+        stale_visual_supports = stale_visual_cleanup["visual_supports"]
+        stale_visual_vote_evidence_refs += stale_visual_cleanup["vote_evidence_refs"]
+        fetch_evidence_links_cleared = _clear_invalid_fetch_evidence_image_links(
+            run_dir,
+            evidence,
+        )
         generated_claims = _visual_claims_from_observations(evidence, now=now)
         evidence["claims"].extend(generated_claims)
         generated_claim_count = len(generated_claims)
         linkage_count = _link_visual_evidence_to_claims(evidence)
+        visual_support_lineage_cleanup = _refresh_claim_visual_support_lineage(evidence)
+        visual_support_lineage_refreshed = visual_support_lineage_cleanup[
+            "visual_supports"
+        ]
+        stale_visual_vote_evidence_refs += visual_support_lineage_cleanup[
+            "vote_evidence_refs"
+        ]
+        stale_visual_vote_evidence_refs += _prune_dangling_image_refs_from_claim_votes(
+            evidence
+        )
+        _canonicalize_visual_observation_links(evidence, phase3_observations)
+        _write_jsonl(visual_observations_path, phase3_observations)
         adapter_status = "visual_evidence_ingested"
     else:
         missing_claims = _missing_visual_claims(evidence, now=now)
@@ -408,6 +454,15 @@ def ingest_vision_observations(
         _write_jsonl(visual_observations_path, [])
         generated_claim_count = 0
         linkage_count = 0
+        lineage_materialization = {
+            "plans_materialized": 0,
+            "candidates_materialized": 0,
+            "fetches_materialized": 0,
+            "image_lineage_records_reconciled": 0,
+        }
+        fetch_evidence_links_cleared = 0
+        visual_support_lineage_refreshed = 0
+        stale_visual_vote_evidence_refs = 0
         adapter_status = "needs_visual_evidence" if missing_claims else "no_visual_tasks"
 
     evidence["vision_adapter"] = {
@@ -421,6 +476,13 @@ def ingest_vision_observations(
         "images_reused": images_reused,
         "observation_claims_created": generated_claim_count,
         "claim_visual_links_created": linkage_count,
+        "stale_visual_supports_cleared": stale_visual_supports
+        if normalized_images
+        else 0,
+        "fetch_evidence_links_cleared": fetch_evidence_links_cleared,
+        "visual_support_lineage_refreshed": visual_support_lineage_refreshed,
+        "stale_visual_vote_evidence_refs_cleared": stale_visual_vote_evidence_refs,
+        "codex_interactive_lineage_materialization": lineage_materialization,
         "missing_visual_claims_created": 0
         if normalized_images
         else len(
@@ -446,11 +508,25 @@ def ingest_vision_observations(
                 "external_vlm_call": automated_analysis.external_vlm_call,
             }
         )
+    elif codex_handoff_provider_status is not None:
+        evidence["vision_adapter"].update(
+            {
+                "provider_mode": codex_handoff_provider_status["provider_mode"],
+                "model_or_tool": codex_handoff_provider_status["diagnostics"]["model"],
+                "vlm_images_analyzed": codex_handoff_provider_status[
+                    "vlm_images_analyzed"
+                ],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "visual_provider_status_path": VISUAL_PROVIDER_STATUS_FILENAME,
+                "external_vlm_call": False,
+            }
+        )
     handoff = evidence.get("handoff")
     if isinstance(handoff, dict):
         handoff["visual_observations_path"] = "visual_observations.jsonl"
         handoff["visual_status"] = adapter_status
-        if automated_analysis is not None:
+        if automated_analysis is not None or codex_handoff_provider_status is not None:
             handoff["visual_provider_status_path"] = VISUAL_PROVIDER_STATUS_FILENAME
 
     _write_json(evidence_path, evidence)
@@ -469,6 +545,7 @@ def ingest_vision_observations(
             "images_reused": images_reused,
             "observation_claims_created": generated_claim_count,
             "claim_visual_links_created": linkage_count,
+            "stale_visual_vote_evidence_refs_cleared": stale_visual_vote_evidence_refs,
             "missing_visual_claims_created": evidence["vision_adapter"][
                 "missing_visual_claims_created"
             ],
@@ -504,6 +581,40 @@ def ingest_vision_observations(
             terminal=False,
             metric_classification="vlm_analysis",
             actionable_cause=_automated_analysis_actionable_cause(automated_analysis),
+            created_at=now,
+        )
+        visual_artifact_validation = validate_visual_artifacts(
+            run_dir=run_dir,
+            evidence_path=None,
+        )
+        status["visual_artifact_validation"] = visual_artifact_validation.to_dict()
+    elif codex_handoff_provider_status is not None:
+        status.update(
+            {
+                "provider_mode": codex_handoff_provider_status["provider_mode"],
+                "model_or_tool": codex_handoff_provider_status["diagnostics"]["model"],
+                "vlm_images_analyzed": codex_handoff_provider_status[
+                    "vlm_images_analyzed"
+                ],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "external_vlm_call": False,
+            }
+        )
+        status["artifacts"]["visual_provider_status"] = str(
+            run_dir / VISUAL_PROVIDER_STATUS_FILENAME
+        )
+        _write_visual_provider_status(
+            run_dir=run_dir,
+            provider_status=codex_handoff_provider_status,
+            status="codex_interactive_visual_handoff_ingested",
+            ok=True,
+            terminal=False,
+            metric_classification="vlm_analysis",
+            actionable_cause=(
+                "codex-interactive visual observations were ingested from child "
+                "session handoff artifacts"
+            ),
             created_at=now,
         )
         visual_artifact_validation = validate_visual_artifacts(
@@ -2154,6 +2265,9 @@ def _write_blocked_missing_vlm_provider(
             "stale_visual_observations_cleared": True,
             "stale_openai_images_cleared": stale_counts["images"],
             "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
+            "stale_openai_vote_evidence_refs_cleared": stale_counts[
+                "vote_evidence_refs"
+            ],
         },
     }
     _write_visual_provider_status(
@@ -2183,6 +2297,7 @@ def _write_blocked_missing_vlm_provider(
         "external_vlm_call": external_vlm_call,
         "stale_openai_images_cleared": stale_counts["images"],
         "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
+        "stale_openai_vote_evidence_refs_cleared": stale_counts["vote_evidence_refs"],
     }
     handoff = evidence.get("handoff")
     if isinstance(handoff, dict):
@@ -2213,6 +2328,9 @@ def _write_blocked_missing_vlm_provider(
             "external_vlm_call": external_vlm_call,
             "stale_openai_images_cleared": stale_counts["images"],
             "stale_openai_visual_supports_cleared": stale_counts["visual_supports"],
+            "stale_openai_vote_evidence_refs_cleared": stale_counts[
+                "vote_evidence_refs"
+            ],
             "artifacts": {
                 "evidence": str(run_dir / "evidence.json"),
                 "visual_observations": str(visual_observations_path),
@@ -2294,6 +2412,9 @@ def _write_blocked_missing_codex_vlm_provider(
             "stale_visual_observations_cleared": True,
             "stale_codex_images_cleared": stale_counts["images"],
             "stale_codex_visual_supports_cleared": stale_counts["visual_supports"],
+            "stale_codex_vote_evidence_refs_cleared": stale_counts[
+                "vote_evidence_refs"
+            ],
         },
     }
     _write_visual_provider_status(
@@ -2323,6 +2444,7 @@ def _write_blocked_missing_codex_vlm_provider(
         "external_vlm_call": False,
         "stale_codex_images_cleared": stale_counts["images"],
         "stale_codex_visual_supports_cleared": stale_counts["visual_supports"],
+        "stale_codex_vote_evidence_refs_cleared": stale_counts["vote_evidence_refs"],
     }
     handoff = evidence.get("handoff")
     if isinstance(handoff, dict):
@@ -2353,6 +2475,9 @@ def _write_blocked_missing_codex_vlm_provider(
             "external_vlm_call": False,
             "stale_codex_images_cleared": stale_counts["images"],
             "stale_codex_visual_supports_cleared": stale_counts["visual_supports"],
+            "stale_codex_vote_evidence_refs_cleared": stale_counts[
+                "vote_evidence_refs"
+            ],
             "artifacts": {
                 "evidence": str(run_dir / "evidence.json"),
                 "visual_observations": str(visual_observations_path),
@@ -2777,7 +2902,12 @@ def _remove_provider_visual_evidence(
 ) -> dict[str, int]:
     images = evidence.get("images", [])
     if not isinstance(images, list):
-        return {"images": 0, "visual_supports": 0, "supporting_images": 0}
+        return {
+            "images": 0,
+            "visual_supports": 0,
+            "supporting_images": 0,
+            "vote_evidence_refs": 0,
+        }
 
     kept_images: list[Any] = []
     removed_image_ids: set[str] = set()
@@ -2792,11 +2922,20 @@ def _remove_provider_visual_evidence(
         kept_images.append(image)
 
     if not removed_images:
-        return {"images": 0, "visual_supports": 0, "supporting_images": 0}
+        return {
+            "images": 0,
+            "visual_supports": 0,
+            "supporting_images": 0,
+            "vote_evidence_refs": 0,
+        }
 
     evidence["images"] = kept_images
     removed_supports = 0
     removed_supporting_images = 0
+    removed_vote_evidence_refs = _prune_stale_image_refs_from_claim_votes(
+        evidence,
+        removed_image_ids,
+    )
     claims = evidence.get("claims", [])
     if isinstance(claims, list):
         for claim in claims:
@@ -2829,6 +2968,7 @@ def _remove_provider_visual_evidence(
         "images": removed_images,
         "visual_supports": removed_supports,
         "supporting_images": removed_supporting_images,
+        "vote_evidence_refs": removed_vote_evidence_refs,
     }
 
 
@@ -2990,6 +3130,340 @@ def _visual_support_from_image(
     return support
 
 
+def _prune_visual_supports_without_current_observations(
+    evidence: dict[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    provider: str,
+) -> dict[str, int]:
+    current_image_ids = {
+        image_id
+        for observation in observations
+        for image_id in (
+            _first_optional_string(observation, "evidence_image_id"),
+            _first_optional_string(observation, "id"),
+        )
+        if image_id
+    }
+    if not current_image_ids:
+        return {"visual_supports": 0, "vote_evidence_refs": 0}
+    claims = evidence.get("claims", [])
+    images = evidence.get("images", [])
+    if not isinstance(claims, list) or not isinstance(images, list):
+        return {"visual_supports": 0, "vote_evidence_refs": 0}
+    provider_image_ids: set[str] = set()
+    stale_provider_image_ids: set[str] = set()
+    kept_images: list[Any] = []
+    for image in images:
+        if not isinstance(image, Mapping):
+            kept_images.append(image)
+            continue
+        image_id = _first_optional_string(image, "id")
+        if not image_id or not _is_provider_visual_image(image, provider):
+            kept_images.append(image)
+            continue
+        if image_id in current_image_ids:
+            provider_image_ids.add(image_id)
+            kept_images.append(image)
+        else:
+            stale_provider_image_ids.add(image_id)
+    if stale_provider_image_ids:
+        evidence["images"] = kept_images
+    if not provider_image_ids and not stale_provider_image_ids:
+        return {"visual_supports": 0, "vote_evidence_refs": 0}
+    removed_vote_evidence_refs = _prune_stale_image_refs_from_claim_votes(
+        evidence,
+        stale_provider_image_ids,
+    )
+    removed = 0
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        visual_supports = claim.get("visual_supports")
+        if not isinstance(visual_supports, list):
+            continue
+        kept_supports: list[Any] = []
+        removed_image_ids: set[str] = set()
+        for support in visual_supports:
+            image_id = (
+                _first_optional_string(support, "image_id")
+                if isinstance(support, Mapping)
+                else None
+            )
+            if (
+                image_id
+                and image_id in stale_provider_image_ids
+                and image_id not in current_image_ids
+            ):
+                removed += 1
+                removed_image_ids.add(image_id)
+                continue
+            kept_supports.append(support)
+        if len(kept_supports) == len(visual_supports):
+            continue
+        claim["visual_supports"] = kept_supports
+        supporting_images = claim.get("supporting_images")
+        if isinstance(supporting_images, list) and removed_image_ids:
+            supported_image_ids = {
+                image_id
+                for support in kept_supports
+                for image_id in [
+                    _first_optional_string(support, "image_id")
+                    if isinstance(support, Mapping)
+                    else None
+                ]
+                if image_id
+            }
+            claim["supporting_images"] = [
+                image_id
+                for image_id in supporting_images
+                if not (
+                    isinstance(image_id, str)
+                    and image_id in removed_image_ids
+                    and image_id not in supported_image_ids
+                )
+            ]
+    return {
+        "visual_supports": removed,
+        "vote_evidence_refs": removed_vote_evidence_refs,
+    }
+
+
+def _prune_stale_image_refs_from_claim_votes(
+    evidence: Mapping[str, Any],
+    stale_image_ids: set[str],
+) -> int:
+    if not stale_image_ids:
+        return 0
+    claims = evidence.get("claims", [])
+    if not isinstance(claims, list):
+        return 0
+    removed = 0
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        votes = claim.get("votes")
+        if not isinstance(votes, list):
+            continue
+        for vote in votes:
+            if not isinstance(vote, dict):
+                continue
+            evidence_refs = vote.get("evidence_refs")
+            if not isinstance(evidence_refs, list):
+                continue
+            filtered_refs = [
+                ref
+                for ref in evidence_refs
+                if not (isinstance(ref, str) and ref in stale_image_ids)
+            ]
+            if filtered_refs == evidence_refs:
+                continue
+            removed += len(evidence_refs) - len(filtered_refs)
+            vote["evidence_refs"] = filtered_refs
+    return removed
+
+
+def _prune_dangling_image_refs_from_claim_votes(evidence: Mapping[str, Any]) -> int:
+    claims = evidence.get("claims", [])
+    if not isinstance(claims, list):
+        return 0
+    known_refs = _evidence_source_ids(evidence) | _evidence_image_ids(evidence)
+    dangling_image_refs: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        votes = claim.get("votes")
+        if not isinstance(votes, list):
+            continue
+        for vote in votes:
+            if not isinstance(vote, Mapping):
+                continue
+            evidence_refs = vote.get("evidence_refs")
+            if not isinstance(evidence_refs, list):
+                continue
+            dangling_image_refs.update(
+                ref
+                for ref in evidence_refs
+                if (
+                    isinstance(ref, str)
+                    and _looks_like_image_evidence_id(ref)
+                    and ref not in known_refs
+                )
+            )
+    return _prune_stale_image_refs_from_claim_votes(evidence, dangling_image_refs)
+
+
+def _evidence_source_ids(evidence: Mapping[str, Any]) -> set[str]:
+    sources = evidence.get("sources", [])
+    if not isinstance(sources, list):
+        return set()
+    return {
+        source_id
+        for source in sources
+        for source_id in [
+            _first_optional_string(source, "id") if isinstance(source, Mapping) else None
+        ]
+        if source_id
+    }
+
+
+def _evidence_image_ids(evidence: Mapping[str, Any]) -> set[str]:
+    images = evidence.get("images", [])
+    if not isinstance(images, list):
+        return set()
+    return {
+        image_id
+        for image in images
+        for image_id in [
+            _first_optional_string(image, "id") if isinstance(image, Mapping) else None
+        ]
+        if image_id
+    }
+
+
+def _looks_like_image_evidence_id(value: str) -> bool:
+    return value.startswith("img_")
+
+
+def _clear_invalid_fetch_evidence_image_links(
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+) -> int:
+    fetch_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    if not fetch_path.exists():
+        return 0
+    images = evidence.get("images", [])
+    evidence_image_ids = {
+        image_id
+        for image in images
+        for image_id in [
+            _first_optional_string(image, "id") if isinstance(image, Mapping) else None
+        ]
+        if image_id
+    }
+    fetches = [
+        dict(item)
+        for item in _read_jsonl(fetch_path)
+        if isinstance(item, Mapping)
+    ]
+    changed = 0
+    for fetch in fetches:
+        evidence_image_id = _first_optional_string(fetch, "evidence_image_id")
+        if not evidence_image_id:
+            continue
+        if evidence_image_id not in evidence_image_ids:
+            fetch["evidence_image_id"] = None
+            changed += 1
+    if changed:
+        _write_jsonl(fetch_path, fetches)
+    return changed
+
+
+def _refresh_claim_visual_support_lineage(evidence: dict[str, Any]) -> dict[str, int]:
+    images = evidence.get("images", [])
+    claims = evidence.get("claims", [])
+    if not isinstance(images, list) or not isinstance(claims, list):
+        return {"visual_supports": 0, "vote_evidence_refs": 0}
+    images_by_id = {
+        image["id"]: image
+        for image in images
+        if isinstance(image, Mapping) and isinstance(image.get("id"), str)
+    }
+    changed = 0
+    removed_vote_evidence_refs = 0
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        supports = claim.get("visual_supports")
+        if not isinstance(supports, list):
+            continue
+        refreshed_supports: list[dict[str, Any]] = []
+        stale_image_ids: set[str] = set()
+        for support in supports:
+            if not isinstance(support, Mapping):
+                changed += 1
+                continue
+            image_id = _first_optional_string(support, "image_id")
+            image = images_by_id.get(image_id or "")
+            refreshed = (
+                _canonical_visual_support_record(support, image)
+                if image is not None
+                else None
+            )
+            if refreshed is None:
+                if image_id:
+                    stale_image_ids.add(image_id)
+                changed += 1
+                continue
+            if dict(support) != refreshed:
+                changed += 1
+            refreshed_supports.append(refreshed)
+        if refreshed_supports != supports:
+            claim["visual_supports"] = refreshed_supports
+        if stale_image_ids:
+            removed_vote_evidence_refs += _prune_stale_image_refs_from_claim_votes(
+                {"claims": [claim]},
+                stale_image_ids,
+            )
+        supporting_images = claim.get("supporting_images")
+        if isinstance(supporting_images, list) and stale_image_ids:
+            valid_image_ids = {
+                image_id
+                for support in refreshed_supports
+                for image_id in [_first_optional_string(support, "image_id")]
+                if image_id
+            }
+            kept_images = [
+                image_id
+                for image_id in supporting_images
+                if not (
+                    isinstance(image_id, str)
+                    and image_id in stale_image_ids
+                    and image_id not in valid_image_ids
+                )
+            ]
+            if kept_images != supporting_images:
+                claim["supporting_images"] = kept_images
+                changed += 1
+    return {
+        "visual_supports": changed,
+        "vote_evidence_refs": removed_vote_evidence_refs,
+    }
+
+
+def _canonical_visual_support_record(
+    support: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(image, Mapping):
+        return None
+    image_id = _first_optional_string(support, "image_id") or _first_optional_string(
+        image,
+        "id",
+    )
+    observation_index = support.get("observation_index")
+    observations = image.get("observations", [])
+    if (
+        not isinstance(image_id, str)
+        or not image_id
+        or not isinstance(observation_index, int)
+        or not isinstance(observations, list)
+        or observation_index < 0
+        or observation_index >= len(observations)
+    ):
+        return None
+    observation_text = observations[observation_index]
+    if not isinstance(observation_text, str) or not observation_text:
+        return None
+    refreshed = dict(support)
+    refreshed["image_id"] = image_id
+    refreshed["observation_ref"] = f"images.{image_id}.observations[{observation_index}]"
+    refreshed["observation_text"] = observation_text
+    for field, value in _visual_lineage_from_image(image).items():
+        refreshed[field] = value
+    return refreshed
+
+
 def _visual_lineage_from_image(image: Mapping[str, Any]) -> dict[str, str]:
     lineage: dict[str, str] = {}
     for field in (
@@ -3112,16 +3586,145 @@ def _valid_existing_visual_supports(
             or observation_index >= len(observations)
         ):
             continue
-        observation_text = observations[observation_index]
-        if not isinstance(observation_text, str) or not observation_text:
-            continue
-        support = dict(raw_support)
-        support["observation_ref"] = f"images.{image_id}.observations[{observation_index}]"
-        support["observation_text"] = observation_text
-        for field, value in _visual_lineage_from_image(image).items():
-            support.setdefault(field, value)
-        supports.append(support)
+        support = _canonical_visual_support_record(raw_support, image)
+        if support is not None:
+            supports.append(support)
     return supports
+
+
+def _canonicalize_visual_observation_links(
+    evidence: Mapping[str, Any],
+    observations: Sequence[MutableMapping[str, Any]],
+) -> int:
+    images = evidence.get("images", [])
+    claims = evidence.get("claims", [])
+    if not isinstance(images, list) or not isinstance(claims, list):
+        return 0
+    images_by_id = {
+        image["id"]: image
+        for image in images
+        if isinstance(image, Mapping) and isinstance(image.get("id"), str)
+    }
+    supports_by_claim_image: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        claim_id = _first_optional_string(claim, "id")
+        if not claim_id:
+            continue
+        for support in _mapping_list(claim.get("visual_supports")):
+            image_id = _first_optional_string(support, "image_id")
+            if image_id:
+                supports_by_claim_image.setdefault((claim_id, image_id), []).append(support)
+    changed = 0
+    for observation in observations:
+        if not isinstance(observation, MutableMapping):
+            continue
+        image_id = _first_optional_string(
+            observation,
+            "evidence_image_id",
+            "image_id",
+            "id",
+        )
+        image = images_by_id.get(image_id or "")
+        for field, key_fields in (
+            ("verifier_links", ("claim_id", "visual_support_ref", "verifier_vote_id")),
+            ("report_links", ("claim_id", "visual_support_ref", "citation_id")),
+        ):
+            links = observation.get(field)
+            if not isinstance(links, list):
+                continue
+            normalized_links: list[Any] = []
+            seen: set[tuple[Any, ...]] = set()
+            for link in links:
+                if not isinstance(link, Mapping):
+                    normalized_links.append(link)
+                    continue
+                link_copy = dict(link)
+                claim_id = _first_optional_string(link_copy, "claim_id")
+                support = _matching_claim_visual_support(
+                    claim_id=claim_id,
+                    image_id=image_id,
+                    link=link_copy,
+                    supports_by_claim_image=supports_by_claim_image,
+                )
+                if support is None:
+                    changed += 1
+                    continue
+                if _canonicalize_visual_observation_link(
+                    link_copy,
+                    observation=observation,
+                    image=image,
+                    support=support,
+                ):
+                    changed += 1
+                key = tuple(link_copy.get(key_field) for key_field in key_fields)
+                if key in seen:
+                    changed += 1
+                    continue
+                seen.add(key)
+                normalized_links.append(link_copy)
+            if normalized_links != links:
+                observation[field] = normalized_links
+    return changed
+
+
+def _matching_claim_visual_support(
+    *,
+    claim_id: str | None,
+    image_id: str | None,
+    link: Mapping[str, Any],
+    supports_by_claim_image: Mapping[tuple[str, str], list[Mapping[str, Any]]],
+) -> Mapping[str, Any] | None:
+    if not claim_id or not image_id:
+        return None
+    supports = supports_by_claim_image.get((claim_id, image_id), [])
+    if not supports:
+        return None
+    visual_support_ref = _first_optional_string(link, "visual_support_ref")
+    if visual_support_ref:
+        for support in supports:
+            if _first_optional_string(support, "observation_ref") == visual_support_ref:
+                return support
+    observation_index = link.get("observation_index")
+    if isinstance(observation_index, int):
+        for support in supports:
+            if support.get("observation_index") == observation_index:
+                return support
+    return supports[0]
+
+
+def _canonicalize_visual_observation_link(
+    link: MutableMapping[str, Any],
+    *,
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+    support: Mapping[str, Any],
+) -> bool:
+    changed = False
+    visual_support_ref = _first_optional_string(support, "observation_ref")
+    if visual_support_ref and link.get("visual_support_ref") != visual_support_ref:
+        link["visual_support_ref"] = visual_support_ref
+        changed = True
+    for field in (
+        "plan_id",
+        "task_id",
+        "angle_id",
+        "route",
+        "candidate_id",
+        "fetch_id",
+        "evidence_image_id",
+    ):
+        value = _first_optional_string(support, field) or _first_optional_string(
+            observation,
+            field,
+        )
+        if not value and image is not None:
+            value = _first_optional_string(image, field)
+        if value and link.get(field) != value:
+            link[field] = value
+            changed = True
+    return changed
 
 
 def _claim_accepts_visual_link(
@@ -3306,7 +3909,18 @@ def _normalize_visual_record(
     )
     image_url = _validated_optional_url(raw_image_url, "image_url", allow_file=True)
     page_url = _validated_optional_url(raw_page_url, "page_url", allow_file=False)
-    if explicit_artifact_path is not None and not artifact_file.is_file():
+    explicit_metadata_only_handoff = (
+        provider == CODEX_INTERACTIVE_PROVIDER
+        and explicit_artifact_path is not None
+        and not artifact_file.is_file()
+        and _metadata_only_artifact_path(local_path)
+        and (image_url is not None or page_url is not None)
+    )
+    if (
+        explicit_artifact_path is not None
+        and not artifact_file.is_file()
+        and not explicit_metadata_only_handoff
+    ):
         raise VisionAdapterError(
             f"local_artifact_path '{local_path}' does not reference an existing run-local file"
         )
@@ -3371,7 +3985,7 @@ def _normalize_visual_record(
         _redact_provider_text(item, config=None)
         for item in (_string_list(record, "caveats") + _string_list(image, "caveats"))
     )
-    if explicit_artifact_path is None and not artifact_file.exists():
+    if (explicit_artifact_path is None and not artifact_file.exists()) or explicit_metadata_only_handoff:
         caveats.append("metadata-only visual record; no local image artifact was provided")
 
     artifact_size_bytes = _artifact_size_bytes(record, image, artifact_file)
@@ -3716,6 +4330,1054 @@ def _copy_optional_visual_metadata(
             visual[key] = _redact_provider_value(dict(value), config=None)
 
 
+def _materialize_codex_interactive_handoff_lineage(
+    run_dir: Path,
+    images: Sequence[MutableMapping[str, Any]],
+) -> dict[str, int]:
+    """Keep Codex-interactive VLM image lineage countable after acquisition rewrites."""
+
+    plan_path = run_dir / "visual_search_plan.json"
+    candidate_path = run_dir / "visual_candidates.jsonl"
+    fetch_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
+    plan_payload: dict[str, Any] = {}
+    if plan_path.exists():
+        try:
+            loaded = _read_json(plan_path)
+        except VisionAdapterError:
+            loaded = {}
+        if isinstance(loaded, Mapping):
+            plan_payload = dict(loaded)
+    plan_tasks = [dict(item) for item in _mapping_list(plan_payload.get("tasks"))]
+    plan_ids = {
+        str(item.get("plan_id"))
+        for item in plan_tasks
+        if _first_optional_string(item, "plan_id")
+    }
+
+    candidates = [
+        dict(item)
+        for item in _read_jsonl(candidate_path)
+        if isinstance(item, Mapping)
+    ] if candidate_path.exists() else []
+    fetches = [
+        dict(item)
+        for item in _read_jsonl(fetch_path)
+        if isinstance(item, Mapping)
+    ] if fetch_path.exists() else []
+    candidates_by_id = {
+        str(item.get("candidate_id") or item.get("id")): item
+        for item in candidates
+        if item.get("candidate_id") or item.get("id")
+    }
+    fetches_by_id = {
+        str(item.get("fetch_id")): item
+        for item in fetches
+        if _first_optional_string(item, "fetch_id")
+    }
+    task_by_id = _codex_interactive_task_by_id(run_dir)
+    task_lineage_reconciled = _reconcile_visual_artifact_task_lineage(
+        plan_tasks=plan_tasks,
+        candidates=candidates,
+        fetches=fetches,
+        task_by_id=task_by_id,
+    )
+    if task_lineage_reconciled:
+        plan_ids = {
+            str(item.get("plan_id"))
+            for item in plan_tasks
+            if _first_optional_string(item, "plan_id")
+        }
+
+    plans_materialized = 0
+    candidates_materialized = 0
+    fetches_materialized = 0
+    images_reconciled = 0
+    plans_reconciled = 0
+    candidates_reconciled = 0
+    fetches_reconciled = 0
+    for image in images:
+        if not isinstance(image, MutableMapping):
+            continue
+        if _first_optional_string(image, "analysis_status") != "analyzed":
+            continue
+        if _first_optional_string(image, "analysis_provider") != CODEX_INTERACTIVE_PROVIDER:
+            continue
+        image_id = _first_optional_string(image, "id")
+        if not image_id:
+            continue
+        images_reconciled += _reconcile_codex_interactive_handoff_image_to_fetched_artifact(
+            run_dir,
+            image,
+            candidates=candidates,
+            fetches=fetches,
+            candidates_by_id=candidates_by_id,
+        )
+        images_reconciled += _apply_task_lineage_to_visual_record(
+            image,
+            task_by_id=task_by_id,
+        )
+        candidate_id = _first_optional_string(image, "candidate_id") or f"cand_{_sanitize_identifier(image_id)}"
+        fetch_id = _first_optional_string(image, "fetch_id") or f"fetch_{_sanitize_identifier(image_id)}"
+        angle_id = _first_optional_string(image, "angle_id") or "angle_001"
+        task_id = _first_optional_string(image, "task_id") or f"task_visual_{_sanitize_identifier(angle_id.removeprefix('angle_'))}"
+        route = _first_optional_string(image, "route") or "visual_required"
+        plan_id = _first_optional_string(image, "plan_id") or _plan_id_for_visual_task(
+            task_id=task_id,
+            angle_id=angle_id,
+            route=route,
+        )
+        for field, value in (
+            ("candidate_id", candidate_id),
+            ("fetch_id", fetch_id),
+            ("plan_id", plan_id),
+            ("task_id", task_id),
+            ("angle_id", angle_id),
+            ("route", route),
+        ):
+            if image.get(field) != value:
+                image[field] = value
+                images_reconciled += 1
+        stale_placeholder_reconciliation = _prune_stale_codex_interactive_handoff_placeholders(
+            run_dir=run_dir,
+            image=image,
+            plan_tasks=plan_tasks,
+            candidates=candidates,
+            fetches=fetches,
+            canonical_plan_id=plan_id,
+            canonical_candidate_id=candidate_id,
+            canonical_fetch_id=fetch_id,
+        )
+        if stale_placeholder_reconciliation["plans_reconciled"]:
+            plan_ids = {
+                str(item.get("plan_id"))
+                for item in plan_tasks
+                if _first_optional_string(item, "plan_id")
+            }
+            plans_reconciled += stale_placeholder_reconciliation["plans_reconciled"]
+        if stale_placeholder_reconciliation["candidates_reconciled"]:
+            candidates_by_id = {
+                str(item.get("candidate_id") or item.get("id")): item
+                for item in candidates
+                if item.get("candidate_id") or item.get("id")
+            }
+            candidates_reconciled += stale_placeholder_reconciliation["candidates_reconciled"]
+        if stale_placeholder_reconciliation["fetches_reconciled"]:
+            fetches_by_id = {
+                str(item.get("fetch_id")): item
+                for item in fetches
+                if _first_optional_string(item, "fetch_id")
+            }
+            fetches_reconciled += stale_placeholder_reconciliation["fetches_reconciled"]
+        if plan_id not in plan_ids:
+            plan_tasks.append(
+                _codex_interactive_handoff_plan_record(
+                    image,
+                    plan_id=plan_id,
+                    task_id=task_id,
+                    angle_id=angle_id,
+                    route=route,
+                )
+            )
+            plan_ids.add(plan_id)
+            plans_materialized += 1
+        else:
+            for plan in plan_tasks:
+                if _first_optional_string(plan, "plan_id") != plan_id:
+                    continue
+                before = dict(plan)
+                _fill_codex_interactive_handoff_plan_record(
+                    plan,
+                    image,
+                    plan_id=plan_id,
+                    task_id=task_id,
+                    angle_id=angle_id,
+                    route=route,
+                )
+                if plan != before:
+                    plans_reconciled += 1
+                break
+        candidate = candidates_by_id.get(candidate_id)
+        if candidate is None:
+            candidate = _codex_interactive_handoff_candidate_record(
+                run_dir,
+                image,
+                candidate_id=candidate_id,
+                plan_id=plan_id,
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+            candidates.append(candidate)
+            candidates_by_id[candidate_id] = candidate
+            candidates_materialized += 1
+        else:
+            before = dict(candidate)
+            _fill_codex_interactive_handoff_candidate_record(
+                run_dir,
+                candidate,
+                image,
+                candidate_id=candidate_id,
+                plan_id=plan_id,
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+            if candidate != before:
+                candidates_reconciled += 1
+        fetch = fetches_by_id.get(fetch_id)
+        if fetch is None:
+            fetch = _codex_interactive_handoff_fetch_record(
+                run_dir,
+                image,
+                candidate_id=candidate_id,
+                fetch_id=fetch_id,
+                plan_id=plan_id,
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+            fetches.append(fetch)
+            fetches_by_id[fetch_id] = fetch
+            fetches_materialized += 1
+        else:
+            before = dict(fetch)
+            _fill_codex_interactive_handoff_fetch_record(
+                run_dir,
+                fetch,
+                image,
+                candidate_id=candidate_id,
+                fetch_id=fetch_id,
+                plan_id=plan_id,
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+            if fetch != before:
+                fetches_reconciled += 1
+
+    if plans_materialized or plans_reconciled or task_lineage_reconciled:
+        plan_payload = {
+            "schema_version": plan_payload.get("schema_version")
+            or "codex-deepresearch.visual-search-plan.v0",
+            "run_id": plan_payload.get("run_id") or run_dir.name,
+            "created_at": plan_payload.get("created_at") or _utc_now(),
+            "status": plan_payload.get("status") or "codex_interactive_handoff_lineage_materialized",
+            "provider": plan_payload.get("provider") or "codex-native",
+            "provider_mode": plan_payload.get("provider_mode") or "real",
+            "tasks": plan_tasks,
+        }
+        _write_json(plan_path, plan_payload)
+    if candidates_materialized or candidates_reconciled or task_lineage_reconciled:
+        _write_jsonl(candidate_path, candidates)
+    if fetches_materialized or fetches_reconciled or task_lineage_reconciled:
+        _write_jsonl(fetch_path, fetches)
+    return {
+        "plans_materialized": plans_materialized,
+        "candidates_materialized": candidates_materialized,
+        "fetches_materialized": fetches_materialized,
+        "plans_reconciled": plans_reconciled,
+        "candidates_reconciled": candidates_reconciled,
+        "fetches_reconciled": fetches_reconciled,
+        "task_lineage_records_reconciled": task_lineage_reconciled,
+        "image_lineage_records_reconciled": (
+            images_reconciled
+            + plans_reconciled
+            + candidates_reconciled
+            + fetches_reconciled
+            + task_lineage_reconciled
+        ),
+    }
+
+
+def _codex_interactive_task_by_id(run_dir: Path) -> dict[str, Mapping[str, Any]]:
+    tasks: dict[str, Mapping[str, Any]] = {}
+    for filename in ("research_tasks.json", "visual_tasks.json"):
+        path = run_dir / filename
+        if not path.exists():
+            continue
+        try:
+            payload = _read_json(path)
+        except VisionAdapterError:
+            continue
+        for task in _mapping_list(payload.get("tasks")):
+            task_id = _first_optional_string(task, "id")
+            if task_id:
+                tasks[task_id] = task
+    evidence_path = run_dir / "evidence.json"
+    if evidence_path.exists():
+        try:
+            evidence = _read_json(evidence_path)
+        except VisionAdapterError:
+            evidence = {}
+        for task in _mapping_list(evidence.get("search_tasks")):
+            task_id = _first_optional_string(task, "id")
+            if task_id and task_id not in tasks:
+                tasks[task_id] = task
+    return tasks
+
+
+def _reconcile_visual_artifact_task_lineage(
+    *,
+    plan_tasks: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    fetches: list[dict[str, Any]],
+    task_by_id: Mapping[str, Mapping[str, Any]],
+) -> int:
+    changed = 0
+    plan_id_rewrites: dict[str, str] = {}
+    for plan in plan_tasks:
+        old_plan_id = _first_optional_string(plan, "plan_id")
+        changed += _apply_task_lineage_to_visual_record(
+            plan,
+            task_by_id=task_by_id,
+            plan_id_rewrites=plan_id_rewrites,
+        )
+        new_plan_id = _first_optional_string(plan, "plan_id")
+        if old_plan_id and new_plan_id and old_plan_id != new_plan_id:
+            plan_id_rewrites[old_plan_id] = new_plan_id
+    if plan_id_rewrites:
+        changed += _deduplicate_visual_plan_tasks(plan_tasks)
+
+    for record in candidates:
+        changed += _apply_task_lineage_to_visual_record(
+            record,
+            task_by_id=task_by_id,
+            plan_id_rewrites=plan_id_rewrites,
+        )
+    for record in fetches:
+        changed += _apply_task_lineage_to_visual_record(
+            record,
+            task_by_id=task_by_id,
+            plan_id_rewrites=plan_id_rewrites,
+        )
+    return changed
+
+
+def _deduplicate_visual_plan_tasks(plan_tasks: list[dict[str, Any]]) -> int:
+    deduped: list[dict[str, Any]] = []
+    by_plan_id: dict[str, dict[str, Any]] = {}
+    changed = 0
+    for plan in plan_tasks:
+        plan_id = _first_optional_string(plan, "plan_id")
+        if not plan_id:
+            deduped.append(plan)
+            continue
+        existing = by_plan_id.get(plan_id)
+        if existing is None:
+            by_plan_id[plan_id] = plan
+            deduped.append(plan)
+            continue
+        changed += 1
+        for key, value in plan.items():
+            if existing.get(key) in (None, "", [], {}):
+                existing[key] = value
+    if changed:
+        plan_tasks[:] = deduped
+    return changed
+
+
+def _prune_stale_codex_interactive_handoff_placeholders(
+    *,
+    run_dir: Path,
+    image: Mapping[str, Any],
+    plan_tasks: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    fetches: list[dict[str, Any]],
+    canonical_plan_id: str,
+    canonical_candidate_id: str,
+    canonical_fetch_id: str,
+) -> dict[str, int]:
+    if not _codex_interactive_handoff_local_artifact_exists(run_dir, image):
+        return {
+            "plans_reconciled": 0,
+            "candidates_reconciled": 0,
+            "fetches_reconciled": 0,
+        }
+    removed_plan_ids: set[str] = set()
+    candidate_count = _prune_stale_codex_interactive_handoff_candidates(
+        image=image,
+        candidates=candidates,
+        canonical_candidate_id=canonical_candidate_id,
+        removed_plan_ids=removed_plan_ids,
+    )
+    fetch_count = _prune_stale_codex_interactive_handoff_fetches(
+        image=image,
+        fetches=fetches,
+        canonical_fetch_id=canonical_fetch_id,
+        removed_plan_ids=removed_plan_ids,
+    )
+    plan_count = 0
+    if removed_plan_ids:
+        plan_count = _prune_stale_codex_interactive_handoff_plans(
+            plan_tasks=plan_tasks,
+            candidates=candidates,
+            fetches=fetches,
+            canonical_plan_id=canonical_plan_id,
+            removed_plan_ids=removed_plan_ids,
+        )
+    return {
+        "plans_reconciled": plan_count,
+        "candidates_reconciled": candidate_count,
+        "fetches_reconciled": fetch_count,
+    }
+
+
+def _prune_stale_codex_interactive_handoff_candidates(
+    *,
+    image: Mapping[str, Any],
+    candidates: list[dict[str, Any]],
+    canonical_candidate_id: str,
+    removed_plan_ids: set[str],
+) -> int:
+    changed = 0
+    for candidate in candidates:
+        candidate_id = _first_optional_string(candidate, "candidate_id", "id")
+        if (
+            not candidate_id
+            or candidate_id == canonical_candidate_id
+            or not _is_stale_codex_interactive_handoff_candidate(candidate)
+            or not _codex_interactive_handoff_records_match_image(image, candidate)
+        ):
+            continue
+        changed += _clear_stale_codex_interactive_handoff_image_links(candidate)
+        if not _codex_interactive_handoff_records_match_image(image, candidate):
+            plan_id = _first_optional_string(candidate, "plan_id")
+            if plan_id:
+                removed_plan_ids.add(plan_id)
+    return changed
+
+
+def _prune_stale_codex_interactive_handoff_fetches(
+    *,
+    image: Mapping[str, Any],
+    fetches: list[dict[str, Any]],
+    canonical_fetch_id: str,
+    removed_plan_ids: set[str],
+) -> int:
+    changed = 0
+    for fetch in fetches:
+        fetch_id = _first_optional_string(fetch, "fetch_id")
+        if (
+            not fetch_id
+            or fetch_id == canonical_fetch_id
+            or not _is_stale_codex_interactive_handoff_fetch(fetch)
+            or not _metadata_only_artifact_path(
+                _first_optional_string(fetch, "local_artifact_path")
+            )
+            or not _codex_interactive_handoff_records_match_image(image, fetch)
+        ):
+            continue
+        changed += _clear_stale_codex_interactive_handoff_image_links(fetch)
+        if not _codex_interactive_handoff_records_match_image(image, fetch):
+            plan_id = _first_optional_string(fetch, "plan_id")
+            if plan_id:
+                removed_plan_ids.add(plan_id)
+    return changed
+
+
+def _clear_stale_codex_interactive_handoff_image_links(
+    record: MutableMapping[str, Any],
+) -> int:
+    changed = 0
+    for field in ("evidence_image_id", "image_id", "source_image_id"):
+        if _first_optional_string(record, field):
+            record[field] = None
+            changed += 1
+    for metadata_field in ("provider_provenance", "raw_provider_metadata"):
+        metadata = record.get(metadata_field)
+        if not isinstance(metadata, MutableMapping):
+            continue
+        for field in ("evidence_image_id", "image_id", "source_image_id"):
+            if _first_optional_string(metadata, field):
+                metadata[field] = None
+                changed += 1
+    return changed
+
+
+def _prune_stale_codex_interactive_handoff_plans(
+    *,
+    plan_tasks: list[dict[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+    fetches: Sequence[Mapping[str, Any]],
+    canonical_plan_id: str,
+    removed_plan_ids: set[str],
+) -> int:
+    used_plan_ids = {
+        plan_id
+        for record in (*candidates, *fetches)
+        for plan_id in [_first_optional_string(record, "plan_id")]
+        if plan_id
+    }
+    used_plan_ids.add(canonical_plan_id)
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for plan in plan_tasks:
+        plan_id = _first_optional_string(plan, "plan_id")
+        if (
+            not plan_id
+            or plan_id not in removed_plan_ids
+            or plan_id in used_plan_ids
+            or not _is_stale_codex_interactive_handoff_plan(plan)
+        ):
+            kept.append(plan)
+            continue
+        removed += 1
+    if removed:
+        plan_tasks[:] = kept
+    return removed
+
+
+def _is_stale_codex_interactive_handoff_candidate(record: Mapping[str, Any]) -> bool:
+    return (
+        _first_optional_string(record, "provider") == "codex-native"
+        and _first_optional_string(record, "handoff_artifact") == "visual_candidates.jsonl"
+        and _first_optional_string(record, "candidate_status") == "fetch_failed"
+        and _first_optional_string(record, "rejection_reason") == "missing_local_artifact"
+    )
+
+
+def _is_stale_codex_interactive_handoff_fetch(record: Mapping[str, Any]) -> bool:
+    return (
+        _first_optional_string(record, "provider") == "codex-native"
+        and _first_optional_string(record, "handoff_artifact") == IMAGE_FETCH_STATUS_FILENAME
+        and _first_optional_string(record, "fetch_status") == "failed"
+        and _first_optional_string(record, "failure_code") == "missing_local_artifact"
+    )
+
+
+def _is_stale_codex_interactive_handoff_plan(record: Mapping[str, Any]) -> bool:
+    return (
+        _first_optional_string(record, "provider") == "codex-native"
+        and _first_optional_string(record, "handoff_artifact") == "visual_search_plan.json"
+    )
+
+
+def _apply_task_lineage_to_visual_record(
+    record: MutableMapping[str, Any],
+    *,
+    task_by_id: Mapping[str, Mapping[str, Any]],
+    plan_id_rewrites: Mapping[str, str] | None = None,
+) -> int:
+    changed = 0
+    plan_id = _first_optional_string(record, "plan_id")
+    if plan_id and plan_id_rewrites and plan_id in plan_id_rewrites:
+        record["plan_id"] = plan_id_rewrites[plan_id]
+        changed += 1
+
+    task_id = _first_optional_string(record, "task_id")
+    task = task_by_id.get(task_id or "")
+    if not isinstance(task, Mapping):
+        return changed
+    expected_angle = _first_optional_string(task, "angle_id")
+    expected_route = _first_optional_string(task, "route", "modality")
+    lineage_changed = False
+    for field, value in (("angle_id", expected_angle), ("route", expected_route)):
+        if not value:
+            continue
+        if record.get(field) != value:
+            record[field] = value
+            changed += 1
+            lineage_changed = True
+    if record.get("semantic_plan_task_id") not in (None, "", task_id):
+        record["semantic_plan_task_id"] = task_id
+        changed += 1
+    elif task_id and record.get("semantic_plan_task_id") in (None, ""):
+        record["semantic_plan_task_id"] = task_id
+        changed += 1
+
+    if task_id and expected_angle and expected_route and (lineage_changed or not plan_id):
+        expected_plan_id = _plan_id_for_visual_task(
+            task_id=task_id,
+            angle_id=expected_angle,
+            route=expected_route,
+        )
+        if record.get("plan_id") != expected_plan_id:
+            record["plan_id"] = expected_plan_id
+            changed += 1
+    return changed
+
+
+def _codex_interactive_handoff_plan_record(
+    image: Mapping[str, Any],
+    *,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> dict[str, Any]:
+    return {
+        "plan_id": plan_id,
+        "task_id": task_id,
+        "semantic_plan_task_id": task_id,
+        "angle_id": angle_id,
+        "route": route,
+        "target_evidence_type": _codex_interactive_handoff_target_evidence_type(image),
+        "query": _first_optional_string(image, "image_url", "page_url") or image.get("id"),
+        "providers": ["codex-native"],
+        "caps": {
+            "max_candidates": 1,
+            "max_fetches": 1,
+            "max_vlm_images": 1,
+            "max_cost_usd": 0.0,
+        },
+        "policy_constraints": {},
+        "estimated_cost_usd": 0.0,
+        "state": "completed",
+        "provider": "codex-native",
+        "provider_mode": "real",
+        "handoff_artifact": "visual_search_plan.json",
+    }
+
+
+def _codex_interactive_handoff_candidate_record(
+    run_dir: Path,
+    image: Mapping[str, Any],
+    *,
+    candidate_id: str,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> dict[str, Any]:
+    record = _codex_interactive_handoff_acquisition_base(
+        image,
+        plan_id=plan_id,
+        task_id=task_id,
+        angle_id=angle_id,
+        route=route,
+    )
+    local_artifact_exists = _codex_interactive_handoff_local_artifact_exists(run_dir, image)
+    record.update(
+        {
+            "candidate_id": candidate_id,
+            "image_id": image.get("id"),
+            "evidence_image_id": image.get("id"),
+            "origin": image.get("origin"),
+            "content_hash": image.get("content_hash") or image.get("hash"),
+            "candidate_status": "fetched" if local_artifact_exists else "fetch_failed",
+            "rank": 1,
+            "score": 1.0,
+            "rejection_reason": None
+            if local_artifact_exists
+            else "missing_local_artifact",
+            "handoff_artifact": "visual_candidates.jsonl",
+        }
+    )
+    return record
+
+
+def _codex_interactive_handoff_fetch_record(
+    run_dir: Path,
+    image: Mapping[str, Any],
+    *,
+    candidate_id: str,
+    fetch_id: str,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> dict[str, Any]:
+    record = _codex_interactive_handoff_acquisition_base(
+        image,
+        plan_id=plan_id,
+        task_id=task_id,
+        angle_id=angle_id,
+        route=route,
+    )
+    local_artifact_exists = _codex_interactive_handoff_local_artifact_exists(run_dir, image)
+    record.update(
+        {
+            "fetch_id": fetch_id,
+            "candidate_id": candidate_id,
+            "image_id": image.get("id"),
+            "evidence_image_id": image.get("id"),
+            "local_artifact_path": image.get("local_artifact_path"),
+            "mime_type": image.get("mime_type"),
+            "http_status": image.get("http_status"),
+            "byte_size": image.get("byte_size") or image.get("artifact_size_bytes"),
+            "width": image.get("width"),
+            "height": image.get("height"),
+            "hash": image.get("hash") or image.get("content_hash"),
+            "phash": image.get("phash"),
+            "retrieval_status": "fetched" if local_artifact_exists else "failed",
+            "fetch_status": "fetched" if local_artifact_exists else "failed",
+            "failure_code": None
+            if local_artifact_exists
+            else "missing_local_artifact",
+            "handoff_artifact": IMAGE_FETCH_STATUS_FILENAME,
+        }
+    )
+    return record
+
+
+def _fill_codex_interactive_handoff_plan_record(
+    record: MutableMapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> None:
+    for key, value in _codex_interactive_handoff_plan_record(
+        image,
+        plan_id=plan_id,
+        task_id=task_id,
+        angle_id=angle_id,
+        route=route,
+    ).items():
+        _fill_missing_codex_interactive_handoff_value(record, key, value)
+
+
+def _codex_interactive_handoff_target_evidence_type(image: Mapping[str, Any]) -> str:
+    origin = _first_optional_string(image, "origin") or ""
+    if origin == "screenshot":
+        return "screenshot"
+    if origin in {"page_image", "open_graph", "srcset", "lazy_loaded"}:
+        return "page_image"
+    if origin in {"pdf_figure", "pdf_page"}:
+        return "pdf_figure"
+    return "web_image"
+
+
+def _codex_interactive_handoff_local_artifact_exists(
+    run_dir: Path,
+    image: Mapping[str, Any],
+) -> bool:
+    local_artifact_path = _first_optional_string(image, "local_artifact_path")
+    if not local_artifact_path:
+        return False
+    mime_type = _first_optional_string(image, "mime_type") or ""
+    if mime_type and not mime_type.startswith("image/"):
+        return False
+    path = Path(local_artifact_path)
+    if path.suffix.lower() in {".json", ".jsonl", ".txt", ".html", ".htm", ".md"}:
+        return False
+    if path.is_absolute():
+        return path.is_file()
+    return (run_dir / path).is_file()
+
+
+def _reconcile_codex_interactive_handoff_image_to_fetched_artifact(
+    run_dir: Path,
+    image: MutableMapping[str, Any],
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    fetches: Sequence[Mapping[str, Any]],
+    candidates_by_id: Mapping[str, Mapping[str, Any]],
+) -> int:
+    match = _codex_interactive_handoff_fetched_artifact_match(
+        run_dir,
+        image,
+        candidates=candidates,
+        fetches=fetches,
+        candidates_by_id=candidates_by_id,
+    )
+    if match is None:
+        return 0
+    candidate, fetch = match
+    changed = 0
+    for key, value in _codex_interactive_handoff_reconciled_values(
+        candidate=candidate,
+        fetch=fetch,
+    ).items():
+        if value in (None, ""):
+            continue
+        if image.get(key) != value:
+            image[key] = value
+            changed += 1
+    caveats = image.get("caveats")
+    if isinstance(caveats, list):
+        filtered = [
+            caveat
+            for caveat in caveats
+            if str(caveat) != "metadata-only visual record; no local image artifact was provided"
+        ]
+        if filtered != caveats:
+            image["caveats"] = filtered
+            changed += 1
+    diagnostics = image.get("visual_validation")
+    if not isinstance(diagnostics, MutableMapping):
+        diagnostics = {}
+        image["visual_validation"] = diagnostics
+        changed += 1
+    if diagnostics.get("codex_interactive_handoff_reconciled") is not True:
+        diagnostics["codex_interactive_handoff_reconciled"] = True
+        changed += 1
+    return changed
+
+
+def _codex_interactive_handoff_fetched_artifact_match(
+    run_dir: Path,
+    image: Mapping[str, Any],
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    fetches: Sequence[Mapping[str, Any]],
+    candidates_by_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
+    for fetch in fetches:
+        if not isinstance(fetch, Mapping):
+            continue
+        if not _safe_fetched_codex_interactive_handoff_artifact(run_dir, fetch):
+            continue
+        candidate_id = _first_optional_string(fetch, "candidate_id")
+        candidate = candidates_by_id.get(candidate_id or "") if candidate_id else None
+        candidate = candidate if isinstance(candidate, Mapping) else {}
+        if _codex_interactive_handoff_records_match_image(image, fetch, candidate):
+            return candidate, fetch
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        if not _codex_interactive_handoff_records_match_image(image, candidate):
+            continue
+        candidate_id = _first_optional_string(candidate, "candidate_id", "id")
+        for fetch in fetches:
+            if not isinstance(fetch, Mapping):
+                continue
+            if _first_optional_string(fetch, "candidate_id") != candidate_id:
+                continue
+            if _safe_fetched_codex_interactive_handoff_artifact(run_dir, fetch):
+                return candidate, fetch
+    return None
+
+
+def _safe_fetched_codex_interactive_handoff_artifact(
+    run_dir: Path,
+    fetch: Mapping[str, Any],
+) -> bool:
+    if fetch.get("fetch_status") != "fetched":
+        return False
+    local_artifact_path = _first_optional_string(fetch, "local_artifact_path")
+    if not local_artifact_path:
+        return False
+    path = Path(local_artifact_path)
+    if path.is_absolute():
+        return False
+    if path.suffix.lower() in {".json", ".jsonl", ".txt", ".html", ".htm", ".md"}:
+        return False
+    try:
+        artifact_path = _resolve_run_relative_path(run_dir, local_artifact_path)
+    except VisionAdapterError:
+        return False
+    if not artifact_path.is_file():
+        return False
+    mime_type = _first_optional_string(fetch, "mime_type")
+    if not mime_type:
+        guessed, _ = mimetypes.guess_type(local_artifact_path)
+        mime_type = guessed
+    return bool(mime_type and mime_type.startswith("image/"))
+
+
+def _codex_interactive_handoff_records_match_image(
+    image: Mapping[str, Any],
+    *records: Mapping[str, Any],
+) -> bool:
+    image_ids = _codex_interactive_handoff_image_ids(image)
+    if not image_ids:
+        return False
+    for record in records:
+        record_ids = _codex_interactive_handoff_record_image_ids(record)
+        if image_ids & record_ids:
+            return True
+    image_lineage_ids = _codex_interactive_handoff_lineage_ids(image)
+    record_lineage_ids = {
+        lineage_id
+        for record in records
+        for lineage_id in _codex_interactive_handoff_lineage_ids(record)
+    }
+    if image_lineage_ids and record_lineage_ids and not (image_lineage_ids & record_lineage_ids):
+        return False
+    image_urls = _codex_interactive_handoff_urls(image)
+    if not image_urls:
+        return False
+    return any(image_urls & _codex_interactive_handoff_urls(record) for record in records)
+
+
+def _codex_interactive_handoff_image_ids(record: Mapping[str, Any]) -> set[str]:
+    return {
+        value
+        for key in ("id", "image_id", "evidence_image_id", "source_image_id")
+        for value in [_first_optional_string(record, key)]
+        if value
+    }
+
+
+def _codex_interactive_handoff_record_image_ids(record: Mapping[str, Any]) -> set[str]:
+    values = _codex_interactive_handoff_image_ids(record)
+    for key in ("provider_provenance", "raw_provider_metadata"):
+        metadata = record.get(key)
+        if isinstance(metadata, Mapping):
+            source_image_id = _first_optional_string(metadata, "source_image_id")
+            if source_image_id:
+                values.add(source_image_id)
+    return values
+
+
+def _codex_interactive_handoff_lineage_ids(record: Mapping[str, Any]) -> set[str]:
+    return {
+        f"{key}:{value}"
+        for key in ("candidate_id", "fetch_id")
+        for value in [_first_optional_string(record, key)]
+        if value
+    }
+
+
+def _codex_interactive_handoff_urls(record: Mapping[str, Any]) -> set[str]:
+    return {
+        value
+        for key in ("image_url", "source_url", "page_url")
+        for value in [_first_optional_string(record, key)]
+        if value
+    }
+
+
+def _codex_interactive_handoff_reconciled_values(
+    *,
+    candidate: Mapping[str, Any],
+    fetch: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "candidate_id": _first_optional_string(candidate, "candidate_id", "id")
+        or _first_optional_string(fetch, "candidate_id"),
+        "fetch_id": _first_optional_string(fetch, "fetch_id"),
+        "plan_id": _first_optional_string(candidate, "plan_id")
+        or _first_optional_string(fetch, "plan_id"),
+        "task_id": _first_optional_string(candidate, "task_id")
+        or _first_optional_string(fetch, "task_id"),
+        "angle_id": _first_optional_string(candidate, "angle_id")
+        or _first_optional_string(fetch, "angle_id"),
+        "route": _first_optional_string(candidate, "route")
+        or _first_optional_string(fetch, "route"),
+        "local_artifact_path": _first_optional_string(fetch, "local_artifact_path")
+        or _first_optional_string(candidate, "local_artifact_path"),
+        "mime_type": _first_optional_string(fetch, "mime_type")
+        or _first_optional_string(candidate, "mime_type"),
+        "artifact_size_bytes": _first_number_value(
+            fetch,
+            "artifact_size_bytes",
+            "byte_size",
+        )
+        or _first_number_value(candidate, "artifact_size_bytes", "byte_size"),
+        "byte_size": _first_number_value(fetch, "byte_size", "artifact_size_bytes")
+        or _first_number_value(candidate, "byte_size", "artifact_size_bytes"),
+        "width": _first_number_value(fetch, "width")
+        or _first_number_value(candidate, "width"),
+        "height": _first_number_value(fetch, "height")
+        or _first_number_value(candidate, "height"),
+        "hash": _first_optional_string(fetch, "hash", "content_hash")
+        or _first_optional_string(candidate, "hash", "content_hash"),
+        "phash": _first_optional_string(fetch, "phash")
+        or _first_optional_string(candidate, "phash"),
+        "image_url": _first_optional_string(candidate, "image_url")
+        or _first_optional_string(fetch, "image_url"),
+        "page_url": _first_optional_string(candidate, "page_url")
+        or _first_optional_string(fetch, "page_url"),
+        "source_url": _first_optional_string(candidate, "source_url")
+        or _first_optional_string(fetch, "source_url"),
+        "estimated_cost_usd": _first_number_value(fetch, "estimated_cost_usd")
+        if _first_number_value(fetch, "estimated_cost_usd") is not None
+        else _first_number_value(candidate, "estimated_cost_usd"),
+        "actual_cost_usd": _first_number_value(fetch, "actual_cost_usd")
+        if _first_number_value(fetch, "actual_cost_usd") is not None
+        else _first_number_value(candidate, "actual_cost_usd"),
+    }
+
+
+def _codex_interactive_handoff_acquisition_base(
+    image: Mapping[str, Any],
+    *,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> dict[str, Any]:
+    return {
+        "plan_id": plan_id,
+        "task_id": task_id,
+        "semantic_plan_task_id": task_id,
+        "angle_id": angle_id,
+        "route": route,
+        "source_id": image.get("source_id"),
+        "page_url": image.get("page_url"),
+        "image_url": image.get("image_url"),
+        "estimated_cost_usd": image.get("estimated_cost_usd") or 0.0,
+        "actual_cost_usd": image.get("actual_cost_usd") or image.get("cost_usd") or 0.0,
+        "provider": "codex-native",
+        "provider_kind": "web_image_search",
+        "provider_mode": "real",
+        "provider_run_id": image.get("provider_run_id") or task_id,
+        "search_provider": "codex-native",
+        "codex_native_handoff": True,
+        "policy_decision": image.get("policy_decision") or "allowed",
+        "policy_flags": list(image.get("policy_flags") or []),
+        "provider_provenance": {
+            "provider": "codex-native",
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "search_provider": "codex-native",
+            "codex_native_handoff": True,
+            "external_network_call": False,
+        },
+    }
+
+
+def _fill_codex_interactive_handoff_candidate_record(
+    run_dir: Path,
+    record: MutableMapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    candidate_id: str,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> None:
+    for key, value in _codex_interactive_handoff_candidate_record(
+        run_dir,
+        image,
+        candidate_id=candidate_id,
+        plan_id=plan_id,
+        task_id=task_id,
+        angle_id=angle_id,
+        route=route,
+    ).items():
+        _fill_missing_codex_interactive_handoff_value(record, key, value)
+
+
+def _fill_codex_interactive_handoff_fetch_record(
+    run_dir: Path,
+    record: MutableMapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    candidate_id: str,
+    fetch_id: str,
+    plan_id: str,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> None:
+    for key, value in _codex_interactive_handoff_fetch_record(
+        run_dir,
+        image,
+        candidate_id=candidate_id,
+        fetch_id=fetch_id,
+        plan_id=plan_id,
+        task_id=task_id,
+        angle_id=angle_id,
+        route=route,
+    ).items():
+        _fill_missing_codex_interactive_handoff_value(record, key, value)
+
+
+def _fill_missing_codex_interactive_handoff_value(
+    record: MutableMapping[str, Any],
+    key: str,
+    value: Any,
+) -> None:
+    if key not in record or record.get(key) in (None, "", []):
+        record[key] = value
+
+
 def _phase3_observation_records(
     records: Sequence[Any],
     images: Sequence[Mapping[str, Any]],
@@ -3726,30 +5388,30 @@ def _phase3_observation_records(
     observations: list[dict[str, Any]] = []
     for index, image in enumerate(images):
         raw = records[index] if index < len(records) and isinstance(records[index], Mapping) else {}
-        image_id = _first_optional_string(raw, "evidence_image_id") or str(image["id"])
+        image_id = str(image["id"])
         candidate_id = (
-            _first_optional_string(raw, "candidate_id")
-            or _first_optional_string(image, "candidate_id")
+            _first_optional_string(image, "candidate_id")
+            or _first_optional_string(raw, "candidate_id")
             or f"cand_{_sanitize_identifier(image_id)}"
         )
         angle_id = (
-            _first_optional_string(raw, "angle_id")
-            or _first_optional_string(image, "angle_id")
+            _first_optional_string(image, "angle_id")
+            or _first_optional_string(raw, "angle_id")
             or "angle_001"
         )
         task_id = (
-            _first_optional_string(raw, "task_id")
-            or _first_optional_string(image, "task_id")
+            _first_optional_string(image, "task_id")
+            or _first_optional_string(raw, "task_id")
             or f"task_visual_{_sanitize_identifier(angle_id.removeprefix('angle_'))}"
         )
         route = (
-            _first_optional_string(raw, "route")
-            or _first_optional_string(image, "route")
+            _first_optional_string(image, "route")
+            or _first_optional_string(raw, "route")
             or "visual_required"
         )
         plan_id = (
-            _first_optional_string(raw, "plan_id")
-            or _first_optional_string(image, "plan_id")
+            _first_optional_string(image, "plan_id")
+            or _first_optional_string(raw, "plan_id")
             or _plan_id_for_visual_task(task_id=task_id, angle_id=angle_id, route=route)
         )
         provider_name = (
@@ -3813,8 +5475,8 @@ def _phase3_observation_records(
             if isinstance(image.get("caveats"), list)
             else [],
             "candidate_id": candidate_id,
-            "fetch_id": _first_optional_string(raw, "fetch_id")
-            or _first_optional_string(image, "fetch_id")
+            "fetch_id": _first_optional_string(image, "fetch_id")
+            or _first_optional_string(raw, "fetch_id")
             or f"fetch_{_sanitize_identifier(candidate_id)}",
             "plan_id": plan_id,
             "task_id": task_id,
@@ -3856,8 +5518,117 @@ def _phase3_observation_records(
         if isinstance(image.get("screenshot"), Mapping):
             phase3["screenshot"] = dict(image["screenshot"])
         _copy_optional_visual_metadata(raw, image, phase3)
+        _restore_phase3_normalized_image_fields(phase3, image)
         observations.append(phase3)
     return observations
+
+
+def _restore_phase3_normalized_image_fields(
+    phase3: MutableMapping[str, Any],
+    image: Mapping[str, Any],
+) -> None:
+    for key in (
+        "candidate_id",
+        "fetch_id",
+        "plan_id",
+        "task_id",
+        "candidate_class",
+        "angle_id",
+        "route",
+        "local_artifact_path",
+        "mime_type",
+        "artifact_size_bytes",
+        "width",
+        "height",
+        "hash",
+        "phash",
+        "image_url",
+        "page_url",
+        "source_url",
+        "estimated_cost_usd",
+        "actual_cost_usd",
+    ):
+        value = image.get(key)
+        if value not in (None, "", []):
+            phase3[key] = value
+
+
+def _codex_interactive_handoff_provider_status(
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    created_at: str,
+    run_dir: Path,
+) -> dict[str, Any] | None:
+    analyzed = [
+        observation
+        for observation in observations
+        if observation.get("provider") == CODEX_INTERACTIVE_PROVIDER
+        and observation.get("provider_kind") == "vlm"
+        and observation.get("provider_mode") == "real"
+        and observation.get("observation_status") == "analyzed"
+        and (
+            observation.get("codex_interactive_handoff") is True
+            or observation.get("handoff_artifact") == "visual_observations.jsonl"
+            or (
+                isinstance(observation.get("provider_provenance"), Mapping)
+                and (
+                    observation["provider_provenance"].get("codex_interactive_handoff")
+                    is True
+                    or observation["provider_provenance"].get("handoff_artifact")
+                    == "visual_observations.jsonl"
+                )
+            )
+        )
+    ]
+    if not analyzed:
+        return None
+    fetched_artifacts = [
+        observation
+        for observation in analyzed
+        if _codex_interactive_handoff_local_artifact_exists(run_dir, observation)
+    ]
+    provider_run_ids = sorted(
+        {
+            value
+            for observation in analyzed
+            for value in [_first_optional_string(observation, "provider_run_id")]
+            if value
+        }
+    )
+    provider_run_id = provider_run_ids[0] if len(provider_run_ids) == 1 else None
+    return {
+        "provider": CODEX_INTERACTIVE_PROVIDER,
+        "provider_kind": "vlm",
+        "provider_mode": "real",
+        "provider_run_id": provider_run_id,
+        "configured": True,
+        "available": True,
+        "blocked_reason": None,
+        "invoked": True,
+        "invocations": len(analyzed),
+        "candidates_discovered": 0,
+        "artifacts_fetched": len(fetched_artifacts),
+        "vlm_images_analyzed": len(analyzed),
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "last_error": None,
+        "external_network_call": False,
+        "external_vlm_call": False,
+        "codex_native_handoff": True,
+        "codex_interactive_handoff": True,
+        "handoff_recorded": True,
+        "handoff_artifact": "visual_observations.jsonl",
+        "explicit_artifact_handoff": True,
+        "hidden_codex_api_call": False,
+        "diagnostics": {
+            "model": CODEX_INTERACTIVE_MODEL,
+            "records_ingested": len(analyzed),
+            "metadata_only_records": len(analyzed) - len(fetched_artifacts),
+            "ingested_at": created_at,
+            "source": "child_visual_observations_jsonl",
+            "fetched_artifacts_preserved": len(fetched_artifacts) == len(analyzed),
+        },
+    }
 
 
 def _provider_provenance(
@@ -4068,6 +5839,7 @@ def _reuse_completed_images(
                 reused.setdefault("artifact_size_bytes", image["artifact_size_bytes"])
             if image.get("source_url") is not None:
                 reused.setdefault("source_url", image["source_url"])
+            _merge_reconciled_image_fields_for_reuse(reused, image)
             result.append(reused)
             reused_count += 1
             continue
@@ -4090,6 +5862,66 @@ def _can_reuse_image(existing: Mapping[str, Any] | None, image: Mapping[str, Any
         "needs_manual_review",
         "policy_blocked",
         "skipped",
+    }
+
+
+def _merge_reconciled_image_fields_for_reuse(
+    reused: dict[str, Any],
+    image: Mapping[str, Any],
+) -> None:
+    replace_metadata_only_artifact = _metadata_only_artifact_path(
+        _first_optional_string(reused, "local_artifact_path")
+    ) and not _metadata_only_artifact_path(_first_optional_string(image, "local_artifact_path"))
+    for key in (
+        "candidate_id",
+        "fetch_id",
+        "plan_id",
+        "task_id",
+        "angle_id",
+        "route",
+        "local_artifact_path",
+        "mime_type",
+        "artifact_size_bytes",
+        "byte_size",
+        "width",
+        "height",
+        "hash",
+        "phash",
+        "image_url",
+        "page_url",
+        "source_url",
+        "estimated_cost_usd",
+        "actual_cost_usd",
+    ):
+        value = image.get(key)
+        if value in (None, "", []):
+            continue
+        if replace_metadata_only_artifact or reused.get(key) in (None, "", []):
+            reused[key] = value
+    if not replace_metadata_only_artifact:
+        return
+    caveats = reused.get("caveats")
+    if isinstance(caveats, list):
+        reused["caveats"] = [
+            caveat
+            for caveat in caveats
+            if str(caveat) != "metadata-only visual record; no local image artifact was provided"
+        ]
+    visual_validation = image.get("visual_validation")
+    if isinstance(visual_validation, Mapping):
+        reused["visual_validation"] = dict(visual_validation)
+
+
+def _metadata_only_artifact_path(local_artifact_path: str | None) -> bool:
+    if not local_artifact_path:
+        return False
+    return Path(local_artifact_path).suffix.lower() in {
+        ".json",
+        ".jsonl",
+        ".txt",
+        ".html",
+        ".htm",
+        ".md",
     }
 
 
