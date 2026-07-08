@@ -815,11 +815,9 @@ class PublicBetaValidationTests(unittest.TestCase):
             payload["semantic_suite_gates"]["semantic_regression_30"]["expected_prompt_count"],
             30,
         )
-        self.assertFalse(payload["manifests"]["blind_holdout"]["selector_release_gate_ready"])
-        self.assertIn(
-            "selector_raw_transcript_path_missing",
-            payload["manifests"]["blind_holdout"]["selector_failures"],
-        )
+        self.assertFalse(payload["release_gate_ready"])
+        self.assertTrue(payload["manifests"]["blind_holdout"]["selector_release_gate_ready"])
+        self.assertEqual(payload["manifests"]["blind_holdout"]["selector_failures"], [])
         self.assertFalse(payload["semantic_suite_gates"]["blind_holdout_12"]["valid"])
         self.assertEqual(
             len(payload["semantic_suite_gates"]["blind_holdout_12"]["missing_prompt_ids"]),

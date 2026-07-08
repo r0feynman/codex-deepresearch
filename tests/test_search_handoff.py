@@ -16,6 +16,7 @@ PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ingest_run, prepare_run as prepare_search_handoff_run, validate_artifacts
+from deepresearch.search_handoff import _search_task_from_bounded_task
 
 
 TEST_MANUAL_ANGLES = ("primary source discovery",)
@@ -387,6 +388,13 @@ class SearchHandoffTests(unittest.TestCase):
         payload = json.loads(completed.stdout)
         self.assertEqual(len(payload["prepare_commands"]), 62)
         first = payload["prepare_commands"][0]
+        self.assertEqual(first["command"][0], "env")
+        self.assertEqual(
+            first["environment"]["CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"],
+            "900.0",
+        )
+        self.assertEqual(first["semantic_adapter_timeout_seconds"], 900.0)
+        self.assertIsNone(first["codex_exec_timeout_seconds"])
         self.assertIn("--manifest-oracle-hash", first["command"])
         self.assertEqual(
             first["semantic_release_validation_input"]["flag"],
@@ -395,6 +403,38 @@ class SearchHandoffTests(unittest.TestCase):
         validation_command = payload["semantic_release_validation_command"]
         self.assertIn("--blind-holdout-manifest", validation_command)
         self.assertIn("--manual-audit-manifest", validation_command)
+
+        invoke_completed = subprocess.run(
+            [
+                str(RUNNER),
+                "semantic-release-run-inputs",
+                "--runs-dir",
+                str(self.temp_runs_dir()),
+                "--suite-id",
+                "issue-133-release-inputs",
+                "--mode",
+                "invoke",
+                "--blind-holdout-manifest",
+                str(holdout_path),
+                "--semantic-adapter-timeout-seconds",
+                "901",
+                "--codex-exec-timeout-seconds",
+                "902",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(invoke_completed.returncode, 0, invoke_completed.stderr)
+        invoke_payload = json.loads(invoke_completed.stdout)
+        invoke_first = invoke_payload["prepare_commands"][0]
+        self.assertEqual(
+            invoke_first["environment"]["CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"],
+            "901.0",
+        )
+        self.assertEqual(invoke_first["codex_exec_timeout_seconds"], 902.0)
+        self.assertIn("--codex-exec-timeout-seconds", invoke_first["command"])
+        self.assertIn("902.0", invoke_first["command"])
 
     def test_prepare_exposes_release_ineligible_semantic_diagnostics(self) -> None:
         result = prepare_run(
@@ -473,6 +513,43 @@ class SearchHandoffTests(unittest.TestCase):
 
         validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
         self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+
+    def test_text_only_bounded_task_under_visual_angle_does_not_inherit_visual_evidence(self) -> None:
+        search_task = _search_task_from_bounded_task(
+            {
+                "task_id": "task_synthesis_001",
+                "angle_id": "angle_visual",
+                "query": "Synthesize already verified visual observations into report findings.",
+                "route": "text_only",
+                "expected_artifacts": ["visual appendix plan"],
+                "expected_source_types": ["verified evidence bundle"],
+                "expected_visual_targets": [],
+                "success_criteria": ["Use only already verified visual observations."],
+                "max_sources": 1,
+                "max_images": 0,
+                "done_condition": "Stop when the report outline is ready.",
+            },
+            1,
+            routing=[
+                {
+                    "id": "angle_visual",
+                    "angle": "Visual synthesis",
+                    "title": "Visual synthesis",
+                    "modality": "visual_required",
+                    "route": "visual_required",
+                    "evidence_need": "visual_observation",
+                    "report_section": "Visual Findings",
+                }
+            ],
+            fallback_max_results=3,
+            semantic_plan_hash="a" * 64,
+            approved_delta_id="base_plan",
+        )
+
+        self.assertEqual(search_task["route"], "text_only")
+        self.assertEqual(search_task["max_images"], 0)
+        self.assertEqual(search_task["expected_visual_targets"], [])
+        self.assertEqual(search_task["expected_evidence"], ["primary_source"])
 
     def test_ingest_search_results_into_sources_and_fetch_queue(self) -> None:
         prepared = prepare_run(

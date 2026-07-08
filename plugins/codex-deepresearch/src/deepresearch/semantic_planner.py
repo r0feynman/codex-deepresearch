@@ -65,6 +65,9 @@ CODEX_SEMANTIC_ADAPTER_SCHEMA_DIRNAME = "semantic_adapter_schemas"
 CODEX_SEMANTIC_PLANNER_SCHEMA_FILENAME = "planner.json"
 CODEX_SEMANTIC_ORACLE_SCHEMA_FILENAME = "oracle.json"
 CODEX_SEMANTIC_REVIEWER_SCHEMA_FILENAME = "reviewer.json"
+CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV = (
+    "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS"
+)
 SEMANTIC_FIT_SCORE_THRESHOLD = 9.0
 SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES = (
     "failed_semantic_fit",
@@ -473,55 +476,84 @@ def codex_semantic_candidate_plan(
             provided_images=provided_images or [],
         )
     )
-    try:
-        adapter_response = invoke_codex_semantic_planner_adapter(raw_request)
-    except SemanticPlannerAdapterUnavailable as exc:
-        return _blocked_codex_semantic_adapter_plan(
-            question=original_question,
-            raw_request=raw_request,
-            reason=str(exc) or "Codex semantic planner adapter is unavailable.",
-            failure_category="adapter_unavailable",
-        )
-    except Exception as exc:  # pragma: no cover - defensive boundary guard
-        return _blocked_codex_semantic_adapter_plan(
-            question=original_question,
-            raw_request=raw_request,
-            reason=f"Codex semantic planner adapter failed: {exc.__class__.__name__}",
-            failure_category="adapter_failed",
-        )
-    if adapter_response is None:
-        return _blocked_codex_semantic_adapter_plan(
-            question=original_question,
-            raw_request=raw_request,
-            reason=(
-                "Codex semantic planner adapter is not configured; refusing to "
-                "materialize local heuristic output as codex_semantic."
-            ),
-            failure_category="adapter_unavailable",
-        )
     parsed_raw_response: dict[str, Any] | None = None
-    try:
-        raw_response = _structured_codex_adapter_response(
-            raw_request=raw_request,
-            adapter_response=adapter_response,
-        )
-        parsed_raw_response = raw_response
-        candidate = _candidate_plan_from_adapter_response(raw_response)
-        candidate_validation = _codex_semantic_candidate_validation(
-            original_question=original_question,
-            candidate=candidate,
-        )
-        raw_response["candidate_validation"] = candidate_validation
-        if candidate_validation.get("ok") is not True:
+    previous_attempts: list[dict[str, Any]] = []
+    max_attempts = _codex_semantic_planner_validation_max_attempts()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            adapter_response = invoke_codex_semantic_planner_adapter(raw_request)
+        except SemanticPlannerAdapterUnavailable as exc:
+            return _blocked_codex_semantic_adapter_plan(
+                question=original_question,
+                raw_request=raw_request,
+                reason=str(exc) or "Codex semantic planner adapter is unavailable.",
+                failure_category="adapter_unavailable",
+            )
+        except Exception as exc:  # pragma: no cover - defensive boundary guard
+            return _blocked_codex_semantic_adapter_plan(
+                question=original_question,
+                raw_request=raw_request,
+                reason=f"Codex semantic planner adapter failed: {exc.__class__.__name__}",
+                failure_category="adapter_failed",
+            )
+        if adapter_response is None:
+            return _blocked_codex_semantic_adapter_plan(
+                question=original_question,
+                raw_request=raw_request,
+                reason=(
+                    "Codex semantic planner adapter is not configured; refusing to "
+                    "materialize local heuristic output as codex_semantic."
+                ),
+                failure_category="adapter_unavailable",
+            )
+        try:
+            raw_response = _structured_codex_adapter_response(
+                raw_request=raw_request,
+                adapter_response=adapter_response,
+            )
+            raw_response["adapter_attempt"] = attempt
+            raw_response["adapter_attempt_count"] = attempt
+            if previous_attempts:
+                raw_response["previous_adapter_attempts"] = list(previous_attempts)
+            parsed_raw_response = raw_response
+            candidate = _candidate_plan_from_adapter_response(raw_response)
+            candidate_validation = _codex_semantic_candidate_validation(
+                original_question=original_question,
+                candidate=candidate,
+            )
+            raw_response["candidate_validation"] = candidate_validation
+            if candidate_validation.get("ok") is True:
+                break
+            if attempt < max_attempts:
+                previous_attempts.append(
+                    _candidate_validation_retry_record(
+                        attempt=attempt,
+                        validation=candidate_validation,
+                        raw_response=raw_response,
+                    )
+                )
+                raw_request = _codex_semantic_retry_raw_request(
+                    raw_request=raw_request,
+                    attempt=attempt + 1,
+                    validation=candidate_validation,
+                )
+                continue
             raise SemanticPlannerAdapterUnavailable(
                 _candidate_validation_blocked_reason(candidate_validation)
             )
-    except SemanticPlannerAdapterUnavailable as exc:
+        except SemanticPlannerAdapterUnavailable as exc:
+            return _blocked_codex_semantic_adapter_plan(
+                question=original_question,
+                raw_request=raw_request,
+                raw_response=parsed_raw_response or adapter_response,
+                reason=str(exc) or "Codex semantic planner adapter returned invalid output.",
+                failure_category="adapter_invalid_response",
+            )
+    else:  # pragma: no cover - loop always returns or breaks
         return _blocked_codex_semantic_adapter_plan(
             question=original_question,
             raw_request=raw_request,
-            raw_response=parsed_raw_response or adapter_response,
-            reason=str(exc) or "Codex semantic planner adapter returned invalid output.",
+            reason="Codex semantic planner adapter returned no valid candidate.",
             failure_category="adapter_invalid_response",
         )
     angles = [
@@ -714,7 +746,10 @@ def invoke_codex_semantic_planner_adapter(
         "adapter_invocation_kind",
         command_boundary["adapter_invocation_kind"],
     )
-    provenance.setdefault("raw_request_hash", request.get("adapter_request_hash"))
+    _force_parent_raw_request_hash(
+        provenance,
+        request.get("adapter_request_hash"),
+    )
     for key, value in codex_event_provenance.items():
         provenance.setdefault(key, value)
     payload = dict(payload)
@@ -941,6 +976,84 @@ def _candidate_validation_blocked_reason(validation: Mapping[str, Any]) -> str:
     if failure_codes:
         reason += ": " + ", ".join(failure_codes[:8])
     return reason
+
+
+def _codex_semantic_planner_validation_max_attempts() -> int:
+    raw_value = os.environ.get(CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV, "3")
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return 3
+    return max(1, min(value, 3))
+
+
+def _candidate_validation_failure_codes(validation: Mapping[str, Any]) -> list[str]:
+    failures = validation.get("failures")
+    if not isinstance(failures, list):
+        return []
+    return [
+        str(failure.get("code"))
+        for failure in failures
+        if isinstance(failure, Mapping) and failure.get("code")
+    ]
+
+
+def _candidate_validation_retry_record(
+    *,
+    attempt: int,
+    validation: Mapping[str, Any],
+    raw_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "candidate_validation_failure_codes": _candidate_validation_failure_codes(
+            validation
+        ),
+        "candidate_validation_failure_count": int(
+            validation.get("failure_count")
+            or len(_candidate_validation_failure_codes(validation))
+        ),
+        "candidate_validation": dict(validation),
+        "raw_response_hash": _sha256_payload(raw_response),
+    }
+
+
+def _codex_semantic_retry_raw_request(
+    *,
+    raw_request: Mapping[str, Any],
+    attempt: int,
+    validation: Mapping[str, Any],
+) -> dict[str, Any]:
+    retry_request = dict(raw_request)
+    retry_request.pop("adapter_request_hash", None)
+    failure_codes = _candidate_validation_failure_codes(validation)
+    retry_request["retry_attempt"] = attempt
+    retry_request["previous_candidate_validation_failure_codes"] = failure_codes
+    retry_request["previous_candidate_validation_failures"] = [
+        dict(failure)
+        for failure in _list(validation.get("failures"))[:8]
+        if isinstance(failure, Mapping)
+    ]
+    retry_request["planner_retry_instructions"] = (
+        "The previous Codex semantic candidate did not pass release validation. "
+        "Generate a fresh semantic decomposition that fixes these failure codes "
+        f"without lowering any release gate: {', '.join(failure_codes) or 'unknown'}. "
+        "For broad questions, return 5 to 8 distinct semantic angles and 20 to 40 "
+        "bounded tasks, with at least 2 bounded_tasks assigned to every angle_id. "
+        "If `broad_angle_has_too_few_tasks` appears, repair the per-angle task "
+        "distribution by adding or reassigning specific bounded tasks so each broad "
+        "angle has at least 2 tasks while the total remains 20 to 40. Preserve the "
+        "user's domain, modality, source-quality, "
+        "geography/time, and deliverable requirements. If the question requires "
+        "visual evidence, include at least one visual angle with evidence_need "
+        "`visual_example` for collecting representative source images and at least "
+        "one visual angle with evidence_need `visual_observation` or `vlm_analysis` "
+        "for image interpretation. Every visual route, visual target, image/chart/"
+        "figure/screenshot artifact, or visual expected evidence task must set "
+        "max_images between 1 and 3; text-only tasks should keep max_images=0."
+    )
+    retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
+    return retry_request
 
 
 def _adapter_model_or_surface(raw_response: Mapping[str, Any]) -> str:
@@ -1413,11 +1526,31 @@ def _invoke_codex_semantic_json_adapter(
         "adapter_invocation_kind",
         command_boundary["adapter_invocation_kind"],
     )
+    _force_parent_raw_request_hash(
+        provenance,
+        request.get("raw_request_hash") or request.get("adapter_request_hash"),
+    )
     for key, value in _codex_event_provenance(codex_events).items():
         provenance.setdefault(key, value)
     payload = dict(payload)
     payload["provenance"] = provenance
     return payload
+
+
+def _force_parent_raw_request_hash(
+    provenance: dict[str, Any],
+    parent_raw_request_hash: Any,
+) -> None:
+    """Treat raw request identity as parent-owned, not model-generated."""
+
+    request_hash = str(parent_raw_request_hash or "").strip()
+    if not request_hash:
+        return
+    child_hash = str(provenance.get("raw_request_hash") or "").strip()
+    if child_hash and child_hash != request_hash:
+        provenance.setdefault("child_reported_raw_request_hash", child_hash)
+        provenance.setdefault("raw_request_hash_overridden_by_parent", True)
+    provenance["raw_request_hash"] = request_hash
 
 
 def _semantic_adapter_command(
@@ -3029,6 +3162,20 @@ def validate_semantic_candidate_plan(
                     "task_id": task.get("task_id"),
                 }
             )
+        route = str(task.get("route") or "text_only")
+        visual_targets = _string_list(task.get("expected_visual_targets"))
+        if route != "text_only" or visual_targets:
+            try:
+                max_images = int(task.get("max_images") or 0)
+            except (TypeError, ValueError):
+                max_images = 0
+            if max_images <= 0:
+                failures.append(
+                    {
+                        "code": "visual_expected_evidence_without_image_budget",
+                        "task_id": task.get("task_id"),
+                    }
+                )
     visual_required = any(
         str(requirement.get("requirement_type") or "") == "visual_modality"
         for requirement in requirements
@@ -3040,10 +3187,18 @@ def validate_semantic_candidate_plan(
         visual_tasks = [
             task for task in tasks if str(task.get("route") or "") != "text_only"
         ]
+        visual_evidence_needs = {
+            str(angle.get("evidence_need") or "")
+            for angle in visual_angles
+        }
         if not visual_angles or not visual_tasks:
             failures.append({"code": "visual_requirement_missing_visual_route"})
         if not any(_string_list(task.get("expected_visual_targets")) for task in visual_tasks):
             failures.append({"code": "visual_requirement_missing_targets"})
+        if "visual_example" not in visual_evidence_needs:
+            failures.append({"code": "visual_example_expected_evidence_missing"})
+        if not (visual_evidence_needs & {"visual_observation", "vlm_analysis"}):
+            failures.append({"code": "visual_observation_expected_evidence_missing"})
     official_required = any(
         str(requirement.get("requirement_type") or "") == "source_quality"
         and (
@@ -6000,8 +6155,6 @@ def _material_difference_checks(
             failures.append("research_question_too_close_to_original")
         if broad_question and max(peer_overlaps or [0.0]) > MATERIAL_PEER_OVERLAP_LIMIT:
             failures.append("research_question_too_close_to_peer")
-        if broad_question and evidence_need_counts[evidence_need] > 1:
-            failures.append("duplicate_evidence_need")
         if broad_question and section_counts[report_section] > 1:
             failures.append("duplicate_report_section")
         if broad_question and artifact_counts[expected_artifacts] > 1:

@@ -1077,19 +1077,30 @@ def run_semantic_release_run_inputs_command(args: argparse.Namespace) -> int:
     ]
     prepare_commands = []
     validation_args = []
+    semantic_timeout_env = {
+        "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS": str(
+            args.semantic_adapter_timeout_seconds
+        ),
+        "CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_TIMEOUT_SECONDS": str(
+            args.semantic_adapter_timeout_seconds
+        ),
+        "CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_TIMEOUT_SECONDS": str(
+            args.semantic_adapter_timeout_seconds
+        ),
+    }
     for suite_label, validation_flag, manifest in prompt_sets:
         for prompt in manifest["prompts"]:
             prompt_id = prompt["id"]
             fragment_id = _manifest_oracle_fragment_id(str(prompt["oracle_path"]))
-            command = [
+            base_command = [
                 str(Path(__file__).resolve()),
                 "prepare" if args.mode == "prepare" else "invoke",
             ]
             if args.mode == "invoke":
-                command.extend([f"$deep-research: {prompt['prompt']}"])
+                base_command.extend([f"$deep-research: {prompt['prompt']}"])
             else:
-                command.append(prompt["prompt"])
-            command.extend(
+                base_command.append(prompt["prompt"])
+            base_command.extend(
                 [
                     "--runs-dir",
                     args.runs_dir,
@@ -1111,12 +1122,33 @@ def run_semantic_release_run_inputs_command(args: argparse.Namespace) -> int:
                     fragment_id,
                 ]
             )
+            if args.mode == "invoke":
+                base_command.extend(
+                    [
+                        "--codex-exec-timeout-seconds",
+                        str(args.codex_exec_timeout_seconds),
+                    ]
+                )
+            command = [
+                "env",
+                *[
+                    f"{name}={value}"
+                    for name, value in sorted(semantic_timeout_env.items())
+                ],
+                *base_command,
+            ]
             prepare_commands.append(
                 {
                     "suite": suite_label,
                     "prompt_id": prompt_id,
                     "mode": args.mode,
                     "command": command,
+                    "base_command": base_command,
+                    "environment": semantic_timeout_env,
+                    "semantic_adapter_timeout_seconds": args.semantic_adapter_timeout_seconds,
+                    "codex_exec_timeout_seconds": (
+                        args.codex_exec_timeout_seconds if args.mode == "invoke" else None
+                    ),
                     "shell": shlex.join(command),
                     "semantic_release_validation_input": {
                         "flag": validation_flag,
@@ -1147,6 +1179,10 @@ def run_semantic_release_run_inputs_command(args: argparse.Namespace) -> int:
         "suite_id": args.suite_id,
         "mode": args.mode,
         "runs_dir": args.runs_dir,
+        "semantic_adapter_timeout_seconds": args.semantic_adapter_timeout_seconds,
+        "codex_exec_timeout_seconds": (
+            args.codex_exec_timeout_seconds if args.mode == "invoke" else None
+        ),
         "prepare_commands": prepare_commands,
         "semantic_release_validation_command": validation_command,
         "semantic_release_validation_shell": shlex.join(validation_command),
@@ -1645,6 +1681,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional manual trace audit manifest path to include in the "
             "generated semantic-release-validation command."
+        ),
+    )
+    semantic_release_inputs.add_argument(
+        "--semantic-adapter-timeout-seconds",
+        type=float,
+        default=900.0,
+        help=(
+            "Timeout to inject for semantic oracle/planner/reviewer Codex adapter calls "
+            "in generated release evidence commands."
+        ),
+    )
+    semantic_release_inputs.add_argument(
+        "--codex-exec-timeout-seconds",
+        type=float,
+        default=900.0,
+        help=(
+            "Per-child codex exec timeout to include in generated invoke commands. "
+            "Only applies when --mode invoke is used."
         ),
     )
     semantic_release_inputs.set_defaults(func=run_semantic_release_run_inputs_command)

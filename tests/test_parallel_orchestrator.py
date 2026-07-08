@@ -22,6 +22,7 @@ from deepresearch import (  # noqa: E402
     CodexExecAdapter,
     FixtureAdapter,
     ParallelOrchestrationError,
+    ingest_vision_observations,
     inspect_run_state,
     merge_evidence_shards,
     plan_research_tasks,
@@ -33,6 +34,7 @@ from deepresearch import (  # noqa: E402
     validate_trace_file,
 )
 from deepresearch import parallel_orchestrator  # noqa: E402
+from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
 
 
 TEST_MANUAL_ANGLES = ("primary source discovery",)
@@ -604,6 +606,31 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 }
             ],
         )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_001",
+                    "image_id": shard["images"][0]["id"],
+                    "evidence_image_id": shard["images"][0]["id"],
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A stale root visual observation without lineage metadata."],
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
         self.write_json(run_dir / "research_tasks.json", tasks_artifact)
 
         merge = merge_evidence_shards(run=run_dir)
@@ -639,8 +666,10 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(observations[0]["provider_kind"], "vlm")
         self.assertEqual(observations[0]["provider_mode"], "real")
         self.assertEqual(observations[0]["observation_status"], "analyzed")
-        self.assertEqual(observations[0]["candidate_id"], "child_candidate_001")
-        self.assertEqual(observations[0]["fetch_id"], "child_fetch_001")
+        self.assertEqual(observations[0]["candidate_id"], candidates[0]["candidate_id"])
+        self.assertEqual(observations[0]["fetch_id"], fetch_status[0]["fetch_id"])
+        self.assertEqual(observations[0]["raw_child_candidate_id"], "child_candidate_001")
+        self.assertEqual(observations[0]["raw_child_fetch_id"], "child_fetch_001")
         self.assertEqual(observations[0]["linked_candidate_id"], candidates[0]["candidate_id"])
         self.assertEqual(observations[0]["linked_fetch_id"], fetch_status[0]["fetch_id"])
         self.assertEqual(
@@ -649,6 +678,25 @@ class ParallelOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(observations[0]["evidence_image_id"], image["id"])
         self.assertEqual(observations[0]["image_id"], image["id"])
+        self.assertEqual(observations[0]["source_id"], image["source_id"])
+        self.assertEqual(observations[0]["image_url"], image["image_url"])
+        self.assertEqual(observations[0]["page_url"], image["page_url"])
+        self.assertEqual(observations[0]["origin"], image["origin"])
+        self.assertEqual(observations[0]["mime_type"], image["mime_type"])
+        self.assertEqual(observations[0]["width"], image["width"])
+        self.assertEqual(observations[0]["height"], image["height"])
+        self.assertEqual(observations[0]["visual_tasks"], image["visual_tasks"])
+        self.assertEqual(observations[0]["analysis_status"], image["analysis_status"])
+        self.assertNotIn("local_artifact_path", observations[0])
+        self.assertEqual(
+            observations[0]["raw_child_local_artifact_path"],
+            image["local_artifact_path"],
+        )
+        ingest_status = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        self.assertEqual(ingest_status["status"], "visual_evidence_ingested", ingest_status)
+        self.assertEqual(ingest_status["images_ingested"], 1)
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
         materialization_diff = self.load_json(run_dir / "semantic_materialization_diff.json")
         self.assertNotIn(
             "visual_search_plan",
@@ -668,6 +716,331 @@ class ParallelOrchestratorTests(unittest.TestCase):
             if check["artifact"] == "evidence.images"
         )
         self.assertEqual(image_check["lineage_failures"], [])
+
+    def test_release_visual_merge_reconciles_child_vlm_to_existing_acquisition_lineage_for_report(self) -> None:
+        prepared = prepare_run(
+            question="Release validation visual acquisition lineage fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-001",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        shard["claims"][0]["promotion_status"] = "eligible"
+        image = shard["images"][0]
+        (run_dir / "images").mkdir(exist_ok=True)
+        metadata_path = run_dir / "images" / "child-metadata.json"
+        metadata_path.write_text(
+            json.dumps({"kind": "metadata-only child visual record"}, sort_keys=True),
+            encoding="utf-8",
+        )
+        fetched_path = run_dir / "images" / "root-fetched.png"
+        fetched_bytes = b"\x89PNG\r\n\x1a\nroot-fetched-visual-artifact"
+        fetched_path.write_bytes(fetched_bytes)
+        image["local_artifact_path"] = "images/child-metadata.json"
+        image["mime_type"] = "image/jpeg"
+        image.pop("estimated_cost_usd", None)
+        image.pop("actual_cost_usd", None)
+        canonical_plan_id = "plan_existing_visual_acquisition"
+        canonical_task_id = task["id"]
+        canonical_candidate_id = "cand_existing_visual_acquisition"
+        canonical_fetch_id = "fetch_existing_visual_acquisition"
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task)],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "image_id": image["id"],
+                    "evidence_image_id": image["id"],
+                    "candidate_id": "child_candidate_unmatched",
+                    "fetch_id": "child_fetch_unmatched",
+                    "plan_id": "child_plan_unmatched",
+                    "task_id": "child_task_unmatched",
+                    "angle_id": "child_angle_unmatched",
+                    "route": "visual_optional",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A child shard visual observation."],
+                    "inferences": ["The image directly supports the visual claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.parallel.v0",
+                "run_id": run_dir.name,
+                "created_at": "2026-06-23T00:00:00Z",
+                "status": "completed",
+                "provider": "codex-native",
+                "provider_mode": "real",
+                "tasks": [
+                    {
+                        "plan_id": canonical_plan_id,
+                        "task_id": canonical_task_id,
+                        "semantic_plan_task_id": canonical_task_id,
+                        "angle_id": task["angle_id"],
+                        "route": "text_only",
+                        "target_evidence_type": "image",
+                        "query": task["query"],
+                        "providers": ["codex-native"],
+                        "state": "completed",
+                        "provider": "codex-native",
+                        "provider_mode": "real",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": canonical_candidate_id,
+                    "evidence_image_id": image["id"],
+                    "image_id": image["id"],
+                    "source_id": image["source_id"],
+                    "page_url": image["page_url"],
+                    "image_url": image["image_url"],
+                    "origin": image["origin"],
+                    "local_artifact_path": "images/root-fetched.png",
+                    "candidate_status": "selected",
+                    "rank": 1,
+                    "score": 1.0,
+                    "provider": "codex-native",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "codex_native_handoff": True,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "plan_id": canonical_plan_id,
+                    "task_id": canonical_task_id,
+                    "angle_id": task["angle_id"],
+                    "route": "text_only",
+                    "estimated_cost_usd": 0.123,
+                    "actual_cost_usd": 0.045,
+                    "provider_provenance": {
+                        "provider": "codex-native",
+                        "provider_kind": "web_image_search",
+                        "provider_mode": "real",
+                        "codex_native_handoff": True,
+                        "external_network_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": canonical_fetch_id,
+                    "candidate_id": canonical_candidate_id,
+                    "evidence_image_id": image["id"],
+                    "image_id": image["id"],
+                    "source_id": image["source_id"],
+                    "page_url": image["page_url"],
+                    "image_url": image["image_url"],
+                    "local_artifact_path": "images/root-fetched.png",
+                    "mime_type": "image/png",
+                    "byte_size": len(fetched_bytes),
+                    "width": image["width"],
+                    "height": image["height"],
+                    "hash": "sha256:root-fetched",
+                    "phash": "root-phash",
+                    "fetch_status": "fetched",
+                    "retrieval_status": "fetched",
+                    "provider": "codex-native",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "codex_native_handoff": True,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "plan_id": canonical_plan_id,
+                    "task_id": canonical_task_id,
+                    "angle_id": task["angle_id"],
+                    "route": "text_only",
+                    "estimated_cost_usd": 0.123,
+                    "actual_cost_usd": 0.045,
+                    "provider_provenance": {
+                        "provider": "codex-native",
+                        "provider_kind": "web_image_search",
+                        "provider_mode": "real",
+                        "codex_native_handoff": True,
+                        "external_network_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+        self.assertEqual(merge["status"], "completed", merge)
+        merge_observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+        self.assertEqual(merge_observations[0]["candidate_id"], canonical_candidate_id)
+        self.assertEqual(merge_observations[0]["fetch_id"], canonical_fetch_id)
+        self.assertEqual(merge_observations[0]["plan_id"], canonical_plan_id)
+        self.assertEqual(merge_observations[0]["task_id"], canonical_task_id)
+        self.assertEqual(merge_observations[0]["route"], task["route"])
+        self.assertEqual(merge_observations[0]["local_artifact_path"], "images/root-fetched.png")
+        self.assertEqual(
+            merge_observations[0]["raw_child_local_artifact_path"],
+            "images/child-metadata.json",
+        )
+        post_merge_image = self.load_json(run_dir / "evidence.json")["images"][0]
+        self.assertEqual(post_merge_image["local_artifact_path"], "images/root-fetched.png")
+        self.assertEqual(
+            post_merge_image["raw_child_local_artifact_path"],
+            "images/child-metadata.json",
+        )
+        self.assertEqual(post_merge_image["estimated_cost_usd"], 0.123)
+        self.assertEqual(post_merge_image["actual_cost_usd"], 0.045)
+        self.assertEqual(
+            merge_observations[0]["raw_child_candidate_id"],
+            "child_candidate_unmatched",
+        )
+        self.assertEqual(merge_observations[0]["raw_child_fetch_id"], "child_fetch_unmatched")
+        ingest_status = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+        self.assertEqual(ingest_status["status"], "visual_evidence_ingested", ingest_status)
+        report_status = synthesize_report(run=run_dir)
+        self.assertEqual(report_status["status"], "completed", report_status)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        merged_image = evidence["images"][0]
+        self.assertEqual(merged_image["candidate_id"], canonical_candidate_id)
+        self.assertEqual(merged_image["fetch_id"], canonical_fetch_id)
+        self.assertEqual(merged_image["plan_id"], canonical_plan_id)
+        self.assertEqual(merged_image["task_id"], canonical_task_id)
+        self.assertEqual(merged_image["route"], task["route"])
+        self.assertEqual(merged_image["local_artifact_path"], "images/root-fetched.png")
+        self.assertEqual(merged_image["mime_type"], "image/png")
+        self.assertEqual(merged_image["estimated_cost_usd"], 0.123)
+        self.assertEqual(merged_image["actual_cost_usd"], 0.045)
+        self.assertEqual(
+            self.load_json(run_dir / "visual_search_plan.json")["tasks"][0]["route"],
+            task["route"],
+        )
+        self.assertEqual(
+            self.load_jsonl(run_dir / "visual_candidates.jsonl")[0]["route"],
+            task["route"],
+        )
+        observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+        self.assertEqual(observations[0]["candidate_id"], canonical_candidate_id)
+        self.assertEqual(observations[0]["fetch_id"], canonical_fetch_id)
+        self.assertEqual(observations[0]["plan_id"], canonical_plan_id)
+        self.assertEqual(observations[0]["task_id"], canonical_task_id)
+        self.assertEqual(observations[0]["local_artifact_path"], "images/root-fetched.png")
+        included_claim = next(
+            claim
+            for claim in report_status["included_claims"]
+            if image["id"] in claim["image_ids"]
+        )
+        support = next(
+            support
+            for support in included_claim["visual_supports"]
+            if support["image_id"] == image["id"]
+        )
+        self.assertEqual(support["candidate_id"], canonical_candidate_id)
+        self.assertEqual(support["fetch_id"], canonical_fetch_id)
+        self.assertEqual(support["plan_id"], canonical_plan_id)
+        report_text = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn(included_claim["claim_id"], report_text)
+        self.assertIn(image["id"], report_text)
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
+        self.assertEqual(minimums["report_cited_images"], 1)
+        self.assertTrue(minimums["satisfied"], minimums)
+
+    def test_release_visual_merge_normalizes_codex_interactive_external_vlm_mislabel(self) -> None:
+        prepared = prepare_run(
+            question="Release validation visual handoff external VLM mislabel fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-001",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task)],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "image_id": shard["images"][0]["id"],
+                    "evidence_image_id": shard["images"][0]["id"],
+                    "candidate_id": "child_candidate_001",
+                    "fetch_id": "child_fetch_001",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A child shard visual observation."],
+                    "inferences": ["The image directly supports the visual claim."],
+                    "policy_decision": "allowed",
+                    "external_vlm_call": True,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": True,
+                    },
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["failed_tasks"], [])
+        observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+        self.assertEqual(observations[0]["external_vlm_call"], False)
+        self.assertTrue(observations[0]["child_reported_external_vlm_call"])
+        self.assertTrue(observations[0]["external_vlm_call_normalized_by_parent"])
+        provenance = observations[0]["provider_provenance"]
+        self.assertEqual(provenance["external_vlm_call"], False)
+        self.assertTrue(provenance["child_reported_external_vlm_call"])
+        self.assertTrue(provenance["external_vlm_call_normalized_by_parent"])
 
     def test_release_visual_merge_rejects_image_shard_without_visual_observations(self) -> None:
         prepared = prepare_run(
@@ -1707,6 +2080,57 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(retry_trace_events[1]["raw_event"]["returncode"], 0)
         self.assertTrue(validate_trace_file(run_dir / "run_trace.jsonl").valid)
 
+    def test_codex_exec_schema_invalid_shard_retries_and_recovers(self) -> None:
+        run_dir = self.prepare()
+        call_count = 0
+
+        def fake_codex_exec(command, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            tasks = self.load_json(run_dir / "research_tasks.json")["tasks"]
+            task = tasks[0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            shard = self.shard(run_dir, task)
+            if call_count == 1:
+                shard["images"][0].pop("policy_flags", None)
+            self.write_json(shard_path, shard)
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch("deepresearch.parallel_orchestrator.random.uniform", return_value=0.0),
+            mock.patch("deepresearch.parallel_orchestrator._sleep_for_retry", return_value=0.0),
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        self.assertEqual(run_mock.call_count, 2)
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        self.assertEqual(task["state"], "merged")
+        self.assertEqual(task["attempt"], 2)
+        attempts = task["attempt_diagnostics"]
+        self.assertEqual(attempts[0]["child_failure_code"], "codex_child_schema_invalid")
+        self.assertEqual(attempts[0]["retry_decision"], "retry")
+        self.assertIsNone(attempts[1]["child_failure_code"])
+        self.assertEqual(attempts[1]["retry_decision"], "do_not_retry")
+
     def test_timeout_release_handoff_invalid_can_capacity_retry(self) -> None:
         task = {
             "id": "task_research_001",
@@ -2528,6 +2952,138 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(merge["image_dedupe"])
         self.assertTrue(merge["claim_dedupe"])
         self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_preserves_duplicate_image_visual_observation_supports(self) -> None:
+        run_dir = self.prepare()
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        tasks = tasks_artifact["tasks"]
+
+        first_task = tasks[0]
+        first_task["state"] = "completed"
+        first_shard_path = run_dir / first_task["output_shard_path"]
+        first_shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(first_shard_path, self.shard(run_dir, first_task, duplicate=True))
+
+        second_task = tasks[1]
+        second_task["state"] = "completed"
+        second_shard_path = run_dir / second_task["output_shard_path"]
+        second_shard_path.parent.mkdir(parents=True, exist_ok=True)
+        second_shard = self.shard(run_dir, second_task, duplicate=True)
+        second_observation = "A second shard visual observation for the same image."
+        second_shard["images"][0]["observations"] = [second_observation]
+        second_shard["claims"][0]["id"] = "claim_duplicate_image_observation"
+        second_shard["claims"][0]["text"] = "The duplicate image also supports a distinct observation."
+        second_shard["claims"][0]["quote_spans"][0]["quote"] = second_shard["claims"][0]["text"]
+        second_shard["claims"][0]["visual_supports"][0]["observation_text"] = second_observation
+        self.write_json(second_shard_path, second_shard)
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge["validation"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(len(evidence["images"]), 1)
+        self.assertIn(second_observation, evidence["images"][0]["observations"])
+        distinct_claim = next(
+            claim
+            for claim in evidence["claims"]
+            if claim["id"] == "claim_duplicate_image_observation"
+        )
+        support = distinct_claim["visual_supports"][0]
+        self.assertEqual(support["image_id"], evidence["images"][0]["id"])
+        self.assertEqual(
+            support["observation_index"],
+            evidence["images"][0]["observations"].index(second_observation),
+        )
+        self.assertEqual(support["observation_text"], second_observation)
+        self.assertEqual(
+            support["observation_ref"],
+            f"images.{evidence['images'][0]['id']}.observations[{support['observation_index']}]",
+        )
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_scopes_duplicate_image_observation_remaps_per_task(self) -> None:
+        run_dir = self.prepare()
+        plan_research_tasks(run=run_dir, min_tasks=3)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        tasks = tasks_artifact["tasks"]
+
+        first_task = tasks[0]
+        first_task["state"] = "completed"
+        first_shard_path = run_dir / first_task["output_shard_path"]
+        first_shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(first_shard_path, self.shard(run_dir, first_task, duplicate=True, common_ids=True))
+
+        second_task = tasks[1]
+        second_task["state"] = "completed"
+        second_shard_path = run_dir / second_task["output_shard_path"]
+        second_shard_path.parent.mkdir(parents=True, exist_ok=True)
+        second_shard = self.shard(run_dir, second_task, duplicate=True, common_ids=True)
+        second_observation = "A second task duplicate image observation."
+        second_shard["images"][0]["observations"] = [second_observation]
+        second_shard["claims"][0]["id"] = "claim_second_duplicate_image"
+        second_shard["claims"][0]["text"] = "The duplicate image has a second task observation."
+        second_shard["claims"][0]["quote_spans"][0]["quote"] = second_shard["claims"][0]["text"]
+        second_shard["claims"][0]["visual_supports"][0]["observation_text"] = second_observation
+        self.write_json(second_shard_path, second_shard)
+
+        third_task = tasks[2]
+        third_task["state"] = "completed"
+        third_shard_path = run_dir / third_task["output_shard_path"]
+        third_shard_path.parent.mkdir(parents=True, exist_ok=True)
+        third_shard = self.shard(run_dir, third_task, common_ids=True)
+        third_observation = "A separate third task image observation."
+        third_shard["images"][0]["observations"] = [third_observation]
+        third_shard["claims"][0]["id"] = "claim_third_nonduplicate_image"
+        third_shard["claims"][0]["text"] = "A separate image keeps its local observation index."
+        third_shard["claims"][0]["quote_spans"][0]["quote"] = third_shard["claims"][0]["text"]
+        third_shard["claims"][0]["visual_supports"][0]["observation_text"] = third_observation
+        self.write_json(third_shard_path, third_shard)
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge["validation"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        third_claim = next(
+            claim for claim in evidence["claims"] if claim["id"] == "claim_third_nonduplicate_image"
+        )
+        support = third_claim["visual_supports"][0]
+        self.assertEqual(support["observation_index"], 0)
+        self.assertEqual(support["observation_text"], third_observation)
+        third_image = next(image for image in evidence["images"] if image["id"] == support["image_id"])
+        self.assertEqual(third_image["observations"], [third_observation])
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_plan_research_tasks_does_not_reinsert_visual_evidence_for_text_only_helper_task(self) -> None:
+        run_dir = self.prepare(route="visual_required")
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["semantic_planner"]["bounded_tasks"] = []
+        evidence["search_tasks"] = [
+            {
+                "id": "task_005",
+                "task_id": "task_005",
+                "angle_id": "angle_001",
+                "route": "text_only",
+                "evidence_need": "visual_example",
+                "expected_evidence": ["primary_source"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["deduplication table"],
+                "success_criteria": ["Use previously collected official images only."],
+                "max_sources": 3,
+                "max_images": 0,
+                "query": "Deduplicate collected official poster candidates.",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        planned = plan_research_tasks(run=run_dir, min_tasks=1)
+
+        task = planned["tasks"][0]
+        self.assertEqual(task["route"], "text_only")
+        self.assertEqual(task["max_images"], 0)
+        self.assertEqual(task["expected_evidence"], ["primary_source"])
 
     def test_shard_merge_namespaces_colliding_local_ids_and_remaps_refs(self) -> None:
         run_dir = self.prepare()

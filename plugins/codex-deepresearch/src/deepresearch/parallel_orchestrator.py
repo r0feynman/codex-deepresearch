@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, MutableMapping, Sequence
 
 from .evidence_schema import (
     EVIDENCE_SCHEMA_VERSION,
@@ -1049,6 +1049,14 @@ def _semantic_task_query(
 def _expected_evidence_for_task(task: Mapping[str, Any], *, route: str) -> list[str]:
     expected = _string_list(task.get("expected_evidence"))
     evidence_need = str(task.get("evidence_need") or "")
+    visual_expected = {"visual_example", "visual_observation", "vlm_analysis"}
+    visual_obligation = (
+        route != "text_only"
+        or bool(_string_list(task.get("expected_visual_targets")))
+        or _nonnegative_int(task.get("max_images")) > 0
+    )
+    if evidence_need in visual_expected and not visual_obligation:
+        evidence_need = ""
     if evidence_need and evidence_need not in expected:
         expected.insert(0, evidence_need)
     if route != "text_only" and "visual_observation" not in expected:
@@ -1527,6 +1535,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
     tasks = _task_list(tasks_artifact)
     source_by_url: dict[str, str] = {}
     image_by_hash: dict[str, str] = {}
+    images_by_id: dict[str, dict[str, Any]] = {}
     claim_by_text: dict[str, str] = {}
     used_source_ids: set[str] = set()
     used_image_ids: set[str] = set()
@@ -1557,6 +1566,10 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         used_image_ids,
         used_claim_ids,
     )
+    for image in _list(evidence.get("images")):
+        image_id = str(image.get("id") or "")
+        if image_id:
+            images_by_id[image_id] = image
 
     for task in tasks:
         state = str(task.get("state"))
@@ -1640,8 +1653,9 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
                 failed_tasks.append(_task_failure_record(task))
                 continue
         id_map: dict[str, str] = {}
+        task_image_observation_index_map: dict[str, dict[int, int]] = {}
         new_claims = 0
-        task_image_records: list[dict[str, Any]] = []
+        task_image_records: list[MutableMapping[str, Any]] = []
         for source in _list(shard.get("sources")):
             key = _source_key(source)
             old_id = str(source.get("id") or "")
@@ -1666,6 +1680,9 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
 
         for image in _list(shard.get("images")):
             image_copy = _with_task_angle_metadata(image, task)
+            if release_identity and str(task.get("last_adapter") or "") == "codex-exec":
+                _force_task_angle_metadata(image_copy, task)
+                _ensure_release_visual_image_cost_fields(image_copy)
             old_id = str(image_copy.get("id") or "")
             if image_copy.get("source_id") in id_map:
                 image_copy["source_id"] = id_map[str(image_copy["source_id"])]
@@ -1673,8 +1690,22 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             existing_id = image_by_hash.get(key)
             if existing_id:
                 id_map[old_id] = existing_id
+                existing_image = images_by_id.get(existing_id)
+                observation_map, merged_observation_count = _merge_duplicate_image_observations(
+                    existing_image,
+                    image_copy,
+                )
+                if observation_map:
+                    task_image_observation_index_map[old_id] = observation_map
+                image_dedupe_record = {
+                    "task_id": task["id"],
+                    "duplicate_id": image.get("id"),
+                    "kept_id": existing_id,
+                }
+                if merged_observation_count:
+                    image_dedupe_record["merged_observation_count"] = merged_observation_count
                 image_dedupe.append(
-                    {"task_id": task["id"], "duplicate_id": image.get("id"), "kept_id": existing_id}
+                    image_dedupe_record
                 )
                 continue
             new_id = _canonical_artifact_id(
@@ -1686,11 +1717,17 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             image_copy["id"] = new_id
             image_by_hash[key] = new_id
             evidence["images"].append(image_copy)
-            task_image_records.append(dict(image_copy))
+            images_by_id[new_id] = image_copy
+            task_image_records.append(image_copy)
             id_map[old_id] = new_id
 
         for claim in _list(shard.get("claims")):
-            claim_copy = _remap_claim_refs(claim, id_map)
+            claim_copy = _remap_claim_refs(
+                claim,
+                id_map,
+                images_by_id=images_by_id,
+                image_observation_index_map=task_image_observation_index_map,
+            )
             claim_copy = _with_task_angle_metadata(claim_copy, task)
             old_id = str(claim.get("id") or "")
             if not _claim_is_mergeable(claim_copy):
@@ -1743,9 +1780,12 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
                 release_visual_image_records.extend(task_image_records)
                 child_visual_observation_records.extend(
                     _release_validation_child_visual_observations(
+                        run_dir=run_dir,
                         task=task,
                         shard_path=shard_path,
                         image_id_map=id_map,
+                        source_id_map=id_map,
+                        images_by_id=images_by_id,
                     )
                 )
         else:
@@ -2119,9 +2159,12 @@ def _write_release_validation_search_results(
 
 def _release_validation_child_visual_observations(
     *,
+    run_dir: Path,
     task: Mapping[str, Any],
     shard_path: Path,
     image_id_map: Mapping[str, str],
+    source_id_map: Mapping[str, str],
+    images_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     sidecar = shard_path.parent / "visual_observations.jsonl"
     if not sidecar.exists():
@@ -2130,15 +2173,39 @@ def _release_validation_child_visual_observations(
     for index, record in enumerate(_read_jsonl(sidecar), start=1):
         if not isinstance(record, Mapping):
             continue
-        observation = _with_task_angle_metadata(record, task)
+        observation = _with_task_angle_metadata(
+            _normalize_codex_interactive_visual_handoff_record(record),
+            task,
+        )
         old_image_id = str(observation.get("evidence_image_id") or "")
         if old_image_id in image_id_map:
             new_image_id = image_id_map[old_image_id]
+            _preserve_child_field(observation, "id")
+            _preserve_child_field(observation, "candidate_id")
+            _preserve_child_field(observation, "fetch_id")
+            observation["id"] = new_image_id
             observation["image_id"] = new_image_id
             observation["evidence_image_id"] = new_image_id
-            observation["linked_candidate_id"] = _release_validation_candidate_id(new_image_id)
-            observation["linked_fetch_id"] = _release_validation_fetch_id(new_image_id)
+            observation["candidate_id"] = _release_validation_candidate_id(new_image_id)
+            observation["fetch_id"] = _release_validation_fetch_id(new_image_id)
+            observation["linked_candidate_id"] = observation["candidate_id"]
+            observation["linked_fetch_id"] = observation["fetch_id"]
             observation["raw_child_evidence_image_id"] = old_image_id
+        new_image_id = str(observation.get("evidence_image_id") or observation.get("image_id") or "")
+        source_id = str(observation.get("source_id") or "")
+        if source_id in source_id_map:
+            observation["source_id"] = source_id_map[source_id]
+        elif not source_id and new_image_id in images_by_id:
+            image_source_id = images_by_id[new_image_id].get("source_id")
+            if isinstance(image_source_id, str) and image_source_id.strip():
+                observation["source_id"] = image_source_id.strip()
+        if new_image_id in images_by_id:
+            _fill_child_visual_observation_from_image(
+                run_dir,
+                observation,
+                images_by_id[new_image_id],
+            )
+        _drop_missing_child_visual_artifact_path(run_dir, observation)
         if "observation_id" not in observation:
             observation["observation_id"] = (
                 f"obs_{task.get('id')}_{index:03d}"
@@ -2146,6 +2213,86 @@ def _release_validation_child_visual_observations(
         observation.setdefault("handoff_artifact", "visual_observations.jsonl")
         observations.append(observation)
     return observations
+
+
+def _preserve_child_field(observation: MutableMapping[str, Any], field: str) -> None:
+    value = observation.get(field)
+    if value is not None and f"raw_child_{field}" not in observation:
+        observation[f"raw_child_{field}"] = value
+
+
+def _fill_child_visual_observation_from_image(
+    run_dir: Path,
+    observation: MutableMapping[str, Any],
+    image: Mapping[str, Any],
+) -> None:
+    for field in (
+        "source_id",
+        "image_url",
+        "page_url",
+        "origin",
+        "mime_type",
+        "width",
+        "height",
+        "hash",
+        "phash",
+        "visual_tasks",
+        "analysis_status",
+        "candidate_class",
+        "source_url",
+    ):
+        if observation.get(field) in (None, "", []):
+            value = image.get(field)
+            if value not in (None, "", []):
+                observation[field] = value
+    if observation.get("local_artifact_path") in (None, ""):
+        local_path = image.get("local_artifact_path")
+        if isinstance(local_path, str) and local_path.strip():
+            try:
+                artifact_path = _resolve_run_relative_artifact_path(run_dir, local_path)
+            except ParallelOrchestrationError:
+                observation.setdefault("raw_child_local_artifact_path", local_path)
+            else:
+                if artifact_path.is_file():
+                    observation["local_artifact_path"] = local_path
+                else:
+                    observation.setdefault("raw_child_local_artifact_path", local_path)
+    if observation.get("analysis_status") in (None, ""):
+        observation["analysis_status"] = observation.get("observation_status") or "analyzed"
+
+
+def _drop_missing_child_visual_artifact_path(
+    run_dir: Path,
+    observation: MutableMapping[str, Any],
+) -> None:
+    local_path = observation.get("local_artifact_path")
+    if not isinstance(local_path, str) or not local_path.strip():
+        return
+    try:
+        artifact_path = _resolve_run_relative_artifact_path(run_dir, local_path)
+    except ParallelOrchestrationError:
+        observation["raw_child_local_artifact_path"] = local_path
+        observation.pop("local_artifact_path", None)
+        return
+    if artifact_path.is_file():
+        return
+    observation["raw_child_local_artifact_path"] = local_path
+    observation.pop("local_artifact_path", None)
+
+
+def _resolve_run_relative_artifact_path(run_dir: Path, raw_path: str) -> Path:
+    run_root = run_dir.resolve()
+    relative_path = Path(raw_path)
+    if relative_path.is_absolute():
+        raise ParallelOrchestrationError(f"artifact path must be run-relative: {raw_path}")
+    resolved_path = (run_root / relative_path).resolve()
+    try:
+        resolved_path.relative_to(run_root)
+    except ValueError as exc:
+        raise ParallelOrchestrationError(
+            f"artifact path resolves outside run directory: {raw_path}"
+        ) from exc
+    return resolved_path
 
 
 def _release_validation_child_visual_sidecar_status(
@@ -2170,7 +2317,9 @@ def _release_validation_child_visual_sidecar_status(
             "records": 0,
         }
     records = [
-        record for record in _read_jsonl(sidecar) if isinstance(record, Mapping)
+        _normalize_codex_interactive_visual_handoff_record(record)
+        for record in _read_jsonl(sidecar)
+        if isinstance(record, Mapping)
     ]
     if not records:
         return {
@@ -2288,6 +2437,45 @@ def _release_validation_child_visual_observation_invalid_reason(
     return None
 
 
+def _normalize_codex_interactive_visual_handoff_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(record)
+    provenance_value = normalized.get("provider_provenance")
+    provenance = dict(provenance_value) if isinstance(provenance_value, Mapping) else None
+    codex_interactive_record = (
+        normalized.get("provider") == "codex-interactive"
+        and normalized.get("provider_kind") == "vlm"
+        and normalized.get("provider_mode") == "real"
+        and (
+            normalized.get("codex_interactive_handoff") is True
+            or normalized.get("handoff_artifact") == "visual_observations.jsonl"
+        )
+    )
+    codex_interactive_provenance = (
+        provenance is not None
+        and provenance.get("provider") == "codex-interactive"
+        and provenance.get("provider_kind") == "vlm"
+        and provenance.get("provider_mode") == "real"
+        and (
+            provenance.get("codex_interactive_handoff") is True
+            or provenance.get("handoff_artifact") == "visual_observations.jsonl"
+        )
+    )
+    if not (codex_interactive_record and codex_interactive_provenance):
+        return normalized
+    if normalized.get("external_vlm_call") is True:
+        normalized["child_reported_external_vlm_call"] = True
+        normalized["external_vlm_call"] = False
+        normalized["external_vlm_call_normalized_by_parent"] = True
+    if provenance is not None and provenance.get("external_vlm_call") is True:
+        provenance["child_reported_external_vlm_call"] = True
+        provenance["external_vlm_call"] = False
+        provenance["external_vlm_call_normalized_by_parent"] = True
+        normalized["provider_provenance"] = provenance
+    return normalized
+
+
 def _release_visual_text_items(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -2308,19 +2496,903 @@ def _write_release_validation_visual_handoffs(
     *,
     run_dir: Path,
     tasks: Sequence[Mapping[str, Any]],
-    image_records: Sequence[Mapping[str, Any]],
+    image_records: Sequence[MutableMapping[str, Any]],
     visual_observations: Sequence[Mapping[str, Any]],
 ) -> None:
     visual_tasks = [task for task in tasks if _task_requests_visual_evidence(task)]
     if not visual_tasks and not image_records and not visual_observations:
         return
-    _write_release_validation_visual_search_plan(run_dir, visual_tasks)
-    _write_release_validation_visual_candidates(run_dir, image_records)
-    _write_release_validation_image_fetch_status(run_dir, image_records)
-    if visual_observations:
-        _write_jsonl_records(run_dir / "visual_observations.jsonl", visual_observations)
+    visual_plan_payload, visual_plan_records = _release_validation_visual_search_plan_payload(
+        run_dir,
+        visual_tasks,
+    )
+    generated_candidates = [
+        _release_validation_visual_candidate_record(
+            image,
+            index=index,
+            visual_plan_records=visual_plan_records,
+        )
+        for index, image in enumerate(image_records, start=1)
+    ]
+    generated_candidate_ids = {
+        candidate_id
+        for candidate in generated_candidates
+        if (candidate_id := _string_or_none(candidate.get("candidate_id") or candidate.get("id")))
+    }
+    candidate_records = _merged_release_jsonl_records(
+        run_dir / "visual_candidates.jsonl",
+        generated_candidates,
+    )
+    generated_fetches = [
+        _release_validation_image_fetch_status_record(
+            image,
+            index=index,
+            visual_plan_records=visual_plan_records,
+        )
+        for index, image in enumerate(image_records, start=1)
+    ]
+    generated_fetch_ids = {
+        fetch_id
+        for fetch in generated_fetches
+        if (fetch_id := _string_or_none(fetch.get("fetch_id")))
+    }
+    fetch_records = _merged_release_jsonl_records(
+        run_dir / "image_fetch_status.jsonl",
+        generated_fetches,
+    )
+    task_lineage = _release_visual_task_lineage_by_id(run_dir)
+    _normalize_release_visual_records_to_task_lineage(visual_plan_records, task_lineage)
+    _normalize_release_visual_records_to_task_lineage(candidate_records, task_lineage)
+    _normalize_release_visual_records_to_task_lineage(fetch_records, task_lineage)
+    normalized_observations = _canonicalize_release_visual_observations(
+        run_dir=run_dir,
+        visual_observations=visual_observations,
+        image_records=image_records,
+        candidate_records=candidate_records,
+        fetch_records=fetch_records,
+        visual_plan_records=visual_plan_records,
+        generated_candidate_ids=generated_candidate_ids,
+        generated_fetch_ids=generated_fetch_ids,
+    )
+    _write_release_validation_visual_search_plan(run_dir, visual_plan_payload)
+    _write_jsonl_records_replace(run_dir / "visual_candidates.jsonl", candidate_records)
+    _write_jsonl_records_replace(run_dir / "image_fetch_status.jsonl", fetch_records)
+    if normalized_observations:
+        _write_jsonl_records_replace(
+            run_dir / "visual_observations.jsonl",
+            normalized_observations,
+        )
     else:
         (run_dir / "visual_observations.jsonl").touch()
+
+
+def _merged_release_jsonl_records(
+    path: Path,
+    generated_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = [
+        dict(record) for record in _read_jsonl(path) if isinstance(record, Mapping)
+    ] if path.exists() else []
+    seen = {_jsonl_record_identity(record) for record in merged}
+    for record in generated_records:
+        record_copy = dict(record)
+        identity = _jsonl_record_identity(record_copy)
+        if identity in seen:
+            continue
+        merged.append(record_copy)
+        seen.add(identity)
+    return merged
+
+
+def _canonicalize_release_visual_observations(
+    *,
+    run_dir: Path,
+    visual_observations: Sequence[Mapping[str, Any]],
+    image_records: Sequence[MutableMapping[str, Any]],
+    candidate_records: Sequence[MutableMapping[str, Any]],
+    fetch_records: Sequence[MutableMapping[str, Any]],
+    visual_plan_records: Sequence[Mapping[str, Any]],
+    generated_candidate_ids: set[str],
+    generated_fetch_ids: set[str],
+) -> list[dict[str, Any]]:
+    images_by_id: dict[str, MutableMapping[str, Any]] = {}
+    for image in image_records:
+        if not isinstance(image, MutableMapping):
+            continue
+        for key in ("evidence_image_id", "image_id", "id"):
+            value = image.get(key)
+            if isinstance(value, str) and value.strip():
+                images_by_id.setdefault(value.strip(), image)
+
+    canonical_maps = _release_visual_canonical_maps(
+        candidate_records=candidate_records,
+        fetch_records=fetch_records,
+        visual_plan_records=visual_plan_records,
+        generated_candidate_ids=generated_candidate_ids,
+        generated_fetch_ids=generated_fetch_ids,
+    )
+    normalized: list[dict[str, Any]] = []
+    for observation in visual_observations:
+        if not isinstance(observation, Mapping):
+            continue
+        record = dict(observation)
+        image_id = str(
+            record.get("evidence_image_id")
+            or record.get("image_id")
+            or record.get("id")
+            or ""
+        ).strip()
+        if image_id:
+            if not _string_or_none(record.get("evidence_image_id")):
+                record["evidence_image_id"] = image_id
+            if not _string_or_none(record.get("image_id")):
+                record["image_id"] = image_id
+        image = images_by_id.get(image_id)
+        if image is not None:
+            _fill_child_visual_observation_from_image(run_dir, record, image)
+            _drop_missing_child_visual_artifact_path(run_dir, record)
+        candidate = _release_visual_match_candidate(record, image, canonical_maps)
+        fetch = _release_visual_match_fetch(record, image, candidate, canonical_maps)
+        plan = _release_visual_match_plan(record, image, candidate, fetch, canonical_maps)
+        lineage = _release_visual_canonical_lineage(candidate, fetch, plan)
+        if candidate is not None:
+            candidate_id = _string_or_none(candidate.get("candidate_id") or candidate.get("id"))
+            if candidate_id:
+                _set_release_canonical_field(record, "candidate_id", candidate_id)
+                record["linked_candidate_id"] = candidate_id
+                if image_id:
+                    if not _string_or_none(candidate.get("evidence_image_id")):
+                        candidate["evidence_image_id"] = image_id
+                    if not _string_or_none(candidate.get("image_id")):
+                        candidate["image_id"] = image_id
+        if fetch is not None:
+            fetch_id = _string_or_none(fetch.get("fetch_id"))
+            if fetch_id:
+                _set_release_canonical_field(record, "fetch_id", fetch_id)
+                record["linked_fetch_id"] = fetch_id
+                if image_id:
+                    if not _string_or_none(fetch.get("evidence_image_id")):
+                        fetch["evidence_image_id"] = image_id
+                    if not _string_or_none(fetch.get("image_id")):
+                        fetch["image_id"] = image_id
+            if candidate is not None:
+                candidate_id = _string_or_none(candidate.get("candidate_id") or candidate.get("id"))
+                if candidate_id and not _string_or_none(fetch.get("candidate_id")):
+                    fetch["candidate_id"] = candidate_id
+        for field in ("plan_id", "task_id", "angle_id", "route"):
+            value = lineage.get(field)
+            if value:
+                _set_release_canonical_field(record, field, value)
+                if candidate is not None and not _string_or_none(candidate.get(field)):
+                    candidate[field] = value
+                if fetch is not None and not _string_or_none(fetch.get(field)):
+                    fetch[field] = value
+        if lineage.get("task_id"):
+            _set_release_canonical_field(
+                record,
+                "semantic_plan_task_id",
+                lineage["task_id"],
+            )
+        if image is not None:
+            _reconcile_release_visual_image_from_lineage(
+                run_dir=run_dir,
+                image=image,
+                observation=record,
+                candidate=candidate,
+                fetch=fetch,
+                plan=plan,
+                generated_candidate_ids=generated_candidate_ids,
+                generated_fetch_ids=generated_fetch_ids,
+            )
+            _reconcile_release_visual_observation_from_lineage(
+                run_dir=run_dir,
+                observation=record,
+                image=image,
+                candidate=candidate,
+                fetch=fetch,
+                plan=plan,
+            )
+        _canonicalize_release_visual_observation_links(record)
+        normalized.append(record)
+    return normalized
+
+
+def _release_visual_task_lineage_by_id(run_dir: Path) -> dict[str, Mapping[str, Any]]:
+    lineage: dict[str, Mapping[str, Any]] = {}
+    for filename in (RESEARCH_TASKS_FILENAME, "visual_tasks.json"):
+        path = run_dir / filename
+        if not path.exists():
+            continue
+        payload = _read_json(path)
+        for task in _list(payload.get("tasks")) if isinstance(payload, Mapping) else []:
+            if not isinstance(task, Mapping):
+                continue
+            task_id = _string_or_none(task.get("id"))
+            if task_id:
+                lineage[task_id] = task
+    return lineage
+
+
+def _normalize_release_visual_records_to_task_lineage(
+    records: Sequence[MutableMapping[str, Any]],
+    task_lineage: Mapping[str, Mapping[str, Any]],
+) -> None:
+    if not task_lineage:
+        return
+    for record in records:
+        if isinstance(record, MutableMapping):
+            _normalize_release_visual_record_to_task_lineage(record, task_lineage)
+
+
+def _normalize_release_visual_record_to_task_lineage(
+    record: MutableMapping[str, Any],
+    task_lineage: Mapping[str, Mapping[str, Any]],
+) -> None:
+    task = _release_visual_task_for_record(record, task_lineage)
+    if task is None:
+        return
+    angle_id = _string_or_none(task.get("angle_id"))
+    route = _string_or_none(task.get("route")) or _string_or_none(task.get("modality"))
+    if angle_id:
+        _set_release_canonical_field(record, "angle_id", angle_id)
+    if route:
+        _set_release_canonical_field(record, "route", route)
+    semantic_task_id = _string_or_none(task.get("semantic_plan_task_id")) or _string_or_none(
+        task.get("task_id")
+    )
+    if semantic_task_id and not _string_or_none(record.get("semantic_plan_task_id")):
+        record["semantic_plan_task_id"] = semantic_task_id
+
+
+def _release_visual_task_for_record(
+    record: Mapping[str, Any],
+    task_lineage: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    for field in ("task_id", "semantic_plan_task_id", "source_task_id"):
+        task_id = _string_or_none(record.get(field))
+        if task_id and task_id in task_lineage:
+            return task_lineage[task_id]
+    return None
+
+
+def _reconcile_release_visual_image_from_lineage(
+    *,
+    run_dir: Path,
+    image: MutableMapping[str, Any],
+    observation: Mapping[str, Any],
+    candidate: Mapping[str, Any] | None,
+    fetch: Mapping[str, Any] | None,
+    plan: Mapping[str, Any] | None,
+    generated_candidate_ids: set[str],
+    generated_fetch_ids: set[str],
+) -> None:
+    candidate_id = _string_or_none((candidate or {}).get("candidate_id") or (candidate or {}).get("id"))
+    fetch_id = _string_or_none((fetch or {}).get("fetch_id"))
+    generated_lineage = (
+        bool(candidate_id and candidate_id in generated_candidate_ids)
+        or bool(fetch_id and fetch_id in generated_fetch_ids)
+    )
+    for field in ("plan_id", "task_id", "angle_id", "route"):
+        if field == "task_id" and generated_lineage:
+            continue
+        value = _first_release_lineage_value(field, plan, candidate, fetch, observation)
+        if value:
+            _set_release_canonical_field(image, field, value)
+    if candidate_id:
+        _set_release_canonical_field(image, "candidate_id", candidate_id)
+    if fetch_id:
+        _set_release_canonical_field(image, "fetch_id", fetch_id)
+
+    if _release_visual_fetch_has_run_local_image(run_dir, fetch):
+        _copy_release_visual_fetch_artifact_to_image(image, fetch or {}, candidate or {})
+        _remove_release_metadata_only_caveat(image)
+    _ensure_release_visual_image_cost_fields(image, fetch, candidate)
+
+
+def _reconcile_release_visual_observation_from_lineage(
+    *,
+    run_dir: Path,
+    observation: MutableMapping[str, Any],
+    image: Mapping[str, Any],
+    candidate: Mapping[str, Any] | None,
+    fetch: Mapping[str, Any] | None,
+    plan: Mapping[str, Any] | None,
+) -> None:
+    for field in ("plan_id", "task_id", "angle_id", "route"):
+        value = _first_release_lineage_value(field, plan, candidate, fetch, image)
+        if value:
+            _set_release_canonical_field(observation, field, value)
+    for field in (
+        "source_id",
+        "image_url",
+        "page_url",
+        "origin",
+        "mime_type",
+        "width",
+        "height",
+        "hash",
+        "phash",
+        "source_url",
+    ):
+        value = _first_release_lineage_value(field, image, fetch, candidate)
+        if value not in (None, "", []):
+            observation[field] = value
+    if _release_visual_fetch_has_run_local_image(run_dir, fetch):
+        local_path = _string_or_none((fetch or {}).get("local_artifact_path"))
+        if local_path:
+            _set_release_canonical_field(observation, "local_artifact_path", local_path)
+            _remove_release_metadata_only_caveat(observation)
+    for field in ("estimated_cost_usd", "actual_cost_usd"):
+        value = _first_release_number(field, fetch, candidate, image, observation)
+        observation[field] = value if value is not None else 0.0
+
+
+def _copy_release_visual_fetch_artifact_to_image(
+    image: MutableMapping[str, Any],
+    fetch: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> None:
+    copy_fields = (
+        "local_artifact_path",
+        "mime_type",
+        "width",
+        "height",
+        "hash",
+        "phash",
+        "http_status",
+        "image_url",
+        "page_url",
+        "source_id",
+    )
+    for field in copy_fields:
+        value = _first_release_lineage_value(field, fetch, candidate)
+        if value not in (None, "", []):
+            _set_release_canonical_field(image, field, value)
+    byte_size = _first_release_lineage_value("byte_size", fetch)
+    if byte_size not in (None, "", []):
+        image["artifact_size_bytes"] = byte_size
+
+
+def _first_release_lineage_value(field: str, *records: Mapping[str, Any] | None) -> Any:
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        value = record.get(field)
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def _ensure_release_visual_image_cost_fields(
+    image: MutableMapping[str, Any],
+    *lineage_records: Mapping[str, Any] | None,
+) -> None:
+    for field in ("estimated_cost_usd", "actual_cost_usd"):
+        value = _first_release_number(field, *lineage_records)
+        if value is None:
+            value = _first_release_number(field, image)
+        if value is None:
+            value = 0.0
+        if image.get(field) != value:
+            old_value = image.get(field)
+            if old_value not in (None, "", []) and f"raw_child_{field}" not in image:
+                image[f"raw_child_{field}"] = old_value
+            image[field] = value
+
+
+def _first_release_number(
+    field: str,
+    *records: Mapping[str, Any] | None,
+) -> float | int | None:
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        value = record.get(field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return value
+    return None
+
+
+def _release_visual_fetch_has_run_local_image(
+    run_dir: Path,
+    fetch: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(fetch, Mapping):
+        return False
+    if fetch.get("fetch_status") != "fetched":
+        return False
+    if fetch.get("provider_mode") != "real":
+        return False
+    local_path = _string_or_none(fetch.get("local_artifact_path"))
+    if not local_path:
+        return False
+    suffix = Path(local_path).suffix.lower()
+    if suffix in {".json", ".jsonl", ".txt", ".html", ".htm", ".md"}:
+        return False
+    mime_type = _string_or_none(fetch.get("mime_type"))
+    if mime_type and not mime_type.lower().startswith("image/"):
+        return False
+    try:
+        artifact_path = _resolve_run_relative_artifact_path(run_dir, local_path)
+    except ParallelOrchestrationError:
+        return False
+    return artifact_path.is_file()
+
+
+def _remove_release_metadata_only_caveat(record: MutableMapping[str, Any]) -> None:
+    caveats = record.get("caveats")
+    if not isinstance(caveats, list):
+        return
+    filtered = [
+        caveat
+        for caveat in caveats
+        if not (
+            isinstance(caveat, str)
+            and "metadata-only visual record" in caveat
+        )
+    ]
+    record["caveats"] = filtered
+
+
+def _release_visual_canonical_maps(
+    *,
+    candidate_records: Sequence[MutableMapping[str, Any]],
+    fetch_records: Sequence[MutableMapping[str, Any]],
+    visual_plan_records: Sequence[Mapping[str, Any]],
+    generated_candidate_ids: set[str],
+    generated_fetch_ids: set[str],
+) -> dict[str, Any]:
+    candidate_index: dict[str, list[MutableMapping[str, Any]]] = {}
+    fetch_index: dict[str, list[MutableMapping[str, Any]]] = {}
+    fetches_by_candidate_id: dict[str, list[MutableMapping[str, Any]]] = {}
+    plans_by_id: dict[str, Mapping[str, Any]] = {}
+    plans_by_lineage: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for plan in visual_plan_records:
+        if not isinstance(plan, Mapping):
+            continue
+        plan_id = _string_or_none(plan.get("plan_id"))
+        if plan_id:
+            plans_by_id.setdefault(plan_id, plan)
+        for key in _release_visual_lineage_keys(plan):
+            plans_by_lineage.setdefault(key, plan)
+    for candidate in candidate_records:
+        if not isinstance(candidate, MutableMapping):
+            continue
+        for key in _release_visual_candidate_index_keys(candidate):
+            candidate_index.setdefault(key, []).append(candidate)
+    for fetch in fetch_records:
+        if not isinstance(fetch, MutableMapping):
+            continue
+        for key in _release_visual_fetch_index_keys(fetch):
+            fetch_index.setdefault(key, []).append(fetch)
+        candidate_id = _string_or_none(fetch.get("candidate_id"))
+        if candidate_id:
+            fetches_by_candidate_id.setdefault(candidate_id, []).append(fetch)
+    return {
+        "candidate_index": candidate_index,
+        "fetch_index": fetch_index,
+        "fetches_by_candidate_id": fetches_by_candidate_id,
+        "plans_by_id": plans_by_id,
+        "plans_by_lineage": plans_by_lineage,
+        "generated_candidate_ids": generated_candidate_ids,
+        "generated_fetch_ids": generated_fetch_ids,
+    }
+
+
+def _release_visual_match_candidate(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+    maps: Mapping[str, Any],
+) -> MutableMapping[str, Any] | None:
+    index = maps.get("candidate_index")
+    if not isinstance(index, Mapping):
+        return None
+    fetches_by_candidate_id = maps.get("fetches_by_candidate_id")
+    if not isinstance(fetches_by_candidate_id, Mapping):
+        fetches_by_candidate_id = {}
+    generated_candidate_ids = maps.get("generated_candidate_ids")
+    if not isinstance(generated_candidate_ids, set):
+        generated_candidate_ids = set()
+    candidates: list[tuple[int, MutableMapping[str, Any]]] = []
+    for priority, keys in enumerate(_release_visual_candidate_lookup_keys(observation, image)):
+        for key in keys:
+            for candidate in index.get(key, []):
+                if isinstance(candidate, MutableMapping):
+                    candidates.append((priority, candidate))
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: _release_visual_candidate_score(
+            item[1],
+            priority=item[0],
+            fetches_by_candidate_id=fetches_by_candidate_id,
+            generated_candidate_ids=generated_candidate_ids,
+        ),
+    )[1]
+
+
+def _release_visual_match_fetch(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+    maps: Mapping[str, Any],
+) -> MutableMapping[str, Any] | None:
+    fetches_by_candidate_id = maps.get("fetches_by_candidate_id")
+    if isinstance(fetches_by_candidate_id, Mapping) and candidate is not None:
+        candidate_id = _string_or_none(candidate.get("candidate_id") or candidate.get("id"))
+        if candidate_id:
+            fetches = [
+                fetch
+                for fetch in fetches_by_candidate_id.get(candidate_id, [])
+                if isinstance(fetch, MutableMapping)
+            ]
+            if fetches:
+                generated_fetch_ids = maps.get("generated_fetch_ids")
+                if not isinstance(generated_fetch_ids, set):
+                    generated_fetch_ids = set()
+                return max(
+                    fetches,
+                    key=lambda fetch: _release_visual_fetch_score(
+                        fetch,
+                        generated_fetch_ids=generated_fetch_ids,
+                    ),
+                )
+    index = maps.get("fetch_index")
+    if not isinstance(index, Mapping):
+        return None
+    generated_fetch_ids = maps.get("generated_fetch_ids")
+    if not isinstance(generated_fetch_ids, set):
+        generated_fetch_ids = set()
+    fetches: list[tuple[int, MutableMapping[str, Any]]] = []
+    for priority, keys in enumerate(_release_visual_fetch_lookup_keys(observation, image)):
+        for key in keys:
+            for fetch in index.get(key, []):
+                if isinstance(fetch, MutableMapping):
+                    fetches.append((priority, fetch))
+    if not fetches:
+        return None
+    return max(
+        fetches,
+        key=lambda item: _release_visual_fetch_score(
+            item[1],
+            generated_fetch_ids=generated_fetch_ids,
+        ) - (item[0] * 100),
+    )[1]
+
+
+def _release_visual_match_plan(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+    fetch: Mapping[str, Any] | None,
+    maps: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    plans_by_id = maps.get("plans_by_id")
+    if not isinstance(plans_by_id, Mapping):
+        plans_by_id = {}
+    for record in (candidate, fetch):
+        if not isinstance(record, Mapping):
+            continue
+        plan_id = _string_or_none(record.get("plan_id"))
+        if plan_id and plan_id in plans_by_id:
+            plan = plans_by_id[plan_id]
+            if isinstance(plan, Mapping):
+                return plan
+    plans_by_lineage = maps.get("plans_by_lineage")
+    if not isinstance(plans_by_lineage, Mapping):
+        plans_by_lineage = {}
+    for record in (candidate, fetch, observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        for key in _release_visual_lineage_keys(record):
+            plan = plans_by_lineage.get(key)
+            if isinstance(plan, Mapping):
+                return plan
+    for record in (observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        plan_id = _string_or_none(record.get("plan_id"))
+        if plan_id and plan_id in plans_by_id:
+            plan = plans_by_id[plan_id]
+            if isinstance(plan, Mapping):
+                return plan
+    return None
+
+
+def _release_visual_canonical_lineage(
+    candidate: Mapping[str, Any] | None,
+    fetch: Mapping[str, Any] | None,
+    plan: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    lineage: dict[str, str] = {}
+    for record in (plan, candidate, fetch):
+        if not isinstance(record, Mapping):
+            continue
+        for field in ("plan_id", "task_id", "angle_id", "route"):
+            if field in lineage:
+                continue
+            value = _string_or_none(record.get(field))
+            if value:
+                lineage[field] = value
+    return lineage
+
+
+def _release_visual_candidate_lookup_keys(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[list[str]]:
+    return [
+        _release_visual_lookup_keys_for_fields("evidence_image_id", observation, image)
+        + _release_visual_lookup_keys_for_fields("image_id", observation, image),
+        _release_visual_lookup_keys_for_fields("image_url", observation, image),
+        _release_visual_lookup_keys_for_fields("normalized_image_url", observation, image),
+        _release_visual_source_url_lookup_keys(observation, image),
+        _release_visual_page_source_keys(observation, image),
+        _release_visual_source_image_keys(observation, image),
+        _release_visual_source_origin_keys(observation, image),
+        _release_visual_lookup_keys_for_fields("local_artifact_path", observation, image),
+        _release_visual_lookup_keys_for_fields("candidate_id", observation, image)
+        + _release_visual_lookup_keys_for_fields("linked_candidate_id", observation, image),
+    ]
+
+
+def _release_visual_fetch_lookup_keys(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[list[str]]:
+    return [
+        _release_visual_lookup_keys_for_fields("evidence_image_id", observation, image)
+        + _release_visual_lookup_keys_for_fields("image_id", observation, image),
+        _release_visual_lookup_keys_for_fields("image_url", observation, image),
+        _release_visual_lookup_keys_for_fields("normalized_image_url", observation, image),
+        _release_visual_source_url_lookup_keys(observation, image),
+        _release_visual_page_source_keys(observation, image),
+        _release_visual_source_image_keys(observation, image),
+        _release_visual_lookup_keys_for_fields("local_artifact_path", observation, image),
+        _release_visual_lookup_keys_for_fields("candidate_id", observation, image)
+        + _release_visual_lookup_keys_for_fields("linked_candidate_id", observation, image),
+        _release_visual_lookup_keys_for_fields("fetch_id", observation, image)
+        + _release_visual_lookup_keys_for_fields("linked_fetch_id", observation, image),
+    ]
+
+
+def _release_visual_candidate_index_keys(record: Mapping[str, Any]) -> list[str]:
+    keys: list[str] = []
+    keys.extend(_release_visual_record_field_keys("candidate_id", record))
+    keys.extend(_release_visual_record_field_keys("id", record, alias="candidate_id"))
+    keys.extend(_release_visual_record_field_keys("evidence_image_id", record))
+    keys.extend(_release_visual_record_field_keys("image_id", record))
+    keys.extend(_release_visual_record_field_keys("image_url", record))
+    keys.extend(_release_visual_record_field_keys("normalized_image_url", record))
+    keys.extend(_release_visual_record_field_keys("source_url", record, alias="page_url"))
+    keys.extend(_release_visual_record_field_keys("local_artifact_path", record))
+    keys.extend(_release_visual_page_source_keys(record, None))
+    keys.extend(_release_visual_source_image_keys(record, None))
+    keys.extend(_release_visual_source_origin_keys(record, None))
+    return keys
+
+
+def _release_visual_fetch_index_keys(record: Mapping[str, Any]) -> list[str]:
+    keys: list[str] = []
+    keys.extend(_release_visual_record_field_keys("fetch_id", record))
+    keys.extend(_release_visual_record_field_keys("candidate_id", record))
+    keys.extend(_release_visual_record_field_keys("evidence_image_id", record))
+    keys.extend(_release_visual_record_field_keys("image_id", record))
+    keys.extend(_release_visual_record_field_keys("image_url", record))
+    keys.extend(_release_visual_record_field_keys("normalized_image_url", record))
+    keys.extend(_release_visual_record_field_keys("source_url", record, alias="page_url"))
+    keys.extend(_release_visual_page_source_keys(record, None))
+    keys.extend(_release_visual_source_image_keys(record, None))
+    keys.extend(_release_visual_record_field_keys("local_artifact_path", record))
+    return keys
+
+
+def _release_visual_lookup_keys_for_fields(
+    field: str,
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[str]:
+    keys: list[str] = []
+    for record in (observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        keys.extend(_release_visual_record_field_keys(field, record))
+    return keys
+
+
+def _release_visual_source_url_lookup_keys(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[str]:
+    keys: list[str] = []
+    for record in (observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        keys.extend(_release_visual_record_field_keys("source_url", record, alias="page_url"))
+    return keys
+
+
+def _release_visual_record_field_keys(
+    field: str,
+    record: Mapping[str, Any],
+    *,
+    alias: str | None = None,
+) -> list[str]:
+    value = _string_or_none(record.get(field))
+    if not value:
+        return []
+    key_field = alias or field
+    if key_field in {"image_url", "normalized_image_url", "page_url"}:
+        value = _release_visual_url_key(value)
+    elif key_field == "local_artifact_path":
+        value = value.replace("\\", "/")
+    if not value:
+        return []
+    return [f"{key_field}:{value}"]
+
+
+def _release_visual_page_source_keys(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[str]:
+    keys: list[str] = []
+    for record in (observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        page_url = _string_or_none(record.get("page_url"))
+        source_id = _string_or_none(record.get("source_id"))
+        if page_url and source_id:
+            keys.append(f"page_source:{_release_visual_url_key(page_url)}\n{source_id}")
+    return keys
+
+
+def _release_visual_source_origin_keys(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[str]:
+    keys: list[str] = []
+    for record in (observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        source_id = _string_or_none(record.get("source_id"))
+        origin = _string_or_none(record.get("origin"))
+        if source_id and origin:
+            keys.append(f"source_origin:{source_id}\n{origin}")
+    return keys
+
+
+def _release_visual_source_image_keys(
+    observation: Mapping[str, Any],
+    image: Mapping[str, Any] | None,
+) -> list[str]:
+    keys: list[str] = []
+    for record in (observation, image):
+        if not isinstance(record, Mapping):
+            continue
+        source_id = _string_or_none(record.get("source_id"))
+        image_url = _string_or_none(record.get("image_url"))
+        if source_id and image_url:
+            keys.append(f"source_image:{source_id}\n{_release_visual_url_key(image_url)}")
+    return keys
+
+
+def _release_visual_url_key(value: str) -> str:
+    return value.strip().lower()
+
+
+def _release_visual_candidate_score(
+    record: Mapping[str, Any],
+    *,
+    priority: int,
+    fetches_by_candidate_id: Mapping[str, Sequence[MutableMapping[str, Any]]],
+    generated_candidate_ids: set[str],
+) -> float:
+    score = 1000.0 - (priority * 100.0)
+    candidate_id = _string_or_none(record.get("candidate_id") or record.get("id"))
+    if candidate_id and candidate_id not in generated_candidate_ids:
+        score += 300.0
+    if record.get("policy_decision") == "allowed":
+        score += 100.0
+    if record.get("provider_mode") == "real":
+        score += 50.0
+    status = str(record.get("candidate_status") or record.get("status") or "")
+    if status in {"analyzed", "fetched"}:
+        score += 90.0
+    elif status in {"selected", "accepted"}:
+        score += 70.0
+    elif status in {"fetch_failed", "rejected"}:
+        score += 10.0
+    if candidate_id:
+        fetches = fetches_by_candidate_id.get(candidate_id, [])
+        if any(fetch.get("fetch_status") == "fetched" for fetch in fetches):
+            score += 120.0
+    rank = _safe_int(record.get("rank"))
+    if rank > 0:
+        score += max(0.0, 10.0 - min(float(rank), 10.0))
+    record_score = record.get("score")
+    if isinstance(record_score, (int, float)) and not isinstance(record_score, bool):
+        score += float(record_score)
+    return score
+
+
+def _release_visual_fetch_score(
+    record: Mapping[str, Any],
+    *,
+    generated_fetch_ids: set[str],
+) -> float:
+    score = 0.0
+    fetch_id = _string_or_none(record.get("fetch_id"))
+    if fetch_id and fetch_id not in generated_fetch_ids:
+        score += 300.0
+    if record.get("fetch_status") == "fetched":
+        score += 200.0
+    if record.get("policy_decision") == "allowed":
+        score += 100.0
+    if record.get("provider_mode") == "real":
+        score += 50.0
+    if _string_or_none(record.get("local_artifact_path")):
+        score += 25.0
+    if _string_or_none(record.get("evidence_image_id")):
+        score += 10.0
+    return score
+
+
+def _release_visual_lineage_keys(record: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    angle_id = _string_or_none(record.get("angle_id"))
+    route = _string_or_none(record.get("route"))
+    if not angle_id or not route:
+        return []
+    task_ids: list[str] = []
+    for field in ("semantic_plan_task_id", "task_id", "source_task_id", "id"):
+        value = _string_or_none(record.get(field))
+        if value and value not in task_ids:
+            task_ids.append(value)
+    return [(task_id, angle_id, route) for task_id in task_ids]
+
+
+def _set_release_canonical_field(
+    record: MutableMapping[str, Any],
+    field: str,
+    value: str,
+) -> None:
+    old_value = record.get(field)
+    if old_value == value:
+        return
+    if old_value not in (None, "", []) and f"raw_child_{field}" not in record:
+        record[f"raw_child_{field}"] = old_value
+    record[field] = value
+
+
+def _canonicalize_release_visual_observation_links(
+    observation: MutableMapping[str, Any],
+) -> None:
+    for field in ("verifier_links", "report_links"):
+        links = observation.get(field)
+        if not isinstance(links, list):
+            continue
+        normalized_links: list[Any] = []
+        for link in links:
+            if not isinstance(link, Mapping):
+                normalized_links.append(link)
+                continue
+            link_copy = dict(link)
+            for lineage_field in (
+                "plan_id",
+                "task_id",
+                "angle_id",
+                "route",
+                "candidate_id",
+                "fetch_id",
+                "evidence_image_id",
+            ):
+                value = _string_or_none(observation.get(lineage_field))
+                if value:
+                    _set_release_canonical_field(link_copy, lineage_field, value)
+            normalized_links.append(link_copy)
+        observation[field] = normalized_links
 
 
 def _task_requests_visual_evidence(task: Mapping[str, Any]) -> bool:
@@ -2334,27 +3406,60 @@ def _task_requests_visual_evidence(task: Mapping[str, Any]) -> bool:
 
 def _write_release_validation_visual_search_plan(
     run_dir: Path,
-    tasks: Sequence[Mapping[str, Any]],
+    payload: Mapping[str, Any],
 ) -> None:
+    _write_json(run_dir / "visual_search_plan.json", dict(payload))
+
+
+def _release_validation_visual_search_plan_payload(
+    run_dir: Path,
+    tasks: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     path = run_dir / "visual_search_plan.json"
+    existing: dict[str, Any] = {}
     if path.exists():
-        return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, Mapping):
+            existing = dict(payload)
+    records = [
+        dict(record)
+        for record in _list(existing.get("tasks"))
+        if isinstance(record, Mapping)
+    ]
+    seen_plan_ids = {
+        str(record.get("plan_id"))
+        for record in records
+        if _string_or_none(record.get("plan_id"))
+    }
+    seen_lineage = {
+        key
+        for record in records
+        for key in _release_visual_lineage_keys(record)
+    }
+    for task in tasks:
+        record = _release_validation_visual_task_record(task)
+        plan_id = str(record.get("plan_id") or "")
+        lineage_keys = _release_visual_lineage_keys(record)
+        if plan_id in seen_plan_ids or any(key in seen_lineage for key in lineage_keys):
+            continue
+        records.append(record)
+        if plan_id:
+            seen_plan_ids.add(plan_id)
+        seen_lineage.update(lineage_keys)
     now = _utc_now()
-    _write_json(
-        path,
-        {
-            "schema_version": PARALLEL_SCHEMA_VERSION,
-            "run_id": run_dir.name,
-            "created_at": now,
-            "status": "release_child_visual_handoff_materialized",
-            "provider": "codex-native",
-            "provider_mode": "real",
-            "tasks": [
-                _release_validation_visual_task_record(task)
-                for task in tasks
-            ],
-        },
-    )
+    payload = {
+        "schema_version": existing.get("schema_version") or PARALLEL_SCHEMA_VERSION,
+        "run_id": existing.get("run_id") or run_dir.name,
+        "created_at": existing.get("created_at") or now,
+        "status": existing.get("status") or "release_child_visual_handoff_materialized",
+        "provider": existing.get("provider") or "codex-native",
+        "provider_mode": existing.get("provider_mode") or "real",
+        "tasks": records,
+    }
+    return payload, records
 
 
 def _release_validation_visual_task_record(task: Mapping[str, Any]) -> dict[str, Any]:
@@ -2364,13 +3469,33 @@ def _release_validation_visual_task_record(task: Mapping[str, Any]) -> dict[str,
         or task.get("id")
         or ""
     )
+    angle_id = str(task.get("angle_id") or "")
+    route = str(task.get("route") or "")
+    max_images = _nonnegative_int(task.get("max_images"))
     record = {
+        "plan_id": _release_validation_plan_id_for_visual_task(
+            task_id=task_id,
+            angle_id=angle_id,
+            route=route,
+        ),
         "task_id": task_id,
         "semantic_plan_task_id": task_id,
-        "angle_id": task.get("angle_id"),
-        "route": task.get("route"),
+        "angle_id": angle_id,
+        "route": route,
+        "target_evidence_type": "image",
+        "query": str(task.get("query") or task.get("semantic_task_query") or ""),
+        "providers": ["codex-native"],
+        "caps": {
+            "max_candidates": max(max_images, 1),
+            "max_fetches": max(max_images, 1),
+            "max_vlm_images": max_images,
+            "max_cost_usd": 0.0,
+        },
+        "policy_constraints": dict(task.get("source_policy") or {}),
+        "estimated_cost_usd": 0.0,
+        "state": "completed",
         "visual_tasks": list(task.get("expected_visual_targets") or []),
-        "max_images": task.get("max_images"),
+        "max_images": max_images,
         "provider": "codex-native",
         "provider_mode": "real",
         "handoff_artifact": "visual_search_plan.json",
@@ -2389,7 +3514,7 @@ def _write_release_validation_visual_candidates(
     image_records: Sequence[Mapping[str, Any]],
 ) -> None:
     records = [
-        _release_validation_visual_candidate_record(image, index=index)
+        _release_validation_visual_candidate_record(image, index=index, visual_plan_records=[])
         for index, image in enumerate(image_records, start=1)
     ]
     _write_jsonl_records(run_dir / "visual_candidates.jsonl", records)
@@ -2399,10 +3524,14 @@ def _release_validation_visual_candidate_record(
     image: Mapping[str, Any],
     *,
     index: int,
+    visual_plan_records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     image_id = str(image.get("id") or f"image_{index:03d}")
     candidate_id = _release_validation_candidate_id(image_id)
-    record = _release_validation_image_lineage_record(image)
+    record = _release_validation_image_lineage_record(
+        image,
+        visual_plan_records=visual_plan_records,
+    )
     record.update(
         {
             "candidate_id": candidate_id,
@@ -2414,6 +3543,11 @@ def _release_validation_visual_candidate_record(
             "origin": image.get("origin"),
             "content_hash": image.get("content_hash"),
             "candidate_status": "selected",
+            "rank": index,
+            "score": round(1.0 / max(index, 1), 6),
+            "rejection_reason": None,
+            "estimated_cost_usd": image.get("estimated_cost_usd") or 0.0,
+            "actual_cost_usd": image.get("actual_cost_usd") or image.get("cost_usd") or 0.0,
             "provider": "codex-native",
             "provider_kind": "web_image_search",
             "provider_mode": "real",
@@ -2428,7 +3562,7 @@ def _release_validation_visual_candidate_record(
             ),
         }
     )
-    return {key: value for key, value in record.items() if value not in (None, "", [])}
+    return {key: value for key, value in record.items() if value not in ("", [])}
 
 
 def _write_release_validation_image_fetch_status(
@@ -2436,7 +3570,7 @@ def _write_release_validation_image_fetch_status(
     image_records: Sequence[Mapping[str, Any]],
 ) -> None:
     records = [
-        _release_validation_image_fetch_status_record(image, index=index)
+        _release_validation_image_fetch_status_record(image, index=index, visual_plan_records=[])
         for index, image in enumerate(image_records, start=1)
     ]
     _write_jsonl_records(run_dir / "image_fetch_status.jsonl", records)
@@ -2446,11 +3580,15 @@ def _release_validation_image_fetch_status_record(
     image: Mapping[str, Any],
     *,
     index: int,
+    visual_plan_records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     image_id = str(image.get("id") or f"image_{index:03d}")
     candidate_id = _release_validation_candidate_id(image_id)
     fetch_id = _release_validation_fetch_id(image_id)
-    record = _release_validation_image_lineage_record(image)
+    record = _release_validation_image_lineage_record(
+        image,
+        visual_plan_records=visual_plan_records,
+    )
     record.update(
         {
             "fetch_id": fetch_id,
@@ -2462,8 +3600,17 @@ def _release_validation_image_fetch_status_record(
             "image_url": image.get("image_url"),
             "local_artifact_path": image.get("local_artifact_path"),
             "mime_type": image.get("mime_type"),
+            "http_status": image.get("http_status"),
+            "byte_size": image.get("byte_size") or image.get("artifact_size_bytes"),
+            "width": image.get("width"),
+            "height": image.get("height"),
+            "hash": image.get("hash") or image.get("content_hash"),
+            "phash": image.get("phash"),
             "retrieval_status": "fetched",
             "fetch_status": "fetched",
+            "failure_code": None,
+            "estimated_cost_usd": image.get("estimated_cost_usd") or 0.0,
+            "actual_cost_usd": image.get("actual_cost_usd") or image.get("cost_usd") or 0.0,
             "policy_decision": image.get("policy_decision") or "allowed",
             "policy_flags": list(image.get("policy_flags") or []),
             "provider": "codex-native",
@@ -2478,11 +3625,13 @@ def _release_validation_image_fetch_status_record(
             ),
         }
     )
-    return {key: value for key, value in record.items() if value not in (None, "", [])}
+    return {key: value for key, value in record.items() if value not in ("", [])}
 
 
 def _release_validation_image_lineage_record(
     image: Mapping[str, Any],
+    *,
+    visual_plan_records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     task_id = str(
         image.get("semantic_plan_task_id")
@@ -2490,7 +3639,7 @@ def _release_validation_image_lineage_record(
         or image.get("source_task_id")
         or ""
     )
-    return {
+    record = {
         "task_id": task_id,
         "semantic_plan_task_id": task_id,
         "semantic_plan_hash": image.get("semantic_plan_hash"),
@@ -2498,6 +3647,50 @@ def _release_validation_image_lineage_record(
         "angle_id": image.get("angle_id"),
         "route": image.get("route"),
     }
+    plan_id = _release_visual_plan_id_for_record(record, visual_plan_records)
+    if plan_id:
+        record["plan_id"] = plan_id
+    return record
+
+
+def _release_visual_plan_id_for_record(
+    record: Mapping[str, Any],
+    visual_plan_records: Sequence[Mapping[str, Any]],
+) -> str | None:
+    plans_by_id: dict[str, Mapping[str, Any]] = {}
+    plans_by_lineage: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for plan in visual_plan_records:
+        plan_id = _string_or_none(plan.get("plan_id"))
+        if plan_id:
+            plans_by_id.setdefault(plan_id, plan)
+        for key in _release_visual_lineage_keys(plan):
+            plans_by_lineage.setdefault(key, plan)
+    existing_plan_id = _string_or_none(record.get("plan_id"))
+    if existing_plan_id and existing_plan_id in plans_by_id:
+        return existing_plan_id
+    for key in _release_visual_lineage_keys(record):
+        plan = plans_by_lineage.get(key)
+        if isinstance(plan, Mapping):
+            return _string_or_none(plan.get("plan_id"))
+    task_id = _string_or_none(record.get("task_id") or record.get("semantic_plan_task_id"))
+    angle_id = _string_or_none(record.get("angle_id"))
+    route = _string_or_none(record.get("route"))
+    if task_id and angle_id and route:
+        return _release_validation_plan_id_for_visual_task(
+            task_id=task_id,
+            angle_id=angle_id,
+            route=route,
+        )
+    return None
+
+
+def _release_validation_plan_id_for_visual_task(
+    *,
+    task_id: str,
+    angle_id: str,
+    route: str,
+) -> str:
+    return "plan_" + _sanitize_id(f"{task_id}_{angle_id}_{route}")
 
 
 def _release_validation_candidate_id(image_id: str) -> str:
@@ -2537,6 +3730,13 @@ def _write_jsonl_records(path: Path, records: Sequence[Mapping[str, Any]]) -> No
         seen.add(identity)
     path.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in merged),
+        encoding="utf-8",
+    )
+
+
+def _write_jsonl_records_replace(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    path.write_text(
+        "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
 
@@ -3150,8 +4350,17 @@ def _maybe_retry_capacity_failure(
     retryable_child_failure_codes = {
         CODEX_CHILD_MODEL_CAPACITY,
         CODEX_CHILD_RELEASE_HANDOFF_INVALID,
+        CODEX_CHILD_SCHEMA_INVALID,
     }
-    if attempt_record.get("child_failure_code") not in retryable_child_failure_codes:
+    child_failure_code = attempt_record.get("child_failure_code")
+    if (
+        child_failure_code == CODEX_CHILD_SCHEMA_INVALID
+        and not _schema_invalid_child_failure_is_retryable(attempt_record)
+    ):
+        task["state"] = "failed"
+        _set_latest_attempt_retry_decision(task, "do_not_retry")
+        return {"retry_decision": "do_not_retry", "should_retry": False}
+    if child_failure_code not in retryable_child_failure_codes:
         task["state"] = "failed"
         _set_latest_attempt_retry_decision(task, "do_not_retry")
         return {"retry_decision": "do_not_retry", "should_retry": False}
@@ -3204,6 +4413,22 @@ def _maybe_retry_capacity_failure(
         "should_retry": True,
         "computed_backoff_seconds": computed_backoff,
     }
+
+
+def _schema_invalid_child_failure_is_retryable(
+    attempt_record: Mapping[str, Any],
+) -> bool:
+    probe = attempt_record.get("attempt_probe")
+    if not isinstance(probe, Mapping):
+        return False
+    shard_schema_version = probe.get("shard_schema_version")
+    if (
+        isinstance(shard_schema_version, str)
+        and shard_schema_version
+        and shard_schema_version != EVIDENCE_SCHEMA_VERSION
+    ):
+        return False
+    return shard_schema_version == EVIDENCE_SCHEMA_VERSION
 
 
 def _capacity_retry_backoff_seconds(
@@ -3333,6 +4558,8 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
             task["failure_category"] = "invalid_shard"
             task["child_failure_code"] = CODEX_CHILD_SCHEMA_INVALID
             task["validation"] = validation_payload
+            attempt_record["status"] = "failed"
+            attempt_record["failure_category"] = "invalid_shard"
             attempt_record["validation"] = validation_payload
             _update_attempt_probe_validation(
                 attempt_record,
@@ -4696,7 +5923,9 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "each observation must set provider `codex-interactive`, provider_kind `vlm`, provider_mode `real`, "
             "analysis_provider `codex-interactive`, observation_status `analyzed`, policy_decision `allowed`, "
             "codex_interactive_handoff true, handoff_artifact `visual_observations.jsonl`, and provider_provenance "
-            "with the same Codex-interactive VLM handoff fields. "
+            "with the same Codex-interactive VLM handoff fields. Set `external_vlm_call` false both on the "
+            "observation record and inside provider_provenance because this is Codex-native VLM handoff, not "
+            "an external VLM provider API call. "
             "otherwise do not include the image. Do not use user-uploaded, manual, login-walled, "
             "paywalled, CAPTCHA-gated, DRM-restricted, or robots-disallowed images. "
         )
@@ -5396,11 +6625,46 @@ def _image_key(image: Mapping[str, Any]) -> str:
     return str(image.get("image_url") or image.get("local_artifact_path") or image.get("id")).lower()
 
 
+def _merge_duplicate_image_observations(
+    existing_image: MutableMapping[str, Any] | None,
+    duplicate_image: Mapping[str, Any],
+) -> tuple[dict[int, int], int]:
+    if existing_image is None:
+        return {}, 0
+    existing_observations = existing_image.get("observations")
+    duplicate_observations = duplicate_image.get("observations")
+    if not isinstance(duplicate_observations, list):
+        return {}, 0
+    if not isinstance(existing_observations, list):
+        existing_observations = []
+        existing_image["observations"] = existing_observations
+
+    index_map: dict[int, int] = {}
+    merged_count = 0
+    for old_index, observation in enumerate(duplicate_observations):
+        if not isinstance(observation, str):
+            continue
+        try:
+            new_index = existing_observations.index(observation)
+        except ValueError:
+            existing_observations.append(observation)
+            new_index = len(existing_observations) - 1
+            merged_count += 1
+        index_map[old_index] = new_index
+    return index_map, merged_count
+
+
 def _claim_key(claim: Mapping[str, Any]) -> str:
     return re.sub(r"\s+", " ", str(claim.get("text") or "").strip().lower())
 
 
-def _remap_claim_refs(claim: Mapping[str, Any], id_map: Mapping[str, str]) -> dict[str, Any]:
+def _remap_claim_refs(
+    claim: Mapping[str, Any],
+    id_map: Mapping[str, str],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    image_observation_index_map: Mapping[str, Mapping[int, int]] | None = None,
+) -> dict[str, Any]:
     claim_copy = dict(claim)
     claim_copy["supporting_sources"] = [
         id_map.get(str(source_id), str(source_id))
@@ -5429,10 +6693,26 @@ def _remap_claim_refs(claim: Mapping[str, Any], id_map: Mapping[str, str]) -> di
         remapped_image_id = id_map.get(image_id, image_id)
         support_copy["image_id"] = remapped_image_id
         observation_index = support_copy.get("observation_index")
+        observation_map = (
+            image_observation_index_map.get(image_id, {})
+            if image_observation_index_map is not None
+            else {}
+        )
+        if isinstance(observation_index, int) and observation_index in observation_map:
+            observation_index = observation_map[observation_index]
+            support_copy["observation_index"] = observation_index
         if isinstance(observation_index, int):
             support_copy["observation_ref"] = (
                 f"images.{remapped_image_id}.observations[{observation_index}]"
             )
+            image = images_by_id.get(remapped_image_id) if images_by_id is not None else None
+            observations = image.get("observations") if isinstance(image, Mapping) else None
+            if (
+                isinstance(observations, list)
+                and 0 <= observation_index < len(observations)
+                and isinstance(observations[observation_index], str)
+            ):
+                support_copy["observation_text"] = observations[observation_index]
         visual_supports.append(support_copy)
     if visual_supports:
         claim_copy["visual_supports"] = visual_supports
@@ -5479,6 +6759,41 @@ def _with_task_angle_metadata(
         if value:
             enriched[key] = value
     return enriched
+
+
+def _force_task_angle_metadata(
+    record: MutableMapping[str, Any],
+    task: Mapping[str, Any],
+) -> None:
+    forced = {
+        "task_id": task.get("id"),
+        "semantic_plan_task_id": (
+            task.get("semantic_plan_task_id")
+            or task.get("task_id")
+            or task.get("id")
+        ),
+        "semantic_plan_hash": task.get("semantic_plan_hash"),
+        "approved_delta_id": (
+            task.get("approved_delta_id")
+            or ("base_plan" if task.get("semantic_plan_hash") else None)
+        ),
+        "angle_id": task.get("angle_id"),
+        "route": task.get("route"),
+        "source_task_id": task.get("id"),
+        "report_section": task.get("report_section"),
+    }
+    for key, value in forced.items():
+        if value in (None, "", []):
+            continue
+        if isinstance(value, str):
+            _set_release_canonical_field(record, key, value)
+        else:
+            old_value = record.get(key)
+            if old_value == value:
+                continue
+            if old_value not in (None, "", []) and f"raw_child_{key}" not in record:
+                record[f"raw_child_{key}"] = old_value
+            record[key] = value
 
 
 def _claim_is_mergeable(claim: Mapping[str, Any]) -> bool:

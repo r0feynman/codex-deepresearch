@@ -27,6 +27,7 @@ from deepresearch.vision_adapter import (
     OpenAIResponsesVisionResult,
     _openai_result_from_response_payload,
 )
+from deepresearch.visual_artifacts import visual_minimums_for_run
 
 prepare_search_handoff_run = prepare_run
 
@@ -487,6 +488,1775 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(resumed["images_reused"], 1)
         self.assertEqual(resumed_evidence["images"][0]["cache_key"], first_cache_key)
         self.assertEqual(resumed_evidence["images"][0]["analyzed_at"], first_analyzed_at)
+
+    def test_codex_interactive_child_handoff_records_provider_status(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": "img_checkout_001",
+                    "image_id": "img_checkout_001",
+                    "evidence_image_id": "img_checkout_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "candidate_id": "cand_checkout_001",
+                    "fetch_id": "fetch_checkout_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:test",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["The screenshot shows a primary checkout button."],
+                    "inferences": ["The visual evidence supports a checkout UI claim."],
+                    "visual_tasks": ["layout_review"],
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:test",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["provider_mode"], "real")
+        self.assertEqual(result["vlm_images_analyzed"], 1)
+        self.assertFalse(result["external_vlm_call"])
+        evidence = self.assert_valid_run(run_dir)
+        self.assertEqual(evidence["vision_adapter"]["visual_provider_status_path"], "visual_provider_status.json")
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "codex_interactive_visual_handoff_ingested")
+        provider = provider_status["providers"][-1]
+        self.assertEqual(provider["provider"], "codex-interactive")
+        self.assertEqual(provider["provider_kind"], "vlm")
+        self.assertEqual(provider["provider_mode"], "real")
+        self.assertEqual(provider["provider_run_id"], "codex-child:test")
+        self.assertEqual(provider["artifacts_fetched"], 1)
+        self.assertEqual(provider["vlm_images_analyzed"], 1)
+        self.assertEqual(provider["invocations"], 1)
+        self.assertTrue(provider["codex_interactive_handoff"])
+        self.assertFalse(provider["external_vlm_call"])
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
+
+    def test_codex_interactive_materializes_child_lineage_after_acquisition_overwrite(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        existing_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for fetch in existing_fetches:
+            fetch["evidence_image_id"] = None
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", existing_fetches)
+        image_id = "img_task_001_001"
+        candidate_id = "cand_img_task_001_001"
+        fetch_id = "fetch_img_task_001_001"
+        task_id = "task_001"
+        angle_id = "angle_001"
+        route = "visual_required"
+        plan_id = "plan_task_001_angle_001_visual_required"
+        image_hash = "sha256:" + hashlib.sha256(PNG_1X1).hexdigest()
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("search_tasks", []).append(
+            {
+                "id": task_id,
+                "angle_id": angle_id,
+                "route": route,
+                "modality": route,
+                "visual_tasks": ["layout_review"],
+            }
+        )
+        evidence["images"] = [
+            {
+                "id": image_id,
+                "source_id": "src_checkout",
+                "origin": "screenshot",
+                "source_url": "https://example.com/checkout",
+                "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                "page_url": "https://example.com/checkout",
+                "local_artifact_path": "images/checkout.png",
+                "mime_type": "image/png",
+                "artifact_size_bytes": len(PNG_1X1),
+                "width": 1,
+                "height": 1,
+                "hash": image_hash,
+                "phash": "checkout-phash",
+                "observations": ["The child VLM observation identifies the checkout button."],
+                "inferences": ["The visual evidence supports checkout completion."],
+                "visual_tasks": ["layout_review"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "analyzed",
+                "candidate_id": candidate_id,
+                "fetch_id": fetch_id,
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "angle_id": angle_id,
+                "route": route,
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "provider_run_id": "codex-child:overwrite",
+                "provider_provenance": {
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:overwrite",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                },
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "caveats": [],
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "checkout-phash",
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:overwrite",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["The child VLM observation identifies the checkout button."],
+                    "inferences": ["The visual evidence supports checkout completion."],
+                    "visual_tasks": ["layout_review"],
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": [],
+                    "codex_interactive_handoff": True,
+                    "codex_native_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:overwrite",
+                        "codex_interactive_handoff": True,
+                        "codex_native_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        pre_plan = self.load_json(run_dir / "visual_search_plan.json")
+        pre_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        pre_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertNotIn(plan_id, {item["plan_id"] for item in pre_plan["tasks"]})
+        self.assertNotIn(candidate_id, {item["candidate_id"] for item in pre_candidates})
+        self.assertNotIn(fetch_id, {item["fetch_id"] for item in pre_fetches})
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"],
+        )
+        evidence = self.assert_valid_run(run_dir)
+        materialization = evidence["vision_adapter"]["codex_interactive_lineage_materialization"]
+        self.assertEqual(materialization["plans_materialized"], 1)
+        self.assertEqual(materialization["candidates_materialized"], 1)
+        self.assertEqual(materialization["fetches_materialized"], 1)
+        post_plan = self.load_json(run_dir / "visual_search_plan.json")
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertIn(plan_id, {item["plan_id"] for item in post_plan["tasks"]})
+        self.assertIn(candidate_id, {item["candidate_id"] for item in post_candidates})
+        self.assertIn(fetch_id, {item["fetch_id"] for item in post_fetches})
+        child_candidate = next(item for item in post_candidates if item["candidate_id"] == candidate_id)
+        child_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(child_candidate["plan_id"], plan_id)
+        self.assertEqual(child_candidate["candidate_status"], "fetched")
+        self.assertEqual(child_candidate["provider"], "codex-native")
+        self.assertEqual(child_candidate["provider_kind"], "web_image_search")
+        self.assertEqual(child_candidate["provider_mode"], "real")
+        self.assertTrue(child_candidate["provider_provenance"]["codex_native_handoff"])
+        self.assertEqual(child_fetch["candidate_id"], candidate_id)
+        self.assertEqual(child_fetch["evidence_image_id"], image_id)
+        self.assertEqual(child_fetch["provider"], "codex-native")
+        self.assertEqual(child_fetch["provider_kind"], "web_image_search")
+        self.assertEqual(child_fetch["provider_mode"], "real")
+        self.assertTrue(child_fetch["provider_provenance"]["codex_native_handoff"])
+
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
+        self.assertGreaterEqual(minimums["fetched_artifacts"], 1)
+
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        linked_minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertGreaterEqual(linked_minimums["report_cited_images"], 1)
+
+    def test_codex_interactive_metadata_child_reconciles_to_fetched_root_artifact(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_x"
+        candidate_id = "cand_x"
+        fetch_id = "fetch_x"
+        task_id = "task_001"
+        angle_id = "angle_001"
+        route = "visual_required"
+        plan_id = "plan_task_001_angle_001_visual_required"
+        image_hash = "sha256:" + hashlib.sha256(PNG_1X1).hexdigest()
+        metadata_path = run_dir / "images" / "img_x.json"
+        fetched_path = run_dir / "images" / "cand_x.jpg"
+        fetched_path.write_bytes(PNG_1X1)
+        self.assertFalse(metadata_path.exists())
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("search_tasks", []).append(
+            {
+                "id": task_id,
+                "angle_id": angle_id,
+                "route": route,
+                "modality": route,
+                "visual_tasks": ["layout_review"],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+        plan_payload = self.load_json(run_dir / "visual_search_plan.json")
+        plan_payload.setdefault("tasks", []).append(
+            {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "semantic_plan_task_id": task_id,
+                "angle_id": angle_id,
+                "route": route,
+                "target_evidence_type": "page_image",
+                "query": "https://example.com/checkout#root-image",
+                "providers": ["codex-native"],
+                "caps": {
+                    "max_candidates": 1,
+                    "max_fetches": 1,
+                    "max_vlm_images": 1,
+                    "max_cost_usd": 0.0,
+                },
+                "policy_constraints": {},
+                "estimated_cost_usd": 0.0,
+                "state": "completed",
+                "provider": "codex-native",
+                "provider_mode": "real",
+                "handoff_artifact": "visual_search_plan.json",
+            }
+        )
+        self.write_json(run_dir / "visual_search_plan.json", plan_payload)
+        provider_provenance = {
+            "provider": "browser-screenshot",
+            "provider_kind": "screenshot",
+            "provider_mode": "real",
+            "provider_run_id": "browser-screenshot:root",
+            "source_image_id": image_id,
+            "external_network_call": False,
+            "external_vlm_call": False,
+        }
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:root",
+                    "provider_provenance": provider_provenance,
+                    "raw_provider_metadata": {"source_image_id": image_id},
+                    "source_id": "src_checkout",
+                    "origin": "page_image",
+                    "source_url": "https://example.com/checkout",
+                    "page_url": "https://example.com/checkout",
+                    "image_url": "https://example.com/checkout#root-image",
+                    "rank": 1,
+                    "score": 1.0,
+                    "candidate_class": "page_image",
+                    "local_artifact_path": "images/cand_x.jpg",
+                    "mime_type": "image/jpeg",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "cand-x-phash",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "fetched",
+                    "rejection_reason": None,
+                    "estimated_cost_usd": 0.02,
+                    "actual_cost_usd": 0.01,
+                    "visual_tasks": ["layout_review"],
+                    "requires_vlm_observation": True,
+                },
+                {
+                    "candidate_id": f"cand_{image_id}",
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "semantic_plan_task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-native",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "provider_run_id": task_id,
+                    "provider_provenance": {
+                        "provider": "codex-native",
+                        "provider_kind": "web_image_search",
+                        "provider_mode": "real",
+                        "search_provider": "codex-native",
+                        "codex_native_handoff": True,
+                        "source_image_id": image_id,
+                    },
+                    "source_id": "src_checkout",
+                    "origin": "page_image",
+                    "source_url": "https://example.com/checkout",
+                    "page_url": "https://example.com/checkout",
+                    "image_url": "https://example.com/checkout#root-image",
+                    "rank": 1,
+                    "score": 1.0,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "fetch_failed",
+                    "rejection_reason": "missing_local_artifact",
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "handoff_artifact": "visual_candidates.jsonl",
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": fetch_id,
+                    "candidate_id": candidate_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:root",
+                    "provider_provenance": provider_provenance,
+                    "raw_provider_metadata": {"source_image_id": image_id},
+                    "fetch_status": "fetched",
+                    "http_status": 200,
+                    "mime_type": "image/jpeg",
+                    "byte_size": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "cand-x-phash",
+                    "local_artifact_path": "images/cand_x.jpg",
+                    "evidence_image_id": None,
+                    "source_image_id": image_id,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "failure_code": None,
+                    "estimated_cost_usd": 0.02,
+                    "actual_cost_usd": 0.01,
+                },
+                {
+                    "fetch_id": f"fetch_{image_id}",
+                    "candidate_id": f"cand_{image_id}",
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_image_id": image_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "semantic_plan_task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-native",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "provider_run_id": task_id,
+                    "provider_provenance": {
+                        "provider": "codex-native",
+                        "provider_kind": "web_image_search",
+                        "provider_mode": "real",
+                        "search_provider": "codex-native",
+                        "codex_native_handoff": True,
+                        "source_image_id": image_id,
+                    },
+                    "raw_provider_metadata": {"source_image_id": image_id},
+                    "fetch_status": "failed",
+                    "retrieval_status": "failed",
+                    "http_status": None,
+                    "mime_type": "image/jpeg",
+                    "byte_size": None,
+                    "width": 512,
+                    "height": 512,
+                    "hash": None,
+                    "phash": None,
+                    "local_artifact_path": "images/img_x.json",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "failure_code": "missing_local_artifact",
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "handoff_artifact": "image_fetch_status.jsonl",
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "page_image",
+                    "source_url": "https://example.com/checkout",
+                    "image_url": "https://example.com/checkout#root-image",
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/img_x.json",
+                    "mime_type": "image/jpeg",
+                    "width": 0,
+                    "height": 0,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:metadata-root",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["The child VLM observation identifies the checkout button."],
+                    "inferences": ["The visual evidence supports checkout completion."],
+                    "visual_tasks": ["layout_review"],
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": ["metadata-only visual record; no local image artifact was provided"],
+                    "codex_interactive_handoff": True,
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:metadata-root",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertFalse(metadata_path.exists())
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"],
+        )
+        evidence = self.assert_valid_run(run_dir)
+        image = next(item for item in evidence["images"] if item["id"] == image_id)
+        self.assertEqual(image["candidate_id"], candidate_id)
+        self.assertEqual(image["fetch_id"], fetch_id)
+        self.assertEqual(image["local_artifact_path"], "images/cand_x.jpg")
+        self.assertEqual(image["mime_type"], "image/jpeg")
+        self.assertEqual(image["artifact_size_bytes"], len(PNG_1X1))
+        self.assertEqual(image["estimated_cost_usd"], 0.02)
+        self.assertEqual(image["actual_cost_usd"], 0.01)
+        self.assertNotIn(
+            "metadata-only visual record; no local image artifact was provided",
+            image.get("caveats", []),
+        )
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(observations[0]["evidence_image_id"], image_id)
+        self.assertEqual(observations[0]["local_artifact_path"], "images/cand_x.jpg")
+        self.assertEqual(observations[0]["candidate_id"], candidate_id)
+        self.assertEqual(observations[0]["fetch_id"], fetch_id)
+        self.assertEqual(observations[0]["estimated_cost_usd"], 0.02)
+        self.assertEqual(observations[0]["actual_cost_usd"], 0.01)
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        stale_fetch = next(item for item in post_fetches if item["fetch_id"] == f"fetch_{image_id}")
+        self.assertEqual(stale_fetch["fetch_status"], "failed")
+        self.assertEqual(stale_fetch["failure_code"], "missing_local_artifact")
+        self.assertEqual(stale_fetch["local_artifact_path"], "images/img_x.json")
+        self.assertIsNone(stale_fetch["evidence_image_id"])
+        self.assertIsNone(stale_fetch["image_id"])
+        self.assertIsNone(stale_fetch["source_image_id"])
+        self.assertIsNone(stale_fetch["provider_provenance"]["source_image_id"])
+        self.assertIsNone(stale_fetch["raw_provider_metadata"]["source_image_id"])
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        stale_candidate = next(
+            item for item in post_candidates if item["candidate_id"] == f"cand_{image_id}"
+        )
+        self.assertEqual(stale_candidate["candidate_status"], "fetch_failed")
+        self.assertIsNone(stale_candidate["evidence_image_id"])
+        self.assertIsNone(stale_candidate["image_id"])
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertEqual(minimums["fetched_artifacts"], 1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
+
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        linked_minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertGreaterEqual(linked_minimums["report_cited_images"], 1)
+
+    def test_codex_interactive_lineage_uses_actual_task_route_and_angle(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_route_angle_reconciled"
+        candidate_id = "cand_route_angle_reconciled"
+        fetch_id = "fetch_route_angle_reconciled"
+        task_id = "task_visual_015"
+        actual_angle_id = "angle_004"
+        actual_route = "visual_optional"
+        stale_angle_id = "angle_999"
+        stale_route = "visual_required"
+        stale_plan_id = "plan_task_visual_015_angle_999_visual_required"
+        expected_plan_id = "plan_task_visual_015_angle_004_visual_optional"
+        image_hash = "sha256:" + hashlib.sha256(PNG_1X1).hexdigest()
+
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.visual-tasks.v0",
+                "tasks": [
+                    {
+                        "id": task_id,
+                        "angle_id": actual_angle_id,
+                        "route": actual_route,
+                        "query": "Inspect the official visual handwashing card.",
+                    }
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": "2026-06-25T00:00:00Z",
+                "tasks": [
+                    {
+                        "plan_id": stale_plan_id,
+                        "task_id": task_id,
+                        "angle_id": stale_angle_id,
+                        "route": stale_route,
+                        "target_evidence_type": "screenshot",
+                        "query": "stale generated visual task",
+                        "providers": ["browser-screenshot"],
+                        "caps": {
+                            "max_candidates": 1,
+                            "max_fetches": 1,
+                            "max_vlm_images": 1,
+                            "max_cost_usd": 0.25,
+                        },
+                        "policy_constraints": {"policy_decision": "allowed"},
+                        "estimated_cost_usd": 0.01,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        provider_provenance = {
+            "provider": "browser-screenshot",
+            "provider_kind": "screenshot",
+            "provider_mode": "real",
+            "provider_run_id": "browser-screenshot:stale-lineage",
+            "external_network_call": False,
+            "external_vlm_call": False,
+        }
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "plan_id": stale_plan_id,
+                    "task_id": task_id,
+                    "angle_id": stale_angle_id,
+                    "route": stale_route,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:stale-lineage",
+                    "provider_provenance": provider_provenance,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "page_url": "https://example.com/checkout",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "rank": 1,
+                    "score": 1.0,
+                    "candidate_class": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "route-angle-phash",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "fetched",
+                    "rejection_reason": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                    "visual_tasks": ["layout_review"],
+                    "requires_vlm_observation": True,
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": fetch_id,
+                    "candidate_id": candidate_id,
+                    "plan_id": stale_plan_id,
+                    "task_id": task_id,
+                    "angle_id": stale_angle_id,
+                    "route": stale_route,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:stale-lineage",
+                    "provider_provenance": provider_provenance,
+                    "fetch_status": "fetched",
+                    "http_status": 200,
+                    "mime_type": "image/png",
+                    "byte_size": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "route-angle-phash",
+                    "local_artifact_path": "images/checkout.png",
+                    "evidence_image_id": image_id,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "failure_code": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "route-angle-phash",
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": stale_plan_id,
+                    "task_id": task_id,
+                    "angle_id": stale_angle_id,
+                    "route": stale_route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:stale-lineage",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["The child VLM observation identifies the official card."],
+                    "inferences": ["The image supports the visual task."],
+                    "visual_tasks": ["layout_review"],
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": [],
+                    "codex_interactive_handoff": True,
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:stale-lineage",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"],
+        )
+        evidence = self.assert_valid_run(run_dir)
+        image = next(item for item in evidence["images"] if item["id"] == image_id)
+        self.assertEqual(image["plan_id"], expected_plan_id)
+        self.assertEqual(image["angle_id"], actual_angle_id)
+        self.assertEqual(image["route"], actual_route)
+        plan = self.load_json(run_dir / "visual_search_plan.json")
+        plan_record = next(item for item in plan["tasks"] if item["plan_id"] == expected_plan_id)
+        self.assertEqual(plan_record["task_id"], task_id)
+        self.assertEqual(plan_record["angle_id"], actual_angle_id)
+        self.assertEqual(plan_record["route"], actual_route)
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+        fetch = next(item for item in fetches if item["fetch_id"] == fetch_id)
+        for record in (candidate, fetch):
+            self.assertEqual(record["plan_id"], expected_plan_id)
+            self.assertEqual(record["angle_id"], actual_angle_id)
+            self.assertEqual(record["route"], actual_route)
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(observations[0]["plan_id"], expected_plan_id)
+        self.assertEqual(observations[0]["angle_id"], actual_angle_id)
+        self.assertEqual(observations[0]["route"], actual_route)
+
+    def test_codex_interactive_lineage_reconciles_claim_support_route_and_angle(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_route_angle_claim_support"
+        candidate_id = "cand_route_angle_claim_support"
+        fetch_id = "fetch_route_angle_claim_support"
+        task_id = "task_visual_015"
+        actual_angle_id = "angle_004"
+        actual_route = "visual_optional"
+        stale_angle_id = "angle_999"
+        stale_route = "visual_required"
+        stale_plan_id = "plan_task_visual_015_angle_999_visual_required"
+        expected_plan_id = "plan_task_visual_015_angle_004_visual_optional"
+        image_hash = "sha256:" + hashlib.sha256(PNG_1X1).hexdigest()
+        claim_id = "claim_route_angle_visual_support"
+
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.visual-tasks.v0",
+                "tasks": [
+                    {
+                        "id": task_id,
+                        "angle_id": actual_angle_id,
+                        "route": actual_route,
+                        "query": "Inspect the official visual handwashing card.",
+                    }
+                ],
+            },
+        )
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": "2026-06-25T00:00:00Z",
+                "tasks": [
+                    {
+                        "plan_id": stale_plan_id,
+                        "task_id": task_id,
+                        "angle_id": stale_angle_id,
+                        "route": stale_route,
+                        "target_evidence_type": "screenshot",
+                        "query": "stale generated visual task",
+                        "providers": ["browser-screenshot"],
+                        "caps": {
+                            "max_candidates": 1,
+                            "max_fetches": 1,
+                            "max_vlm_images": 1,
+                            "max_cost_usd": 0.25,
+                        },
+                        "policy_constraints": {"policy_decision": "allowed"},
+                        "estimated_cost_usd": 0.01,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        provider_provenance = {
+            "provider": "browser-screenshot",
+            "provider_kind": "screenshot",
+            "provider_mode": "real",
+            "provider_run_id": "browser-screenshot:stale-claim-lineage",
+            "external_network_call": False,
+            "external_vlm_call": False,
+        }
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "plan_id": stale_plan_id,
+                    "task_id": task_id,
+                    "angle_id": stale_angle_id,
+                    "route": stale_route,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:stale-claim-lineage",
+                    "provider_provenance": provider_provenance,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "page_url": "https://example.com/checkout",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "rank": 1,
+                    "score": 1.0,
+                    "candidate_class": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "route-angle-claim-support-phash",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "fetched",
+                    "rejection_reason": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                    "visual_tasks": ["layout_review"],
+                    "requires_vlm_observation": True,
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": fetch_id,
+                    "candidate_id": candidate_id,
+                    "plan_id": stale_plan_id,
+                    "task_id": task_id,
+                    "angle_id": stale_angle_id,
+                    "route": stale_route,
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": "browser-screenshot:stale-claim-lineage",
+                    "provider_provenance": provider_provenance,
+                    "fetch_status": "fetched",
+                    "http_status": 200,
+                    "mime_type": "image/png",
+                    "byte_size": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "route-angle-claim-support-phash",
+                    "local_artifact_path": "images/checkout.png",
+                    "evidence_image_id": image_id,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "failure_code": None,
+                    "estimated_cost_usd": 0.01,
+                    "actual_cost_usd": 0.01,
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": image_hash,
+                    "phash": "route-angle-claim-support-phash",
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": stale_plan_id,
+                    "task_id": task_id,
+                    "angle_id": stale_angle_id,
+                    "route": stale_route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:stale-claim-lineage",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["The child VLM observation identifies the official card."],
+                    "inferences": ["The image supports the visual task."],
+                    "visual_tasks": ["layout_review"],
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": [],
+                    "verifier_links": [],
+                    "report_links": [],
+                    "codex_interactive_handoff": True,
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:stale-claim-lineage",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("claims", []).append(
+            {
+                "id": claim_id,
+                "text": "The official card is visible in the screenshot.",
+                "claim_type": "visual",
+                "supporting_sources": ["src_checkout"],
+                "supporting_images": [image_id],
+                "visual_supports": [
+                    {
+                        "image_id": image_id,
+                        "evidence_image_id": image_id,
+                        "observation_index": 0,
+                        "observation_ref": f"images.{image_id}.observations[0]",
+                        "observation_text": "The child VLM observation identifies the official card.",
+                        "relation_type": "screenshot_support",
+                        "provider": "codex-interactive",
+                        "rationale": "Regression fixture for route and angle lineage reconciliation.",
+                        "plan_id": stale_plan_id,
+                        "task_id": task_id,
+                        "angle_id": stale_angle_id,
+                        "route": stale_route,
+                        "candidate_id": "cand_img_route_angle_claim_support",
+                        "fetch_id": "fetch_img_route_angle_claim_support",
+                        "confidence": 0.74,
+                    }
+                ],
+                "quote_spans": [],
+                "votes": [],
+                "verification_status": "unverified",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "low",
+                "caveats": [],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        evidence = self.assert_valid_run(run_dir)
+        claim = next(item for item in evidence["claims"] if item["id"] == claim_id)
+        support = claim["visual_supports"][0]
+        expected_lineage = {
+            "plan_id": expected_plan_id,
+            "task_id": task_id,
+            "angle_id": actual_angle_id,
+            "route": actual_route,
+            "candidate_id": candidate_id,
+            "fetch_id": fetch_id,
+            "evidence_image_id": image_id,
+        }
+        for field, value in expected_lineage.items():
+            self.assertEqual(support[field], value)
+
+    def test_codex_interactive_rerun_reconciles_stale_visual_support_links(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        claim = next(
+            item
+            for item in evidence["claims"]
+            if item.get("claim_type") == "visual"
+            and "img_checkout_001" in item.get("supporting_images", [])
+        )
+        support = claim["visual_supports"][0]
+        stale_lineage = {
+            "plan_id": "plan_task_001_angle_999_visual_optional",
+            "task_id": "task_001",
+            "angle_id": "angle_999",
+            "route": "visual_optional",
+            "candidate_id": "cand_img_checkout_001",
+            "fetch_id": "fetch_img_checkout_001",
+        }
+        support.update(stale_lineage)
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for field, value in stale_lineage.items():
+            observations[0]["verifier_links"][0][field] = value
+            observations[0]["report_links"][0][field] = value
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+
+        evidence = self.assert_valid_run(run_dir)
+        claim = next(item for item in evidence["claims"] if item["id"] == claim["id"])
+        support = claim["visual_supports"][0]
+        expected_lineage = {
+            "plan_id": "plan_task_visual_001",
+            "task_id": "task_visual_001",
+            "angle_id": "angle_001",
+            "route": "visual_required",
+            "candidate_id": "cand_checkout_001",
+            "fetch_id": "fetch_checkout_001",
+            "evidence_image_id": "img_checkout_001",
+        }
+        for field, value in expected_lineage.items():
+            self.assertEqual(support[field], value)
+
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        verifier_link = observations[0]["verifier_links"][0]
+        report_link = observations[0]["report_links"][0]
+        for link in (verifier_link, report_link):
+            for field, value in expected_lineage.items():
+                self.assertEqual(link[field], value)
+
+        report_status = self.load_json(run_dir / "report_status.json")
+        report_claim = next(
+            item for item in report_status["included_claims"] if item["claim_id"] == claim["id"]
+        )
+        report_support = report_claim["visual_supports"][0]
+        for field, value in expected_lineage.items():
+            self.assertEqual(report_support[field], value)
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_rerun_removes_stale_visual_support_without_links(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        stale_image_id = "img_task_016_korea_2024_cardnews"
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("images", []).append(
+            {
+                "id": stale_image_id,
+                "source_id": "src_checkout",
+                "origin": "page_image",
+                "source_url": "https://example.com/checkout",
+                "image_url": "https://example.com/stale-card.png",
+                "page_url": "https://example.com/checkout",
+                "local_artifact_path": "evidence_shards/task_016/source_004.html",
+                "mime_type": "text/html",
+                "artifact_size_bytes": 120,
+                "width": 0,
+                "height": 0,
+                "observations": ["Stale cardnews observation."],
+                "inferences": [],
+                "visual_tasks": ["stale_review"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "analyzed",
+                "task_id": "task_016",
+                "angle_id": "angle_004",
+                "route": "text_only",
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+            }
+        )
+        evidence.setdefault("claims", []).append(
+            {
+                "id": "claim_stale_cardnews_support",
+                "text": "The stale cardnews support should not remain linked.",
+                "claim_type": "mixed",
+                "supporting_sources": ["src_checkout"],
+                "supporting_images": [stale_image_id],
+                "visual_supports": [
+                    {
+                        "image_id": stale_image_id,
+                        "evidence_image_id": stale_image_id,
+                        "observation_index": 0,
+                        "observation_ref": f"images.{stale_image_id}.observations[0]",
+                        "observation_text": "Stale cardnews observation.",
+                        "relation_type": "ocr_support",
+                        "provider": "codex-interactive",
+                        "task_id": "task_016",
+                        "angle_id": "angle_004",
+                        "route": "text_only",
+                        "confidence": 0.74,
+                    }
+                ],
+                "quote_spans": [],
+                "votes": [],
+                "verification_status": "supported",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "medium",
+                "caveats": [],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        evidence = self.assert_valid_run(run_dir)
+        self.assertNotIn(stale_image_id, {image["id"] for image in evidence["images"]})
+        stale_claim = next(
+            claim for claim in evidence["claims"] if claim["id"] == "claim_stale_cardnews_support"
+        )
+        self.assertNotIn(stale_image_id, stale_claim.get("supporting_images", []))
+        self.assertFalse(
+            any(
+                support.get("image_id") == stale_image_id
+                for support in stale_claim.get("visual_supports", [])
+                if isinstance(support, dict)
+            )
+        )
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_rerun_prunes_stale_image_vote_refs(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        valid_image_id = "img_checkout_001"
+        stale_image_id = "img_task_016_korea_2024_cardnews"
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("images", []).append(
+            {
+                "id": stale_image_id,
+                "source_id": "src_checkout",
+                "origin": "page_image",
+                "source_url": "https://example.com/checkout",
+                "image_url": "https://example.com/stale-card.png",
+                "page_url": "https://example.com/checkout",
+                "local_artifact_path": "evidence_shards/task_016/source_004.html",
+                "mime_type": "text/html",
+                "artifact_size_bytes": 120,
+                "width": 0,
+                "height": 0,
+                "observations": ["Stale cardnews observation."],
+                "inferences": [],
+                "visual_tasks": ["stale_review"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "analyzed",
+                "task_id": "task_016",
+                "angle_id": "angle_004",
+                "route": "text_only",
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+            }
+        )
+        evidence.setdefault("claims", []).append(
+            {
+                "id": "claim_stale_cardnews_vote_ref",
+                "text": "The stale cardnews support should not remain vote evidence.",
+                "claim_type": "mixed",
+                "supporting_sources": ["src_checkout"],
+                "supporting_images": [stale_image_id],
+                "visual_supports": [
+                    {
+                        "image_id": stale_image_id,
+                        "evidence_image_id": stale_image_id,
+                        "observation_index": 0,
+                        "observation_ref": f"images.{stale_image_id}.observations[0]",
+                        "observation_text": "Stale cardnews observation.",
+                        "relation_type": "ocr_support",
+                        "provider": "codex-interactive",
+                        "task_id": "task_016",
+                        "angle_id": "angle_004",
+                        "route": "text_only",
+                        "confidence": 0.74,
+                    }
+                ],
+                "quote_spans": [],
+                "votes": [
+                    {
+                        "id": "vote_stale_cardnews_vote_ref",
+                        "claim_id": "claim_stale_cardnews_vote_ref",
+                        "verifier_type": "visual",
+                        "agent_name": "codex-interactive",
+                        "method": "codex-subagent",
+                        "model_or_tool": "codex-interactive",
+                        "vote": "support",
+                        "confidence": 0.72,
+                        "evidence_refs": ["src_checkout", stale_image_id, valid_image_id],
+                        "rationale": "Regression fixture for stale visual vote evidence refs.",
+                        "created_at": "2026-06-22T00:00:00Z",
+                    }
+                ],
+                "verification_status": "supported",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "medium",
+                "caveats": [],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(ingest["stale_visual_vote_evidence_refs_cleared"], 1)
+        evidence = self.assert_valid_run(run_dir)
+        self.assertEqual(
+            evidence["vision_adapter"]["stale_visual_vote_evidence_refs_cleared"],
+            1,
+        )
+        stale_claim = next(
+            claim for claim in evidence["claims"] if claim["id"] == "claim_stale_cardnews_vote_ref"
+        )
+        self.assertEqual(stale_claim["votes"][0]["evidence_refs"], ["src_checkout", valid_image_id])
+        for claim in evidence["claims"]:
+            for vote in claim.get("votes", []):
+                if isinstance(vote, dict):
+                    self.assertNotIn(stale_image_id, vote.get("evidence_refs", []))
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_rerun_prunes_already_removed_stale_image_vote_refs(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        stale_image_id = "img_task_016_korea_2024_cardnews"
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("claims", []).append(
+            {
+                "id": "claim_already_removed_stale_cardnews_vote_ref",
+                "text": "The stale cardnews vote ref should be removed after prior cleanup.",
+                "claim_type": "text",
+                "supporting_sources": ["src_checkout"],
+                "supporting_images": [],
+                "visual_supports": [],
+                "quote_spans": [],
+                "votes": [
+                    {
+                        "id": "vote_already_removed_stale_cardnews_vote_ref",
+                        "claim_id": "claim_already_removed_stale_cardnews_vote_ref",
+                        "verifier_type": "text",
+                        "agent_name": "verification-agent",
+                        "method": "codex-subagent",
+                        "model_or_tool": "codex",
+                        "vote": "support",
+                        "confidence": 0.76,
+                        "evidence_refs": ["src_checkout", stale_image_id],
+                        "rationale": "Regression fixture for stale image refs after prior cleanup.",
+                        "created_at": "2026-06-22T00:00:00Z",
+                    }
+                ],
+                "verification_status": "supported",
+                "review_status": "not_reviewed",
+                "promotion_status": "not_eligible",
+                "confidence": "medium",
+                "caveats": [],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        self.assertEqual(ingest["stale_visual_vote_evidence_refs_cleared"], 1)
+        evidence = self.assert_valid_run(run_dir)
+        stale_claim = next(
+            claim
+            for claim in evidence["claims"]
+            if claim["id"] == "claim_already_removed_stale_cardnews_vote_ref"
+        )
+        self.assertEqual(stale_claim["votes"][0]["evidence_refs"], ["src_checkout"])
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_rerun_decanonicalizes_stale_placeholder_fetch_lineage(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("search_tasks", []).append(
+            {
+                "id": "task_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "modality": "visual_required",
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        plan = self.load_json(run_dir / "visual_search_plan.json")
+        plan["tasks"].append(
+            {
+                "plan_id": "plan_task_001_angle_001_visual_required",
+                "task_id": "task_001",
+                "semantic_plan_task_id": "task_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "target_evidence_type": "page_image",
+                "query": "https://example.com/checkout",
+                "providers": ["codex-native"],
+                "caps": {
+                    "max_candidates": 1,
+                    "max_fetches": 1,
+                    "max_vlm_images": 1,
+                    "max_cost_usd": 0.0,
+                },
+                "policy_constraints": {},
+                "estimated_cost_usd": 0.0,
+                "state": "completed",
+                "provider": "codex-native",
+                "provider_mode": "real",
+                "handoff_artifact": "visual_search_plan.json",
+            }
+        )
+        self.write_json(run_dir / "visual_search_plan.json", plan)
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidates.append(
+            {
+                "candidate_id": "cand_img_checkout_001",
+                "image_id": "img_checkout_001",
+                "evidence_image_id": "img_checkout_001",
+                "plan_id": "plan_task_001_angle_001_visual_required",
+                "task_id": "task_001",
+                "semantic_plan_task_id": "task_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "provider": "codex-native",
+                "provider_kind": "screenshot",
+                "provider_mode": "real",
+                "provider_run_id": "task_001",
+                "provider_provenance": {
+                    "provider": "codex-native",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "codex_native_handoff": True,
+                },
+                "source_id": "src_checkout",
+                "origin": "screenshot",
+                "page_url": "https://example.com/checkout",
+                "image_url": "https://example.com/checkout",
+                "rank": 1,
+                "score": 1.0,
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "candidate_status": "fetch_failed",
+                "rejection_reason": "missing_local_artifact",
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "handoff_artifact": "visual_candidates.jsonl",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetches.append(
+            {
+                "fetch_id": "fetch_img_checkout_001",
+                "candidate_id": "cand_img_checkout_001",
+                "image_id": "img_checkout_001",
+                "evidence_image_id": "img_checkout_001",
+                "plan_id": "plan_task_001_angle_001_visual_required",
+                "task_id": "task_001",
+                "semantic_plan_task_id": "task_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "provider": "codex-native",
+                "provider_kind": "screenshot",
+                "provider_mode": "real",
+                "provider_run_id": "task_001",
+                "provider_provenance": {
+                    "provider": "codex-native",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "codex_native_handoff": True,
+                },
+                "fetch_status": "failed",
+                "http_status": None,
+                "mime_type": "image/png",
+                "byte_size": None,
+                "width": 1,
+                "height": 1,
+                "hash": None,
+                "phash": None,
+                "local_artifact_path": "images/img_checkout_001.json",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "failure_code": "missing_local_artifact",
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "handoff_artifact": "image_fetch_status.jsonl",
+            }
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        evidence = self.assert_valid_run(run_dir)
+        image = next(item for item in evidence["images"] if item["id"] == "img_checkout_001")
+        self.assertEqual(image["candidate_id"], "cand_checkout_001")
+        self.assertEqual(image["fetch_id"], "fetch_checkout_001")
+        self.assertEqual(image["plan_id"], "plan_task_visual_001")
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        plan = self.load_json(run_dir / "visual_search_plan.json")
+        stale_candidate = next(
+            item for item in candidates if item["candidate_id"] == "cand_img_checkout_001"
+        )
+        stale_fetch = next(item for item in fetches if item["fetch_id"] == "fetch_img_checkout_001")
+        self.assertEqual(stale_candidate["candidate_status"], "fetch_failed")
+        self.assertIsNone(stale_candidate["evidence_image_id"])
+        self.assertIsNone(stale_candidate["image_id"])
+        self.assertEqual(stale_fetch["fetch_status"], "failed")
+        self.assertEqual(stale_fetch["failure_code"], "missing_local_artifact")
+        self.assertIsNone(stale_fetch["evidence_image_id"])
+        self.assertIsNone(stale_fetch["image_id"])
+        self.assertTrue(
+            any(
+                item["plan_id"] == "plan_task_001_angle_001_visual_required"
+                for item in plan["tasks"]
+            )
+        )
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_metadata_only_child_lineage_does_not_count_as_fetched(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        existing_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for fetch in existing_fetches:
+            fetch["evidence_image_id"] = None
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", existing_fetches)
+        image_id = "img_task_001_001"
+        candidate_id = "cand_img_task_001_001"
+        fetch_id = "fetch_img_task_001_001"
+        task_id = "task_001"
+        angle_id = "angle_001"
+        route = "visual_required"
+        plan_id = "plan_task_001_angle_001_visual_required"
+        metadata_path = run_dir / "images" / "img_task_001_001.json"
+        self.write_json(
+            metadata_path,
+            {
+                "kind": "metadata-only visual record",
+                "image_url": "https://example.com/checkout#poster",
+            },
+        )
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("search_tasks", []).append(
+            {
+                "id": task_id,
+                "angle_id": angle_id,
+                "route": route,
+                "modality": route,
+                "visual_tasks": ["layout_review"],
+            }
+        )
+        evidence["images"] = [
+            {
+                "id": image_id,
+                "source_id": "src_checkout",
+                "origin": "page_image",
+                "source_url": "https://example.com/checkout",
+                "image_url": "https://example.com/checkout#poster",
+                "page_url": "https://example.com/checkout",
+                "local_artifact_path": "images/img_task_001_001.json",
+                "mime_type": "image/jpeg",
+                "artifact_size_bytes": None,
+                "width": 0,
+                "height": 0,
+                "observations": ["Metadata-only Codex visual observation."],
+                "inferences": ["This should not count as a fetched local image artifact."],
+                "visual_tasks": ["layout_review"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "analyzed",
+                "candidate_id": candidate_id,
+                "fetch_id": fetch_id,
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "angle_id": angle_id,
+                "route": route,
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "provider_run_id": "codex-child:metadata-only",
+                "provider_provenance": {
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:metadata-only",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                },
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+                "caveats": ["metadata-only visual record; no local image artifact was provided"],
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "page_image",
+                    "image_url": "https://example.com/checkout#poster",
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/img_task_001_001.json",
+                    "mime_type": "image/jpeg",
+                    "width": 0,
+                    "height": 0,
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:metadata-only",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["Metadata-only Codex visual observation."],
+                    "inferences": ["This should not count as a fetched local image artifact."],
+                    "visual_tasks": ["layout_review"],
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": ["metadata-only visual record; no local image artifact was provided"],
+                    "codex_interactive_handoff": True,
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:metadata-only",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"],
+        )
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        child_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(child_fetch["fetch_status"], "failed")
+        self.assertEqual(child_fetch["failure_code"], "missing_local_artifact")
+        provider_status = self.load_json(run_dir / "visual_provider_status.json")
+        provider = provider_status["providers"][-1]
+        self.assertEqual(provider["artifacts_fetched"], 0)
+        self.assertEqual(provider["vlm_images_analyzed"], 1)
+        self.assertEqual(provider["diagnostics"]["metadata_only_records"], 1)
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
+        self.assertEqual(minimums["vlm_images_analyzed"], 0)
+        self.assertFalse(minimums["satisfied"])
 
     def test_corrected_observation_rerun_replaces_previous_image_analysis(self) -> None:
         run_dir = self.prepared_visual_run()
@@ -1424,7 +3194,7 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(claim["confidence"], "low")
         self.assertEqual(claim["supporting_images"], [])
 
-    def test_missing_local_artifact_fails_normalization(self) -> None:
+    def test_missing_non_metadata_local_artifact_fails_normalization(self) -> None:
         run_dir = self.prepared_visual_run()
         observations_path = run_dir / "missing_artifact.jsonl"
         self.write_jsonl(
@@ -1434,6 +3204,7 @@ class VisionAdapterTests(unittest.TestCase):
                     "image_id": "missing-artifact",
                     "source_id": "src_checkout",
                     "local_artifact_path": "images/missing.png",
+                    "image_url": "https://example.com/checkout#missing-image",
                     "observations": ["This should not become analyzed evidence."],
                     "width": 1,
                     "height": 1,

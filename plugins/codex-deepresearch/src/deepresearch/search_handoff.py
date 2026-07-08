@@ -280,6 +280,11 @@ def prepare_run(
         created_at=now,
         locked_oracle=locked_oracle,
     )
+    _sync_semantic_trace_artifact_hash(
+        run_dir,
+        event_type="semantic_planner_request_created",
+        artifact_key="semantic_planner_raw_request",
+    )
     pre_review_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
     _record_semantic_artifact_trace(
         run_dir,
@@ -1085,6 +1090,47 @@ def _record_semantic_artifact_trace(
     )
 
 
+def _sync_semantic_trace_artifact_hash(
+    run_dir: Path,
+    *,
+    event_type: str,
+    artifact_key: str,
+) -> None:
+    trace_file = run_dir / "run_trace.jsonl"
+    if not trace_file.exists():
+        return
+    changed = False
+    rewritten: list[str] = []
+    for line in trace_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            rewritten.append(line)
+            continue
+        if (
+            not changed
+            and isinstance(record, dict)
+            and record.get("event_type") == event_type
+        ):
+            artifact_paths = record.get("semantic_artifact_paths")
+            artifact_hashes = record.get("artifact_hashes")
+            if isinstance(artifact_paths, Mapping) and isinstance(artifact_hashes, dict):
+                raw_path = artifact_paths.get(artifact_key)
+                if isinstance(raw_path, str) and raw_path:
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        path = run_dir / path
+                    if path.exists():
+                        artifact_hashes[artifact_key] = _sha256_file(path)
+                        record["artifact_hashes"] = artifact_hashes
+                        changed = True
+        rewritten.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    if changed:
+        trace_file.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+
 def _sha256_file(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
 
@@ -1627,6 +1673,34 @@ def _expected_evidence_for_angle(evidence_need: str, route: str) -> list[str]:
     return list(dict.fromkeys(expected))
 
 
+def _expected_evidence_for_bounded_task(
+    evidence_need: str,
+    *,
+    route: str,
+    expected_visual_targets: Any,
+    max_images: int,
+) -> list[str]:
+    visual_obligation = (
+        route != "text_only"
+        or _has_string_items(expected_visual_targets)
+        or max_images > 0
+    )
+    if not visual_obligation and evidence_need in {
+        "visual_example",
+        "visual_observation",
+        "vlm_analysis",
+    }:
+        return ["primary_source"]
+    return _expected_evidence_for_angle(evidence_need, route)
+
+
+def _has_string_items(value: Any) -> bool:
+    return isinstance(value, list) and any(
+        isinstance(item, str) and item.strip()
+        for item in value
+    )
+
+
 def _apply_budget_image_allocations(
     routing: Sequence[Mapping[str, Any]],
     allocations: Mapping[str, int],
@@ -1757,9 +1831,11 @@ def _search_task_from_bounded_task(
         "expected_artifacts": list(bounded_task.get("expected_artifacts") or []),
         "expected_source_types": list(bounded_task.get("expected_source_types") or []),
         "expected_visual_targets": list(bounded_task.get("expected_visual_targets") or []),
-        "expected_evidence": _expected_evidence_for_angle(
+        "expected_evidence": _expected_evidence_for_bounded_task(
             str(route_record.get("evidence_need") or "primary_source"),
-            route,
+            route=route,
+            expected_visual_targets=bounded_task.get("expected_visual_targets"),
+            max_images=max_images,
         ),
         "success_criteria": list(bounded_task.get("success_criteria") or []),
         "done_condition": str(bounded_task.get("done_condition") or ""),

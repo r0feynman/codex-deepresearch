@@ -29,6 +29,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV,
     CODEX_SEMANTIC_ORACLE_COMMAND_ENV,
     CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
+    CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV,
     CODEX_SEMANTIC_REVIEWER_COMMAND_ENV,
     PLANNER_MODE_BLOCKED,
     PLANNER_MODE_CODEX_SEMANTIC,
@@ -46,6 +47,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     validate_codex_semantic_adapter_provenance,
     write_semantic_materialization_diff,
     write_semantic_planner_validation,
+    _codex_semantic_planner_validation_max_attempts,
     _semantic_adapter_command,
 )
 
@@ -651,14 +653,16 @@ class SemanticPlannerTests(unittest.TestCase):
         task_index = 1
         evidence_needs = (
             "primary_source",
-            "official_source",
+            "visual_example",
             "visual_observation",
+            "official_source",
             "recent_change",
             "comparative_analysis",
             "counter_evidence",
         )
         angle_focus = {
             "primary_source": ("baseline primary evidence", "baseline source dossier"),
+            "visual_example": ("representative image examples", "visual example set"),
             "official_source": ("official regulatory records", "official records matrix"),
             "visual_observation": ("image chart figure inspection", "visual evidence table"),
             "recent_change": ("recent 2026 timeline changes", "recent-change timeline"),
@@ -1533,6 +1537,82 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("primary_source_discovery_only", codes)
         self.assertIn("broad_question_angle_count_out_of_range", codes)
 
+    def test_distinct_angles_may_share_evidence_need_without_material_difference_failure(self) -> None:
+        run_dir = self.temp_runs_dir()
+        evidence = {
+            "run_id": "semantic-shared-evidence-need",
+            "question": "Compare public health poster guidance across official sources.",
+            "semantic_planner": {
+                "fixture_id": "shared-evidence-need",
+                "question_class": "policy",
+                "broad_question": True,
+                "expected_evidence_needs": [
+                    "official_source",
+                    "official_source",
+                    "implementation_detail",
+                    "failure_pattern",
+                    "synthesis",
+                ],
+            },
+            "semantic_angles": [
+                {
+                    "angle_id": "angle_001",
+                    "title": "Central agency source set",
+                    "research_question": "Which central agency sources define the poster guidance?",
+                    "route": "text_only",
+                    "evidence_need": "official_source",
+                    "expected_artifacts": ["central source table"],
+                    "success_criteria": ["Cite central agency records."],
+                    "report_section": "Central Sources",
+                },
+                {
+                    "angle_id": "angle_002",
+                    "title": "Local agency source set",
+                    "research_question": "Which local public health sources adapt the poster guidance?",
+                    "route": "text_only",
+                    "evidence_need": "official_source",
+                    "expected_artifacts": ["local source table"],
+                    "success_criteria": ["Cite local agency records."],
+                    "report_section": "Local Sources",
+                },
+                {
+                    "angle_id": "angle_003",
+                    "title": "Message structure",
+                    "research_question": "How do source messages differ by step, duration, and audience?",
+                    "route": "text_only",
+                    "evidence_need": "implementation_detail",
+                    "expected_artifacts": ["message comparison"],
+                    "success_criteria": ["Extract structured differences."],
+                    "report_section": "Message Structure",
+                },
+                {
+                    "angle_id": "angle_004",
+                    "title": "Contradiction checks",
+                    "research_question": "Which guidance differences are genuine contradictions?",
+                    "route": "text_only",
+                    "evidence_need": "failure_pattern",
+                    "expected_artifacts": ["contradiction log"],
+                    "success_criteria": ["Separate contradictions from wording differences."],
+                    "report_section": "Contradictions",
+                },
+                {
+                    "angle_id": "angle_005",
+                    "title": "Synthesis limits",
+                    "research_question": "What caveats should constrain the final comparison?",
+                    "route": "text_only",
+                    "evidence_need": "synthesis",
+                    "expected_artifacts": ["caveat list"],
+                    "success_criteria": ["State limits and confidence."],
+                    "report_section": "Limits",
+                },
+            ],
+        }
+
+        validation = semantic_planner_validation(run_dir=run_dir, evidence=evidence, tasks=[])
+
+        codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("semantic_angle_material_difference_failed", codes)
+
     def test_suffix_duplicate_and_generic_fanout_fails_validation(self) -> None:
         run_dir = self.prepare_fixture(SEMANTIC_FIXTURES[0])
         evidence = self.load_json(run_dir / "evidence.json")
@@ -1667,7 +1747,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         raw_request = self.load_json(run_dir / "semantic_planner_raw" / "planner_request.json")
@@ -1700,7 +1780,7 @@ class SemanticPlannerTests(unittest.TestCase):
             command_env_configured=False,
             default_codex_available=True,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
 
@@ -1753,7 +1833,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         oracle_request = self.load_json(
@@ -1858,7 +1938,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
             reviewer_configured=False,
         )
         run_dir = Path(result["run_dir"])
@@ -1888,7 +1968,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         (run_dir / "run_trace.jsonl").unlink()
@@ -1913,7 +1993,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         trace_path = run_dir / "run_trace.jsonl"
@@ -1948,7 +2028,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         trace_path = run_dir / "run_trace.jsonl"
@@ -1985,7 +2065,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         oracle = self.load_json(run_dir / "semantic_expectation_oracle.json")
@@ -2032,7 +2112,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "source_quality", "visual_modality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         fake_hash = "0" * 64
@@ -2290,6 +2370,175 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         persisted_validation = self.load_json(run_dir / "semantic_planner_validation.json")
         self.assertTrue(persisted_validation["ok"], persisted_validation)
+
+    def test_codex_semantic_parent_overrides_model_mistyped_raw_request_hash(self) -> None:
+        question = "Compare official public health poster images for handwashing guidance"
+
+        def mistype_hash(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            response["provenance"]["raw_request_hash"] = "model-mistyped-request-hash"
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=mistype_hash,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+        run_dir = Path(result["run_dir"])
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        provenance = raw_response["provenance"]
+
+        self.assertTrue(result["semantic_release_eligible"])
+        self.assertEqual(result["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
+        self.assertEqual(
+            provenance["raw_request_hash"],
+            adapter_request["adapter_request_hash"],
+        )
+        self.assertEqual(
+            provenance["child_reported_raw_request_hash"],
+            "model-mistyped-request-hash",
+        )
+        self.assertTrue(provenance["raw_request_hash_overridden_by_parent"])
+        self.assertEqual(
+            semantic_plan["planner_provenance"]["adapter_invocation"]["raw_request_hash"],
+            adapter_request["adapter_request_hash"],
+        )
+        self.assertEqual(
+            semantic_plan["planner_provenance"]["adapter_invocation"][
+                "child_reported_raw_request_hash"
+            ],
+            "model-mistyped-request-hash",
+        )
+
+    def test_codex_semantic_planner_validation_max_attempts_defaults_to_three_and_caps(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 3)
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "1"},
+            clear=True,
+        ):
+            self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 1)
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "9"},
+            clear=True,
+        ):
+            self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 3)
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "invalid"},
+            clear=True,
+        ):
+            self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 3)
+
+    def test_codex_semantic_retries_candidate_validation_failures_until_third_attempt(self) -> None:
+        question = "Compare official public health poster images for handwashing guidance"
+        attempts = {"count": 0}
+
+        def first_two_responses_underallocate_one_broad_angle(response: dict) -> dict:
+            attempts["count"] += 1
+            response = json.loads(json.dumps(response))
+            if attempts["count"] > 2:
+                return response
+            candidate = response["candidate_plan"]
+            underallocated_angle_id = "angle_006"
+            seen_underallocated_angle_task = False
+            kept_tasks = []
+            for task in candidate["bounded_tasks"]:
+                if task.get("angle_id") != underallocated_angle_id:
+                    kept_tasks.append(task)
+                    continue
+                if not seen_underallocated_angle_task:
+                    kept_tasks.append(task)
+                    seen_underallocated_angle_task = True
+            kept_task_ids = {task["task_id"] for task in kept_tasks}
+            candidate["bounded_tasks"] = kept_tasks
+            for requirement in candidate["requirement_coverage_map"]:
+                requirement["covered_by_task_ids"] = [
+                    task_id
+                    for task_id in requirement["covered_by_task_ids"]
+                    if task_id in kept_task_ids
+                ]
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=first_two_responses_underallocate_one_broad_angle,
+            angle_count=6,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+        run_dir = Path(result["run_dir"])
+        raw_request = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_request.json"
+        )
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertTrue(result["semantic_release_eligible"])
+        self.assertEqual(result["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
+        self.assertEqual(raw_response["adapter_attempt"], 3)
+        self.assertEqual(raw_response["adapter_attempt_count"], 3)
+        self.assertEqual(len(raw_response["previous_adapter_attempts"]), 2)
+        self.assertIn(
+            "broad_angle_has_too_few_tasks",
+            raw_response["previous_adapter_attempts"][0][
+                "candidate_validation_failure_codes"
+            ],
+        )
+        self.assertIn(
+            "broad_angle_has_too_few_tasks",
+            raw_response["previous_adapter_attempts"][1][
+                "candidate_validation_failure_codes"
+            ],
+        )
+        self.assertEqual(raw_request["retry_attempt"], 3)
+        self.assertIn(
+            "broad_angle_has_too_few_tasks",
+            raw_request["previous_candidate_validation_failure_codes"],
+        )
+        self.assertIn(
+            "broad_angle_has_too_few_tasks",
+            raw_request["planner_retry_instructions"],
+        )
+        self.assertIn(
+            "at least 2 bounded_tasks assigned to every angle_id",
+            raw_request["planner_retry_instructions"],
+        )
+        self.assertIn(
+            "per-angle task distribution",
+            raw_request["planner_retry_instructions"],
+        )
+        self.assertTrue(
+            any(
+                failure.get("code") == "broad_angle_has_too_few_tasks"
+                and failure.get("angle_id") == "angle_006"
+                for failure in raw_request["previous_candidate_validation_failures"]
+            ),
+            raw_request["previous_candidate_validation_failures"],
+        )
+        self.assertEqual(
+            raw_response["provenance"]["raw_request_hash"],
+            raw_request["adapter_request_hash"],
+        )
+        self.assertEqual(
+            semantic_plan["planner_provenance"]["adapter_request_hash"],
+            raw_request["adapter_request_hash"],
+        )
+        self.assertEqual(adapter_request["retry_attempt"], 3)
 
     def test_codex_semantic_independence_qualifies_reused_item_ids_by_session(self) -> None:
         question = "Research coastal microgrid outage recovery using official source records"
@@ -2552,7 +2801,7 @@ class SemanticPlannerTests(unittest.TestCase):
                         "geography",
                         "deliverable_shape",
                     ),
-                    visual_angle_indexes=(3,),
+                    visual_angle_indexes=(2, 3),
                     response_mutator=mutator,
                 )
 
@@ -2694,7 +2943,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 "geography",
                 "deliverable_shape",
             ),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
@@ -2720,6 +2969,29 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertFalse(validation["ok"])
         self.assertIn(
             "visual_requirement_missing_visual_route",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+        visual_budget_zero = json.loads(json.dumps(plan))
+        visual_task = next(
+            task
+            for task in visual_budget_zero["bounded_tasks"]
+            if task["route"] != "text_only"
+            or task.get("expected_visual_targets")
+            or any(
+                token in artifact.lower()
+                for artifact in task.get("expected_artifacts", [])
+                for token in ("image", "visual", "screenshot", "chart", "figure", "diagram")
+            )
+        )
+        visual_task["max_images"] = 0
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=visual_budget_zero,
+        )
+        self.assertFalse(validation["ok"])
+        self.assertIn(
+            "visual_expected_evidence_without_image_budget",
             {failure["code"] for failure in validation["failures"]},
         )
 
@@ -2907,7 +3179,7 @@ class SemanticPlannerTests(unittest.TestCase):
         result, _adapter_request = self.prepare_with_codex_adapter(
             question,
             requirement_types=("subject", "visual_modality", "source_quality"),
-            visual_angle_indexes=(3,),
+            visual_angle_indexes=(2, 3),
         )
         run_dir = Path(result["run_dir"])
         evidence = self.load_json(run_dir / "evidence.json")
