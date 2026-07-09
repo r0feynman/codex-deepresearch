@@ -4843,6 +4843,7 @@ def _apply_visual_acquisition_lineage_to_images(
         if candidate is None and fetch is None:
             continue
         changed += _apply_visual_acquisition_metadata_to_image(
+            run_dir,
             image,
             candidate=candidate,
             fetch=fetch,
@@ -4906,6 +4907,7 @@ def _visual_acquisition_lineage_for_image(
 
 
 def _apply_visual_acquisition_metadata_to_image(
+    run_dir: Path,
     image: MutableMapping[str, Any],
     *,
     candidate: Mapping[str, Any] | None,
@@ -4931,8 +4933,6 @@ def _apply_visual_acquisition_metadata_to_image(
         "route",
         "candidate_id",
         "fetch_id",
-        "local_artifact_path",
-        "hash",
     ):
         value = _first_visual_acquisition_string(field, fetch, candidate)
         if value:
@@ -4942,6 +4942,32 @@ def _apply_visual_acquisition_metadata_to_image(
                 value,
                 preserve_raw=True,
             )
+
+    current_artifact_path = _first_optional_string(image, "local_artifact_path")
+    if not current_artifact_path or _metadata_only_artifact_path(current_artifact_path):
+        artifact_record = _safe_visual_acquisition_artifact_record(
+            run_dir,
+            fetch,
+            allowed_status_fields={"fetch_status": {"fetched"}},
+        )
+        if artifact_record is None:
+            artifact_record = _safe_visual_acquisition_artifact_record(
+                run_dir,
+                candidate,
+                allowed_status_fields={
+                    "candidate_status": {"fetched", "analyzed"},
+                },
+            )
+        if artifact_record is not None:
+            for field in ("local_artifact_path", "hash"):
+                value = _first_visual_acquisition_string(field, artifact_record)
+                if value:
+                    changed += _set_visual_acquisition_image_field(
+                        image,
+                        field,
+                        value,
+                        preserve_raw=True,
+                    )
 
     provider = _first_visual_acquisition_string("provider", fetch, candidate)
     if provider:
@@ -6098,6 +6124,41 @@ def _safe_fetched_codex_interactive_handoff_artifact(
     return bool(mime_type and mime_type.startswith("image/"))
 
 
+def _safe_visual_acquisition_artifact_record(
+    run_dir: Path,
+    record: Mapping[str, Any] | None,
+    *,
+    allowed_status_fields: Mapping[str, set[str]],
+) -> Mapping[str, Any] | None:
+    if not isinstance(record, Mapping):
+        return None
+    for field, allowed_values in allowed_status_fields.items():
+        status = _first_optional_string(record, field)
+        if status and status not in allowed_values:
+            return None
+    local_artifact_path = _first_optional_string(record, "local_artifact_path")
+    if not local_artifact_path:
+        return None
+    path = Path(local_artifact_path)
+    if path.is_absolute():
+        return None
+    if path.suffix.lower() in {".json", ".jsonl", ".txt", ".html", ".htm", ".md"}:
+        return None
+    try:
+        artifact_path = _resolve_run_relative_path(run_dir, local_artifact_path)
+    except VisionAdapterError:
+        return None
+    if not artifact_path.is_file():
+        return None
+    mime_type = _first_optional_string(record, "mime_type")
+    if not mime_type:
+        guessed, _ = mimetypes.guess_type(local_artifact_path)
+        mime_type = guessed
+    if not (mime_type and mime_type.startswith("image/")):
+        return None
+    return record
+
+
 def _codex_interactive_handoff_records_match_image(
     image: Mapping[str, Any],
     *records: Mapping[str, Any],
@@ -6284,7 +6345,7 @@ def _fill_codex_interactive_handoff_candidate_record(
     )
     for key, value in values.items():
         _fill_missing_codex_interactive_handoff_value(record, key, value)
-    _reconcile_used_codex_interactive_handoff_record(
+    _reconcile_budget_pruned_codex_interactive_handoff_record_fields(
         record,
         values,
         fields=(
@@ -6329,7 +6390,7 @@ def _fill_codex_interactive_handoff_fetch_record(
     )
     for key, value in values.items():
         _fill_missing_codex_interactive_handoff_value(record, key, value)
-    _reconcile_used_codex_interactive_handoff_record(
+    _reconcile_budget_pruned_codex_interactive_handoff_record_fields(
         record,
         values,
         fields=(
@@ -6386,16 +6447,20 @@ def _codex_interactive_handoff_image_policy_decision(image: Mapping[str, Any]) -
     return decision or "allowed"
 
 
-def _reconcile_used_codex_interactive_handoff_record(
+def _reconcile_budget_pruned_codex_interactive_handoff_record_fields(
     record: MutableMapping[str, Any],
     values: Mapping[str, Any],
     *,
     fields: Iterable[str],
     nullable_fields: Iterable[str] = (),
 ) -> None:
+    if _has_protected_codex_interactive_handoff_policy_state(record):
+        return
     nullable = set(nullable_fields)
     for key in fields:
         if key not in values:
+            continue
+        if not _is_budget_pruned_marker(record.get(key)):
             continue
         value = values.get(key)
         if value in (None, "", []) and key not in nullable:
@@ -6421,6 +6486,8 @@ def _reconcile_budget_pruned_codex_interactive_handoff_policy(
     record: MutableMapping[str, Any],
     values: Mapping[str, Any],
 ) -> None:
+    if _has_protected_codex_interactive_handoff_policy_state(record):
+        return
     if _is_budget_pruned_marker(record.get("policy_decision")):
         _set_codex_interactive_handoff_reconciled_value(
             record,
@@ -6445,6 +6512,8 @@ def _reconcile_budget_pruned_codex_interactive_handoff_candidate_status(
     record: MutableMapping[str, Any],
     values: Mapping[str, Any],
 ) -> None:
+    if _has_protected_codex_interactive_handoff_policy_state(record):
+        return
     status = _first_optional_string(record, "candidate_status")
     status_budget_pruned = _is_budget_pruned_marker(status)
     rejection_budget_pruned = _is_budget_pruned_marker(record.get("rejection_reason"))
@@ -6468,6 +6537,8 @@ def _reconcile_budget_pruned_codex_interactive_handoff_fetch_status(
     record: MutableMapping[str, Any],
     values: Mapping[str, Any],
 ) -> None:
+    if _has_protected_codex_interactive_handoff_policy_state(record):
+        return
     status = _first_optional_string(record, "fetch_status")
     status_budget_pruned = _is_budget_pruned_marker(status)
     retrieval_budget_pruned = _is_budget_pruned_marker(record.get("retrieval_status"))
@@ -6503,13 +6574,38 @@ def _is_budget_pruned_marker(value: Any) -> bool:
     return False
 
 
-def _is_protected_acquisition_status(value: str | None) -> bool:
+def _has_protected_codex_interactive_handoff_policy_state(
+    record: Mapping[str, Any],
+) -> bool:
+    return any(
+        _is_protected_acquisition_status(record.get(field))
+        for field in (
+            "policy_decision",
+            "policy_flags",
+            "candidate_status",
+            "fetch_status",
+            "retrieval_status",
+            "rejection_reason",
+            "failure_code",
+        )
+    )
+
+
+def _is_protected_acquisition_status(value: Any) -> bool:
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_is_protected_acquisition_status(item) for item in value)
     return str(value or "").strip().lower() in {
         "blocked",
         "policy_blocked",
+        "policy_decision_blocked",
         "manual_review",
         "disallowed",
         "restricted",
+        "license_policy_blocked",
+        "license_disallowed",
+        "license_restricted",
+        "robots_disallowed",
+        "robots_restricted",
     }
 
 

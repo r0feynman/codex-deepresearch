@@ -431,6 +431,83 @@ class VisionAdapterTests(unittest.TestCase):
                 source["robots_policy"] = "allowed"
         self.write_json(run_dir / "evidence.json", evidence)
 
+    def write_codex_interactive_observation(
+        self,
+        run_dir: Path,
+        *,
+        provider_run_id: str,
+        image_id: str = "img_checkout_001",
+        candidate_id: str = "cand_checkout_001",
+        fetch_id: str = "fetch_checkout_001",
+        plan_id: str = "plan_task_visual_001",
+        task_id: str = "task_visual_001",
+        angle_id: str = "angle_001",
+        route: str = "visual_required",
+        policy_decision: str = "allowed",
+    ) -> None:
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "observation_id": f"obs_{image_id}_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": "sha256:fixture-checkout",
+                    "phash": "checkout-phash",
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": provider_run_id,
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "model_or_tool": "codex-exec-image-worker",
+                    "observations": ["The checkout screenshot shows a primary payment button."],
+                    "inferences": ["The analyzed image supports checkout completion."],
+                    "visual_tasks": ["layout_review"],
+                    "confidence": 0.83,
+                    "policy_decision": policy_decision,
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": [],
+                    "verifier_links": [],
+                    "report_links": [],
+                    "created_at": "2026-06-22T00:00:00Z",
+                    "codex_interactive_handoff": True,
+                    "codex_native_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": provider_run_id,
+                        "codex_interactive_handoff": True,
+                        "codex_native_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
     def assert_valid_run(self, run_dir: Path) -> dict:
         result = validate_artifacts(
             evidence_path=run_dir / "evidence.json",
@@ -1181,6 +1258,189 @@ class VisionAdapterTests(unittest.TestCase):
             any(
                 error.code == "lineage_mismatch"
                 and "policy_decision" in error.path
+                for error in visual_validation.errors
+            ),
+            [error.to_dict() for error in visual_validation.errors],
+        )
+
+    def test_codex_interactive_does_not_convert_blocked_policy_with_budget_pruned_status(
+        self,
+    ) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_checkout_001"
+        candidate_id = "cand_checkout_001"
+        fetch_id = "fetch_checkout_001"
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+        candidate.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "candidate_status": "budget_pruned",
+                "policy_decision": "blocked",
+                "rejection_reason": "budget_pruned",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetch = next(item for item in fetches if item["fetch_id"] == fetch_id)
+        fetch.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "fetch_status": "budget_pruned",
+                "retrieval_status": "budget_pruned",
+                "policy_decision": "blocked",
+                "failure_code": "budget_pruned",
+            }
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self.write_codex_interactive_observation(
+            run_dir,
+            provider_run_id="codex-child:mixed-blocked-budget-pruned",
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertFalse(result["visual_artifact_validation"]["valid"])
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_candidate = next(item for item in post_candidates if item["candidate_id"] == candidate_id)
+        post_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(post_candidate["policy_decision"], "blocked")
+        self.assertEqual(post_candidate["candidate_status"], "budget_pruned")
+        self.assertEqual(post_candidate["rejection_reason"], "budget_pruned")
+        self.assertEqual(post_fetch["policy_decision"], "blocked")
+        self.assertEqual(post_fetch["fetch_status"], "budget_pruned")
+        self.assertEqual(post_fetch["retrieval_status"], "budget_pruned")
+        self.assertEqual(post_fetch["failure_code"], "budget_pruned")
+        self.assertNotIn("raw_codex_interactive_handoff_candidate_status", post_candidate)
+        self.assertNotIn("raw_codex_interactive_handoff_fetch_status", post_fetch)
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertFalse(visual_validation.valid)
+        self.assertTrue(
+            any(
+                error.code == "lineage_mismatch"
+                and "policy_decision" in error.path
+                for error in visual_validation.errors
+            ),
+            [error.to_dict() for error in visual_validation.errors],
+        )
+
+    def test_codex_interactive_keeps_non_budget_fetch_artifact_mismatch_visible(
+        self,
+    ) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_checkout_001"
+        candidate_id = "cand_checkout_001"
+        fetch_id = "fetch_checkout_001"
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+        candidate.update(
+            {
+                "image_id": "img_corrupt_sidecar",
+                "evidence_image_id": "img_corrupt_sidecar",
+                "candidate_status": "fetched",
+                "policy_decision": "allowed",
+                "rejection_reason": None,
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetch = next(item for item in fetches if item["fetch_id"] == fetch_id)
+        fetch.update(
+            {
+                "image_id": "img_corrupt_sidecar",
+                "evidence_image_id": image_id,
+                "fetch_status": "fetched",
+                "retrieval_status": "fetched",
+                "policy_decision": "allowed",
+                "failure_code": None,
+                "local_artifact_path": "images/corrupt-sidecar.png",
+                "hash": "sha256:corrupt-sidecar",
+                "width": 99,
+                "height": 99,
+                "byte_size": 999,
+            }
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self.write_codex_interactive_observation(
+            run_dir,
+            provider_run_id="codex-child:non-budget-artifact-mismatch",
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertFalse(result["visual_artifact_validation"]["valid"])
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_candidate = next(item for item in post_candidates if item["candidate_id"] == candidate_id)
+        post_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(post_candidate["image_id"], "img_corrupt_sidecar")
+        self.assertEqual(post_candidate["evidence_image_id"], "img_corrupt_sidecar")
+        self.assertEqual(post_fetch["local_artifact_path"], "images/corrupt-sidecar.png")
+        self.assertEqual(post_fetch["hash"], "sha256:corrupt-sidecar")
+        self.assertEqual(post_fetch["width"], 99)
+        self.assertEqual(post_fetch["height"], 99)
+        self.assertEqual(post_fetch["byte_size"], 999)
+        self.assertNotIn("raw_codex_interactive_handoff_local_artifact_path", post_fetch)
+        self.assertNotIn("raw_codex_interactive_handoff_hash", post_fetch)
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertFalse(visual_validation.valid)
+        self.assertTrue(
+            any(
+                error.code == "lineage_mismatch"
+                and "local_artifact_path" in error.path
+                for error in visual_validation.errors
+            ),
+            [error.to_dict() for error in visual_validation.errors],
+        )
+        self.assertTrue(
+            any(
+                error.code == "lineage_mismatch"
+                and error.path.endswith(".hash")
                 for error in visual_validation.errors
             ),
             [error.to_dict() for error in visual_validation.errors],
