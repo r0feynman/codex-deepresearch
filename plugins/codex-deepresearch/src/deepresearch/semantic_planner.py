@@ -2570,11 +2570,7 @@ def _has_forbidden_internal_leakage(
     plan: SemanticPlan,
     oracle: Mapping[str, Any],
 ) -> bool:
-    forbidden = _string_list(oracle.get("forbidden_internal_implementation_terms"))
-    if not forbidden:
-        forbidden = _forbidden_internal_terms()
-    text = _plan_executable_review_text(plan)
-    return any(term.lower() in text for term in forbidden)
+    return bool(_forbidden_internal_leakage_terms(plan=plan, oracle=oracle))
 
 
 def _semantic_substitute_implementation_check(
@@ -2584,11 +2580,7 @@ def _semantic_substitute_implementation_check(
 ) -> dict[str, Any]:
     text = _plan_executable_review_text(plan)
     forbidden_angles = [item.lower() for item in _string_list(oracle.get("forbidden_angles"))]
-    leakage_terms = [
-        term
-        for term in _string_list(oracle.get("forbidden_internal_implementation_terms"))
-        if term.lower() in text
-    ]
+    leakage_terms = _forbidden_internal_leakage_terms(plan=plan, oracle=oracle)
     forbidden_angle_hits = [term for term in forbidden_angles if term and term in text]
     generic_hits = [
         phrase
@@ -2610,42 +2602,311 @@ def _semantic_substitute_implementation_check(
     }
 
 
-def _plan_executable_review_text(plan: SemanticPlan) -> str:
-    values: list[Any] = [
-        plan.intent_summary,
-        plan.domain_entities,
-        plan.constraints,
+def _forbidden_internal_leakage_terms(
+    *,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> list[str]:
+    forbidden = _string_list(oracle.get("forbidden_internal_implementation_terms"))
+    if not forbidden:
+        forbidden = _forbidden_internal_terms()
+    records = _plan_executable_review_records(plan)
+    return [
+        term
+        for term in _ordered_unique(forbidden)
+        if _forbidden_internal_term_matches(term=term, records=records)
     ]
+
+
+def _forbidden_internal_term_matches(
+    *,
+    term: str,
+    records: Sequence[tuple[str, str]],
+) -> bool:
+    normalized_term = _normalize_text(term)
+    if not normalized_term:
+        return False
+    compact_term = normalized_term.replace(" ", "_")
+    for _field_name, value in records:
+        normalized_value = _normalize_text(value)
+        if not _contains_normalized_phrase(normalized_value, normalized_term):
+            continue
+        if compact_term == "schema":
+            if _schema_term_is_internal_leakage(normalized_value):
+                return True
+            continue
+        if compact_term in {"planner", "adapter", "oracle", "budget"}:
+            if _ambiguous_internal_term_has_context(compact_term, normalized_value):
+                return True
+            continue
+        return True
+    return False
+
+
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    return f" {phrase} " in f" {text} "
+
+
+def _schema_term_is_internal_leakage(normalized_value: str) -> bool:
+    internal_schema_phrases = (
+        "adapter schema",
+        "schema adapter",
+        "schema contract",
+        "contract schema",
+        "planner schema",
+        "schema planner",
+        "oracle schema",
+        "schema oracle",
+        "subagent schema",
+        "schema subagent",
+        "run id schema",
+        "requirement id schema",
+        "internal schema",
+        "implementation schema",
+        "schema implementation",
+        "json schema",
+        "output schema",
+        "response schema",
+        "input schema",
+        "schema validation",
+        "schema stub",
+        "schema stubs",
+        "schema file",
+    )
+    if any(
+        _contains_normalized_phrase(normalized_value, phrase)
+        for phrase in internal_schema_phrases
+    ):
+        return True
+    internal_terms = {
+        "implementation",
+        "internal",
+        "internals",
+        "contract",
+        "adapter",
+        "planner",
+        "oracle",
+        "subagent",
+        "run",
+        "id",
+        "requirement",
+        "deterministic",
+        "fixture",
+        "template",
+        "local",
+        "raw",
+        "provenance",
+        "command",
+        "json",
+    }
+    if _normalized_text_has_any_token(normalized_value, internal_terms):
+        return True
+    deliverable_terms = {
+        "comparison",
+        "comparative",
+        "table",
+        "matrix",
+        "report",
+        "deliverable",
+        "shape",
+        "structure",
+        "format",
+        "column",
+        "columns",
+        "field",
+        "fields",
+        "row",
+        "rows",
+        "taxonomy",
+        "outline",
+    }
+    if _normalized_text_has_any_token(normalized_value, deliverable_terms):
+        return False
+    return True
+
+
+def _ambiguous_internal_term_has_context(term: str, normalized_value: str) -> bool:
+    context_terms_by_term = {
+        "planner": {
+            "implementation",
+            "internal",
+            "internals",
+            "deterministic",
+            "fixture",
+            "template",
+            "local",
+            "adapter",
+            "oracle",
+            "subagent",
+            "schema",
+            "contract",
+            "raw",
+            "output",
+            "provenance",
+            "command",
+        },
+        "adapter": {
+            "implementation",
+            "internal",
+            "internals",
+            "deterministic",
+            "fixture",
+            "template",
+            "local",
+            "planner",
+            "oracle",
+            "subagent",
+            "schema",
+            "contract",
+            "raw",
+            "output",
+            "provenance",
+            "command",
+        },
+        "oracle": {
+            "implementation",
+            "internal",
+            "internals",
+            "deterministic",
+            "fixture",
+            "template",
+            "local",
+            "planner",
+            "adapter",
+            "subagent",
+            "schema",
+            "contract",
+            "raw",
+            "output",
+            "provenance",
+            "command",
+            "requirement",
+        },
+        "budget": {
+            "implementation",
+            "internal",
+            "internals",
+            "deterministic",
+            "fixture",
+            "template",
+            "local",
+            "planner",
+            "adapter",
+            "oracle",
+            "subagent",
+            "token",
+            "context",
+            "command",
+        },
+    }
+    phrases_by_term = {
+        "planner": (
+            "semantic planner implementation",
+            "planner implementation",
+            "planner internals",
+            "planner output",
+            "planner adapter",
+            "planner schema",
+            "heuristic template planner",
+        ),
+        "adapter": (
+            "adapter implementation",
+            "adapter internals",
+            "adapter schema",
+            "adapter contract",
+            "adapter command",
+            "local adapter",
+        ),
+        "oracle": (
+            "oracle implementation",
+            "oracle internals",
+            "oracle schema",
+            "oracle contract",
+            "oracle requirement",
+            "oracle adapter",
+        ),
+        "budget": (
+            "token budget",
+            "context budget",
+            "planner budget",
+            "adapter budget",
+            "oracle budget",
+            "subagent budget",
+        ),
+    }
+    if any(
+        _contains_normalized_phrase(normalized_value, phrase)
+        for phrase in phrases_by_term.get(term, ())
+    ):
+        return True
+    return _normalized_text_has_any_token(
+        normalized_value,
+        context_terms_by_term.get(term, set()),
+    )
+
+
+def _normalized_text_has_any_token(text: str, tokens: set[str]) -> bool:
+    padded = f" {text} "
+    return any(f" {token} " in padded for token in tokens)
+
+
+def _plan_executable_review_records(plan: SemanticPlan) -> list[tuple[str, str]]:
+    records: list[tuple[str, str]] = []
+
+    def add_value(field_name: str, value: Any) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                records.append((field_name, value))
+            return
+        if isinstance(value, Mapping):
+            for nested_value in value.values():
+                add_value(field_name, nested_value)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested_value in value:
+                add_value(field_name, nested_value)
+
+    for field_name, value in (
+        ("intent_summary", plan.intent_summary),
+        ("domain_entities", plan.domain_entities),
+        ("constraints", plan.constraints),
+    ):
+        add_value(field_name, value)
     for angle in plan.angles:
-        values.extend(
-            [
-                angle.title,
-                angle.research_question,
-                angle.why_this_angle_matters,
-                angle.included_scope,
-                angle.expected_source_types,
-                angle.expected_visual_targets,
-                angle.expected_artifacts,
-                angle.search_queries,
-                angle.success_criteria,
-                angle.report_section,
-                angle.risk_or_contradiction_checks,
-            ]
-        )
+        for field_name, value in (
+            ("angles.title", angle.title),
+            ("angles.research_question", angle.research_question),
+            ("angles.why_this_angle_matters", angle.why_this_angle_matters),
+            ("angles.included_scope", angle.included_scope),
+            ("angles.expected_source_types", angle.expected_source_types),
+            ("angles.expected_visual_targets", angle.expected_visual_targets),
+            ("angles.expected_artifacts", angle.expected_artifacts),
+            ("angles.search_queries", angle.search_queries),
+            ("angles.success_criteria", angle.success_criteria),
+            ("angles.report_section", angle.report_section),
+            ("angles.risk_or_contradiction_checks", angle.risk_or_contradiction_checks),
+        ):
+            add_value(field_name, value)
     for task in plan.bounded_tasks:
         if not isinstance(task, Mapping):
             continue
-        values.extend(
-            [
-                task.get("query"),
-                task.get("source_policy"),
-                task.get("expected_source_types"),
-                task.get("expected_visual_targets"),
-                task.get("expected_artifacts"),
-                task.get("success_criteria"),
-                task.get("done_condition"),
-            ]
-        )
+        for field_name in (
+            "query",
+            "source_policy",
+            "expected_source_types",
+            "expected_visual_targets",
+            "expected_artifacts",
+            "success_criteria",
+            "done_condition",
+        ):
+            add_value(f"bounded_tasks.{field_name}", task.get(field_name))
+    return records
+
+
+def _plan_executable_review_text(plan: SemanticPlan) -> str:
+    values = [value for _field_name, value in _plan_executable_review_records(plan)]
     return json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
 
 

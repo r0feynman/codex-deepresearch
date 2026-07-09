@@ -37,6 +37,8 @@ from deepresearch.semantic_planner import (  # noqa: E402
     PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_FIT_SCORE_THRESHOLD,
+    SemanticAngle,
+    SemanticPlan,
     SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
     SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX,
     SemanticPlannerAdapterUnavailable,
@@ -48,7 +50,9 @@ from deepresearch.semantic_planner import (  # noqa: E402
     write_semantic_materialization_diff,
     write_semantic_planner_validation,
     _codex_semantic_planner_validation_max_attempts,
+    _has_forbidden_internal_leakage,
     _semantic_adapter_command,
+    _semantic_substitute_implementation_check,
 )
 
 
@@ -1192,6 +1196,142 @@ class SemanticPlannerTests(unittest.TestCase):
             self.assertEqual(validation[field], source[field])
         self.assertRegex(validation["raw_request_hash"], r"^[0-9a-f]{64}$")
         self.assertRegex(validation["raw_response_hash"], r"^[0-9a-f]{64}$")
+
+    def semantic_internal_leakage_review_plan(
+        self,
+        *,
+        query: str = "Compare official source evidence for the requested report.",
+        expected_artifacts: list[str] | None = None,
+        success_criteria: list[str] | None = None,
+        done_condition: str = "Stop when source-backed findings are ready for the report.",
+    ) -> SemanticPlan:
+        artifacts = expected_artifacts or ["source-backed comparison notes"]
+        criteria = success_criteria or ["Findings must cite source metadata."]
+        angle = SemanticAngle(
+            angle_id="angle_001",
+            title="Source-backed comparison",
+            research_question=query,
+            question_context="Compare official source evidence for the requested report.",
+            route="text_only",
+            evidence_need="comparative_analysis",
+            expected_artifacts=list(artifacts),
+            success_criteria=list(criteria),
+            report_section="Comparison",
+            why_this_angle_matters="This angle preserves the requested deliverable shape.",
+            included_scope=["Official source evidence"],
+            expected_source_types=["official sources"],
+            search_queries=[query],
+        )
+        return SemanticPlan(
+            schema_version="codex-deepresearch.semantic-planner.v0",
+            question_class="product_market",
+            broad_question=False,
+            source="codex_semantic",
+            expected_evidence_needs=["comparative_analysis"],
+            angles=[angle],
+            intent_summary="Compare official source evidence for the requested report.",
+            bounded_tasks=[
+                {
+                    "task_id": "task_semantic_001",
+                    "angle_id": "angle_001",
+                    "query": query,
+                    "route": "text_only",
+                    "source_policy": {"decision": "allowed"},
+                    "expected_source_types": ["official sources"],
+                    "expected_visual_targets": [],
+                    "expected_artifacts": list(artifacts),
+                    "success_criteria": list(criteria),
+                    "max_sources": 3,
+                    "max_images": 0,
+                    "done_condition": done_condition,
+                }
+            ],
+            planner_mode=PLANNER_MODE_CODEX_SEMANTIC,
+        )
+
+    def semantic_internal_leakage_oracle(self) -> dict:
+        return {
+            "forbidden_angles": [],
+            "forbidden_internal_implementation_terms": [
+                "planner",
+                "subagent",
+                "oracle",
+                "budget",
+                "run_id",
+                "adapter",
+                "schema",
+                "requirement_id",
+                "local deterministic template",
+            ],
+        }
+
+    def test_semantic_substitute_check_allows_table_report_schema_deliverables(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        plan = self.semantic_internal_leakage_review_plan(
+            expected_artifacts=[
+                "comparison_table_schema",
+                "table schema",
+                "report schema",
+            ],
+            success_criteria=[
+                "Produce a comparison table schema with report columns.",
+                "Describe the report schema as a deliverable structure.",
+            ],
+        )
+
+        substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+
+        self.assertFalse(_has_forbidden_internal_leakage(plan=plan, oracle=oracle))
+        self.assertTrue(substitute["passed"], substitute)
+        self.assertEqual(
+            substitute["forbidden_internal_implementation_terms_found"],
+            [],
+        )
+
+    def test_semantic_substitute_check_blocks_internal_implementation_leakage(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        cases = (
+            (
+                "semantic planner implementation",
+                "Document semantic planner implementation work before fan-out.",
+                {"planner"},
+            ),
+            (
+                "local deterministic template",
+                "Use local deterministic template output as the research plan.",
+                {"local deterministic template"},
+            ),
+            (
+                "run_id adapter schema contract",
+                "Implement run_id propagation through the adapter schema contract.",
+                {"run_id", "adapter", "schema"},
+            ),
+            (
+                "oracle subagent implementation",
+                "Describe oracle and subagent implementation work.",
+                {"oracle", "subagent"},
+            ),
+        )
+
+        for label, query, expected_terms in cases:
+            with self.subTest(label=label):
+                plan = self.semantic_internal_leakage_review_plan(
+                    query=query,
+                    success_criteria=[query],
+                )
+                substitute = _semantic_substitute_implementation_check(
+                    plan=plan,
+                    oracle=oracle,
+                )
+
+                self.assertTrue(_has_forbidden_internal_leakage(plan=plan, oracle=oracle))
+                self.assertFalse(substitute["passed"], substitute)
+                self.assertTrue(
+                    expected_terms.issubset(
+                        set(substitute["forbidden_internal_implementation_terms_found"])
+                    ),
+                    substitute,
+                )
 
     def test_prepared_run_validation_carries_semantic_integrity_fields(self) -> None:
         run_dir = self.prepare_fixture(SEMANTIC_FIXTURES[0])
