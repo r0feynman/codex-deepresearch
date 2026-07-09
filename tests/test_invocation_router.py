@@ -72,6 +72,41 @@ class InvocationRouterTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_create_status_run_dir_retries_when_mkdir_collides(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        fixed_timestamp = "2026-07-09T10:23:34Z"
+        base_name = "dr_preflight_20260709T102334"
+        original_mkdir = Path.mkdir
+        collided = {"done": False}
+        attempted_names: list[str] = []
+
+        def mkdir_with_collision(path: Path, *args, **kwargs):
+            attempted_names.append(path.name)
+            if path.name == base_name and not collided["done"]:
+                collided["done"] = True
+                raise FileExistsError(
+                    "simulated concurrent status run directory allocation"
+                )
+            return original_mkdir(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(invocation_router, "_utc_now", return_value=fixed_timestamp),
+            mock.patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
+                side_effect=mkdir_with_collision,
+            ),
+        ):
+            run_dir = invocation_router._create_status_run_dir(runs_dir)
+
+        self.assertEqual(run_dir.name, f"{base_name}_2")
+        self.assertTrue(run_dir.is_dir())
+        self.assertEqual(
+            [name for name in attempted_names if name.startswith(base_name)],
+            [base_name, f"{base_name}_2"],
+        )
+
     def write_visual_lineage_fixture(
         self,
         run_dir: Path,

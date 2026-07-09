@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -1949,11 +1950,17 @@ def _create_unique_run_dir(runs_dir: Path, created_at: str) -> Path:
     timestamp = created_at.replace("-", "").replace(":", "").rstrip("Z")
     run_dir = runs_dir / f"dr_{timestamp}"
     suffix = 1
-    while run_dir.exists():
+    while True:
+        try:
+            run_dir.mkdir()
+            return run_dir.resolve()
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
         suffix += 1
         run_dir = runs_dir / f"dr_{timestamp}_{suffix}"
-    run_dir.mkdir()
-    return run_dir.resolve()
 
 
 def _unique_source_id(result_id: str, used_source_ids: set[str]) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -2471,11 +2472,17 @@ def _create_status_run_dir(runs_dir: Path) -> Path:
     timestamp = _utc_now().replace("-", "").replace(":", "").rstrip("Z")
     run_dir = runs_dir / f"dr_preflight_{timestamp}"
     suffix = 1
-    while run_dir.exists():
+    while True:
+        try:
+            run_dir.mkdir()
+            return run_dir.resolve()
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
         suffix += 1
         run_dir = runs_dir / f"dr_preflight_{timestamp}_{suffix}"
-    run_dir.mkdir()
-    return run_dir.resolve()
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

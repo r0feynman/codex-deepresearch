@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +17,7 @@ PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ingest_run, prepare_run as prepare_search_handoff_run, validate_artifacts
-from deepresearch.search_handoff import _search_task_from_bounded_task
+from deepresearch.search_handoff import _create_unique_run_dir, _search_task_from_bounded_task
 
 
 TEST_MANUAL_ANGLES = ("primary source discovery",)
@@ -81,6 +82,36 @@ class SearchHandoffTests(unittest.TestCase):
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_create_unique_run_dir_retries_when_mkdir_collides(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        created_at = "2026-07-09T10:23:34Z"
+        base_name = "dr_20260709T102334"
+        original_mkdir = Path.mkdir
+        collided = {"done": False}
+        attempted_names: list[str] = []
+
+        def mkdir_with_collision(path: Path, *args, **kwargs):
+            attempted_names.append(path.name)
+            if path.name == base_name and not collided["done"]:
+                collided["done"] = True
+                raise FileExistsError("simulated concurrent run directory allocation")
+            return original_mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(
+            Path,
+            "mkdir",
+            autospec=True,
+            side_effect=mkdir_with_collision,
+        ):
+            run_dir = _create_unique_run_dir(runs_dir, created_at)
+
+        self.assertEqual(run_dir.name, f"{base_name}_2")
+        self.assertTrue(run_dir.is_dir())
+        self.assertEqual(
+            [name for name in attempted_names if name.startswith(base_name)],
+            [base_name, f"{base_name}_2"],
+        )
 
     def manual_source(self) -> dict:
         return {
