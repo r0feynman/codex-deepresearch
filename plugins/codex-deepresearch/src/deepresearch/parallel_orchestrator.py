@@ -7128,6 +7128,13 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             f"prompt_hash `{release_identity['prompt_hash']}`, "
             "and do not set hidden_codex_api_call or codex_native_api_call. "
             "Do not use fixture, manual, user-provided-only, or post-hoc provider_mode values. "
+            "For every verifier vote record in verifier_votes.jsonl, include release-required fields "
+            "`id`, `claim_id`, `verifier_type`, `agent_name`, `method`, `model_or_tool`, `vote`, "
+            "`rationale`, `created_at`, numeric `confidence`, and `evidence_refs`. "
+            "`verifier_type` must be one of `text`, `visual`, `policy`, or `freshness`; use `visual` "
+            "for image/VLM-backed claims, `text` for source/quote-backed claims, `policy` for "
+            "policy/guardrail claims, and `freshness` for recency/currentness claims. "
+            "`evidence_refs` must reference only source or image IDs present in the same shard. "
         )
     # Child shard contract: the parent accepts only Evidence Schema v0 envelopes
     # validated by evidence_schema.validate_artifacts; legacy shard-specific

@@ -301,6 +301,43 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("Only direct quote_spans.quote values should remain verbatim", korean_command[-1])
         self.assertIn("Prioritize a compact shard", korean_command[-1])
 
+    def test_codex_exec_adapter_release_prompt_requires_release_valid_verifier_votes(self) -> None:
+        prepared = prepare_run(
+            question="Release prompt verifier vote contract fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-vote-contract",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+
+        command = CodexExecAdapter(project_root=ROOT).build_command(task, max_threads=8, run_dir=run_dir)
+        prompt = command[-1]
+
+        self.assertIn("For every verifier vote record in verifier_votes.jsonl", prompt)
+        for field in (
+            "id",
+            "claim_id",
+            "verifier_type",
+            "agent_name",
+            "method",
+            "model_or_tool",
+            "vote",
+            "rationale",
+            "created_at",
+            "confidence",
+            "evidence_refs",
+        ):
+            self.assertIn(f"`{field}`", prompt)
+        self.assertIn("numeric `confidence`", prompt)
+        self.assertIn("`verifier_type` must be one of `text`, `visual`, `policy`, or `freshness`", prompt)
+        self.assertIn("use `visual` for image/VLM-backed claims", prompt)
+        self.assertIn("`text` for source/quote-backed claims", prompt)
+        self.assertIn("`policy` for policy/guardrail claims", prompt)
+        self.assertIn("`freshness` for recency/currentness claims", prompt)
+        self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", prompt)
+
     def test_codex_exec_adapter_default_timeout_remains_300_seconds(self) -> None:
         adapter = CodexExecAdapter(project_root=ROOT)
 
