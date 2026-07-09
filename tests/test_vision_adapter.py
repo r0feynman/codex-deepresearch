@@ -559,6 +559,117 @@ class VisionAdapterTests(unittest.TestCase):
         minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
         self.assertEqual(minimums["vlm_images_analyzed"], 1)
 
+    def test_codex_interactive_handoff_uses_fetch_canonical_image_id(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": "img_obs_task019_001",
+                    "evidence_image_id": "img_obs_task019_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "candidate_id": "cand_checkout_001",
+                    "fetch_id": "fetch_checkout_001",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:test",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["A reused visual observation references the checkout screenshot."],
+                    "inferences": ["The stale observation id should not fork image lineage."],
+                    "visual_tasks": ["layout_review"],
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:test",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                },
+                {
+                    "id": "img_checkout_001",
+                    "evidence_image_id": "img_checkout_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "candidate_id": "cand_checkout_001",
+                    "fetch_id": "fetch_checkout_001",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:test",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["The canonical observation uses the existing checkout id."],
+                    "inferences": [],
+                    "visual_tasks": ["layout_review"],
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:test",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["duplicate_images_merged"], 1)
+        evidence = self.load_json(run_dir / "evidence.json")
+        image_ids = [image["id"] for image in evidence["images"]]
+        self.assertEqual(image_ids, ["img_checkout_001"])
+        image = evidence["images"][0]
+        self.assertEqual(image["evidence_image_id"], "img_checkout_001")
+        self.assertEqual(image["raw_visual_observation_image_id"], "img_obs_task019_001")
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(observations[0]["evidence_image_id"], "img_checkout_001")
+        self.assertEqual(observations[0]["fetch_id"], "fetch_checkout_001")
+        self.assertEqual(observations[0]["candidate_id"], "cand_checkout_001")
+        for claim in evidence["claims"]:
+            self.assertNotIn("img_obs_task019_001", claim.get("supporting_images", []))
+            for support in claim.get("visual_supports", []):
+                self.assertNotEqual(support.get("evidence_image_id"), "img_obs_task019_001")
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
     def test_codex_interactive_materializes_child_lineage_after_acquisition_overwrite(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
         self.write_codex_vlm_handoff(run_dir)
@@ -578,8 +689,18 @@ class VisionAdapterTests(unittest.TestCase):
         route = "visual_required"
         plan_id = "plan_task_001_angle_001_visual_required"
         image_hash = "sha256:" + hashlib.sha256(PNG_1X1).hexdigest()
+        original_question = "Compare checkout UI screenshots"
+        release_identity = {
+            "prompt_id": "pb-visual-plan-identity",
+            "suite_id": "public-beta-validation",
+            "prompt_hash": hashlib.sha256(original_question.encode("utf-8")).hexdigest(),
+            "execution_mode": "codex-plugin",
+            "runner_mode": "full-runner",
+            "original_question": original_question,
+        }
 
         evidence = self.load_json(run_dir / "evidence.json")
+        evidence.update(release_identity)
         evidence.setdefault("search_tasks", []).append(
             {
                 "id": task_id,
@@ -636,6 +757,10 @@ class VisionAdapterTests(unittest.TestCase):
             }
         ]
         self.write_json(run_dir / "evidence.json", evidence)
+        run_status_path = run_dir / "run_status.json"
+        run_status = self.load_json(run_status_path) if run_status_path.exists() else {}
+        run_status.update(release_identity)
+        self.write_json(run_status_path, run_status)
         self.write_jsonl(
             run_dir / "visual_observations.jsonl",
             [
@@ -731,6 +856,8 @@ class VisionAdapterTests(unittest.TestCase):
             for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        for field, value in release_identity.items():
+            self.assertEqual(post_plan[field], value)
         self.assertIn(plan_id, {item["plan_id"] for item in post_plan["tasks"]})
         self.assertIn(candidate_id, {item["candidate_id"] for item in post_candidates})
         self.assertIn(fetch_id, {item["fetch_id"] for item in post_fetches})
@@ -1759,6 +1886,108 @@ class VisionAdapterTests(unittest.TestCase):
         visual_validation = validate_visual_artifacts(run_dir=run_dir)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
 
+    def test_verification_prunes_visual_supporting_image_without_support(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+
+        ingest = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(ingest["status"], "visual_evidence_ingested")
+        evidence = self.load_json(run_dir / "evidence.json")
+        claim = next(
+            item
+            for item in evidence["claims"]
+            if item.get("claim_type") == "visual"
+            and item.get("source_image_id") == "img_checkout_001"
+        )
+        extra_image_id = "img_unlinked_current_001"
+        extra_image = dict(evidence["images"][0])
+        extra_image.update(
+            {
+                "id": extra_image_id,
+                "evidence_image_id": extra_image_id,
+                "observations": ["The unrelated visual observation is current."],
+                "source_id": "src_checkout",
+                "candidate_id": "cand_unlinked_001",
+                "fetch_id": "fetch_unlinked_001",
+            }
+        )
+        evidence["images"].append(extra_image)
+        claim["supporting_images"].append(extra_image_id)
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        extra_candidate = dict(candidates[0])
+        extra_candidate["candidate_id"] = "cand_unlinked_001"
+        candidates.append(extra_candidate)
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        extra_fetch = dict(fetches[0])
+        extra_fetch.update(
+            {
+                "fetch_id": "fetch_unlinked_001",
+                "candidate_id": "cand_unlinked_001",
+                "evidence_image_id": extra_image_id,
+            }
+        )
+        fetches.append(extra_fetch)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        extra_observation = dict(observations[0])
+        extra_observation.update(
+            {
+                "id": extra_image_id,
+                "observation_id": "obs_img_unlinked_current_001_001",
+                "evidence_image_id": extra_image_id,
+                "observations": ["The unrelated visual observation is current."],
+                "verifier_links": [],
+                "report_links": [],
+                "candidate_id": "cand_unlinked_001",
+                "fetch_id": "fetch_unlinked_001",
+            }
+        )
+        observations.append(extra_observation)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        verify = verify_claims(run=run_dir)
+        report = synthesize_report(run=run_dir)
+
+        self.assertEqual(verify["status"], "completed")
+        self.assertEqual(report["status"], "completed")
+        evidence = self.assert_valid_run(run_dir)
+        claim = next(item for item in evidence["claims"] if item["id"] == claim["id"])
+        self.assertNotIn(extra_image_id, claim["supporting_images"])
+        self.assertTrue(
+            any(
+                support.get("image_id") == "img_checkout_001"
+                for support in claim.get("visual_supports", [])
+            )
+        )
+        self.assertEqual(
+            evidence["verification_matrix"]["dangling_visual_supporting_images_pruned"],
+            1,
+        )
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
     def test_codex_interactive_rerun_prunes_stale_image_vote_refs(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
         self.write_codex_vlm_handoff(run_dir)
@@ -2462,6 +2691,12 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(image["provider_mode"], "real")
         self.assertEqual(image["provider_kind"], "vlm")
         self.assertEqual(image["provider_provenance"]["provider"], "codex-interactive")
+        self.assertEqual(image["visual_acquisition_provider_kind"], "screenshot")
+        self.assertEqual(image["visual_acquisition_provider_mode"], "real")
+        self.assertEqual(
+            image["visual_acquisition_provider_provenance"]["provider"],
+            "browser-screenshot",
+        )
         self.assertTrue(image["provider_provenance"]["codex_native_handoff"])
         self.assertTrue(image["provider_provenance"]["codex_interactive_handoff"])
         self.assertFalse(image["provider_provenance"]["hidden_codex_api_call"])

@@ -613,14 +613,18 @@ def codex_semantic_candidate_plan(
         ),
         "parsed_response_hash": parsed_response_hash,
     }
+    expected_evidence_needs = _ordered_unique(angle.evidence_need for angle in angles)
+    broad_question = _effective_broad_question(
+        question_class=question_class,
+        expected_needs=expected_evidence_needs,
+        declared_broad=candidate["question_scope"] == "broad",
+    )
     return SemanticPlan(
         schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
         question_class=question_class,
-        broad_question=candidate["question_scope"] == "broad",
+        broad_question=broad_question,
         source="codex_semantic",
-        expected_evidence_needs=_ordered_unique(
-            angle.evidence_need for angle in angles
-        ),
+        expected_evidence_needs=expected_evidence_needs,
         angles=angles,
         intent_summary=str(candidate["intent_summary"]),
         domain_entities=list(candidate["domain_entities"]),
@@ -2976,11 +2980,38 @@ def validate_semantic_candidate_plan(
                 }
             )
     scope = str(plan.get("question_scope") or "")
-    if scope == "broad" and not (5 <= len(angles) <= 8):
-        failures.append({"code": "broad_angle_count_out_of_range"})
-    if scope == "broad" and not (20 <= len(tasks) <= 40):
-        failures.append({"code": "broad_task_count_out_of_range"})
-    if scope == "narrow" and tasks and not (6 <= len(tasks) <= 12):
+    candidate_question_class = _candidate_validation_question_class(
+        plan=plan,
+        angles=angles,
+        requirements=requirements,
+    )
+    expected_needs = _candidate_validation_expected_needs(plan=plan, angles=angles)
+    effective_broad_question = _effective_broad_question(
+        question_class=candidate_question_class,
+        expected_needs=expected_needs,
+        declared_broad=scope == "broad",
+    )
+    if effective_broad_question and not (5 <= len(angles) <= 8):
+        failures.append(
+            {
+                "code": "broad_question_angle_count_out_of_range",
+                "declared_question_scope": scope,
+                "question_class": candidate_question_class,
+                "angle_count": len(angles),
+                "expected_evidence_needs": expected_needs,
+            }
+        )
+    if effective_broad_question and not (20 <= len(tasks) <= 40):
+        failures.append(
+            {
+                "code": "broad_question_task_count_out_of_range",
+                "declared_question_scope": scope,
+                "question_class": candidate_question_class,
+                "task_count": len(tasks),
+                "expected_evidence_needs": expected_needs,
+            }
+        )
+    if not effective_broad_question and scope == "narrow" and tasks and not (6 <= len(tasks) <= 12):
         failures.append({"code": "narrow_task_count_out_of_range"})
     angle_ids = {str(angle.get("angle_id") or "") for angle in angles}
     task_ids = {str(task.get("task_id") or "") for task in tasks}
@@ -3040,7 +3071,7 @@ def validate_semantic_candidate_plan(
                     }
                 )
     tasks_per_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
-    if scope == "broad":
+    if effective_broad_question:
         for angle_id in angle_ids:
             if tasks_per_angle[angle_id] < 2:
                 failures.append(
@@ -3235,10 +3266,69 @@ def validate_semantic_candidate_plan(
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "planner_mode": plan.get("planner_mode"),
         "semantic_release_eligible": bool(plan.get("semantic_release_eligible")),
+        "declared_question_scope": scope,
+        "effective_broad_question": effective_broad_question,
+        "question_class": candidate_question_class,
+        "expected_evidence_needs": expected_needs,
+        "angle_count": len(angles),
+        "task_count": len(tasks),
         "failure_count": len(failures),
         "failures": failures,
         "ok": not failures,
     }
+
+
+def _candidate_validation_question_class(
+    *,
+    plan: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+) -> str:
+    candidate_class = str(plan.get("question_class") or "")
+    if candidate_class in {
+        _CLASS_GENERAL,
+        _CLASS_TECHNICAL,
+        _CLASS_PRODUCT,
+        _CLASS_VISUAL,
+        _CLASS_POLICY,
+        _CLASS_IMPLEMENTATION,
+    }:
+        return candidate_class
+    if any(str(angle.get("route") or "text_only") != "text_only" for angle in angles):
+        return _CLASS_VISUAL
+    if any(
+        str(requirement.get("requirement_type") or "")
+        in {"source_quality", "safety_risk"}
+        for requirement in requirements
+    ):
+        return _CLASS_POLICY
+    return _CLASS_GENERAL
+
+
+def _candidate_validation_expected_needs(
+    *,
+    plan: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    expected_needs = _string_list(plan.get("expected_evidence_needs"))
+    if expected_needs:
+        return expected_needs
+    return _ordered_unique(
+        str(angle.get("evidence_need") or "")
+        for angle in angles
+        if str(angle.get("evidence_need") or "").strip()
+    )
+
+
+def _effective_broad_question(
+    *,
+    question_class: str,
+    expected_needs: Sequence[str],
+    declared_broad: bool,
+) -> bool:
+    if declared_broad:
+        return True
+    return question_class != _CLASS_GENERAL and len(set(expected_needs)) >= 4
 
 
 def _codex_semantic_raw_request(
@@ -5550,9 +5640,11 @@ def semantic_planner_validation(
     angles = _semantic_angles_from_evidence(evidence)
     if not expected_needs:
         expected_needs = _expected_needs_for_class(question_class, angles)
-    broad_question = bool(planner_metadata.get("broad_question"))
-    if not broad_question:
-        broad_question = question_class != _CLASS_GENERAL and len(set(expected_needs)) >= 4
+    broad_question = _effective_broad_question(
+        question_class=question_class,
+        expected_needs=expected_needs,
+        declared_broad=bool(planner_metadata.get("broad_question")),
+    )
 
     route_counts = Counter(str(angle.get("route") or "text_only") for angle in angles)
     evidence_need_counts = Counter(

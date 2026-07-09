@@ -2440,6 +2440,80 @@ class SemanticPlannerTests(unittest.TestCase):
         ):
             self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 3)
 
+    def test_codex_semantic_rejects_effective_broad_narrow_self_label_before_reviewer(self) -> None:
+        question = "Compare official product screenshots and chart images for onboarding workflows"
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            question_scope="narrow",
+            angle_count=4,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+
+        self.assert_invalid_adapter_response_blocked(
+            result,
+            expected_failure_codes={
+                "broad_question_angle_count_out_of_range",
+                "broad_question_task_count_out_of_range",
+            },
+        )
+        run_dir = Path(result["run_dir"])
+        self.assertEqual(adapter_request["retry_attempt"], 3)
+        self.assertFalse(
+            (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
+        )
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        candidate_validation = raw_response["adapter_response"]["candidate_validation"]
+        self.assertTrue(candidate_validation["effective_broad_question"])
+        self.assertEqual(candidate_validation["declared_question_scope"], "narrow")
+        self.assertEqual(candidate_validation["question_class"], "visual_style")
+        self.assertEqual(candidate_validation["angle_count"], 4)
+        self.assertEqual(candidate_validation["task_count"], 8)
+        self.assertEqual(
+            set(candidate_validation["expected_evidence_needs"]),
+            {
+                "primary_source",
+                "visual_example",
+                "visual_observation",
+                "official_source",
+            },
+        )
+
+    def test_validate_semantic_candidate_plan_accepts_valid_effective_broad_candidate(self) -> None:
+        question = "Compare official product screenshots and chart images for onboarding workflows"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v1",
+            "adapter_request_hash": "a" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=response["candidate_plan"],
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(validation["effective_broad_question"])
+        self.assertEqual(validation["declared_question_scope"], "broad")
+        self.assertEqual(validation["question_class"], "visual_style")
+        self.assertEqual(validation["angle_count"], 5)
+        self.assertEqual(validation["task_count"], 20)
+
     def test_codex_semantic_retries_candidate_validation_failures_until_third_attempt(self) -> None:
         question = "Compare official public health poster images for handwashing guidance"
         attempts = {"count": 0}

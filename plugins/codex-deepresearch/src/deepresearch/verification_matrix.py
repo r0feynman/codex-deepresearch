@@ -109,6 +109,10 @@ def verify_claims(
     sources_by_id = _records_by_id(evidence.get("sources", []))
     images_by_id = _records_by_id(evidence.get("images", []))
     routing_by_angle = _routing_by_angle(evidence.get("routing", []))
+    visual_image_ref_reconciliation = _reconcile_visual_claim_supporting_images(
+        claims,
+        images_by_id=images_by_id,
+    )
     route_counts = {route: 0 for route in SEARCH_ROUTES}
     all_votes: list[dict[str, Any]] = []
     claim_statuses: list[dict[str, Any]] = []
@@ -207,6 +211,12 @@ def verify_claims(
         "claims_processed": len([claim for claim in claims if isinstance(claim, Mapping)]),
         "claims_reused": reused_count,
         "claims_budget_pruned": pruned_count,
+        "dangling_visual_supporting_images_pruned": visual_image_ref_reconciliation[
+            "supporting_images_pruned"
+        ],
+        "visual_supporting_images_added": visual_image_ref_reconciliation[
+            "supporting_images_added"
+        ],
     }
 
     verifier_votes_path = run_dir / "verifier_votes.jsonl"
@@ -986,6 +996,87 @@ def _usable_visual_support_refs(
         if _image_policy_blocks(image, claim=claim):
             continue
         if not _has_image_source_or_capture(claim, image):
+            continue
+        observations = image.get("observations", [])
+        if not isinstance(observations, list):
+            continue
+        if observation_index < 0 or observation_index >= len(observations):
+            continue
+        if support.get("observation_text") != observations[observation_index]:
+            continue
+        usable.append(image_id)
+    return list(dict.fromkeys(usable))
+
+
+def _reconcile_visual_claim_supporting_images(
+    claims: Sequence[Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    pruned = 0
+    added = 0
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+
+        original_images = list(dict.fromkeys(_string_list(claim.get("supporting_images"))))
+        supported_images = _valid_visual_support_image_refs(
+            claim,
+            images_by_id=images_by_id,
+        )
+        if not supported_images:
+            continue
+        supported_image_set = set(supported_images)
+        reconciled_images = [
+            image_id for image_id in original_images if image_id in supported_image_set
+        ]
+        reconciled_image_set = set(reconciled_images)
+        for image_id in supported_images:
+            if image_id not in reconciled_image_set:
+                reconciled_images.append(image_id)
+                reconciled_image_set.add(image_id)
+
+        if reconciled_images == original_images:
+            continue
+        pruned += len(
+            [
+                image_id
+                for image_id in original_images
+                if image_id not in supported_image_set
+            ]
+        )
+        original_image_set = set(original_images)
+        added += len(
+            [image_id for image_id in supported_images if image_id not in original_image_set]
+        )
+        claim["supporting_images"] = reconciled_images
+
+    return {
+        "supporting_images_pruned": pruned,
+        "supporting_images_added": added,
+    }
+
+
+def _valid_visual_support_image_refs(
+    claim: Mapping[str, Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    supports = claim.get("visual_supports", [])
+    if not isinstance(supports, list):
+        return []
+    usable: list[str] = []
+    for support in supports:
+        if not isinstance(support, Mapping):
+            continue
+        image_id = support.get("image_id")
+        observation_index = support.get("observation_index")
+        if not isinstance(image_id, str) or not isinstance(observation_index, int):
+            continue
+        image = images_by_id.get(image_id)
+        if not isinstance(image, Mapping):
             continue
         observations = image.get("observations", [])
         if not isinstance(observations, list):

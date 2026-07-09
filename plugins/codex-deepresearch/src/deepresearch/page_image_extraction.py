@@ -14,14 +14,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .cache_keys import image_cache_key, normalize_url
 from .evidence_schema import validate_artifacts
-from .search_handoff import resolve_run_dir
+from .search_handoff import (
+    apply_release_validation_identity,
+    release_validation_identity_from_payload,
+    resolve_run_dir,
+)
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
     VISUAL_ARTIFACT_SCHEMA_VERSION,
@@ -612,8 +616,25 @@ def _candidate_records_from_raw_images(
     route = _source_route(source, routes_by_angle)
     visual_task = visual_task_by_angle.get(str(route.get("id") or source.get("angle_id") or ""))
     task_id = (
-        _string(visual_task.get("id")) if isinstance(visual_task, Mapping) else None
-    ) or _string(source.get("task_id")) or _task_id_for_angle(route.get("id"))
+        _string(source.get("semantic_plan_task_id"))
+        or _string(source.get("task_id"))
+        or (
+            _string(visual_task.get("semantic_plan_task_id"))
+            if isinstance(visual_task, Mapping)
+            else None
+        )
+        or (
+            _string(visual_task.get("task_id"))
+            if isinstance(visual_task, Mapping)
+            else None
+        )
+        or (
+            _string(visual_task.get("id"))
+            if isinstance(visual_task, Mapping)
+            else None
+        )
+        or _task_id_for_angle(route.get("id"))
+    )
     angle_id = _string(route.get("id")) or _string(source.get("angle_id")) or "angle_001"
     route_name = _string(route.get("modality")) or _string(source.get("route")) or "visual_required"
     provider_provenance = {
@@ -693,6 +714,7 @@ def _candidate_records_from_raw_images(
         if policy_decision == "blocked":
             record["candidate_status"] = "policy_blocked"
             record["rejection_reason"] = "policy_blocked"
+        _apply_page_visual_semantic_lineage(record, source, visual_task or {}, route)
         records.append(record)
     return records
 
@@ -993,6 +1015,10 @@ def _base_fetch_record(candidate: Mapping[str, Any], fetch_id: str) -> dict[str,
         "candidate_id": candidate.get("candidate_id"),
         "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
+        "semantic_plan_task_id": candidate.get("semantic_plan_task_id"),
+        "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+        "approved_delta_id": candidate.get("approved_delta_id"),
+        "visual_task_id": candidate.get("visual_task_id"),
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
         "origin": candidate.get("origin"),
@@ -1081,6 +1107,10 @@ def _evidence_image(
         "id": image_id,
         "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
+        "semantic_plan_task_id": candidate.get("semantic_plan_task_id"),
+        "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+        "approved_delta_id": candidate.get("approved_delta_id"),
+        "visual_task_id": candidate.get("visual_task_id"),
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
         "candidate_id": candidate.get("candidate_id"),
@@ -1355,18 +1385,29 @@ def _visual_search_plan(
 ) -> dict[str, Any]:
     task_keys: dict[tuple[str, str, str], dict[str, Any]] = {}
     for candidate in candidates:
+        route_name = _string(candidate.get("route")) or "visual_required"
+        if route_name == "text_only":
+            continue
+        task_id = _string(candidate.get("task_id"))
+        if not task_id:
+            continue
+        semantic_task_id = _string(candidate.get("semantic_plan_task_id")) or task_id
         key = (
             str(candidate.get("plan_id")),
-            str(candidate.get("task_id")),
+            task_id,
             str(candidate.get("angle_id")),
         )
-        task_keys.setdefault(
+        task = task_keys.setdefault(
             key,
             {
                 "plan_id": candidate.get("plan_id"),
-                "task_id": candidate.get("task_id"),
+                "task_id": task_id,
+                "semantic_plan_task_id": semantic_task_id,
+                "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+                "approved_delta_id": candidate.get("approved_delta_id"),
+                "visual_task_id": candidate.get("visual_task_id"),
                 "angle_id": candidate.get("angle_id"),
-                "route": candidate.get("route") or "visual_required",
+                "route": route_name,
                 "target_evidence_type": "page_image",
                 "query": str(evidence.get("question") or ""),
                 "providers": [PROVIDER_NAME],
@@ -1387,17 +1428,22 @@ def _visual_search_plan(
                 "state": "completed",
             },
         )
+        _apply_page_visual_semantic_lineage(task, candidate)
         result_id = candidate.get("source_search_result_id")
         if isinstance(result_id, str) and result_id:
             refs = task_keys[key]["source_search_result_ids"]
             if result_id not in refs:
                 refs.append(result_id)
-    return {
+    payload = {
         "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "created_at": created_at,
         "tasks": list(task_keys.values()),
     }
+    return apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence),
+    )
 
 
 def _visual_provider_status(
@@ -2225,6 +2271,65 @@ def _safe_id(value: str) -> str:
 
 def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
     return "plan_" + _safe_id(f"{task_id}_{angle_id}_{route}")
+
+
+def _apply_page_visual_semantic_lineage(
+    record: MutableMapping[str, Any],
+    *lineage_sources: Mapping[str, Any],
+) -> None:
+    current_task_id = _string(record.get("task_id"))
+    semantic_task_id = _first_lineage_value(
+        "semantic_plan_task_id",
+        *lineage_sources,
+        record,
+    )
+    if not semantic_task_id:
+        semantic_task_id = _string(record.get("semantic_plan_task_id")) or current_task_id
+    if not semantic_task_id:
+        semantic_task_id = _first_lineage_value("task_id", *lineage_sources)
+    if semantic_task_id:
+        if (
+            current_task_id
+            and current_task_id != semantic_task_id
+            and current_task_id.startswith("task_visual_")
+        ):
+            record.setdefault("visual_task_id", current_task_id)
+        elif not current_task_id:
+            record["task_id"] = semantic_task_id
+        record["semantic_plan_task_id"] = semantic_task_id
+        angle_id = _string(record.get("angle_id")) or _first_lineage_value(
+            "angle_id",
+            *lineage_sources,
+        )
+        route = _string(record.get("route")) or _first_lineage_value(
+            "route",
+            *lineage_sources,
+        )
+        if angle_id and route and not _string(record.get("plan_id")):
+            record["plan_id"] = _plan_id_for_visual_task(
+                task_id=_string(record.get("task_id")) or semantic_task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+    visual_task_id = _first_lineage_value("visual_task_id", *lineage_sources)
+    if visual_task_id and visual_task_id != record.get("task_id"):
+        record.setdefault("visual_task_id", visual_task_id)
+    for field in ("semantic_plan_hash", "approved_delta_id"):
+        value = _first_lineage_value(field, *lineage_sources, record)
+        if value:
+            record[field] = value
+    if record.get("semantic_plan_hash") and not _string(record.get("approved_delta_id")):
+        record["approved_delta_id"] = "base_plan"
+
+
+def _first_lineage_value(field: str, *records: Mapping[str, Any]) -> str:
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        value = _string(record.get(field))
+        if value:
+            return value
+    return ""
 
 
 def _dedupe(values: Sequence[str]) -> list[str]:

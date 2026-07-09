@@ -23,6 +23,7 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     DEFAULT_MANUAL_TRACE_AUDIT_MANIFEST,
     DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
     DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+    SEMANTIC_RELEASE_REPORT_FILENAME,
     SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME,
     EXTERNAL_GATE_REQUIREMENTS,
     PublicBetaValidationError,
@@ -41,6 +42,10 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     run_semantic_anti_overfit_scan,
     run_semantic_release_validation,
     semantic_manifest_execution_gate,
+    _semantic_angle_ids,
+    _valid_oracle_requirement_map,
+    _valid_requirement_coverage_map,
+    _valid_semantic_angles,
 )
 from deepresearch.semantic_planner import (  # noqa: E402
     SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
@@ -828,6 +833,26 @@ class PublicBetaValidationTests(unittest.TestCase):
             payload["manual_trace_audit_gate"]["failures"],
         )
 
+    def test_semantic_release_validation_writes_standalone_report_artifact(self) -> None:
+        with self.assertRaises(PublicBetaValidationError) as raised:
+            run_semantic_release_validation(
+                runs_dir=self.temp_dir(),
+                suite_id="semantic-release-standalone-report",
+                clean=True,
+                manual_audit_manifest=None,
+            )
+
+        payload = self.read_json(raised.exception.results_path)
+        report_path = Path(payload["artifacts"]["semantic_release_report"])
+        report = self.read_json(report_path)
+
+        self.assertEqual(report_path.name, SEMANTIC_RELEASE_REPORT_FILENAME)
+        self.assertTrue(report_path.is_file())
+        self.assertEqual(report["artifact_type"], "semantic_release_report")
+        self.assertEqual(report["report_path"], str(report_path.resolve()))
+        self.assertFalse(report["valid"])
+        self.assertEqual(payload["semantic_release_report"], report)
+
     def test_semantic_release_validation_cli_reports_not_ready_without_artifacts(self) -> None:
         runs_dir = self.temp_dir()
 
@@ -1087,6 +1112,17 @@ class PublicBetaValidationTests(unittest.TestCase):
             first["artifact_hashes"]["semantic_materialization_diff"],
             r"^[0-9a-f]{64}$",
         )
+        visual_run = next(
+            run
+            for run in report["runs"]
+            if run["route"] in {"visual_required", "visual_optional"}
+        )
+        verifier_votes_path = Path(visual_run["artifact_paths"]["verifier_votes"])
+        self.assertIn("verifier_votes", visual_run["required_artifacts"])
+        self.assertEqual(
+            visual_run["artifact_hashes"]["verifier_votes"],
+            hashlib.sha256(verifier_votes_path.read_bytes()).hexdigest(),
+        )
 
     def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -1184,6 +1220,75 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertFalse(
             any(failure.get("check") == "manifest_oracle_binding" for failure in failures),
             failures,
+        )
+
+    def test_semantic_artifact_integrity_accepts_korean_particle_overlap(self) -> None:
+        original_question = "한국 공공보건 포스터 이미지의 손씻기 지침 차이를 공식 출처와 함께 분석해줘."
+        angles = [
+            {
+                "angle_id": "angle_004",
+                "title": "대상 상황별 지침 차이",
+                "research_question": (
+                    "일상 감염병 예방, 식중독 예방, 학교 또는 아동 대상, "
+                    "의료기관 대상 포스터는 손씻기 필요 시점과 강조점이 어떻게 다른가?"
+                ),
+                "evidence_need": "official poster comparison",
+                "expected_artifacts": ["시점 비교 매트릭스"],
+                "success_criteria": ["공식 포스터별 차이를 직접 비교한다."],
+                "report_section": "상황별 차이",
+            },
+            {
+                "angle_id": "angle_005",
+                "title": "시기와 현재성 검토",
+                "research_question": (
+                    "포스터의 게시 또는 배포 시기에 따라 손씻기 안내 표현이 달라졌는지, "
+                    "현재 공식 지침과 비교해 오래된 표현은 없는가?"
+                ),
+                "evidence_need": "official freshness comparison",
+                "expected_artifacts": ["포스터별 날짜 메타데이터 표"],
+                "success_criteria": ["공식 현재 지침과 포스터 문구를 대조한다."],
+                "report_section": "현재성",
+            },
+        ]
+        requirement_coverage_map = [
+            {
+                "requirement_id": "req_001",
+                "coverage_status": "covered",
+                "covered_by_angle_ids": ["angle_004"],
+            },
+            {
+                "requirement_id": "req_002",
+                "coverage_status": "covered",
+                "covered_by_angle_ids": ["angle_005"],
+            },
+        ]
+        oracle_requirement_map = [
+            {
+                "requirement_id": "req_001",
+                "requirement_text": "Compare Korean public health poster guidance by situation.",
+                "covered_by_angle_ids": ["angle_004"],
+            },
+            {
+                "requirement_id": "req_002",
+                "requirement_text": "Check official current guidance against poster publication timing.",
+                "covered_by_angle_ids": ["angle_005"],
+            },
+        ]
+
+        self.assertTrue(_valid_semantic_angles(angles, original_question=original_question))
+        angle_ids = _semantic_angle_ids(angles)
+        self.assertTrue(
+            _valid_requirement_coverage_map(
+                requirement_coverage_map,
+                plan_angle_ids=angle_ids,
+            )
+        )
+        self.assertTrue(
+            _valid_oracle_requirement_map(
+                oracle_requirement_map,
+                plan_angle_ids=angle_ids,
+                requirement_coverage_map=requirement_coverage_map,
+            )
         )
 
     def test_semantic_release_checks_require_manifest_oracle_binding(self) -> None:
@@ -1961,6 +2066,101 @@ class PublicBetaValidationTests(unittest.TestCase):
                     artifact="semantic_plan",
                     field=expected_field,
                 )
+
+    def test_semantic_angles_accept_korean_particle_overlap(self) -> None:
+        original_question = (
+            "전시 포스터 이미지 저작권 배포 조건 사용 허가 출처 확인"
+        )
+        angles = [
+            {
+                "angle_id": "angle_001",
+                "title": "포스터는 저작권의 표시 근거",
+                "research_question": (
+                    "포스터의 저작권은 어떤 공식 근거를 요구하는가"
+                ),
+                "evidence_need": "primary_source",
+                "expected_artifacts": ["공식 출처 목록"],
+                "success_criteria": ["근거 문구를 출처와 연결한다."],
+                "report_section": "저작권 근거",
+            },
+            {
+                "angle_id": "angle_002",
+                "title": "이미지의 배포 조건을 사용 허가와 비교",
+                "research_question": (
+                    "이미지에는 배포의 조건은 어떤 허가 출처로 확인되는가"
+                ),
+                "evidence_need": "comparative_analysis",
+                "expected_artifacts": ["조건 비교표"],
+                "success_criteria": ["조건 차이를 출처별로 분리한다."],
+                "report_section": "배포 조건",
+            },
+        ]
+
+        self.assertTrue(
+            _valid_semantic_angles(angles, original_question=original_question)
+        )
+
+    def test_semantic_angles_reject_shallow_korean_particle_only_overlap(self) -> None:
+        original_question = (
+            "전시 포스터 이미지 저작권 배포 조건 사용 허가 출처 확인"
+        )
+        angles = [
+            {
+                "angle_id": "angle_001",
+                "title": "포스터는 이미지의",
+                "research_question": "포스터의 이미지는 무엇인가",
+                "evidence_need": "primary_source",
+                "expected_artifacts": ["출처"],
+                "success_criteria": ["출처를 찾는다."],
+                "report_section": "포스터",
+            },
+            {
+                "angle_id": "angle_002",
+                "title": "배포는 조건의",
+                "research_question": "배포의 조건은 무엇인가",
+                "evidence_need": "comparative_analysis",
+                "expected_artifacts": ["출처"],
+                "success_criteria": ["조건을 찾는다."],
+                "report_section": "배포",
+            },
+        ]
+
+        self.assertFalse(
+            _valid_semantic_angles(angles, original_question=original_question)
+        )
+
+    def test_semantic_angles_reject_generic_text_after_korean_normalization(self) -> None:
+        original_question = (
+            "전시 포스터 이미지 저작권 배포 조건 사용 허가 출처 확인"
+        )
+        angles = [
+            {
+                "angle_id": "angle_001",
+                "title": "포스터는 저작권의 표시 근거",
+                "research_question": (
+                    "포스터의 저작권은 어떤 공식 근거를 요구하는가"
+                ),
+                "evidence_need": "primary_source",
+                "expected_artifacts": ["공식 출처 목록"],
+                "success_criteria": ["근거 문구를 출처와 연결한다."],
+                "report_section": "저작권 근거",
+            },
+            {
+                "angle_id": "angle_002",
+                "title": "Primary source discovery",
+                "research_question": (
+                    "Find authoritative sources that directly answer the research question"
+                ),
+                "evidence_need": "primary_source",
+                "expected_artifacts": ["source list"],
+                "success_criteria": ["Find one source."],
+                "report_section": "Primary Sources",
+            },
+        ]
+
+        self.assertFalse(
+            _valid_semantic_angles(angles, original_question=original_question)
+        )
 
     def test_codex_semantic_text_run_rejects_generic_one_angle_plan(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -3101,6 +3301,15 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "passed", result)
+        self.assertTrue(result["semantic_release_checks"]["valid"], result)
+        self.assertTrue(
+            result["semantic_release_checks"]["semantic_materialization_diff_valid"],
+            result,
+        )
+        self.assertTrue(
+            result["semantic_release_checks"]["computed_materialization_diff_valid"],
+            result,
+        )
         self.assertTrue(result["visual_release_checks"]["valid"], result)
         self.assertGreaterEqual(
             result["visual_release_checks"]["counts"]["real_candidates"],
@@ -3138,6 +3347,24 @@ class PublicBetaValidationTests(unittest.TestCase):
                 )
                 self.assertIsInstance(timestamp, str)
                 self.assertTrue(timestamp.endswith("Z"), timestamp)
+        visual_plan = self.read_json(run_dir / "visual_search_plan.json")
+        expected_semantic_task_ids = {
+            task["task_id"]
+            for task in self.semantic_bounded_tasks(prompt)
+            if task["route"] != "text_only"
+        }
+        self.assertEqual(
+            {task["task_id"] for task in visual_plan["tasks"]},
+            expected_semantic_task_ids,
+        )
+        for task in visual_plan["tasks"]:
+            self.assertEqual(task["semantic_plan_task_id"], task["task_id"])
+            self.assertFalse(task["task_id"].startswith("task_visual_"), task)
+            self.assertRegex(task["semantic_plan_hash"], r"^[0-9a-f]{64}$")
+            self.assertEqual(task["approved_delta_id"], "base_plan")
+        computed_diff = result["semantic_release_checks"]["computed_materialization_diff"]
+        self.assertTrue(computed_diff["valid"], computed_diff)
+        self.assertFalse(computed_diff.get("failures"), computed_diff)
 
     def test_visual_gate_accepts_preserved_raw_child_lineage_with_parent_links(self) -> None:
         _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
@@ -3457,8 +3684,8 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertTrue(result["visual_release_checks"]["valid"])
 
-    def test_visual_gate_rejects_policy_denied_surplus_records(self) -> None:
-        manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
+    def test_visual_gate_ignores_policy_denied_surplus_records(self) -> None:
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = next(
             prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
         )
@@ -3482,12 +3709,75 @@ class PublicBetaValidationTests(unittest.TestCase):
             suite_id="public-beta-validation",
         )
 
+        self.assertEqual(result["status"], "passed", result)
+        self.assertTrue(result["visual_release_checks"]["valid"], result)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_candidates"], 10)
+
+    def test_visual_gate_rejects_policy_denied_release_candidate_conflict(self) -> None:
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "policy-denied-release-conflict",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        denied_candidate = dict(candidates[0])
+        denied_candidate["policy_decision"] = "disallowed"
+        denied_candidate["candidate_status"] = "policy_blocked"
+        candidates.append(denied_candidate)
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
         self.assertEqual(result["status"], "failed")
         checks = {
             failure["check"]
             for failure in result["visual_release_checks"]["failures"]
         }
         self.assertIn("policy_allows_release_counting", checks)
+
+    def test_visual_gate_excludes_policy_denied_records_from_release_counts(self) -> None:
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "policy-denied-count-exclusion",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        candidates[-1]["policy_decision"] = "disallowed"
+        candidates[-1]["candidate_status"] = "policy_blocked"
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        checks = {
+            failure["check"]
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("at_least_10_real_image_centric_candidates", checks)
+        self.assertNotIn("policy_allows_release_counting", checks)
+        counts = result["visual_release_checks"]["counts"]
+        self.assertEqual(counts["real_candidates"], 9)
 
     def test_visual_run_rejects_hidden_codex_interactive_api_assumption(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -3518,6 +3808,32 @@ class PublicBetaValidationTests(unittest.TestCase):
             for failure in result["visual_release_checks"]["failures"]
         }
         self.assertIn("codex_interactive_hidden_api_rejected", checks)
+
+    def test_visual_run_allows_explicit_false_hidden_api_markers(self) -> None:
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "false-hidden-vlm-api",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["hidden_codex_api_call"] = False
+        observations[0]["provider_provenance"]["hidden_codex_api_call"] = False
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "passed", result)
+        self.assertTrue(result["visual_release_checks"]["valid"], result)
 
     def test_visual_observation_must_keep_handoff_flags_with_report_links(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)

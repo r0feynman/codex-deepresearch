@@ -692,6 +692,7 @@ def run_semantic_release_validation(
         shutil.rmtree(suite_dir)
     suite_dir.mkdir(parents=True)
     results_path = suite_dir / SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME
+    semantic_report_path = suite_dir / SEMANTIC_RELEASE_REPORT_FILENAME
     generated_at = _utc_now()
 
     regression_manifest = load_semantic_regression_manifest(semantic_regression_manifest)
@@ -747,6 +748,18 @@ def run_semantic_release_validation(
         manual_audit_manifest,
         required=True,
     )
+    evaluated_runs = [
+        *regression_evaluated,
+        *public_beta_evaluated,
+        *holdout_evaluated,
+    ]
+    semantic_release_report = _semantic_release_report(
+        evaluated_runs=evaluated_runs,
+        report_path=semantic_report_path,
+        generated_at=generated_at,
+        manual_audit_manifest=manual_audit_manifest,
+        require_manual_trace_audits=True,
+    )
     holdout_selector_ready = holdout_manifest.get("release_gate_ready") is True
     valid = (
         all(gate.get("valid") is True for gate in suite_gates.values())
@@ -793,6 +806,7 @@ def run_semantic_release_validation(
         "semantic_suite_gates": suite_gates,
         "anti_overfit_scan": anti_overfit_scan,
         "manual_trace_audit_gate": manual_trace_audit_gate,
+        "semantic_release_report": semantic_release_report,
         "runs": {
             "semantic_regression_30": regression_evaluated,
             "public_beta_semantic_20": public_beta_evaluated,
@@ -806,8 +820,10 @@ def run_semantic_release_validation(
         ),
         "artifacts": {
             "results": str(results_path.resolve()),
+            "semantic_release_report": str(semantic_report_path.resolve()),
         },
     }
+    _write_json(semantic_report_path, semantic_release_report)
     _write_json(results_path, results)
     if not valid:
         raise PublicBetaValidationError(
@@ -3173,6 +3189,7 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
             "run_trace",
             "report",
             "report_status",
+            "verifier_votes",
         }
     }
     semantic_checks = run.get("semantic_release_checks")
@@ -3205,6 +3222,7 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
                 "visual_candidates",
                 "image_fetch_status",
                 "visual_observations",
+                "verifier_votes",
             }
         )
     missing_required = sorted(
@@ -3243,6 +3261,7 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "holdout_or_regression_class": run.get("holdout_or_regression_class")
         or "public_beta_semantic_manifest",
+        "required_artifacts": sorted(required_names),
         "artifact_paths": dict(sorted(artifact_paths.items())),
         "artifact_hashes": artifact_hashes,
         "failure_category": run.get("failure_category"),
@@ -5049,11 +5068,60 @@ def _semantic_angle_ids(value: Any) -> set[str]:
 
 
 def _semantic_token_list(text: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
-        if len(token) > 2
-    ]
+    tokens: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower()):
+        if _semantic_token_has_hangul(token):
+            normalized = _normalize_korean_semantic_token(token)
+            if len(normalized) >= 2:
+                tokens.append(normalized)
+        elif len(token) > 2:
+            tokens.append(token)
+    return tokens
+
+
+def _semantic_token_has_hangul(token: str) -> bool:
+    return any("\uac00" <= char <= "\ud7a3" for char in token)
+
+
+KOREAN_SEMANTIC_PARTICLE_SUFFIXES = (
+    "께서는",
+    "에서는",
+    "에게는",
+    "으로는",
+    "로는",
+    "에는",
+    "과는",
+    "와는",
+    "에서",
+    "에게",
+    "께서",
+    "으로",
+    "로",
+    "부터",
+    "까지",
+    "처럼",
+    "보다",
+    "마다",
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "의",
+    "와",
+    "과",
+    "도",
+    "만",
+    "에",
+)
+
+
+def _normalize_korean_semantic_token(token: str) -> str:
+    for suffix in KOREAN_SEMANTIC_PARTICLE_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 2:
+            return token[: -len(suffix)]
+    return token
 
 
 def _semantic_meaningful_token_list(text: str) -> list[str]:
@@ -5878,7 +5946,14 @@ def _visual_release_checks(
                 ),
             }
         )
-    if _policy_blocks_release(candidates, fetches, observations):
+    if _policy_blocks_release(
+        candidates=candidates,
+        fetches=fetches,
+        observations=observations,
+        release_candidates=real_candidates,
+        release_fetches=real_fetches,
+        release_observations=real_observations,
+    ):
         failures.append(
             {
                 "check": "policy_allows_release_counting",
@@ -6568,22 +6643,90 @@ def _has_codex_interactive_vlm_provider(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+_RELEASE_BLOCKING_POLICY_DECISIONS = {
+    "blocked",
+    "manual_review",
+    "disallowed",
+    "restricted",
+}
+
+
 def _policy_blocks_release(
+    *,
     candidates: Sequence[Mapping[str, Any]],
     fetches: Sequence[Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
+    release_candidates: Sequence[Mapping[str, Any]],
+    release_fetches: Sequence[Mapping[str, Any]],
+    release_observations: Sequence[Mapping[str, Any]],
 ) -> bool:
-    for record in list(candidates) + list(fetches) + list(observations):
-        if record.get("provider_mode") != "real":
+    release_candidate_ids = _release_record_ids(release_candidates, "candidate_id")
+    release_fetch_ids = _release_record_ids(release_fetches, "fetch_id")
+    release_image_ids = _release_record_ids(release_observations, "evidence_image_id")
+    release_observation_ids = _release_record_ids(release_observations, "observation_id")
+
+    for record in candidates:
+        if not _has_release_blocking_policy(record):
             continue
-        if record.get("policy_decision") in {
-            "blocked",
-            "manual_review",
-            "disallowed",
-            "restricted",
-        }:
+        if _string_record_field(record, "candidate_id") in release_candidate_ids:
+            return True
+    for record in fetches:
+        if not _has_release_blocking_policy(record):
+            continue
+        if _string_record_field(record, "fetch_id") in release_fetch_ids:
+            return True
+        if _string_record_field(record, "candidate_id") in release_candidate_ids:
+            return True
+        if _string_record_field(record, "evidence_image_id") in release_image_ids:
+            return True
+    for record in observations:
+        if not _has_release_blocking_policy(record):
+            continue
+        if _string_record_field(record, "observation_id") in release_observation_ids:
+            return True
+        if _string_record_field(record, "evidence_image_id") in release_image_ids:
+            return True
+        if _string_record_field(record, "candidate_id") in release_candidate_ids:
+            return True
+        if _string_record_field(record, "linked_candidate_id") in release_candidate_ids:
+            return True
+        if _string_record_field(record, "fetch_id") in release_fetch_ids:
+            return True
+        if _string_record_field(record, "linked_fetch_id") in release_fetch_ids:
             return True
     return False
+
+
+def _has_release_blocking_policy(record: Mapping[str, Any]) -> bool:
+    if record.get("provider_mode") != "real":
+        return False
+    if record.get("policy_decision") in _RELEASE_BLOCKING_POLICY_DECISIONS:
+        return True
+    return any(
+        record.get(status_field) == "policy_blocked"
+        for status_field in (
+            "analysis_status",
+            "candidate_status",
+            "fetch_status",
+            "observation_status",
+        )
+    )
+
+
+def _release_record_ids(
+    records: Sequence[Mapping[str, Any]],
+    field: str,
+) -> set[str]:
+    return {
+        value
+        for value in (_string_record_field(record, field) for record in records)
+        if value
+    }
+
+
+def _string_record_field(record: Mapping[str, Any], field: str) -> str:
+    value = record.get(field)
+    return value if isinstance(value, str) and value else ""
 
 
 def _report_cited_visual_claims(
@@ -7025,10 +7168,13 @@ def _handoff_artifact_mentions(
 
 
 def _claims_hidden_codex_api(record: Mapping[str, Any]) -> bool:
-    return bool(
-        "hidden_codex_api_call" in record
-        or "codex_native_api_call" in record
-        or "hidden_api_call" in record
+    return any(
+        record.get(field) is True
+        for field in (
+            "hidden_codex_api_call",
+            "codex_native_api_call",
+            "hidden_api_call",
+        )
     )
 
 

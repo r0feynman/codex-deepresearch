@@ -698,7 +698,11 @@ def _validate_search_results(
                     "dangling_reference",
                     f"search result references unknown routed angle '{angle_id}'",
                 )
-            elif route is not None and expected_route != route:
+            elif (
+                route is not None
+                and expected_route != route
+                and not _uses_valid_semantic_task_route(record, route)
+            ):
                 collector.add(
                     f"{path}.route",
                     "route_mismatch",
@@ -731,6 +735,15 @@ def _validate_search_results(
                 "invalid_type",
                 "raw_provider_metadata must be an object",
             )
+
+
+def _uses_valid_semantic_task_route(record: Mapping[str, Any], route: str) -> bool:
+    semantic_task_route = record.get("semantic_task_route")
+    return (
+        isinstance(semantic_task_route, str)
+        and semantic_task_route.strip() in SEARCH_ROUTES
+        and semantic_task_route.strip() == route
+    )
 
 
 def _validate_visual_observations(

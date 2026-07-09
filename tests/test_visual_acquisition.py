@@ -27,6 +27,7 @@ from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
 from deepresearch.visual_acquisition import (  # noqa: E402
     _BraveImageSearchResponse,
     _merge_visual_observation_records,
+    _release_visible_visual_records_if_needed,
 )
 from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
 
@@ -751,6 +752,8 @@ class VisualAcquisitionTests(unittest.TestCase):
             question="Text-only visual acquisition gating",
             runs_dir=self.temp_runs_dir(),
             route="text_only",
+            prompt_id="text-only-visual-identity",
+            suite_id="issue-133-suite",
         )
         run_dir = Path(prepared["run_dir"])
 
@@ -766,9 +769,75 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertFalse(result["external_vlm_call"])
         self.assertEqual(self.read_jsonl(run_dir / "visual_candidates.jsonl"), [])
         self.assertEqual(self.read_jsonl(run_dir / "visual_observations.jsonl"), [])
+        plan = self.read_json(run_dir / "visual_search_plan.json")
+        self.assertEqual(plan["prompt_id"], "text-only-visual-identity")
+        self.assertEqual(plan["suite_id"], "issue-133-suite")
+        self.assertEqual(plan["execution_mode"], "codex-plugin")
+        self.assertEqual(plan["runner_mode"], "full-runner")
+        self.assertEqual(plan["tasks"], [])
         evidence = self.read_json(run_dir / "evidence.json")
         self.assertEqual(evidence["images"], [])
         self.assertEqual(evidence["visual_acquisition"]["status"], "no_visual_tasks")
+
+    def test_release_visible_filter_handles_null_task_id_and_drops_text_only(self) -> None:
+        prepared = prepare_run(
+            question="Release visual sidecar filtering",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="sem-reg-null-task-id",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-plan.v0",
+                "semantic_plan": {
+                    "bounded_tasks": [
+                        {
+                            "id": None,
+                            "task_id": "task_001",
+                            "angle_id": "angle_001",
+                            "route": "visual_required",
+                            "max_images": 1,
+                        },
+                        {
+                            "id": None,
+                            "task_id": "task_017",
+                            "angle_id": "angle_005",
+                            "route": "text_only",
+                            "max_images": 0,
+                        },
+                    ]
+                },
+            },
+        )
+        records = [
+            {
+                "candidate_id": "cand_task_001",
+                "task_id": "task_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "candidate_status": "fetched",
+                "policy_decision": "allowed",
+            },
+            {
+                "candidate_id": "cand_task_017",
+                "task_id": "task_017",
+                "angle_id": "angle_005",
+                "route": "text_only",
+                "candidate_status": "budget_pruned",
+                "policy_decision": "budget_pruned",
+            },
+        ]
+
+        filtered = _release_visible_visual_records_if_needed(run_dir, evidence, records)
+
+        self.assertEqual([record["task_id"] for record in filtered], ["task_001"])
+        self.assertEqual(filtered[0]["semantic_plan_task_id"], "task_001")
+        self.assertTrue(filtered[0]["semantic_plan_hash"])
+        self.assertEqual(filtered[0]["approved_delta_id"], "base_plan")
 
     def test_real_brave_image_search_provider_normalizes_candidates(self) -> None:
         prepared = prepare_run(
@@ -1155,6 +1224,305 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertEqual(len(angle_002_evidence_images), 1)
         self.assertEqual(angle_002_evidence_images[0]["task_id"], "task_visual_002")
         self.assertEqual(angle_002_evidence_images[0]["angle_id"], "angle_002")
+
+    def test_child_discovered_provider_preserves_semantic_visual_plan_identity_and_lineage(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Find release semantic visual lineage evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="sem-reg-visual-lineage",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        semantic_hash = "a" * 64
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.visual-tasks.v0",
+                "run_id": run_dir.name,
+                "tasks": [
+                    {
+                        "id": "task_visual_001",
+                        "task_id": "task_visual_001",
+                        "semantic_plan_task_id": "task_001",
+                        "semantic_plan_hash": semantic_hash,
+                        "approved_delta_id": "base_plan",
+                        "angle_id": "angle_001",
+                        "route": "visual_required",
+                        "query": "official visual evidence for semantic task one",
+                        "visual_tasks": ["image_claim_alignment"],
+                        "max_images": 2,
+                    }
+                ],
+            },
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["routing"] = [
+            {
+                "id": "angle_001",
+                "label": "Primary visual angle",
+                "modality": "visual_required",
+                "visual_tasks": ["image_claim_alignment"],
+                "max_images": 2,
+            }
+        ]
+        source = {
+            "id": "src_semantic_visual_lineage",
+            "type": "web",
+            "url": "https://example.com/semantic-visual-lineage",
+            "title": "Semantic visual lineage source",
+            "published_at": None,
+            "accessed_at": "2026-07-09T00:00:00Z",
+            "quality": "primary",
+            "retrieval_status": "fetched",
+            "local_artifact_path": "sources/semantic-visual-lineage.html",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "search_result_id": "search_semantic_visual_lineage",
+            "task_id": "task_001",
+            "semantic_plan_task_id": "task_001",
+            "semantic_plan_hash": semantic_hash,
+            "approved_delta_id": "base_plan",
+            "angle_id": "angle_001",
+            "route": "visual_required",
+        }
+        evidence["sources"] = [source]
+        allowed_image = {
+            "id": "img_semantic_visual_lineage",
+            "source_id": source["id"],
+            "origin": "image_search",
+            "page_url": source["url"],
+            "image_url": "https://images.example.com/semantic-visual-lineage.png",
+            "local_artifact_path": "evidence_shards/task_001/image_001.png",
+            "mime_type": "image/png",
+            "width": 640,
+            "height": 480,
+            "observations": [],
+            "inferences": [],
+            "visual_tasks": ["image_claim_alignment"],
+            "analysis_provider": "codex-interactive",
+            "analysis_status": "skipped",
+            "policy_flags": [],
+            "caveats": [],
+            "source_search_result_id": source["search_result_id"],
+            "task_id": "task_001",
+            "semantic_plan_task_id": "task_001",
+            "semantic_plan_hash": semantic_hash,
+            "approved_delta_id": "base_plan",
+            "angle_id": "angle_001",
+            "route": "visual_required",
+        }
+        blocked_image = dict(allowed_image)
+        blocked_image.update(
+            {
+                "id": "img_policy_blocked_release_candidate",
+                "image_url": "https://images.example.com/policy-blocked.png",
+                "analysis_status": "policy_blocked",
+                "policy_decision": "blocked",
+                "policy_flags": ["license_policy_blocked"],
+            }
+        )
+        evidence["images"] = [allowed_image, blocked_image]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "merge_status.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "status": "completed",
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "real_child_execution": True,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "accepted_shards": 1,
+                },
+            },
+        )
+
+        def fake_child_fetch(url: str) -> FetchResponse:
+            return FetchResponse(
+                content=(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                    b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                ),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["child-discovered-image-url"],
+            child_image_transport=fake_child_fetch,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        plan = self.read_json(run_dir / "visual_search_plan.json")
+        self.assertEqual(plan["prompt_id"], "sem-reg-visual-lineage")
+        self.assertEqual(plan["suite_id"], "issue-133-suite")
+        self.assertEqual(plan["execution_mode"], "codex-plugin")
+        self.assertEqual(plan["runner_mode"], "full-runner")
+        self.assertEqual(len(plan["tasks"]), 1)
+        self.assertEqual(plan["tasks"][0]["task_id"], "task_001")
+        self.assertEqual(plan["tasks"][0]["semantic_plan_task_id"], "task_001")
+        self.assertEqual(plan["tasks"][0]["semantic_plan_hash"], semantic_hash)
+        self.assertEqual(plan["tasks"][0]["approved_delta_id"], "base_plan")
+
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        self.assertEqual(
+            {candidate["evidence_image_id"] for candidate in candidates},
+            {"img_semantic_visual_lineage"},
+        )
+        self.assertTrue(
+            all(candidate.get("policy_decision") == "allowed" for candidate in candidates),
+            candidates,
+        )
+        candidate = candidates[0]
+        self.assertEqual(candidate["task_id"], "task_001")
+        self.assertEqual(candidate["semantic_plan_task_id"], "task_001")
+        self.assertEqual(candidate["semantic_plan_hash"], semantic_hash)
+        self.assertEqual(candidate["approved_delta_id"], "base_plan")
+        fetches = self.read_jsonl(run_dir / "image_fetch_status.jsonl")
+        self.assertEqual(
+            {fetch["evidence_image_id"] for fetch in fetches},
+            {"img_semantic_visual_lineage"},
+        )
+        self.assertTrue(
+            all(fetch.get("policy_decision") == "allowed" for fetch in fetches),
+            fetches,
+        )
+        fetch = fetches[0]
+        self.assertEqual(fetch["task_id"], "task_001")
+        self.assertEqual(fetch["semantic_plan_task_id"], "task_001")
+        self.assertEqual(fetch["semantic_plan_hash"], semantic_hash)
+        self.assertEqual(fetch["approved_delta_id"], "base_plan")
+
+    def test_child_discovered_provider_registers_synthetic_visual_plan_tasks(self) -> None:
+        prepared = prepare_run(
+            question="Find generated visual task lineage evidence",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            angles=[
+                "Visual angle one",
+                "Visual angle two",
+                "Visual angle three",
+                "Visual angle four",
+                "Visual angle five",
+                "Visual angle six",
+            ],
+        )
+        run_dir = Path(prepared["run_dir"])
+        visual_tasks = self.read_json(run_dir / "visual_tasks.json")
+        visual_tasks["tasks"] = [
+            task
+            for task in visual_tasks["tasks"]
+            if task.get("id") not in {"task_visual_005", "task_visual_006"}
+        ]
+        self.write_json(run_dir / "visual_tasks.json", visual_tasks)
+        evidence = self.read_json(run_dir / "evidence.json")
+        source = {
+            "id": "src_synthetic_visual_tasks",
+            "type": "web",
+            "url": "https://example.com/synthetic-visual-tasks",
+            "title": "Synthetic Visual Task Source",
+            "published_at": None,
+            "accessed_at": "2026-07-09T00:00:00Z",
+            "quality": "primary",
+            "retrieval_status": "fetched",
+            "local_artifact_path": "sources/synthetic-visual-tasks.html",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "angle_id": "angle_001",
+            "route": "visual_required",
+            "search_result_id": "search_synthetic_visual_tasks",
+        }
+        evidence["sources"] = [source]
+        evidence["images"] = [
+            {
+                "id": f"img_child_synthetic_angle_{index:03d}",
+                "source_id": source["id"],
+                "origin": "image_search",
+                "page_url": source["url"],
+                "image_url": f"https://images.example.com/synthetic-angle-{index}.png",
+                "local_artifact_path": f"evidence_shards/task_research_{index:03d}/image_001.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 480,
+                "observations": [],
+                "inferences": [],
+                "visual_tasks": ["image_claim_alignment"],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "skipped",
+                "policy_flags": [],
+                "caveats": [],
+                "angle_id": f"angle_{index:03d}",
+                "route": "visual_required",
+                "source_search_result_id": source["search_result_id"],
+            }
+            for index in (5, 6)
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "merge_status.json",
+            {
+                "schema_version": "codex-deepresearch.parallel-orchestration.v0",
+                "status": "completed",
+                "evidence_source": {
+                    "type": "real_child_execution",
+                    "real_child_execution": True,
+                    "fixture_only": False,
+                    "manual_handoff": False,
+                    "accepted_shards": 2,
+                },
+            },
+        )
+
+        def fake_child_fetch(url: str) -> FetchResponse:
+            return FetchResponse(
+                content=(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                    b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                    + url.rsplit("-", 1)[-1].encode("ascii")
+                ),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = acquire_visual_candidates(
+            run=run_dir,
+            providers=["child-discovered-image-url"],
+            child_image_transport=fake_child_fetch,
+        )
+
+        self.assertEqual(result["status"], "real_image_search_candidates_collected")
+        candidates = self.read_jsonl(run_dir / "visual_candidates.jsonl")
+        synthetic_task_ids = {"task_visual_005", "task_visual_006"}
+        self.assertEqual({candidate["task_id"] for candidate in candidates}, synthetic_task_ids)
+
+        plan = self.read_json(run_dir / "visual_search_plan.json")
+        plan_task_ids = {task["task_id"] for task in plan["tasks"]}
+        self.assertTrue(synthetic_task_ids <= plan_task_ids)
+        registered_task_ids = {
+            task["id"] for task in self.read_json(run_dir / "visual_tasks.json")["tasks"]
+        }
+        self.assertTrue(synthetic_task_ids <= registered_task_ids)
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(
+            visual_validation.valid,
+            [error.to_dict() for error in visual_validation.errors],
+        )
 
     def test_page_extractor_remote_html_fallback_covers_failed_child_image_urls(
         self,

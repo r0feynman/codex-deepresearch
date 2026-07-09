@@ -32,9 +32,13 @@ from deepresearch import (  # noqa: E402
     synthesize_report,
     validate_artifacts,
     validate_trace_file,
+    verify_claims,
 )
 from deepresearch import parallel_orchestrator  # noqa: E402
-from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
+from deepresearch.visual_artifacts import (  # noqa: E402
+    validate_visual_artifacts,
+    visual_minimums_for_run,
+)
 
 
 TEST_MANUAL_ANGLES = ("primary source discovery",)
@@ -418,6 +422,43 @@ class ParallelOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual((run_dir / "search_results.jsonl").read_text(encoding="utf-8"), "")
 
+    def test_release_validation_child_search_sidecar_rejects_invalid_freshness(self) -> None:
+        prepared = prepare_run(
+            question="Release validation child freshness fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-invalid-freshness",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, self.shard(run_dir, task))
+        invalid_record = self.release_search_result(
+            task,
+            freshness_requirement="newest agency pages only",
+            policy_flags=[],
+            raw_provider_metadata={"release_fixture": True},
+        )
+        self.write_jsonl(shard_path.parent / "search_results.jsonl", [invalid_record])
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_search_handoff")
+        self.assertIn("invalid_freshness_requirement", failed_task["diagnostic"])
+        handoff = merge["codex_native_search_handoff"]
+        self.assertEqual(handoff["records"], 0)
+        self.assertIn("invalid_freshness_requirement", handoff["rejections"][0]["reason"])
+
     def test_release_validation_invalid_child_search_sidecar_retries_and_recovers(self) -> None:
         prepared = prepare_run(
             question="Release validation sidecar retry fixture.",
@@ -539,6 +580,58 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(latest_assignment["semantic_plan_task_id"], task["semantic_plan_task_id"])
         self.assertEqual(latest_assignment["semantic_plan_hash"], task["semantic_plan_hash"])
         self.assertEqual(latest_assignment["approved_delta_id"], task["approved_delta_id"])
+
+    def test_release_validation_merge_materializes_search_result_sidecar_defaults(self) -> None:
+        prepared = prepare_run(
+            question="한국 공공보건 최신 안내를 확인해줘.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-ko-search-defaults",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "text_only"
+        task["max_images"] = 0
+        task["freshness_requirement"] = "최근 공공기관 발표 기준"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, self.shard(run_dir, task))
+        record = self.release_search_result(
+            task,
+            policy_flags=[],
+            raw_provider_metadata={"release_fixture": True},
+            semantic_task_freshness_requirement=task["freshness_requirement"],
+        )
+        for field in ("freshness_requirement", "language", "region"):
+            record.pop(field, None)
+        self.write_jsonl(shard_path.parent / "search_results.jsonl", [record])
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        records = self.load_jsonl(run_dir / "search_results.jsonl")
+        self.assertEqual(len(records), 1)
+        merged_record = records[0]
+        self.assertEqual(merged_record["route"], "text_only")
+        self.assertEqual(merged_record["semantic_task_route"], "text_only")
+        self.assertEqual(merged_record["freshness_requirement"], "any")
+        self.assertEqual(
+            merged_record["semantic_task_freshness_requirement"],
+            "최근 공공기관 발표 기준",
+        )
+        self.assertEqual(merged_record["language"], "ko")
+        self.assertEqual(merged_record["region"], "KR")
+        validation = validate_artifacts(
+            evidence_path=run_dir / "evidence.json",
+            search_results_path=run_dir / "search_results.jsonl",
+        )
+        self.assertTrue(validation.valid, validation.to_dict())
 
     def test_release_visual_merge_preserves_child_lineage_and_materializes_handoffs(self) -> None:
         prepared = prepare_run(
@@ -716,6 +809,167 @@ class ParallelOrchestratorTests(unittest.TestCase):
             if check["artifact"] == "evidence.images"
         )
         self.assertEqual(image_check["lineage_failures"], [])
+
+    def test_release_visual_merge_keeps_duplicate_image_per_semantic_task(self) -> None:
+        prepared = prepare_run(
+            question="Release validation duplicate visual fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-duplicate",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        self.assertEqual(len(tasks_artifact["tasks"]), 2)
+        shared_image_url = "https://example.com/shared-release-image.png"
+        first_image_id = ""
+
+        for index, task in enumerate(tasks_artifact["tasks"], start=1):
+            task["semantic_plan_task_id"] = f"task_semantic_{index:03d}"
+            task["semantic_plan_hash"] = "semantic-plan-hash-fixture"
+            task["approved_delta_id"] = "base_plan"
+            task["state"] = "completed"
+            task["last_adapter"] = "codex-exec"
+        expected_task_ids = {task["semantic_plan_task_id"] for task in tasks_artifact["tasks"]}
+
+        for index, task in enumerate(tasks_artifact["tasks"], start=1):
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            shard = self.shard(run_dir, task)
+            image = shard["images"][0]
+            image["image_url"] = shared_image_url
+            image["page_url"] = "https://example.com/shared-release-visual-page"
+            image["content_hash"] = "shared-release-image-hash"
+            image["local_artifact_path"] = (
+                f"evidence_shards/{task['id']}/shared-release-image.png"
+            )
+            if index == 1:
+                first_image_id = image["id"]
+            unique_claim = f"Unique visual claim for semantic task {task['id']}."
+            shard["claims"][0]["text"] = unique_claim
+            shard["claims"][0]["quote_spans"][0]["quote"] = unique_claim
+            self.write_json(shard_path, shard)
+            self.write_jsonl(
+                shard_path.parent / "search_results.jsonl",
+                [self.release_search_result(task)],
+            )
+            self.write_jsonl(
+                shard_path.parent / "visual_observations.jsonl",
+                [
+                    {
+                        "observation_id": f"obs_child_{index:03d}",
+                        "image_id": image["id"],
+                        "evidence_image_id": image["id"],
+                        "candidate_id": f"child_candidate_{index:03d}",
+                        "fetch_id": f"child_fetch_{index:03d}",
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "analysis_provider": "codex-interactive",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "observation_status": "analyzed",
+                        "observations": [
+                            f"Child shard visual observation for {task['id']}."
+                        ],
+                        "inferences": [
+                            f"The duplicate image is independently relevant to {task['id']}."
+                        ],
+                        "policy_decision": "allowed",
+                        "provider_provenance": {
+                            "provider": "codex-interactive",
+                            "provider_kind": "vlm",
+                            "provider_mode": "real",
+                            "codex_interactive_handoff": True,
+                            "handoff_artifact": "visual_observations.jsonl",
+                            "external_vlm_call": False,
+                        },
+                    }
+                ],
+            )
+        stale_candidate_id = f"cand_{first_image_id}"
+        stale_fetch_id = f"fetch_{first_image_id}"
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    "candidate_id": stale_candidate_id,
+                    "image_id": first_image_id,
+                    "evidence_image_id": first_image_id,
+                    "task_id": "task_stale_visual",
+                    "semantic_plan_task_id": "task_stale_visual",
+                    "angle_id": "angle_stale",
+                    "route": "visual_required",
+                    "image_url": shared_image_url,
+                    "candidate_status": "selected",
+                    "provider": "codex-native",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "policy_decision": "allowed",
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    "fetch_id": stale_fetch_id,
+                    "candidate_id": stale_candidate_id,
+                    "image_id": first_image_id,
+                    "evidence_image_id": first_image_id,
+                    "task_id": "task_stale_visual",
+                    "semantic_plan_task_id": "task_stale_visual",
+                    "angle_id": "angle_stale",
+                    "route": "visual_required",
+                    "image_url": shared_image_url,
+                    "fetch_status": "fetched",
+                    "retrieval_status": "fetched",
+                    "provider": "codex-native",
+                    "provider_kind": "web_image_search",
+                    "provider_mode": "real",
+                    "policy_decision": "allowed",
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        evidence = self.load_json(run_dir / "evidence.json")
+        duplicate_images = [
+            image
+            for image in evidence["images"]
+            if image.get("image_url") == shared_image_url
+        ]
+        self.assertEqual(
+            {image["semantic_plan_task_id"] for image in duplicate_images},
+            expected_task_ids,
+        )
+        self.assertEqual(len({image["id"] for image in duplicate_images}), 2)
+        candidates = self.load_jsonl(run_dir / "visual_candidates.jsonl")
+        fetches = self.load_jsonl(run_dir / "image_fetch_status.jsonl")
+        observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+        candidate_by_id = {record["candidate_id"]: record for record in candidates}
+        fetch_by_id = {record["fetch_id"]: record for record in fetches}
+        self.assertEqual(
+            candidate_by_id[stale_candidate_id]["semantic_plan_task_id"],
+            "task_semantic_001",
+        )
+        self.assertEqual(
+            fetch_by_id[stale_fetch_id]["semantic_plan_task_id"],
+            "task_semantic_001",
+        )
+        for records in (candidates, fetches, observations):
+            self.assertEqual(
+                {
+                    record["semantic_plan_task_id"]
+                    for record in records
+                    if record.get("image_url") == shared_image_url
+                },
+                expected_task_ids,
+            )
 
     def test_release_visual_merge_reconciles_child_vlm_to_existing_acquisition_lineage_for_report(self) -> None:
         prepared = prepare_run(
@@ -934,7 +1188,9 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(merged_image["candidate_id"], canonical_candidate_id)
         self.assertEqual(merged_image["fetch_id"], canonical_fetch_id)
         self.assertEqual(merged_image["plan_id"], canonical_plan_id)
-        self.assertEqual(merged_image["task_id"], canonical_task_id)
+        self.assertEqual(merged_image["task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(merged_image["semantic_plan_task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(merged_image["visual_task_id"], canonical_task_id)
         self.assertEqual(merged_image["route"], task["route"])
         self.assertEqual(merged_image["local_artifact_path"], "images/root-fetched.png")
         self.assertEqual(merged_image["mime_type"], "image/png")
@@ -952,7 +1208,9 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(observations[0]["candidate_id"], canonical_candidate_id)
         self.assertEqual(observations[0]["fetch_id"], canonical_fetch_id)
         self.assertEqual(observations[0]["plan_id"], canonical_plan_id)
-        self.assertEqual(observations[0]["task_id"], canonical_task_id)
+        self.assertEqual(observations[0]["task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(observations[0]["semantic_plan_task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(observations[0]["visual_task_id"], canonical_task_id)
         self.assertEqual(observations[0]["local_artifact_path"], "images/root-fetched.png")
         included_claim = next(
             claim
@@ -974,6 +1232,840 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(minimums["vlm_images_analyzed"], 1)
         self.assertEqual(minimums["report_cited_images"], 1)
         self.assertTrue(minimums["satisfied"], minimums)
+
+    def test_issue133_text_child_visual_image_keeps_release_artifact_fields(self) -> None:
+        prepared = prepare_run(
+            question="Release validation issue 133 visual artifact fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-issue133",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "text_only"
+        task["max_images"] = 0
+
+        image_id = "img_019_kdca_poster"
+        source_id = "src_019_kdca_poster"
+        root_source_id = "src_existing_issue133_kdca_poster"
+        image_url = "https://example.com/issue133/kdca-poster.png"
+        page_url = "https://example.com/issue133/kdca-poster"
+        html_rel = f"evidence_shards/{task['id']}/source_002.html"
+        artifact_hash = "sha256:not-redownloaded-task019-kdca-poster"
+        plan_id = f"plan_{task['id']}_{task['angle_id']}_{task['route']}"
+        candidate_id = f"cand_{image_id}"
+        fetch_id = f"fetch_{image_id}"
+        acquisition_provenance = {
+            "provider": "codex-native",
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "search_provider": "codex-native",
+            "codex_native_handoff": True,
+            "external_network_call": False,
+        }
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        (run_dir / html_rel).write_text(
+            "<html><body><p>KDCA poster metadata placeholder.</p></body></html>",
+            encoding="utf-8",
+        )
+        shard = self.shard(run_dir, task)
+        shard["sources"][0].update(
+            {
+                "id": source_id,
+                "url": page_url,
+                "local_artifact_path": html_rel,
+            }
+        )
+        image = shard["images"][0]
+        image.update(
+            {
+                "id": image_id,
+                "source_id": source_id,
+                "origin": "image_search",
+                "page_url": page_url,
+                "image_url": image_url,
+                "local_artifact_path": html_rel,
+                "mime_type": "image/png",
+                "hash": artifact_hash,
+                "content_hash": "issue133-kdca-poster-content",
+                "observations": ["The KDCA poster shows public health guidance."],
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "analyzed",
+            }
+        )
+        for field in (
+            "provider_kind",
+            "provider_provenance",
+            "policy_decision",
+            "estimated_cost_usd",
+            "actual_cost_usd",
+        ):
+            image.pop(field, None)
+        claim = shard["claims"][0]
+        claim["supporting_sources"] = [source_id]
+        claim["supporting_images"] = [image_id]
+        claim["visual_supports"][0].update(
+            {
+                "image_id": image_id,
+                "observation_ref": f"images.{image_id}.observations[0]",
+                "observation_text": "The KDCA poster shows public health guidance.",
+                "provider": "codex-interactive",
+            }
+        )
+        claim["quote_spans"][0]["source_id"] = source_id
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task, url=page_url)],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": "obs_issue133_kdca_poster",
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "candidate_id": "child_candidate_issue133",
+                    "fetch_id": "child_fetch_issue133",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["The poster contains visible KDCA guidance."],
+                    "inferences": ["The poster directly supports the public health claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "local_artifact_path": html_rel,
+                    "mime_type": "image/png",
+                    "hash": artifact_hash,
+                    "image_url": image_url,
+                    "page_url": page_url,
+                }
+            ],
+        )
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["sources"].append(
+            {
+                "id": root_source_id,
+                "type": "web",
+                "url": page_url,
+                "title": "Existing issue 133 source",
+                "published_at": None,
+                "accessed_at": "2026-06-23T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": html_rel,
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+            }
+        )
+        existing_image = dict(image)
+        existing_image["source_id"] = root_source_id
+        existing_image["provider"] = "codex-interactive"
+        for field in (
+            "provider_kind",
+            "provider_provenance",
+            "policy_decision",
+            "estimated_cost_usd",
+            "actual_cost_usd",
+        ):
+            existing_image.pop(field, None)
+        evidence["images"].append(existing_image)
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "visual_search_plan.json",
+            {
+                "schema_version": "codex-deepresearch.visual-search-plan.v0",
+                "run_id": run_dir.name,
+                "created_at": "2026-06-23T00:00:00Z",
+                "status": "completed",
+                "provider": "codex-native",
+                "provider_mode": "real",
+                "tasks": [
+                    {
+                        "plan_id": plan_id,
+                        "task_id": task["id"],
+                        "semantic_plan_task_id": task["id"],
+                        "angle_id": task["angle_id"],
+                        "route": task["route"],
+                        "target_evidence_type": "web_image",
+                        "query": task["query"],
+                        "providers": ["codex-native"],
+                        "caps": {
+                            "max_candidates": 1,
+                            "max_fetches": 1,
+                            "max_vlm_images": 1,
+                            "max_cost_usd": 0.0,
+                        },
+                        "policy_constraints": {},
+                        "estimated_cost_usd": 0.0,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        acquisition_base = {
+            "plan_id": plan_id,
+            "task_id": task["id"],
+            "semantic_plan_task_id": task["id"],
+            "angle_id": task["angle_id"],
+            "route": task["route"],
+            "source_id": root_source_id,
+            "page_url": page_url,
+            "image_url": image_url,
+            "provider": "codex-native",
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "provider_run_id": task["id"],
+            "provider_provenance": acquisition_provenance,
+            "codex_native_handoff": True,
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+        }
+        self.write_jsonl(
+            run_dir / "visual_candidates.jsonl",
+            [
+                {
+                    **acquisition_base,
+                    "candidate_id": candidate_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "origin": "image_search",
+                    "local_artifact_path": html_rel,
+                    "content_hash": artifact_hash,
+                    "candidate_status": "fetch_failed",
+                    "rank": 1,
+                    "score": 1.0,
+                    "rejection_reason": "missing_local_artifact",
+                    "handoff_artifact": "visual_candidates.jsonl",
+                }
+            ],
+        )
+        self.write_jsonl(
+            run_dir / "image_fetch_status.jsonl",
+            [
+                {
+                    **acquisition_base,
+                    "fetch_id": fetch_id,
+                    "candidate_id": candidate_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "local_artifact_path": html_rel,
+                    "mime_type": "image/png",
+                    "http_status": None,
+                    "byte_size": None,
+                    "width": image["width"],
+                    "height": image["height"],
+                    "hash": artifact_hash,
+                    "phash": None,
+                    "retrieval_status": "failed",
+                    "fetch_status": "failed",
+                    "failure_code": "missing_local_artifact",
+                    "handoff_artifact": "image_fetch_status.jsonl",
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shard_count"], 1)
+        post_merge_image = self.load_json(run_dir / "evidence.json")["images"][0]
+        self.assertEqual(post_merge_image["id"], image_id)
+        self.assertEqual(post_merge_image["provider_kind"], "web_image_search")
+        self.assertEqual(post_merge_image["provider_provenance"]["provider"], "codex-native")
+        self.assertEqual(post_merge_image["policy_decision"], "allowed")
+        self.assertEqual(post_merge_image["estimated_cost_usd"], 0.0)
+        self.assertEqual(post_merge_image["actual_cost_usd"], 0.0)
+        self.assertEqual(post_merge_image["candidate_id"], candidate_id)
+        self.assertEqual(post_merge_image["fetch_id"], fetch_id)
+        self.assertEqual(post_merge_image["local_artifact_path"], html_rel)
+        merge_fetch = self.load_jsonl(run_dir / "image_fetch_status.jsonl")[0]
+        self.assertEqual(merge_fetch["fetch_status"], "failed")
+        self.assertEqual(merge_fetch["failure_code"], "missing_local_artifact")
+        post_merge_validation = validate_visual_artifacts(run_dir=run_dir, evidence_path=None)
+        self.assertTrue(post_merge_validation.valid, post_merge_validation.to_dict())
+
+        ingest_status = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(ingest_status["status"], "needs_visual_evidence", ingest_status)
+        self.assertEqual(ingest_status["images_ingested"], 0)
+        final_image = self.load_json(run_dir / "evidence.json")["images"][0]
+        self.assertEqual(final_image["provider_kind"], "web_image_search")
+        self.assertEqual(final_image["provider_provenance"]["provider"], "codex-native")
+        self.assertEqual(final_image["policy_decision"], "allowed")
+        self.assertEqual(final_image["estimated_cost_usd"], 0.0)
+        self.assertEqual(final_image["actual_cost_usd"], 0.0)
+        self.assertEqual(self.load_jsonl(run_dir / "visual_observations.jsonl"), [])
+        final_fetch = self.load_jsonl(run_dir / "image_fetch_status.jsonl")[0]
+        self.assertEqual(final_fetch["fetch_status"], "failed")
+        self.assertEqual(final_fetch["failure_code"], "missing_local_artifact")
+
+    def test_release_visual_merge_preserves_child_verifier_votes_for_observation_links(self) -> None:
+        prepared = prepare_run(
+            question="Release validation child verifier vote fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-verifier-links",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "merged"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "visual_required"
+        task["max_images"] = 1
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        source = shard["sources"][0]
+        image = shard["images"][0]
+        claim = shard["claims"][0]
+        for rel_path in (source["local_artifact_path"], image["local_artifact_path"]):
+            artifact = run_dir / rel_path
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("fixture artifact", encoding="utf-8")
+
+        vote_id = f"vote_{task['id']}_visual_001"
+        child_vote = {
+            "id": vote_id,
+            "claim_id": claim["id"],
+            "verifier_type": "visual",
+            "agent_name": "issue-133-child-verifier",
+            "method": "runner-agent",
+            "model_or_tool": "codex-exec-child",
+            "vote": "support",
+            "confidence": 0.91,
+            "evidence_refs": [source["id"], image["id"]],
+            "rationale": "The child visual observation supports the merged claim.",
+            "created_at": "2026-06-23T00:00:00Z",
+        }
+        claim["votes"] = [dict(child_vote)]
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task, url=source["url"])],
+        )
+        self.write_jsonl(shard_path.parent / "verifier_votes.jsonl", [child_vote])
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_visual_001",
+                    "image_id": image["id"],
+                    "evidence_image_id": image["id"],
+                    "candidate_id": f"child_candidate_{image['id']}",
+                    "fetch_id": f"child_fetch_{image['id']}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A visible fixture image."],
+                    "inferences": ["The image supports the claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "verifier_links": [
+                        {
+                            "claim_id": claim["id"],
+                            "visual_support_ref": claim["visual_supports"][0]["observation_ref"],
+                            "verifier_vote_id": vote_id,
+                        }
+                    ],
+                    "report_links": [
+                        {
+                            "claim_id": claim["id"],
+                            "visual_support_ref": claim["visual_supports"][0]["observation_ref"],
+                            "citation_id": "citation_fixture_001",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        existing_claim = dict(claim)
+        existing_claim["votes"] = []
+        existing_claim.pop("verifier_vote_refs", None)
+        existing_claim.pop("visual_verifier_vote_refs", None)
+        evidence["sources"].append(dict(source))
+        evidence["images"].append(dict(image))
+        evidence["claims"].append(existing_claim)
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shard_count"], 1)
+        self.assertEqual(
+            merge["codex_native_visual_handoff"]["invalid_verifier_links_cleared"],
+            0,
+        )
+        self.assertEqual(
+            merge["codex_native_visual_handoff"]["verifier_votes_attached_to_claims"],
+            1,
+        )
+
+        def assert_no_dangling_visual_vote_links() -> None:
+            observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+            votes = self.load_jsonl(run_dir / "verifier_votes.jsonl")
+            vote_ids = {vote["id"] for vote in votes}
+            linked_vote_ids = {
+                link["verifier_vote_id"]
+                for observation in observations
+                for link in observation.get("verifier_links", [])
+                if isinstance(link, dict) and link.get("verifier_vote_id")
+            }
+            self.assertIn(vote_id, linked_vote_ids)
+            self.assertFalse(linked_vote_ids - vote_ids)
+            validation = validate_artifacts(
+                evidence_path=run_dir / "evidence.json",
+                visual_observations_path=run_dir / "visual_observations.jsonl",
+                verifier_votes_path=run_dir / "verifier_votes.jsonl",
+            )
+            self.assertTrue(validation.valid, validation.to_dict())
+
+        assert_no_dangling_visual_vote_links()
+        merged_claim = self.load_json(run_dir / "evidence.json")["claims"][0]
+        self.assertIn(vote_id, [vote.get("id") for vote in merged_claim["votes"]])
+
+        verification = verify_claims(run=run_dir)
+
+        self.assertEqual(verification["status"], "completed", verification)
+        assert_no_dangling_visual_vote_links()
+
+    def test_release_visual_merge_rejects_post_merge_invalid_child_verifier_vote(self) -> None:
+        prepared = prepare_run(
+            question="Release validation post-merge invalid verifier vote fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-post-merge-invalid-verifier",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "visual_required"
+        task["max_images"] = 1
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        source = shard["sources"][0]
+        image = shard["images"][0]
+        rejected_claim = dict(shard["claims"][0])
+        rejected_claim["id"] = f"claim_{task['id']}_rejected"
+        rejected_claim["text"] = "Rejected child claim that should not merge."
+        rejected_claim["review_status"] = "human_rejected"
+        rejected_claim["quote_spans"] = [
+            {
+                "source_id": source["id"],
+                "quote": rejected_claim["text"],
+                "location": "paragraph 2",
+            }
+        ]
+        shard["claims"].append(rejected_claim)
+        child_vote = {
+            "id": f"vote_{task['id']}_rejected_claim",
+            "claim_id": rejected_claim["id"],
+            "verifier_type": "visual",
+            "agent_name": "issue-133-child-verifier",
+            "method": "runner-agent",
+            "model_or_tool": "codex-exec-child",
+            "vote": "support",
+            "confidence": 0.91,
+            "evidence_refs": [source["id"], image["id"]],
+            "rationale": "The raw child claim exists before merge but is rejected.",
+            "created_at": "2026-06-23T00:00:00Z",
+        }
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task, url=source["url"])],
+        )
+        self.write_jsonl(shard_path.parent / "verifier_votes.jsonl", [child_vote])
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_visual_001",
+                    "image_id": image["id"],
+                    "evidence_image_id": image["id"],
+                    "candidate_id": f"child_candidate_{image['id']}",
+                    "fetch_id": f"child_fetch_{image['id']}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A visible fixture image."],
+                    "inferences": ["The image supports a child claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        self.assertIn("claim_id_not_merged", failed_task["diagnostic"])
+        validation = failed_task["release_visual_handoff_validation"]
+        self.assertEqual(validation["reason"], "child_verifier_votes_invalid")
+        self.assertEqual(validation["validation_stage"], "post_merge")
+        self.assertEqual(validation["rejections"][0]["reason"], "claim_id_not_merged")
+        handoff = merge["codex_native_visual_handoff"]
+        self.assertEqual(handoff["verifier_vote_records"], 0)
+        self.assertEqual(
+            handoff["verifier_vote_rejections"][0]["reason"],
+            "claim_id_not_merged",
+        )
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["sources"], [])
+        self.assertEqual(evidence["images"], [])
+        self.assertEqual(evidence["claims"], [])
+        self.assertEqual(self.load_jsonl(run_dir / "visual_observations.jsonl"), [])
+
+    def test_release_visual_merge_rejects_child_observation_when_shard_has_no_images(self) -> None:
+        prepared = prepare_run(
+            question="Release validation stale child visual observation without images fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-stale-visual-observation",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "text_only"
+        task["max_images"] = 0
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        stale_image_id = shard["images"][0]["id"]
+        shard["images"] = []
+        claim = shard["claims"][0]
+        claim["claim_type"] = "text"
+        claim["supporting_images"] = []
+        claim["visual_supports"] = []
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task)],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_stale_visual_001",
+                    "image_id": stale_image_id,
+                    "evidence_image_id": stale_image_id,
+                    "candidate_id": f"child_candidate_{stale_image_id}",
+                    "fetch_id": f"child_fetch_{stale_image_id}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A stale child visual observation."],
+                    "inferences": ["The stale image is not present in the shard."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        validation = failed_task["release_visual_handoff_validation"]
+        self.assertEqual(validation["reason"], "child_visual_observations_extra_image_refs")
+        self.assertEqual(validation["invalid_records"][0]["reason"], "image_ref_not_in_shard")
+        self.assertEqual(validation["invalid_records"][0]["image_id"], stale_image_id)
+        self.assertIn(stale_image_id, validation["extra_image_ids"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+        self.assertEqual(evidence["claims"], [])
+        self.assertEqual(self.load_jsonl(run_dir / "visual_observations.jsonl"), [])
+
+    def test_release_visual_merge_rejects_invalid_child_verifier_vote(self) -> None:
+        prepared = prepare_run(
+            question="Release validation invalid child verifier vote fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-invalid-verifier",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "visual_required"
+        task["max_images"] = 1
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        source = shard["sources"][0]
+        image = shard["images"][0]
+        claim = shard["claims"][0]
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task, url=source["url"])],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_visual_001",
+                    "image_id": image["id"],
+                    "evidence_image_id": image["id"],
+                    "candidate_id": f"child_candidate_{image['id']}",
+                    "fetch_id": f"child_fetch_{image['id']}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A visible fixture image."],
+                    "inferences": ["The image supports the claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_jsonl(
+            shard_path.parent / "verifier_votes.jsonl",
+            [
+                {
+                    "id": f"vote_{task['id']}_invalid_method",
+                    "claim_id": claim["id"],
+                    "verifier_type": "visual",
+                    "agent_name": "issue-133-child-verifier",
+                    "method": "unsupported-method",
+                    "model_or_tool": "codex-exec-child",
+                    "vote": "support",
+                    "confidence": 0.91,
+                    "evidence_refs": [source["id"], image["id"]],
+                    "rationale": "The child visual observation supports the claim.",
+                    "created_at": "2026-06-23T00:00:00Z",
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        self.assertIn("invalid_method", failed_task["diagnostic"])
+        validation = failed_task["release_visual_handoff_validation"]
+        self.assertEqual(validation["reason"], "child_verifier_votes_invalid")
+        self.assertEqual(validation["rejections"][0]["reason"], "invalid_method")
+        handoff = merge["codex_native_visual_handoff"]
+        self.assertEqual(handoff["verifier_vote_records"], 0)
+        self.assertEqual(handoff["verifier_vote_rejections"][0]["reason"], "invalid_method")
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["claims"], [])
+
+    def test_release_visual_merge_rejects_child_observation_for_non_shard_image(self) -> None:
+        prepared = prepare_run(
+            question="Release validation stale child visual observation fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-stale-observation",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        image = shard["images"][0]
+        stale_image_id = "img_stale_not_in_current_shard"
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task)],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_visual_001",
+                    "image_id": image["id"],
+                    "evidence_image_id": image["id"],
+                    "candidate_id": f"child_candidate_{image['id']}",
+                    "fetch_id": f"child_fetch_{image['id']}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A current shard visual observation."],
+                    "inferences": ["The image supports the claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                },
+                {
+                    "observation_id": f"obs_{task['id']}_stale_visual_001",
+                    "image_id": stale_image_id,
+                    "evidence_image_id": stale_image_id,
+                    "candidate_id": "child_candidate_stale",
+                    "fetch_id": "child_fetch_stale",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A stale child visual observation."],
+                    "inferences": ["This stale image is outside the current shard."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                },
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        validation = failed_task["release_visual_handoff_validation"]
+        self.assertEqual(validation["reason"], "child_visual_observations_extra_image_refs")
+        self.assertEqual(validation["invalid_records"][0]["reason"], "image_ref_not_in_shard")
+        self.assertEqual(validation["invalid_records"][0]["image_id"], stale_image_id)
+        self.assertIn(stale_image_id, validation["extra_image_ids"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["images"], [])
+        self.assertEqual(self.load_jsonl(run_dir / "visual_observations.jsonl"), [])
 
     def test_release_visual_merge_normalizes_codex_interactive_external_vlm_mislabel(self) -> None:
         prepared = prepare_run(
@@ -1372,6 +2464,156 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["task_id"], "task_search_001")
         self.assertEqual(records[0]["retrieval_status"], "fetched")
+
+    def test_release_validation_post_merge_visual_handoff_failure_blocks_partial_parallel(self) -> None:
+        prepared = prepare_run(
+            question="Release validation post-merge visual handoff partial fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-post-merge-partial",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+
+        class PartialReleaseVisualCodexAdapter(CodexExecAdapter):
+            name = "codex-exec"
+            timeout_seconds = 120.0
+
+            def __init__(inner_self) -> None:
+                super().__init__(project_root=ROOT, timeout_seconds=120)
+
+            def available(inner_self) -> bool:
+                return True
+
+            def run_task(inner_self, task, *, run_dir, max_threads):
+                task = dict(task)
+                task["route"] = "visual_required"
+                task["max_images"] = 1
+                task_id = str(task["id"])
+                shard_path = run_dir / task["output_shard_path"]
+                shard_path.parent.mkdir(parents=True, exist_ok=True)
+                shard = self.shard(run_dir, task)
+                source = shard["sources"][0]
+                image = shard["images"][0]
+                self.write_jsonl(
+                    shard_path.parent / "search_results.jsonl",
+                    [self.release_search_result(task, url=source["url"])],
+                )
+                self.write_jsonl(
+                    shard_path.parent / "visual_observations.jsonl",
+                    [
+                        {
+                            "observation_id": f"obs_{task_id}_visual_001",
+                            "image_id": image["id"],
+                            "evidence_image_id": image["id"],
+                            "candidate_id": f"child_candidate_{image['id']}",
+                            "fetch_id": f"child_fetch_{image['id']}",
+                            "provider": "codex-interactive",
+                            "provider_kind": "vlm",
+                            "provider_mode": "real",
+                            "analysis_provider": "codex-interactive",
+                            "codex_interactive_handoff": True,
+                            "handoff_artifact": "visual_observations.jsonl",
+                            "observation_status": "analyzed",
+                            "observations": ["A visible fixture image."],
+                            "inferences": ["The image supports the claim."],
+                            "policy_decision": "allowed",
+                            "provider_provenance": {
+                                "provider": "codex-interactive",
+                                "provider_kind": "vlm",
+                                "provider_mode": "real",
+                                "codex_interactive_handoff": True,
+                                "handoff_artifact": "visual_observations.jsonl",
+                                "external_vlm_call": False,
+                            },
+                        }
+                    ],
+                )
+                if task_id.endswith("002"):
+                    rejected_claim = dict(shard["claims"][0])
+                    rejected_claim["id"] = f"claim_{task_id}_rejected"
+                    rejected_claim["text"] = "Rejected child claim that should not merge."
+                    rejected_claim["review_status"] = "human_rejected"
+                    rejected_claim["quote_spans"] = [
+                        {
+                            "source_id": source["id"],
+                            "quote": rejected_claim["text"],
+                            "location": "paragraph 2",
+                        }
+                    ]
+                    shard["claims"].append(rejected_claim)
+                    self.write_jsonl(
+                        shard_path.parent / "verifier_votes.jsonl",
+                        [
+                            {
+                                "id": f"vote_{task_id}_rejected_claim",
+                                "claim_id": rejected_claim["id"],
+                                "verifier_type": "visual",
+                                "agent_name": "issue-133-child-verifier",
+                                "method": "runner-agent",
+                                "model_or_tool": "codex-exec-child",
+                                "vote": "support",
+                                "confidence": 0.91,
+                                "evidence_refs": [source["id"], image["id"]],
+                                "rationale": (
+                                    "The raw child claim exists before merge but is rejected."
+                                ),
+                                "created_at": "2026-06-23T00:00:00Z",
+                            }
+                        ],
+                    )
+                self.write_json(shard_path, shard)
+                return type("Result", (), {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "child_thread_id": f"codex-{task_id}",
+                    "events": (),
+                    "shard_path": str(shard_path),
+                    "failure_category": None,
+                    "message": None,
+                })()
+
+        with mock.patch(
+            "deepresearch.parallel_orchestrator._adapter",
+            return_value=PartialReleaseVisualCodexAdapter(),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=2,
+                max_tasks=2,
+                allow_degraded=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed_release_handoff_invalid")
+        self.assertTrue(result["needs_serial_handoff"])
+        self.assertEqual(len(result["merge"]["accepted_shards"]), 1)
+        self.assertEqual(
+            result["merge"]["accepted_shards"][0]["task_id"],
+            "task_research_001",
+        )
+        self.assertEqual(result["failure_counts"]["failed_tasks"], 1)
+        self.assertEqual(
+            result["failure_counts"]["by_category"]["invalid_release_visual_handoff"],
+            1,
+        )
+        failed_task = result["merge"]["failed_tasks"][0]
+        self.assertEqual(failed_task["task_id"], "task_research_002")
+        self.assertEqual(failed_task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        self.assertEqual(
+            failed_task["release_visual_handoff_validation"]["validation_stage"],
+            "post_merge",
+        )
+        self.assertEqual(
+            failed_task["release_visual_handoff_validation"]["rejections"][0]["reason"],
+            "claim_id_not_merged",
+        )
 
     def test_passing_partial_parallel_exposes_stable_reason_summary(self) -> None:
         run_dir = self.prepare()
@@ -2077,7 +3319,57 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(retry_trace_events[0]["raw_event"]["computed_backoff_seconds"], 5.0)
         self.assertEqual(retry_trace_events[0]["raw_event"]["actual_sleep_seconds"], 0.0)
         self.assertEqual(retry_trace_events[0]["raw_event"]["child_failure_code"], "codex_child_model_capacity")
+        self.assertEqual(retry_trace_events[0]["status"], "retrying")
+        self.assertEqual(retry_trace_events[0]["child_status"], "retrying")
+        self.assertEqual(retry_trace_events[1]["status"], "completed")
+        self.assertEqual(retry_trace_events[1]["child_status"], "completed")
         self.assertEqual(retry_trace_events[1]["raw_event"]["returncode"], 0)
+        self.assertTrue(validate_trace_file(run_dir / "run_trace.jsonl").valid)
+
+    def test_codex_exec_success_retry_decision_trace_status_is_completed(self) -> None:
+        run_dir = self.prepare()
+
+        def fake_codex_exec(command, **_kwargs):
+            task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout='{"type":"message","status":"completed","message":"wrote shard"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch("deepresearch.parallel_orchestrator.shutil.which", return_value="/usr/bin/codex"),
+            mock.patch(
+                "deepresearch.parallel_orchestrator.subprocess.run",
+                side_effect=fake_codex_exec,
+            ) as run_mock,
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                codex_exec_timeout_seconds=120,
+                min_tasks=1,
+                max_tasks=1,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "completed_parallel")
+        run_mock.assert_called_once()
+        retry_trace_events = [
+            record
+            for record in read_trace_records(run_dir / "run_trace.jsonl")
+            if record.get("event_type") == "retry_decision"
+        ]
+        self.assertEqual(len(retry_trace_events), 1)
+        retry_event = retry_trace_events[0]
+        self.assertEqual(retry_event["raw_event"]["retry_decision"], "do_not_retry")
+        self.assertEqual(retry_event["raw_event"]["returncode"], 0)
+        self.assertEqual(retry_event["status"], "completed")
+        self.assertEqual(retry_event["child_status"], "completed")
         self.assertTrue(validate_trace_file(run_dir / "run_trace.jsonl").valid)
 
     def test_codex_exec_schema_invalid_shard_retries_and_recovers(self) -> None:
@@ -2276,6 +3568,8 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 self.assertEqual(len(retry_trace_events), 1)
                 self.assertEqual(retry_trace_events[0]["raw_event"]["retry_decision"], "do_not_retry")
                 self.assertEqual(retry_trace_events[0]["raw_event"]["child_failure_code"], expected_code)
+                self.assertEqual(retry_trace_events[0]["status"], "failed")
+                self.assertEqual(retry_trace_events[0]["child_status"], "failed")
 
     def test_codex_exec_non_capacity_do_not_retry_does_not_reenter_degraded_serial_fallback(self) -> None:
         run_dir = self.prepare()

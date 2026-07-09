@@ -412,6 +412,160 @@ class PageImageExtractionTests(unittest.TestCase):
             [error.to_dict() for error in visual_validation.errors],
         )
 
+    def test_page_image_plan_keeps_release_identity_and_filters_text_only_sources(self) -> None:
+        prepared = prepare_run(
+            question="Extract semantic page image lineage",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="sem-reg-page-lineage",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        semantic_hash = "b" * 64
+        image_path = run_dir / "sources" / "lineage-image.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(PNG_1X1 + b"lineage")
+        image_uri = image_path.resolve().as_uri()
+        visual_page = run_dir / "sources" / "visual-page.html"
+        text_page = run_dir / "sources" / "text-page.html"
+        visual_page.write_text(
+            f'<html><body><img src="{image_uri}" alt="Visual lineage"></body></html>',
+            encoding="utf-8",
+        )
+        text_page.write_text(
+            f'<html><body><img src="{image_uri}" alt="Text lineage"></body></html>',
+            encoding="utf-8",
+        )
+        self.write_json(
+            run_dir / "visual_tasks.json",
+            {
+                "schema_version": "codex-deepresearch.visual-tasks.v0",
+                "run_id": run_dir.name,
+                "tasks": [
+                    {
+                        "id": "task_visual_001",
+                        "task_id": "task_visual_001",
+                        "semantic_plan_task_id": "task_001",
+                        "semantic_plan_hash": semantic_hash,
+                        "approved_delta_id": "base_plan",
+                        "angle_id": "angle_001",
+                        "route": "visual_required",
+                        "max_images": 1,
+                    }
+                ],
+            },
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["routing"] = [
+            {
+                "id": "angle_001",
+                "modality": "visual_required",
+                "max_images": 1,
+                "visual_tasks": ["image_claim_alignment"],
+            },
+            {
+                "id": "angle_002",
+                "modality": "text_only",
+                "max_images": 0,
+                "visual_tasks": [],
+            },
+        ]
+        evidence["sources"] = [
+            {
+                "id": "src_visual_lineage",
+                "type": "web",
+                "url": visual_page.resolve().as_uri(),
+                "title": "Visual lineage page",
+                "published_at": None,
+                "accessed_at": "2026-07-09T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/visual-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "search_result_id": "search_visual_lineage",
+                "task_id": "task_001",
+                "semantic_plan_task_id": "task_001",
+                "semantic_plan_hash": semantic_hash,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            },
+            {
+                "id": "src_text_lineage",
+                "type": "web",
+                "url": text_page.resolve().as_uri(),
+                "title": "Text lineage page",
+                "published_at": None,
+                "accessed_at": "2026-07-09T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/text-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "search_result_id": "search_text_lineage",
+                "task_id": "task_002",
+                "semantic_plan_task_id": "task_002",
+                "semantic_plan_hash": semantic_hash,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_002",
+                "route": "text_only",
+            },
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        def transport(url: str) -> FetchResponse:
+            path = Path(unquote(urlparse(url).path))
+            return FetchResponse(
+                content=path.read_bytes(),
+                mime_type="image/png",
+                status_code=None,
+                final_url=url,
+            )
+
+        result = extract_and_fetch_page_images(
+            run=run_dir,
+            transport=transport,
+            provider_mode="fixture",
+            max_fetches=4,
+        )
+
+        self.assertEqual(result["status"], "page_images_processed")
+        plan = self.read_json(run_dir / VISUAL_SEARCH_PLAN_FILENAME)
+        self.assertEqual(plan["prompt_id"], "sem-reg-page-lineage")
+        self.assertEqual(plan["suite_id"], "issue-133-suite")
+        self.assertEqual(plan["execution_mode"], "codex-plugin")
+        self.assertEqual(plan["runner_mode"], "full-runner")
+        self.assertEqual({task["task_id"] for task in plan["tasks"]}, {"task_001"})
+        self.assertEqual(plan["tasks"][0]["semantic_plan_hash"], semantic_hash)
+        self.assertEqual(plan["tasks"][0]["approved_delta_id"], "base_plan")
+
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        candidate_by_source = {candidate["source_id"]: candidate for candidate in candidates}
+        self.assertEqual(candidate_by_source["src_visual_lineage"]["task_id"], "task_001")
+        self.assertEqual(
+            candidate_by_source["src_visual_lineage"]["semantic_plan_hash"],
+            semantic_hash,
+        )
+        self.assertEqual(candidate_by_source["src_text_lineage"]["task_id"], "task_002")
+        self.assertEqual(
+            candidate_by_source["src_text_lineage"]["semantic_plan_hash"],
+            semantic_hash,
+        )
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        candidate_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+        fetch_by_source = {
+            candidate_by_id[fetch["candidate_id"]]["source_id"]: fetch
+            for fetch in fetches
+        }
+        self.assertEqual(fetch_by_source["src_text_lineage"]["task_id"], "task_002")
+        self.assertEqual(fetch_by_source["src_text_lineage"]["semantic_plan_hash"], semantic_hash)
+        self.assertEqual(fetch_by_source["src_text_lineage"]["approved_delta_id"], "base_plan")
+
     def test_real_mode_fetches_remote_source_html_when_local_artifact_missing_or_empty(
         self,
     ) -> None:
