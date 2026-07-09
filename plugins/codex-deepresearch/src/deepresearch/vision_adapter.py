@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import MutableMapping
+from collections.abc import Iterable, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4961,9 +4961,10 @@ def _apply_visual_acquisition_metadata_to_image(
         _first_visual_acquisition_string("provider_mode", fetch, candidate)
         or "real"
     )
-    policy_decision = (
-        _first_visual_acquisition_string("policy_decision", fetch, candidate)
-        or "allowed"
+    policy_decision = _visual_acquisition_policy_decision_for_image(
+        image,
+        fetch=fetch,
+        candidate=candidate,
     )
 
     provider_run_id = _first_visual_acquisition_string("provider_run_id", fetch, candidate)
@@ -5102,6 +5103,24 @@ def _first_visual_acquisition_mapping(
     return None
 
 
+def _visual_acquisition_policy_decision_for_image(
+    image: Mapping[str, Any],
+    *,
+    fetch: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+) -> str:
+    decision = (
+        _first_visual_acquisition_string("policy_decision", fetch, candidate)
+        or "allowed"
+    )
+    if (
+        decision == "budget_pruned"
+        and _is_analyzed_codex_interactive_handoff_image(image)
+    ):
+        return _codex_interactive_handoff_image_policy_decision(image)
+    return decision
+
+
 def _set_visual_acquisition_image_field(
     image: MutableMapping[str, Any],
     field: str,
@@ -5219,9 +5238,7 @@ def _materialize_codex_interactive_handoff_lineage(
     for image in images:
         if not isinstance(image, MutableMapping):
             continue
-        if _first_optional_string(image, "analysis_status") != "analyzed":
-            continue
-        if _first_optional_string(image, "analysis_provider") != CODEX_INTERACTIVE_PROVIDER:
+        if not _is_analyzed_codex_interactive_handoff_image(image):
             continue
         image_id = _first_optional_string(image, "id")
         if not image_id:
@@ -6232,7 +6249,7 @@ def _codex_interactive_handoff_acquisition_base(
         "provider_run_id": image.get("provider_run_id") or task_id,
         "search_provider": "codex-native",
         "codex_native_handoff": True,
-        "policy_decision": image.get("policy_decision") or "allowed",
+        "policy_decision": _codex_interactive_handoff_image_policy_decision(image),
         "policy_flags": list(image.get("policy_flags") or []),
         "provider_provenance": {
             "provider": "codex-native",
@@ -6256,7 +6273,7 @@ def _fill_codex_interactive_handoff_candidate_record(
     angle_id: str,
     route: str,
 ) -> None:
-    for key, value in _codex_interactive_handoff_candidate_record(
+    values = _codex_interactive_handoff_candidate_record(
         run_dir,
         image,
         candidate_id=candidate_id,
@@ -6264,8 +6281,28 @@ def _fill_codex_interactive_handoff_candidate_record(
         task_id=task_id,
         angle_id=angle_id,
         route=route,
-    ).items():
+    )
+    for key, value in values.items():
         _fill_missing_codex_interactive_handoff_value(record, key, value)
+    _reconcile_used_codex_interactive_handoff_record(
+        record,
+        values,
+        fields=(
+            "plan_id",
+            "task_id",
+            "semantic_plan_task_id",
+            "angle_id",
+            "route",
+            "candidate_id",
+            "image_id",
+            "evidence_image_id",
+        ),
+    )
+    _reconcile_budget_pruned_codex_interactive_handoff_policy(record, values)
+    _reconcile_budget_pruned_codex_interactive_handoff_candidate_status(
+        record,
+        values,
+    )
 
 
 def _fill_codex_interactive_handoff_fetch_record(
@@ -6280,7 +6317,7 @@ def _fill_codex_interactive_handoff_fetch_record(
     angle_id: str,
     route: str,
 ) -> None:
-    for key, value in _codex_interactive_handoff_fetch_record(
+    values = _codex_interactive_handoff_fetch_record(
         run_dir,
         image,
         candidate_id=candidate_id,
@@ -6289,8 +6326,37 @@ def _fill_codex_interactive_handoff_fetch_record(
         task_id=task_id,
         angle_id=angle_id,
         route=route,
-    ).items():
+    )
+    for key, value in values.items():
         _fill_missing_codex_interactive_handoff_value(record, key, value)
+    _reconcile_used_codex_interactive_handoff_record(
+        record,
+        values,
+        fields=(
+            "plan_id",
+            "task_id",
+            "semantic_plan_task_id",
+            "angle_id",
+            "route",
+            "candidate_id",
+            "fetch_id",
+            "image_id",
+            "evidence_image_id",
+            "local_artifact_path",
+            "mime_type",
+            "byte_size",
+            "width",
+            "height",
+            "hash",
+            "phash",
+        ),
+        nullable_fields=("hash", "phash"),
+    )
+    _reconcile_budget_pruned_codex_interactive_handoff_policy(record, values)
+    _reconcile_budget_pruned_codex_interactive_handoff_fetch_status(
+        record,
+        values,
+    )
 
 
 def _fill_missing_codex_interactive_handoff_value(
@@ -6300,6 +6366,151 @@ def _fill_missing_codex_interactive_handoff_value(
 ) -> None:
     if key not in record or record.get(key) in (None, "", []):
         record[key] = value
+
+
+def _is_analyzed_codex_interactive_handoff_image(image: Mapping[str, Any]) -> bool:
+    return (
+        _first_optional_string(image, "analysis_status") == "analyzed"
+        and _first_optional_string(image, "analysis_provider")
+        == CODEX_INTERACTIVE_PROVIDER
+    )
+
+
+def _codex_interactive_handoff_image_policy_decision(image: Mapping[str, Any]) -> str:
+    decision = _first_optional_string(image, "policy_decision")
+    if (
+        decision in (None, "budget_pruned")
+        and _is_analyzed_codex_interactive_handoff_image(image)
+    ):
+        return "allowed"
+    return decision or "allowed"
+
+
+def _reconcile_used_codex_interactive_handoff_record(
+    record: MutableMapping[str, Any],
+    values: Mapping[str, Any],
+    *,
+    fields: Iterable[str],
+    nullable_fields: Iterable[str] = (),
+) -> None:
+    nullable = set(nullable_fields)
+    for key in fields:
+        if key not in values:
+            continue
+        value = values.get(key)
+        if value in (None, "", []) and key not in nullable:
+            continue
+        _set_codex_interactive_handoff_reconciled_value(record, key, value)
+
+
+def _set_codex_interactive_handoff_reconciled_value(
+    record: MutableMapping[str, Any],
+    key: str,
+    value: Any,
+) -> None:
+    old_value = record.get(key)
+    if old_value == value:
+        return
+    raw_key = f"raw_codex_interactive_handoff_{key}"
+    if old_value not in (None, "", []) and raw_key not in record:
+        record[raw_key] = copy.deepcopy(old_value)
+    record[key] = copy.deepcopy(value)
+
+
+def _reconcile_budget_pruned_codex_interactive_handoff_policy(
+    record: MutableMapping[str, Any],
+    values: Mapping[str, Any],
+) -> None:
+    if _is_budget_pruned_marker(record.get("policy_decision")):
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "policy_decision",
+            values.get("policy_decision") or "allowed",
+        )
+        if "policy_flags" in values:
+            _set_codex_interactive_handoff_reconciled_value(
+                record,
+                "policy_flags",
+                values.get("policy_flags") or [],
+            )
+    elif _is_budget_pruned_marker(record.get("policy_flags")) and "policy_flags" in values:
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "policy_flags",
+            values.get("policy_flags") or [],
+        )
+
+
+def _reconcile_budget_pruned_codex_interactive_handoff_candidate_status(
+    record: MutableMapping[str, Any],
+    values: Mapping[str, Any],
+) -> None:
+    status = _first_optional_string(record, "candidate_status")
+    status_budget_pruned = _is_budget_pruned_marker(status)
+    rejection_budget_pruned = _is_budget_pruned_marker(record.get("rejection_reason"))
+    if status_budget_pruned or (
+        rejection_budget_pruned and not _is_protected_acquisition_status(status)
+    ):
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "candidate_status",
+            values.get("candidate_status") or "fetched",
+        )
+    if status_budget_pruned or rejection_budget_pruned:
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "rejection_reason",
+            values.get("rejection_reason"),
+        )
+
+
+def _reconcile_budget_pruned_codex_interactive_handoff_fetch_status(
+    record: MutableMapping[str, Any],
+    values: Mapping[str, Any],
+) -> None:
+    status = _first_optional_string(record, "fetch_status")
+    status_budget_pruned = _is_budget_pruned_marker(status)
+    retrieval_budget_pruned = _is_budget_pruned_marker(record.get("retrieval_status"))
+    failure_budget_pruned = _is_budget_pruned_marker(record.get("failure_code"))
+    status_update_allowed = status_budget_pruned or (
+        failure_budget_pruned and not _is_protected_acquisition_status(status)
+    )
+    if status_update_allowed:
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "fetch_status",
+            values.get("fetch_status") or "fetched",
+        )
+    if status_update_allowed or retrieval_budget_pruned:
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "retrieval_status",
+            values.get("retrieval_status") or values.get("fetch_status") or "fetched",
+        )
+    if status_budget_pruned or failure_budget_pruned:
+        _set_codex_interactive_handoff_reconciled_value(
+            record,
+            "failure_code",
+            values.get("failure_code"),
+        )
+
+
+def _is_budget_pruned_marker(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() == "budget_pruned"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_is_budget_pruned_marker(item) for item in value)
+    return False
+
+
+def _is_protected_acquisition_status(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {
+        "blocked",
+        "policy_blocked",
+        "manual_review",
+        "disallowed",
+        "restricted",
+    }
 
 
 def _phase3_observation_records(

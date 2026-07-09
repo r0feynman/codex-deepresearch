@@ -887,6 +887,305 @@ class VisionAdapterTests(unittest.TestCase):
         linked_minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
         self.assertGreaterEqual(linked_minimums["report_cited_images"], 1)
 
+    def test_codex_interactive_reconciles_budget_pruned_sidecars_for_used_image(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_checkout_001"
+        candidate_id = "cand_checkout_001"
+        fetch_id = "fetch_checkout_001"
+        plan_id = "plan_task_visual_001"
+        task_id = "task_visual_001"
+        angle_id = "angle_001"
+        route = "visual_required"
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+        candidate.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "candidate_status": "budget_pruned",
+                "policy_decision": "budget_pruned",
+                "rejection_reason": "budget_pruned",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetch = next(item for item in fetches if item["fetch_id"] == fetch_id)
+        fetch.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "fetch_status": "budget_pruned",
+                "retrieval_status": "budget_pruned",
+                "policy_decision": "budget_pruned",
+                "failure_code": "budget_pruned",
+            }
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "observation_id": "obs_img_checkout_001_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": "sha256:fixture-checkout",
+                    "phash": "checkout-phash",
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:budget-pruned-reconcile",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "model_or_tool": "codex-exec-image-worker",
+                    "observations": ["The checkout screenshot shows a primary payment button."],
+                    "inferences": ["The analyzed image supports checkout completion."],
+                    "visual_tasks": ["layout_review"],
+                    "confidence": 0.83,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": [],
+                    "verifier_links": [],
+                    "report_links": [],
+                    "created_at": "2026-06-22T00:00:00Z",
+                    "codex_interactive_handoff": True,
+                    "codex_native_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:budget-pruned-reconcile",
+                        "codex_interactive_handoff": True,
+                        "codex_native_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"],
+        )
+        evidence = self.assert_valid_run(run_dir)
+        image = next(item for item in evidence["images"] if item["id"] == image_id)
+        self.assertEqual(image["policy_decision"], "allowed")
+        self.assertEqual(image["visual_acquisition_policy_decision"], "allowed")
+
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_candidate = next(item for item in post_candidates if item["candidate_id"] == candidate_id)
+        post_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(post_candidate["policy_decision"], "allowed")
+        self.assertEqual(post_candidate["candidate_status"], "fetched")
+        self.assertIsNone(post_candidate["rejection_reason"])
+        self.assertEqual(
+            post_candidate["raw_codex_interactive_handoff_policy_decision"],
+            "budget_pruned",
+        )
+        self.assertEqual(
+            post_candidate["raw_codex_interactive_handoff_candidate_status"],
+            "budget_pruned",
+        )
+        self.assertEqual(post_fetch["policy_decision"], "allowed")
+        self.assertEqual(post_fetch["fetch_status"], "fetched")
+        self.assertIsNone(post_fetch["failure_code"])
+        self.assertEqual(
+            post_fetch["raw_codex_interactive_handoff_policy_decision"],
+            "budget_pruned",
+        )
+        self.assertEqual(
+            post_fetch["raw_codex_interactive_handoff_fetch_status"],
+            "budget_pruned",
+        )
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_does_not_convert_blocked_sidecars_to_allowed(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_checkout_001"
+        candidate_id = "cand_checkout_001"
+        fetch_id = "fetch_checkout_001"
+        plan_id = "plan_task_visual_001"
+        task_id = "task_visual_001"
+        angle_id = "angle_001"
+        route = "visual_required"
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+        candidate.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "candidate_status": "policy_blocked",
+                "policy_decision": "blocked",
+                "rejection_reason": "policy_blocked",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetch = next(item for item in fetches if item["fetch_id"] == fetch_id)
+        fetch.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "fetch_status": "policy_blocked",
+                "retrieval_status": "policy_blocked",
+                "policy_decision": "blocked",
+                "failure_code": "policy_blocked",
+            }
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "observation_id": "obs_img_checkout_001_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": (run_dir / "images" / "checkout.png").resolve().as_uri(),
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": "images/checkout.png",
+                    "mime_type": "image/png",
+                    "artifact_size_bytes": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": "sha256:fixture-checkout",
+                    "phash": "checkout-phash",
+                    "candidate_id": candidate_id,
+                    "fetch_id": fetch_id,
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": route,
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:blocked-not-reconciled",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "model_or_tool": "codex-exec-image-worker",
+                    "observations": ["The checkout screenshot shows a primary payment button."],
+                    "inferences": ["The analyzed image would support checkout completion."],
+                    "visual_tasks": ["layout_review"],
+                    "confidence": 0.83,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                    "caveats": [],
+                    "verifier_links": [],
+                    "report_links": [],
+                    "created_at": "2026-06-22T00:00:00Z",
+                    "codex_interactive_handoff": True,
+                    "codex_native_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "provider_run_id": "codex-child:blocked-not-reconciled",
+                        "codex_interactive_handoff": True,
+                        "codex_native_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_candidate = next(item for item in post_candidates if item["candidate_id"] == candidate_id)
+        post_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(post_candidate["policy_decision"], "blocked")
+        self.assertEqual(post_candidate["candidate_status"], "policy_blocked")
+        self.assertEqual(post_fetch["policy_decision"], "blocked")
+        self.assertEqual(post_fetch["fetch_status"], "policy_blocked")
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertFalse(visual_validation.valid)
+        self.assertTrue(
+            any(
+                error.code == "lineage_mismatch"
+                and "policy_decision" in error.path
+                for error in visual_validation.errors
+            ),
+            [error.to_dict() for error in visual_validation.errors],
+        )
+
     def test_codex_interactive_metadata_child_reconciles_to_fetched_root_artifact(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
         self.write_codex_vlm_handoff(run_dir)
