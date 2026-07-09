@@ -6582,6 +6582,8 @@ def _has_protected_codex_interactive_handoff_policy_state(
         for field in (
             "policy_decision",
             "policy_flags",
+            "license_policy",
+            "robots_policy",
             "candidate_status",
             "fetch_status",
             "retrieval_status",
@@ -6601,10 +6603,19 @@ def _is_protected_acquisition_status(value: Any) -> bool:
         "manual_review",
         "disallowed",
         "restricted",
+        "policy_manual_review",
         "license_policy_blocked",
+        "license_policy_manual_review",
         "license_disallowed",
+        "license_manual_review",
         "license_restricted",
+        "copyright_manual_review",
+        "copyright_restricted",
+        "robots_blocked",
         "robots_disallowed",
+        "robots_manual_review",
+        "robots_policy_blocked",
+        "robots_policy_manual_review",
         "robots_restricted",
     }
 

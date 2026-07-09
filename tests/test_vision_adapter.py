@@ -1348,6 +1348,99 @@ class VisionAdapterTests(unittest.TestCase):
             [error.to_dict() for error in visual_validation.errors],
         )
 
+    def test_codex_interactive_keeps_license_robots_protected_budget_pruned_sidecars_visible(
+        self,
+    ) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        image_id = "img_checkout_001"
+        candidate_id = "cand_checkout_001"
+        fetch_id = "fetch_checkout_001"
+
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+        candidate.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "candidate_status": "budget_pruned",
+                "policy_decision": "budget_pruned",
+                "rejection_reason": "budget_pruned",
+                "license_policy": "manual_review",
+                "robots_policy": "allowed",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetch = next(item for item in fetches if item["fetch_id"] == fetch_id)
+        fetch.update(
+            {
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "fetch_status": "budget_pruned",
+                "retrieval_status": "budget_pruned",
+                "policy_decision": "budget_pruned",
+                "failure_code": "budget_pruned",
+                "license_policy": "allowed",
+                "robots_policy": "disallowed",
+            }
+        )
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self.write_codex_interactive_observation(
+            run_dir,
+            provider_run_id="codex-child:license-robots-protected-budget-pruned",
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertFalse(result["visual_artifact_validation"]["valid"])
+        post_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        post_candidate = next(item for item in post_candidates if item["candidate_id"] == candidate_id)
+        post_fetch = next(item for item in post_fetches if item["fetch_id"] == fetch_id)
+        self.assertEqual(post_candidate["license_policy"], "manual_review")
+        self.assertEqual(post_candidate["policy_decision"], "budget_pruned")
+        self.assertEqual(post_candidate["candidate_status"], "budget_pruned")
+        self.assertEqual(post_candidate["rejection_reason"], "budget_pruned")
+        self.assertEqual(post_fetch["robots_policy"], "disallowed")
+        self.assertEqual(post_fetch["policy_decision"], "budget_pruned")
+        self.assertEqual(post_fetch["fetch_status"], "budget_pruned")
+        self.assertEqual(post_fetch["retrieval_status"], "budget_pruned")
+        self.assertEqual(post_fetch["failure_code"], "budget_pruned")
+        self.assertNotIn("raw_codex_interactive_handoff_policy_decision", post_candidate)
+        self.assertNotIn("raw_codex_interactive_handoff_candidate_status", post_candidate)
+        self.assertNotIn("raw_codex_interactive_handoff_policy_decision", post_fetch)
+        self.assertNotIn("raw_codex_interactive_handoff_fetch_status", post_fetch)
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        self.assertFalse(visual_validation.valid)
+        self.assertTrue(
+            any(
+                error.code == "lineage_mismatch"
+                and "policy_decision" in error.path
+                for error in visual_validation.errors
+            ),
+            [error.to_dict() for error in visual_validation.errors],
+        )
+
     def test_codex_interactive_keeps_non_budget_fetch_artifact_mismatch_visible(
         self,
     ) -> None:
