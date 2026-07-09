@@ -13,10 +13,11 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse
+from urllib.parse import quote, unquote, unquote_to_bytes, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .cache_keys import image_cache_key, normalize_url
@@ -839,6 +840,21 @@ def _fetch_candidates(
                 )
             )
             continue
+        try:
+            request_url = _request_safe_image_url(image_url)
+        except (UnicodeError, ValueError) as exc:
+            failure_code = f"fetch_failed:{exc.__class__.__name__}"
+            candidate["candidate_status"] = "fetch_failed"
+            candidate["rejection_reason"] = failure_code
+            fetch_records.append(
+                _complete_fetch_record(
+                    base_record,
+                    fetch_status="failed",
+                    failure_code=failure_code,
+                    normalized_url=normalized_url,
+                )
+            )
+            continue
         seen_urls[normalized_url] = {
             "candidate_id": candidate.get("candidate_id"),
             "fetch_id": fetch_id,
@@ -847,7 +863,7 @@ def _fetch_candidates(
             "phash": None,
         }
         response = _fetch_image(
-            image_url,
+            request_url,
             transport=transport,
             max_image_bytes=max_image_bytes,
             timeout_seconds=timeout_seconds,
@@ -1161,30 +1177,40 @@ def _fetch_image(
     max_image_bytes: int,
     timeout_seconds: float,
 ) -> FetchResponse:
+    try:
+        request_url = _request_safe_image_url(url)
+    except (UnicodeError, ValueError) as exc:
+        return FetchResponse(
+            content=None,
+            mime_type=None,
+            status_code=None,
+            final_url=url,
+            error_code=f"fetch_failed:{exc.__class__.__name__}",
+        )
     if transport is not None:
         try:
-            return transport(url)
+            return transport(request_url)
         except Exception as exc:  # pragma: no cover - exercised through public result
             return FetchResponse(
                 content=None,
                 mime_type=None,
                 status_code=None,
-                final_url=url,
+                final_url=request_url,
                 error_code=f"fetch_failed:{exc.__class__.__name__}",
             )
     try:
         return _default_fetch_image(
-            url,
+            request_url,
             timeout_seconds=timeout_seconds,
             max_image_bytes=max_image_bytes,
         )
-    except (OSError, ValueError, HTTPError, URLError) as exc:
+    except (OSError, ValueError, HTTPException, HTTPError, URLError) as exc:
         status = exc.code if isinstance(exc, HTTPError) else None
         return FetchResponse(
             content=None,
             mime_type=None,
             status_code=status,
-            final_url=url,
+            final_url=request_url,
             error_code=f"fetch_failed:{exc.__class__.__name__}",
         )
 
@@ -1196,32 +1222,99 @@ def _fetch_source_html(
     timeout_seconds: float,
     max_html_bytes: int,
 ) -> FetchResponse:
+    try:
+        request_url = _request_safe_http_url(url)
+    except (UnicodeError, ValueError) as exc:
+        return FetchResponse(
+            content=None,
+            mime_type=None,
+            status_code=None,
+            final_url=url,
+            error_code=f"fetch_failed:{exc.__class__.__name__}",
+        )
     if transport is not None:
         try:
-            return transport(url)
+            return transport(request_url)
         except Exception as exc:  # pragma: no cover - exercised through public result
             return FetchResponse(
                 content=None,
                 mime_type=None,
                 status_code=None,
-                final_url=url,
+                final_url=request_url,
                 error_code=f"fetch_failed:{exc.__class__.__name__}",
             )
     try:
         return _default_fetch_source_html(
-            url,
+            request_url,
             timeout_seconds=timeout_seconds,
             max_html_bytes=max_html_bytes,
         )
-    except (OSError, ValueError, HTTPError, URLError) as exc:
+    except (OSError, ValueError, HTTPException, HTTPError, URLError) as exc:
         status = exc.code if isinstance(exc, HTTPError) else None
         return FetchResponse(
             content=None,
             mime_type=None,
             status_code=status,
-            final_url=url,
+            final_url=request_url,
             error_code=f"fetch_failed:{exc.__class__.__name__}",
         )
+
+
+def _request_safe_http_url(url: str) -> str:
+    if _has_control_character(url):
+        raise ValueError("source URL contains control characters")
+    url = url.strip(" ")
+    if _has_invalid_percent_escape(url):
+        raise ValueError("source URL contains invalid percent escape")
+    raw_authority = _raw_http_authority(url)
+    if raw_authority is not None and _has_invalid_authority_character(raw_authority):
+        raise ValueError("source URL authority contains invalid characters")
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("malformed source URL") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("unsupported source URL scheme")
+    if not parsed.netloc or not hostname:
+        raise ValueError("missing source URL host")
+    return parsed._replace(
+        path=quote(parsed.path, safe="/%:@!$&'()*+,;="),
+        params=quote(parsed.params, safe="%:@!$&'()*+,;="),
+        query=quote(parsed.query, safe="/?%:@!$&'()*+,;="),
+        fragment=quote(parsed.fragment, safe="/?%:@!$&'()*+,;="),
+    ).geturl()
+
+
+def _request_safe_image_url(url: str) -> str:
+    if _is_http_like_url(url):
+        return _request_safe_http_url(url)
+    return url
+
+
+def _is_http_like_url(url: str) -> bool:
+    return re.match(r"(?i)^[\x00-\x20\x7f]*https?:", url) is not None
+
+
+def _raw_http_authority(url: str) -> str | None:
+    match = re.match(r"(?i)^https?://([^/?#]*)", url)
+    return match.group(1) if match else None
+
+
+def _has_control_character(value: str) -> bool:
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def _has_invalid_authority_character(value: str) -> bool:
+    return any(
+        char == "%" or char.isspace() or ord(char) <= 0x20 or ord(char) == 0x7F
+        for char in value
+    )
+
+
+def _has_invalid_percent_escape(value: str) -> bool:
+    return re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None
 
 
 def _default_fetch_image(
@@ -1230,6 +1323,8 @@ def _default_fetch_image(
     timeout_seconds: float,
     max_image_bytes: int,
 ) -> FetchResponse:
+    if _is_http_like_url(url):
+        url = _request_safe_http_url(url)
     parsed = urlparse(url)
     if parsed.scheme == "data":
         header, _, payload = url.partition(",")
@@ -1288,6 +1383,7 @@ def _default_fetch_source_html(
     timeout_seconds: float,
     max_html_bytes: int,
 ) -> FetchResponse:
+    url = _request_safe_http_url(url)
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("unsupported source URL scheme")
@@ -1368,10 +1464,10 @@ class _PrivateNetworkBlockingRedirectHandler(HTTPRedirectHandler):
         headers: Mapping[str, Any],
         newurl: str,
     ) -> Request | None:
-        redirect_url = urljoin(req.full_url, newurl)
+        redirect_url = _request_safe_http_url(urljoin(req.full_url, newurl))
         if _is_private_or_reserved_http_url(redirect_url, resolve_host=True):
             raise ValueError("private_network_redirect")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, redirect_url)
 
 
 def _visual_search_plan(
@@ -1612,12 +1708,15 @@ def _remote_source_html_fetch_allowed(
     source_url = _string(source.get("url"))
     if not source_url:
         return False
+    source_url = source_url.strip(" ")
     try:
         parsed = urlparse(source_url)
     except ValueError:
-        return False
-    if parsed.scheme not in {"http", "https"}:
-        return False
+        if not _raw_http_authority(source_url):
+            return False
+    else:
+        if parsed.scheme not in {"http", "https"}:
+            return False
     route = _source_route(source, routes_by_angle)
     route_name = _string(route.get("modality")) or _string(source.get("route"))
     if route_name == "text_only":
@@ -1647,7 +1746,12 @@ def _fetch_remote_source_html(
         "failure_code": None,
         "external_network_call": False,
     }
-    if _is_private_or_reserved_http_url(source_url, resolve_host=transport is None):
+    try:
+        request_url = _request_safe_http_url(source_url)
+    except (UnicodeError, ValueError) as exc:
+        base_record["failure_code"] = f"fetch_failed:{exc.__class__.__name__}"
+        return base_record, None, source_url
+    if _is_private_or_reserved_http_url(request_url, resolve_host=transport is None):
         base_record.update(
             {
                 "status": "blocked",
@@ -1655,9 +1759,9 @@ def _fetch_remote_source_html(
                 "external_network_call": False,
             }
         )
-        return base_record, None, source_url
+        return base_record, None, request_url
     response = _fetch_source_html(
-        source_url,
+        request_url,
         transport=transport,
         timeout_seconds=timeout_seconds,
         max_html_bytes=max_html_bytes,
@@ -1949,6 +2053,17 @@ def _image_url_fetch_block_reason(
     source_html_path: Path | None,
     resolve_hosts: bool,
 ) -> str | None:
+    if _is_http_like_url(url):
+        try:
+            request_url = _request_safe_http_url(url)
+        except (UnicodeError, ValueError):
+            return None
+        if (
+            _source_is_remote_page(source)
+            and _is_private_or_reserved_http_url(request_url, resolve_host=resolve_hosts)
+        ):
+            return "private_network_url_from_remote_page"
+        return None
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -1998,14 +2113,19 @@ def _source_allows_local_image_references(source: Mapping[str, Any]) -> bool:
 
 
 def _source_is_remote_page(source: Mapping[str, Any]) -> bool:
+    source_type = _string(source.get("type")) or ""
+    if source_type in {"local", "fixture"}:
+        return False
     source_url = _string(source.get("url"))
     if not source_url:
         return False
+    if _is_http_like_url(source_url):
+        return True
+    source_url = source_url.strip(" ")
     try:
         scheme = urlparse(source_url).scheme.lower()
     except ValueError:
-        return False
-    source_type = _string(source.get("type")) or ""
+        return _is_http_like_url(source_url)
     return scheme in {"http", "https"} and source_type not in {"local", "fixture"}
 
 
@@ -2069,10 +2189,22 @@ def _is_obvious_internal_hostname(host: str) -> bool:
 
 
 def _safe_join_url(page_url: str, image_url: str) -> str | None:
+    if _has_control_character_in_http_like_url(image_url):
+        return image_url or None
     try:
         return urljoin(page_url, image_url)
     except ValueError:
         return image_url or None
+
+
+def _has_control_character_in_http_like_url(value: str) -> bool:
+    return _has_control_character(value) and (
+        _is_http_like_url(value) or _is_network_path_like_url(value)
+    )
+
+
+def _is_network_path_like_url(value: str) -> bool:
+    return re.match(r"^[\x00-\x20\x7f]*//", value) is not None
 
 
 def _numeric_hostname_addresses(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:

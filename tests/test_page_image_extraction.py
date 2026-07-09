@@ -679,6 +679,365 @@ class PageImageExtractionTests(unittest.TestCase):
         self.assertTrue(provider["external_network_call"])
         self.assertEqual(provider["diagnostics"]["remote_page_fetches"], 2)
 
+    def test_real_mode_encodes_unescaped_unicode_source_url_before_transport(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Recover page images from Korean public source URLs",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        raw_url = " https://www.law.go.kr/법령/학교급식법 시행규칙 "
+        encoded_url = (
+            "https://www.law.go.kr/%EB%B2%95%EB%A0%B9/"
+            "%ED%95%99%EA%B5%90%EA%B8%89%EC%8B%9D%EB%B2%95%20"
+            "%EC%8B%9C%ED%96%89%EA%B7%9C%EC%B9%99"
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_korean_remote_page",
+                "type": "web",
+                "url": raw_url,
+                "title": "Korean public source",
+                "published_at": None,
+                "accessed_at": "2026-07-09T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/missing-korean-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "search_result_id": "search_korean_remote_page",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            if url == encoded_url:
+                return FetchResponse(
+                    content=(
+                        b'<html><body><img src="https://img.example.test/korean.png" '
+                        b'alt="Korean source image"></body></html>'
+                    ),
+                    mime_type="text/html",
+                    status_code=200,
+                    final_url=url,
+                )
+            return FetchResponse(
+                content=PNG_1X1 + b"korean",
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = extract_and_fetch_page_images(
+            run=run_dir,
+            transport=transport,
+            provider_mode="real",
+            max_fetches=1,
+        )
+
+        self.assertEqual(calls[0], encoded_url)
+        self.assertNotIn(raw_url, calls)
+        self.assertEqual(result["remote_page_fetch_status_counts"], {"fetched": 1})
+        self.assertEqual(result["candidate_records"], 1)
+        self.assertEqual(result["images_linked"], 1)
+        evidence = self.read_json(run_dir / "evidence.json")
+        fetch_record = evidence["page_image_extraction"]["remote_page_fetch_records"][0]
+        self.assertEqual(fetch_record["source_url"], raw_url)
+        self.assertEqual(fetch_record["final_url"], encoded_url)
+
+    def test_default_source_html_fetch_encodes_unescaped_unicode_url_before_opener(
+        self,
+    ) -> None:
+        raw_url = " https://www.law.go.kr/법령/학교급식법 시행규칙 "
+        encoded_url = (
+            "https://www.law.go.kr/%EB%B2%95%EB%A0%B9/"
+            "%ED%95%99%EA%B5%90%EA%B8%89%EC%8B%9D%EB%B2%95%20"
+            "%EC%8B%9C%ED%96%89%EA%B7%9C%EC%B9%99"
+        )
+        private_checks: list[str] = []
+        opened_urls: list[str] = []
+        test_case = self
+
+        class FakeHeaders:
+            def get_content_type(self) -> str:
+                return "text/html"
+
+        class FakeResponse:
+            status = 200
+            headers = FakeHeaders()
+
+            def __init__(self, final_url: str) -> None:
+                self.final_url = final_url
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return b"<html><body>safe</body></html>"
+
+            def geturl(self) -> str:
+                return self.final_url
+
+        class FakeOpener:
+            def open(self, request: Request, timeout: float) -> FakeResponse:
+                test_case.assertEqual(timeout, 1.0)
+                opened_urls.append(request.full_url)
+                return FakeResponse(request.full_url)
+
+        original_private_check = page_images._is_private_or_reserved_http_url
+        original_build_opener = page_images.build_opener
+
+        def fake_private_check(url: str, *, resolve_host: bool = False) -> bool:
+            self.assertTrue(resolve_host)
+            private_checks.append(url)
+            return False
+
+        try:
+            page_images._is_private_or_reserved_http_url = fake_private_check
+            page_images.build_opener = lambda *_args, **_kwargs: FakeOpener()
+            response = page_images._default_fetch_source_html(
+                raw_url,
+                timeout_seconds=1.0,
+                max_html_bytes=128,
+            )
+        finally:
+            page_images._is_private_or_reserved_http_url = original_private_check
+            page_images.build_opener = original_build_opener
+
+        self.assertEqual(private_checks, [encoded_url])
+        self.assertEqual(opened_urls, [encoded_url])
+        self.assertEqual(response.content, b"<html><body>safe</body></html>")
+        self.assertEqual(response.final_url, encoded_url)
+
+    def test_malformed_remote_source_http_urls_fail_without_transport_call(
+        self,
+    ) -> None:
+        malformed_urls = [
+            "https://example.test/%zz",
+            "https://exa mple.test/path",
+            " https://exa mple.test/path",
+            "https://[::1",
+            " https://[::1",
+            "https://example.test:bad/source",
+            " https://example.test:bad/source",
+        ]
+        for source_url in malformed_urls:
+            with self.subTest(source_url=source_url):
+                prepared = prepare_run(
+                    question="Malformed remote source URL should not crash extraction",
+                    runs_dir=self.temp_runs_dir(),
+                    route="visual_required",
+                )
+                run_dir = Path(prepared["run_dir"])
+                evidence = self.read_json(run_dir / "evidence.json")
+                evidence["sources"] = [
+                    {
+                        "id": "src_malformed_remote_page",
+                        "type": "web",
+                        "url": source_url,
+                        "title": "Malformed remote page",
+                        "published_at": None,
+                        "accessed_at": "2026-07-09T00:00:00Z",
+                        "quality": "primary",
+                        "retrieval_status": "fetched",
+                        "local_artifact_path": "sources/missing-malformed-page.html",
+                        "license_policy": "allowed",
+                        "robots_policy": "allowed",
+                        "policy_decision": "allowed",
+                        "policy_flags": [],
+                        "search_result_id": "search_malformed_remote_page",
+                        "angle_id": "angle_001",
+                        "route": "visual_required",
+                    }
+                ]
+                self.write_json(run_dir / "evidence.json", evidence)
+                calls: list[str] = []
+
+                def transport(url: str) -> FetchResponse:
+                    calls.append(url)
+                    raise AssertionError(f"unexpected transport call: {url}")
+
+                result = extract_and_fetch_page_images(
+                    run=run_dir,
+                    transport=transport,
+                    provider_mode="real",
+                )
+
+                self.assertEqual(calls, [])
+                self.assertEqual(result["page_sources_scanned"], 1)
+                self.assertEqual(result["remote_page_fetches"], 1)
+                self.assertEqual(result["remote_page_fetch_status_counts"], {"failed": 1})
+                self.assertEqual(result["candidate_records"], 0)
+                self.assertEqual(result["images_linked"], 0)
+                evidence = self.read_json(run_dir / "evidence.json")
+                fetch_record = evidence["page_image_extraction"]["remote_page_fetch_records"][0]
+                self.assertEqual(fetch_record["source_url"], source_url)
+                self.assertEqual(fetch_record["final_url"], source_url)
+                self.assertEqual(fetch_record["status"], "failed")
+                self.assertEqual(fetch_record["failure_code"], "fetch_failed:ValueError")
+                self.assertFalse(fetch_record["external_network_call"])
+
+    def test_source_html_fetch_rejects_leading_space_malformed_authority_before_transport(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            raise AssertionError(f"unexpected transport call: {url}")
+
+        response = page_images._fetch_source_html(
+            " https://exa mple.test/path",
+            transport=transport,
+            timeout_seconds=1.0,
+            max_html_bytes=128,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIsNone(response.content)
+        self.assertEqual(response.final_url, " https://exa mple.test/path")
+        self.assertEqual(response.error_code, "fetch_failed:ValueError")
+
+    def test_source_html_fetch_rejects_percent_encoded_authority_before_transport_and_opener(
+        self,
+    ) -> None:
+        source_url = "http://%31%32%37.0.0.1/source.html"
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            raise AssertionError(f"unexpected transport call: {url}")
+
+        response = page_images._fetch_source_html(
+            source_url,
+            transport=transport,
+            timeout_seconds=1.0,
+            max_html_bytes=128,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIsNone(response.content)
+        self.assertEqual(response.final_url, source_url)
+        self.assertEqual(response.error_code, "fetch_failed:ValueError")
+
+        original_build_opener = page_images.build_opener
+
+        def fail_build_opener(*_args, **_kwargs):
+            raise AssertionError("default opener should not be reached")
+
+        try:
+            page_images.build_opener = fail_build_opener
+            with self.assertRaises(ValueError):
+                page_images._default_fetch_source_html(
+                    source_url,
+                    timeout_seconds=1.0,
+                    max_html_bytes=128,
+                )
+            with self.assertRaises(ValueError):
+                page_images._default_fetch_image(
+                    "http://%31%32%37.0.0.1/private.png",
+                    timeout_seconds=1.0,
+                    max_image_bytes=128,
+                )
+        finally:
+            page_images.build_opener = original_build_opener
+
+    def test_remote_percent_encoded_authority_source_url_writes_failed_record_without_opener(
+        self,
+    ) -> None:
+        source_url = "http://%31%32%37.0.0.1/source.html"
+        prepared = prepare_run(
+            question="Percent-encoded private source URL should not reach transport",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_percent_authority_remote_page",
+                "type": "web",
+                "url": source_url,
+                "title": "Percent encoded authority source",
+                "published_at": None,
+                "accessed_at": "2026-07-09T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/missing-percent-authority-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "search_result_id": "search_percent_authority_remote_page",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        original_build_opener = page_images.build_opener
+
+        def fail_build_opener(*_args, **_kwargs):
+            raise AssertionError("default opener should not be reached")
+
+        try:
+            page_images.build_opener = fail_build_opener
+            result = extract_and_fetch_page_images(run=run_dir, provider_mode="real")
+        finally:
+            page_images.build_opener = original_build_opener
+
+        self.assertEqual(result["page_sources_scanned"], 1)
+        self.assertEqual(result["remote_page_fetches"], 1)
+        self.assertEqual(result["remote_page_fetch_status_counts"], {"failed": 1})
+        self.assertEqual(result["candidate_records"], 0)
+        self.assertEqual(result["images_linked"], 0)
+        evidence = self.read_json(run_dir / "evidence.json")
+        fetch_record = evidence["page_image_extraction"]["remote_page_fetch_records"][0]
+        self.assertEqual(fetch_record["source_url"], source_url)
+        self.assertEqual(fetch_record["final_url"], source_url)
+        self.assertEqual(fetch_record["status"], "failed")
+        self.assertEqual(fetch_record["failure_code"], "fetch_failed:ValueError")
+        self.assertFalse(fetch_record["external_network_call"])
+
+    def test_image_fetch_allows_percent_encoded_path_query_before_transport(self) -> None:
+        image_url = (
+            "https://img.example.test/%EB%B2%95%20%EB%A0%B9.png"
+            "?label=%ED%95%9C%EA%B8%80%20%EA%B0%92"
+        )
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(
+                content=PNG_1X1 + b"encoded",
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        response = page_images._fetch_image(
+            image_url,
+            transport=transport,
+            max_image_bytes=128,
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(calls, [image_url])
+        self.assertEqual(response.content, PNG_1X1 + b"encoded")
+        self.assertEqual(response.final_url, image_url)
+        self.assertIsNone(response.error_code)
+
     def test_fixture_mode_does_not_fetch_remote_source_html_for_missing_local_artifact(
         self,
     ) -> None:
@@ -987,6 +1346,112 @@ class PageImageExtractionTests(unittest.TestCase):
         self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
         self.assertEqual(fetches[0]["failure_code"], "private_network_url_from_remote_page")
 
+    def test_remote_page_percent_encoded_authority_image_url_fails_without_transport(
+        self,
+    ) -> None:
+        image_url = "http://%31%32%37.0.0.1/private.png"
+        prepared = prepare_run(
+            question="Reject percent-encoded private authority image",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "percent-authority-page.html"
+        page.write_text(
+            f'<html><body><img src="{image_url}" alt="Private"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_percent_authority_page",
+                "type": "web",
+                "url": "https://example.test/remote/",
+                "title": "Percent authority image page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/percent-authority-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            raise AssertionError(f"unexpected transport call: {url}")
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["candidate_records"], 1)
+        self.assertEqual(result["images_linked"], 0)
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        self.assertEqual(candidates[0]["image_url"], image_url)
+        self.assertEqual(candidates[0]["candidate_status"], "fetch_failed")
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0]["fetch_status"], "failed")
+        self.assertEqual(fetches[0]["failure_code"], "fetch_failed:ValueError")
+
+    def test_malformed_remote_source_url_private_image_is_policy_blocked(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Reject private image from malformed remote source metadata",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "malformed-remote-page.html"
+        page.write_text(
+            '<html><body><img src="http://127.0.0.1/private.png" alt="Private"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_malformed_remote_page",
+                "type": "web",
+                "url": "https://[::1",
+                "title": "Malformed remote page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/malformed-remote-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(content=PNG_1X1, mime_type="image/png", status_code=200)
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["images_linked"], 0)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(fetches[0]["fetch_status"], "policy_blocked")
+        self.assertEqual(fetches[0]["failure_code"], "private_network_url_from_remote_page")
+
     def test_remote_page_obvious_internal_hosts_are_policy_blocked_without_transport(
         self,
     ) -> None:
@@ -1164,7 +1629,157 @@ class PageImageExtractionTests(unittest.TestCase):
             {"private_network_url_from_remote_page"},
         )
 
-    def test_malformed_image_url_is_skipped_without_transport(self) -> None:
+    def test_leading_control_http_image_urls_fail_before_transport(self) -> None:
+        bad_urls = [
+            "\thttp://127.0.0.1/private.png",
+            "\nhttps://img.example.test/x.png",
+        ]
+        for url in bad_urls:
+            with self.subTest(url=repr(url)):
+                calls: list[str] = []
+
+                def transport(request_url: str) -> FetchResponse:
+                    calls.append(request_url)
+                    raise AssertionError(f"unexpected transport call: {request_url!r}")
+
+                response = page_images._fetch_image(
+                    url,
+                    transport=transport,
+                    max_image_bytes=128,
+                    timeout_seconds=1.0,
+                )
+
+                self.assertEqual(calls, [])
+                self.assertIsNone(response.content)
+                self.assertEqual(response.final_url, url)
+                self.assertEqual(response.error_code, "fetch_failed:ValueError")
+
+    def test_html_extraction_leading_control_http_image_url_fails_without_transport(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Leading control image URL should not be repaired during extraction",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "leading-control-page.html"
+        page.write_text(
+            '<html><body><img src="\nhttps://img.example.test/x.png" alt="Bad"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_leading_control_page",
+                "type": "web",
+                "url": "https://example.test/leading-control/",
+                "title": "Leading control page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/leading-control-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(request_url: str) -> FetchResponse:
+            calls.append(request_url)
+            raise AssertionError(f"unexpected transport call: {request_url!r}")
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["candidate_records"], 1)
+        self.assertEqual(result["images_linked"], 0)
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        self.assertEqual(candidates[0]["image_url"], "\nhttps://img.example.test/x.png")
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0]["fetch_status"], "failed")
+        self.assertEqual(fetches[0]["failure_code"], "fetch_failed:ValueError")
+        self.assertEqual(result["status_counts"], {"failed": 1})
+
+    def test_leading_control_http_image_url_does_not_dedupe_clean_later_url(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Malformed image URL should not suppress later valid URL",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "leading-control-clean-page.html"
+        clean_url = "https://img.example.test/x.png"
+        malformed_url = f"\n{clean_url}"
+        page.write_text(
+            (
+                '<html><body>'
+                f'<img src="{malformed_url}" alt="Bad">'
+                f'<img src="{clean_url}" alt="Clean">'
+                '</body></html>'
+            ),
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_leading_control_clean_page",
+                "type": "web",
+                "url": "https://example.test/leading-control-clean/",
+                "title": "Leading control clean page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/leading-control-clean-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        calls: list[str] = []
+
+        def transport(request_url: str) -> FetchResponse:
+            calls.append(request_url)
+            return FetchResponse(
+                content=PNG_1X1 + b"clean",
+                mime_type="image/png",
+                status_code=200,
+                final_url=request_url,
+            )
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [clean_url])
+        self.assertEqual(result["candidate_records"], 2)
+        self.assertEqual(result["images_linked"], 1)
+        self.assertEqual(result["status_counts"], {"failed": 1, "fetched": 1})
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        self.assertEqual(candidates[0]["image_url"], malformed_url)
+        self.assertEqual(candidates[1]["image_url"], clean_url)
+        self.assertEqual(candidates[0]["candidate_status"], "fetch_failed")
+        self.assertEqual(candidates[1]["candidate_status"], "fetched")
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual([record["fetch_status"] for record in fetches], ["failed", "fetched"])
+        self.assertEqual(fetches[0]["failure_code"], "fetch_failed:ValueError")
+        self.assertIsNone(fetches[1]["failure_code"])
+
+    def test_malformed_http_image_urls_fail_without_transport_call(self) -> None:
         prepared = prepare_run(
             question="Malformed image URL should not crash extraction",
             runs_dir=self.temp_runs_dir(),
@@ -1173,8 +1788,19 @@ class PageImageExtractionTests(unittest.TestCase):
         run_dir = Path(prepared["run_dir"])
         (run_dir / "sources").mkdir(exist_ok=True)
         page = run_dir / "sources" / "malformed-page.html"
+        malformed_urls = [
+            "https://img.example.test/%zz",
+            "https://img.example.test:bad/x.png",
+            "https://exa mple.test/path.png",
+            "https://[::1",
+        ]
         page.write_text(
-            '<html><body><img src="http://[::1" alt="Bad"></body></html>',
+            "<html><body>"
+            + "".join(
+                f'<img src="{url}" alt="Bad {index}">'
+                for index, url in enumerate(malformed_urls, start=1)
+            )
+            + "</body></html>",
             encoding="utf-8",
         )
         evidence = self.read_json(run_dir / "evidence.json")
@@ -1207,11 +1833,138 @@ class PageImageExtractionTests(unittest.TestCase):
         result = extract_and_fetch_page_images(run=run_dir, transport=transport)
 
         self.assertEqual(calls, [])
+        self.assertEqual(result["candidate_records"], len(malformed_urls))
         self.assertEqual(result["images_linked"], 0)
         fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
-        self.assertEqual(len(fetches), 1)
-        self.assertEqual(fetches[0]["fetch_status"], "skipped")
-        self.assertEqual(fetches[0]["failure_code"], "unsupported_url_scheme")
+        self.assertEqual(len(fetches), len(malformed_urls))
+        self.assertEqual({record["fetch_status"] for record in fetches}, {"failed"})
+        self.assertEqual(
+            {record["failure_code"] for record in fetches},
+            {"fetch_failed:ValueError"},
+        )
+        self.assertEqual(result["status_counts"], {"failed": len(malformed_urls)})
+
+    def test_bad_port_http_image_url_without_transport_writes_failed_status(self) -> None:
+        prepared = prepare_run(
+            question="Bad port image URL should not crash default extraction",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "bad-port-page.html"
+        page.write_text(
+            '<html><body><img src="https://img.example.test:bad/x.png" alt="Bad port"></body></html>',
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_bad_port_page",
+                "type": "web",
+                "url": "https://example.test/bad-port/",
+                "title": "Bad port page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/bad-port-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        original_build_opener = page_images.build_opener
+
+        def fail_build_opener(*_args, **_kwargs):
+            raise AssertionError("default opener should not be reached")
+
+        try:
+            page_images.build_opener = fail_build_opener
+            result = extract_and_fetch_page_images(run=run_dir)
+        finally:
+            page_images.build_opener = original_build_opener
+
+        self.assertEqual(result["candidate_records"], 1)
+        self.assertEqual(result["images_linked"], 0)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(fetches[0]["fetch_status"], "failed")
+        self.assertEqual(fetches[0]["failure_code"], "fetch_failed:ValueError")
+
+    def test_http_image_url_with_unicode_and_spaces_is_encoded_before_transport(
+        self,
+    ) -> None:
+        prepared = prepare_run(
+            question="Unicode image URL should be encoded before fetch",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+        )
+        run_dir = Path(prepared["run_dir"])
+        (run_dir / "sources").mkdir(exist_ok=True)
+        page = run_dir / "sources" / "unicode-image-page.html"
+        page.write_text(
+            (
+                '<html><body><img src=" '
+                'https://img.example.test/법 령 이미지.png?label=한글 값 '
+                '" alt="Unicode image"></body></html>'
+            ),
+            encoding="utf-8",
+        )
+        evidence = self.read_json(run_dir / "evidence.json")
+        evidence["sources"] = [
+            {
+                "id": "src_unicode_image_page",
+                "type": "web",
+                "url": "https://example.test/unicode-image/",
+                "title": "Unicode image page",
+                "published_at": None,
+                "accessed_at": "2026-06-25T00:00:00Z",
+                "quality": "primary",
+                "retrieval_status": "fetched",
+                "local_artifact_path": "sources/unicode-image-page.html",
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "angle_id": "angle_001",
+                "route": "visual_required",
+            }
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+        raw_candidate_url = "https://img.example.test/법 령 이미지.png?label=한글 값 "
+        encoded_url = (
+            "https://img.example.test/%EB%B2%95%20%EB%A0%B9%20"
+            "%EC%9D%B4%EB%AF%B8%EC%A7%80.png?label=%ED%95%9C%EA%B8%80%20%EA%B0%92"
+        )
+        normalized_url = (
+            "https://img.example.test/%EB%B2%95%20%EB%A0%B9%20"
+            "%EC%9D%B4%EB%AF%B8%EC%A7%80.png?label=%ED%95%9C%EA%B8%80+%EA%B0%92"
+        )
+        calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            calls.append(url)
+            return FetchResponse(
+                content=PNG_1X1 + b"unicode",
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        result = extract_and_fetch_page_images(run=run_dir, transport=transport)
+
+        self.assertEqual(calls, [encoded_url])
+        self.assertEqual(result["images_linked"], 1)
+        candidates = self.read_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+        self.assertEqual(candidates[0]["image_url"], raw_candidate_url)
+        self.assertEqual(candidates[0]["normalized_image_url"], normalized_url)
+        fetches = self.read_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME)
+        self.assertEqual(fetches[0]["fetch_status"], "fetched")
+        self.assertEqual(fetches[0]["normalized_image_url"], normalized_url)
 
     def test_source_html_path_must_be_run_relative(self) -> None:
         prepared = prepare_run(
