@@ -3238,6 +3238,7 @@ def _write_release_validation_visual_handoffs(
         normalized_observations,
         expected_semantic_task_ids=expected_visual_task_ids,
     )
+    _normalize_release_visual_observation_ids(normalized_observations)
     link_cleanup = _clear_dangling_visual_observation_verifier_links(
         normalized_observations,
         verifier_vote_ids=verifier_vote_merge["verifier_vote_ids"],
@@ -3579,6 +3580,57 @@ def _canonicalize_release_visual_observations(
         _canonicalize_release_visual_observation_links(record)
         normalized.append(record)
     return normalized
+
+
+def _normalize_release_visual_observation_ids(
+    records: Sequence[MutableMapping[str, Any]],
+) -> None:
+    id_counts: dict[str, int] = {}
+    for record in records:
+        observation_id = _string_or_none(record.get("observation_id"))
+        if observation_id:
+            id_counts[observation_id] = id_counts.get(observation_id, 0) + 1
+
+    used_ids: set[str] = set()
+    unavailable_ids = {
+        observation_id
+        for observation_id, count in id_counts.items()
+        if count == 1
+    }
+    for index, record in enumerate(records, start=1):
+        observation_id = _string_or_none(record.get("observation_id"))
+        if not observation_id or id_counts.get(observation_id, 0) > 1 or observation_id in used_ids:
+            original_observation_id = observation_id
+            observation_id = _unique_release_visual_observation_id(record, index, unavailable_ids)
+            if original_observation_id:
+                _set_release_canonical_field(record, "observation_id", observation_id)
+            else:
+                record["observation_id"] = observation_id
+        used_ids.add(observation_id)
+        unavailable_ids.add(observation_id)
+
+
+def _unique_release_visual_observation_id(
+    record: Mapping[str, Any],
+    index: int,
+    used_ids: set[str],
+) -> str:
+    parts = [
+        _sanitize_id(value)
+        for field in ("task_id", "evidence_image_id", "candidate_id", "fetch_id")
+        for value in [_string_or_none(record.get(field))]
+        if value
+    ]
+    if parts:
+        base = "obs_" + "_".join(parts)
+    else:
+        base = f"obs_record_{index:03d}"
+    candidate = base
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _release_visual_task_lineage_by_id(run_dir: Path) -> dict[str, Mapping[str, Any]]:

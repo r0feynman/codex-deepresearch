@@ -285,6 +285,111 @@ class VisualAcquisitionTests(unittest.TestCase):
             ["updated child shard visual observation"],
         )
 
+    def test_visual_observation_merge_normalizes_duplicate_and_missing_ids(self) -> None:
+        first_links = {
+            "verifier_links": [
+                {
+                    "claim_id": "claim_001",
+                    "task_id": "task_001",
+                    "evidence_image_id": "img_task_001",
+                    "candidate_id": "cand_task_001",
+                    "fetch_id": "fetch_task_001",
+                    "verifier_vote_id": "vote_001",
+                }
+            ],
+            "report_links": [
+                {
+                    "claim_id": "claim_001",
+                    "task_id": "task_001",
+                    "evidence_image_id": "img_task_001",
+                    "candidate_id": "cand_task_001",
+                    "fetch_id": "fetch_task_001",
+                    "citation_id": "img:img_task_001",
+                }
+            ],
+        }
+        second_links = {
+            "verifier_links": [
+                {
+                    "claim_id": "claim_022",
+                    "task_id": "task_022",
+                    "evidence_image_id": "img_task_022",
+                    "candidate_id": "cand_task_022",
+                    "fetch_id": "fetch_task_022",
+                    "verifier_vote_id": "vote_022",
+                }
+            ],
+            "report_links": [
+                {
+                    "claim_id": "claim_022",
+                    "task_id": "task_022",
+                    "evidence_image_id": "img_task_022",
+                    "candidate_id": "cand_task_022",
+                    "fetch_id": "fetch_task_022",
+                    "citation_id": "img:img_task_022",
+                }
+            ],
+        }
+        merged = _merge_visual_observation_records(
+            [
+                {
+                    "observation_id": "obs_001",
+                    "task_id": "task_001",
+                    "evidence_image_id": "img_task_001",
+                    "candidate_id": "cand_task_001",
+                    "fetch_id": "fetch_task_001",
+                    **first_links,
+                }
+            ],
+            [
+                {
+                    "observation_id": "obs_001",
+                    "task_id": "task_022",
+                    "evidence_image_id": "img_task_022",
+                    "candidate_id": "cand_task_022",
+                    "fetch_id": "fetch_task_022",
+                    **second_links,
+                },
+                {
+                    "task_id": "task_003",
+                    "evidence_image_id": "img_task_003",
+                    "candidate_id": "cand_task_003",
+                    "fetch_id": "fetch_task_003",
+                    "verifier_links": [],
+                    "report_links": [],
+                },
+            ],
+        )
+
+        observation_ids = [record["observation_id"] for record in merged]
+        self.assertEqual(len(observation_ids), len(set(observation_ids)))
+        by_image = {record["evidence_image_id"]: record for record in merged}
+        self.assertEqual(
+            by_image["img_task_001"]["observation_id"],
+            "obs_task_001_img_task_001_cand_task_001_fetch_task_001",
+        )
+        self.assertEqual(
+            by_image["img_task_022"]["observation_id"],
+            "obs_task_022_img_task_022_cand_task_022_fetch_task_022",
+        )
+        self.assertEqual(
+            by_image["img_task_003"]["observation_id"],
+            "obs_task_003_img_task_003_cand_task_003_fetch_task_003",
+        )
+        self.assertEqual(by_image["img_task_001"]["raw_child_observation_id"], "obs_001")
+        self.assertEqual(by_image["img_task_022"]["raw_child_observation_id"], "obs_001")
+        self.assertNotIn("raw_child_observation_id", by_image["img_task_003"])
+        self.assertEqual(by_image["img_task_001"]["verifier_links"], first_links["verifier_links"])
+        self.assertEqual(by_image["img_task_001"]["report_links"], first_links["report_links"])
+        self.assertEqual(by_image["img_task_022"]["verifier_links"], second_links["verifier_links"])
+        self.assertEqual(by_image["img_task_022"]["report_links"], second_links["report_links"])
+        for image_id, expected_task_id in (
+            ("img_task_001", "task_001"),
+            ("img_task_022", "task_022"),
+            ("img_task_003", "task_003"),
+        ):
+            self.assertEqual(by_image[image_id]["task_id"], expected_task_id)
+
     def prepared_visual_run_with_html_source(self) -> Path:
         prepared = prepare_run(
             question="Inspect product screenshots and image search candidates",

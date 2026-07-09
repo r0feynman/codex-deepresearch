@@ -881,11 +881,15 @@ class ParallelOrchestratorTests(unittest.TestCase):
             image["local_artifact_path"] = (
                 f"evidence_shards/{task['id']}/shared-release-image.png"
             )
+            artifact_path = run_dir / image["local_artifact_path"]
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(b"\x89PNG\r\n\x1a\nshared-release-image")
             if index == 1:
                 first_image_id = image["id"]
+            claim = shard["claims"][0]
             unique_claim = f"Unique visual claim for semantic task {task['id']}."
-            shard["claims"][0]["text"] = unique_claim
-            shard["claims"][0]["quote_spans"][0]["quote"] = unique_claim
+            claim["text"] = unique_claim
+            claim["quote_spans"][0]["quote"] = unique_claim
             self.write_json(shard_path, shard)
             self.write_jsonl(
                 shard_path.parent / "search_results.jsonl",
@@ -895,7 +899,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 shard_path.parent / "visual_observations.jsonl",
                 [
                     {
-                        "observation_id": f"obs_child_{index:03d}",
+                        "observation_id": "obs_001",
                         "image_id": image["id"],
                         "evidence_image_id": image["id"],
                         "candidate_id": f"child_candidate_{index:03d}",
@@ -922,6 +926,18 @@ class ParallelOrchestratorTests(unittest.TestCase):
                             "handoff_artifact": "visual_observations.jsonl",
                             "external_vlm_call": False,
                         },
+                        "verifier_links": [
+                            {
+                                "claim_id": claim["id"],
+                                "verifier_vote_id": None,
+                            }
+                        ],
+                        "report_links": [
+                            {
+                                "claim_id": claim["id"],
+                                "citation_id": f"citation_{index:03d}",
+                            }
+                        ],
                     }
                 ],
             )
@@ -988,6 +1004,9 @@ class ParallelOrchestratorTests(unittest.TestCase):
         candidates = self.load_jsonl(run_dir / "visual_candidates.jsonl")
         fetches = self.load_jsonl(run_dir / "image_fetch_status.jsonl")
         observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+        observation_ids = [record["observation_id"] for record in observations]
+        self.assertEqual(len(observation_ids), len(set(observation_ids)))
+        self.assertNotIn("obs_001", observation_ids)
         candidate_by_id = {record["candidate_id"]: record for record in candidates}
         fetch_by_id = {record["fetch_id"]: record for record in fetches}
         self.assertEqual(
@@ -1007,6 +1026,166 @@ class ParallelOrchestratorTests(unittest.TestCase):
                 },
                 expected_task_ids,
             )
+        for observation in observations:
+            if observation.get("image_url") != shared_image_url:
+                continue
+            self.assertEqual(observation["raw_child_observation_id"], "obs_001")
+            for link_field in ("verifier_links", "report_links"):
+                self.assertEqual(len(observation[link_field]), 1)
+                link = observation[link_field][0]
+                for lineage_field in (
+                    "plan_id",
+                    "task_id",
+                    "angle_id",
+                    "route",
+                    "candidate_id",
+                    "fetch_id",
+                    "evidence_image_id",
+                ):
+                    self.assertEqual(link[lineage_field], observation[lineage_field])
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        observation_id_errors = [
+            error.to_dict()
+            for error in visual_validation.errors
+            if error.code == "duplicate_id" and ".observation_id" in error.path
+        ]
+        self.assertEqual(observation_id_errors, [])
+
+    def test_release_visual_merge_normalizes_missing_blank_and_colliding_observation_ids(self) -> None:
+        prepared = prepare_run(
+            question="Release validation observation id normalization fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-observation-id-normalization",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=5)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        tasks = tasks_artifact["tasks"]
+
+        for index, task in enumerate(tasks, start=1):
+            task["semantic_plan_task_id"] = f"task_semantic_{index:03d}"
+            task["semantic_plan_hash"] = "semantic-plan-hash-fixture"
+            task["approved_delta_id"] = "base_plan"
+            task["state"] = "completed"
+            task["last_adapter"] = "codex-exec"
+
+        blank_task = tasks[1]
+        blank_image_id = f"img_{blank_task['id']}"
+        blank_generated_base = (
+            f"obs_{blank_task['semantic_plan_task_id']}_{blank_image_id}_"
+            f"cand_{blank_image_id}_fetch_{blank_image_id}"
+        )
+        observation_ids: list[str | None] = [
+            None,
+            "   ",
+            blank_generated_base,
+            "obs_child_duplicate",
+            "obs_child_duplicate",
+        ]
+
+        def child_visual_observation(task: dict, image: dict, index: int) -> dict:
+            observation = {
+                "image_id": image["id"],
+                "evidence_image_id": image["id"],
+                "candidate_id": f"child_candidate_{index:03d}",
+                "fetch_id": f"child_fetch_{index:03d}",
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "analysis_provider": "codex-interactive",
+                "codex_interactive_handoff": True,
+                "handoff_artifact": "visual_observations.jsonl",
+                "observation_status": "analyzed",
+                "observations": [f"Observation id normalization fixture for {task['id']}."],
+                "inferences": [f"The fixture image supports {task['id']}."],
+                "policy_decision": "allowed",
+                "provider_provenance": {
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                },
+            }
+            observation_id = observation_ids[index - 1]
+            if observation_id is not None:
+                observation["observation_id"] = observation_id
+            return observation
+
+        for index, task in enumerate(tasks, start=1):
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            shard = self.shard(run_dir, task)
+            image = shard["images"][0]
+            artifact_path = run_dir / image["local_artifact_path"]
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n" + f"observation-id-{index}".encode("utf-8")
+            )
+            self.write_json(shard_path, shard)
+            self.write_jsonl(
+                shard_path.parent / "search_results.jsonl",
+                [self.release_search_result(task)],
+            )
+            self.write_jsonl(
+                shard_path.parent / "visual_observations.jsonl",
+                [child_visual_observation(task, image, index)],
+            )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        observations = self.load_jsonl(run_dir / "visual_observations.jsonl")
+        observations_by_semantic_id = {
+            record["semantic_plan_task_id"]: record for record in observations
+        }
+        expected_semantic_ids = {task["semantic_plan_task_id"] for task in tasks}
+        self.assertEqual(set(observations_by_semantic_id), expected_semantic_ids)
+        merged_observation_ids = [record["observation_id"] for record in observations]
+        self.assertEqual(len(merged_observation_ids), len(set(merged_observation_ids)))
+
+        missing_observation = observations_by_semantic_id[tasks[0]["semantic_plan_task_id"]]
+        self.assertEqual(
+            missing_observation["observation_id"],
+            f"obs_{tasks[0]['id']}_001",
+        )
+
+        blank_observation = observations_by_semantic_id[tasks[1]["semantic_plan_task_id"]]
+        blank_generated_id = (
+            f"obs_{blank_observation['task_id']}_{blank_observation['evidence_image_id']}_"
+            f"{blank_observation['candidate_id']}_{blank_observation['fetch_id']}"
+        )
+        self.assertEqual(blank_generated_id, blank_generated_base)
+        self.assertEqual(blank_observation["observation_id"], f"{blank_generated_base}_2")
+
+        existing_collision = observations_by_semantic_id[tasks[2]["semantic_plan_task_id"]]
+        self.assertEqual(existing_collision["observation_id"], blank_generated_base)
+
+        raw_child_observation_ids = {
+            record["semantic_plan_task_id"]: record["raw_child_observation_id"]
+            for record in observations
+            if "raw_child_observation_id" in record
+        }
+        self.assertEqual(
+            raw_child_observation_ids,
+            {
+                tasks[3]["semantic_plan_task_id"]: "obs_child_duplicate",
+                tasks[4]["semantic_plan_task_id"]: "obs_child_duplicate",
+            },
+        )
+        self.assertNotIn("obs_child_duplicate", merged_observation_ids)
+
+        visual_validation = validate_visual_artifacts(run_dir=run_dir)
+        observation_id_errors = [
+            error.to_dict()
+            for error in visual_validation.errors
+            if error.code == "duplicate_id" and ".observation_id" in error.path
+        ]
+        self.assertEqual(observation_id_errors, [])
 
     def test_release_visual_merge_reconciles_child_vlm_to_existing_acquisition_lineage_for_report(self) -> None:
         prepared = prepare_run(

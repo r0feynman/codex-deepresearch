@@ -5483,7 +5483,60 @@ def _merge_visual_observation_records(
             if value not in (None, "", []):
                 current[field] = value
         merged[index_by_key[key]] = current
-    return merged
+    return _normalize_visual_observation_ids(merged)
+
+
+def _normalize_visual_observation_ids(
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    id_counts: dict[str, int] = {}
+    for record in records:
+        observation_id = _string(record.get("observation_id"))
+        if observation_id:
+            id_counts[observation_id] = id_counts.get(observation_id, 0) + 1
+
+    normalized: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    unavailable_ids = {
+        observation_id
+        for observation_id, count in id_counts.items()
+        if count == 1
+    }
+    for index, record in enumerate(records, start=1):
+        record_copy = dict(record)
+        observation_id = _string(record_copy.get("observation_id"))
+        if not observation_id or id_counts.get(observation_id, 0) > 1 or observation_id in used_ids:
+            if observation_id and "raw_child_observation_id" not in record_copy:
+                record_copy["raw_child_observation_id"] = observation_id
+            observation_id = _unique_visual_observation_id(record_copy, index, unavailable_ids)
+            record_copy["observation_id"] = observation_id
+        used_ids.add(observation_id)
+        unavailable_ids.add(observation_id)
+        normalized.append(record_copy)
+    return normalized
+
+
+def _unique_visual_observation_id(
+    record: Mapping[str, Any],
+    index: int,
+    used_ids: set[str],
+) -> str:
+    parts = [
+        _safe_id(value)
+        for field in ("task_id", "evidence_image_id", "candidate_id", "fetch_id")
+        for value in [_string(record.get(field))]
+        if value
+    ]
+    if parts:
+        base = "obs_" + "_".join(parts)
+    else:
+        base = f"obs_record_{index:03d}"
+    candidate = base
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _visual_observation_key(record: Mapping[str, Any]) -> str:
