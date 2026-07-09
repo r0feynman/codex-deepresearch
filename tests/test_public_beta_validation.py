@@ -1123,6 +1123,25 @@ class PublicBetaValidationTests(unittest.TestCase):
             visual_run["artifact_hashes"]["verifier_votes"],
             hashlib.sha256(verifier_votes_path.read_bytes()).hexdigest(),
         )
+        verifier_votes = self.read_jsonl(verifier_votes_path)
+        self.assertTrue(verifier_votes)
+        for field in (
+            "id",
+            "claim_id",
+            "verifier_type",
+            "agent_name",
+            "method",
+            "model_or_tool",
+            "vote",
+            "confidence",
+            "evidence_refs",
+            "rationale",
+            "created_at",
+        ):
+            self.assertIn(field, verifier_votes[0])
+        self.assertEqual(verifier_votes[0]["claim_id"], "claim_visual_001")
+        self.assertEqual(verifier_votes[0]["verifier_type"], "visual")
+        self.assertTrue(verifier_votes[0]["evidence_refs"])
 
     def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
@@ -3366,6 +3385,46 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertTrue(computed_diff["valid"], computed_diff)
         self.assertFalse(computed_diff.get("failures"), computed_diff)
 
+    def test_visual_release_rejects_id_only_verifier_votes(self) -> None:
+        _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
+        prompt = next(
+            prompt for prompt in manifest["prompts"] if prompt["route"] == "visual_required"
+        )
+        run_dir = self.write_visual_run(
+            self.temp_dir() / "visual-id-only-verifier-votes",
+            prompt=prompt,
+            suite_id="public-beta-validation",
+            run_status="completed_auto_visual",
+            provider_status="completed_auto_visual",
+        )
+        self.write_jsonl(
+            run_dir / "verifier_votes.jsonl",
+            [{"id": f"vote_visual_{index:03d}"} for index in range(1, 4)],
+        )
+
+        result = evaluate_public_beta_prompt_run(
+            prompt,
+            run_dir,
+            suite_id="public-beta-validation",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        checks = {
+            failure["check"]: failure
+            for failure in result["visual_release_checks"]["failures"]
+        }
+        self.assertIn("release_verifier_vote_schema", checks)
+        schema_detail = checks["release_verifier_vote_schema"]["detail"]
+        self.assertIn(
+            "verifier_votes.jsonl has malformed release verifier vote records",
+            schema_detail,
+        )
+        self.assertIn("missing required field(s): claim_id", schema_detail)
+        self.assertIn(
+            "verifier_votes.jsonl contains no release-valid verifier vote records",
+            schema_detail,
+        )
+
     def test_visual_gate_accepts_preserved_raw_child_lineage_with_parent_links(self) -> None:
         _, manifest = self.write_oracle_bound_public_beta_prompt_manifest(self.temp_dir())
         prompt = next(
@@ -5569,8 +5628,14 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         self.write_jsonl(
             run_dir / "verifier_votes.jsonl",
-            [{"id": f"vote_visual_{index:03d}"} for index in range(1, len(observations) + 1)]
-            or [{"id": "vote_visual_001"}],
+            [
+                self.visual_verifier_vote_record(
+                    index=index,
+                    image_id=image_id,
+                    timestamp=timestamp,
+                )
+                for index, image_id in enumerate(image_ids, start=1)
+            ],
         )
         report = (
             f"Claim `claim_visual_001` is supported by Image `{cited_image_id}`.\n"
@@ -6003,6 +6068,29 @@ class PublicBetaValidationTests(unittest.TestCase):
                     **link_lineage,
                 }
             ],
+        }
+
+    def visual_verifier_vote_record(
+        self,
+        *,
+        index: int,
+        image_id: str,
+        timestamp: str,
+    ) -> dict[str, Any]:
+        return {
+            "id": f"vote_visual_{index:03d}",
+            "claim_id": "claim_visual_001",
+            "verifier_type": "visual",
+            "agent_name": "visual_verifier_1",
+            "method": "codex-subagent",
+            "model_or_tool": "codex-interactive",
+            "vote": "support",
+            "confidence": 0.86,
+            "evidence_refs": [image_id],
+            "rationale": (
+                "The Codex-interactive visual observation supports the cited claim."
+            ),
+            "created_at": timestamp,
         }
 
     def codex_native_search_result(

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .evidence_schema import VERIFIER_METHODS, VERIFIER_TYPES, VERIFIER_VOTES
 from .semantic_planner import (
     SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
     build_semantic_materialization_diff,
@@ -66,6 +67,17 @@ SUPPLIED_RUN_MAX_AGE_DAYS = 30
 MIN_PUBLIC_BETA_REAL_VISUAL_CANDIDATES = 10
 MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED = 3
 MIN_PUBLIC_BETA_REPORT_CITED_VISUAL_OR_MIXED_CLAIMS = 1
+RELEASE_VERIFIER_VOTE_REQUIRED_STRING_FIELDS = (
+    "id",
+    "claim_id",
+    "verifier_type",
+    "agent_name",
+    "method",
+    "model_or_tool",
+    "vote",
+    "rationale",
+    "created_at",
+)
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST = (
@@ -5847,7 +5859,14 @@ def _visual_release_checks(
     candidates = _mapping_list(_read_optional_jsonl(artifacts["visual_candidates"]))
     fetches = _mapping_list(_read_optional_jsonl(artifacts["image_fetch_status"]))
     observations = _mapping_list(_read_optional_jsonl(artifacts["visual_observations"]))
-    verifier_votes = _mapping_list(_read_optional_jsonl(artifacts["verifier_votes"]))
+    raw_verifier_votes = _read_optional_jsonl(artifacts["verifier_votes"])
+    verifier_votes = _mapping_list(raw_verifier_votes)
+    verifier_vote_validation = _release_verifier_vote_validation(
+        raw_records=raw_verifier_votes,
+        records=verifier_votes,
+        evidence=evidence,
+    )
+    release_verifier_votes_by_id = verifier_vote_validation["valid_votes_by_id"]
     counts = real_automatic_visual_release_counts(
         candidates=candidates,
         fetches=fetches,
@@ -5873,7 +5892,7 @@ def _visual_release_checks(
         candidates=candidates,
         fetches=fetches,
         observations=observations,
-        verifier_votes=verifier_votes,
+        verifier_votes_by_id=release_verifier_votes_by_id,
         report_text=report_text,
     )
 
@@ -5931,6 +5950,20 @@ def _visual_release_checks(
                 "detail": (
                     "visual observations must use explicit Codex-interactive "
                     "artifact handoff, not hidden API markers"
+                ),
+            }
+        )
+    if (
+        _terminal_status(run_status) == "completed_auto_visual"
+        and not verifier_vote_validation["valid"]
+    ):
+        failures.append(
+            {
+                "check": "release_verifier_vote_schema",
+                "classification": "report-linkage",
+                "detail": (
+                    "verifier_votes.jsonl has malformed release verifier vote records: "
+                    + "; ".join(verifier_vote_validation["failures"])
                 ),
             }
         )
@@ -6729,6 +6762,143 @@ def _string_record_field(record: Mapping[str, Any], field: str) -> str:
     return value if isinstance(value, str) and value else ""
 
 
+def _release_verifier_vote_validation(
+    *,
+    raw_records: Any,
+    records: Sequence[Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    failures: list[str] = []
+    valid_votes_by_id: dict[str, Mapping[str, Any]] = {}
+    if raw_records is None:
+        failures.append("verifier_votes.jsonl is missing or invalid JSONL")
+        return {
+            "valid": False,
+            "valid_votes_by_id": valid_votes_by_id,
+            "failures": failures,
+        }
+    if not isinstance(raw_records, list):
+        failures.append("verifier_votes.jsonl must contain JSONL records")
+        return {
+            "valid": False,
+            "valid_votes_by_id": valid_votes_by_id,
+            "failures": failures,
+        }
+    claims_by_id = {
+        str(claim.get("id")): claim
+        for claim in _mapping_list(evidence.get("claims"))
+        if isinstance(claim.get("id"), str) and claim.get("id")
+    }
+    known_evidence_ids = {
+        str(source.get("id"))
+        for source in _mapping_list(evidence.get("sources"))
+        if isinstance(source.get("id"), str) and source.get("id")
+    } | {
+        str(image.get("id"))
+        for image in _mapping_list(evidence.get("images"))
+        if isinstance(image.get("id"), str) and image.get("id")
+    }
+    seen_vote_ids: set[str] = set()
+    for index, raw_record in enumerate(raw_records, start=1):
+        if not isinstance(raw_record, Mapping):
+            failures.append(f"record {index}: verifier vote must be an object")
+            continue
+        reasons = _release_verifier_vote_invalid_reasons(
+            raw_record,
+            claims_by_id=claims_by_id,
+            known_evidence_ids=known_evidence_ids,
+            seen_vote_ids=seen_vote_ids,
+        )
+        vote_id = str(raw_record.get("id") or "").strip()
+        if vote_id:
+            seen_vote_ids.add(vote_id)
+        if reasons:
+            label = f"record {index}"
+            if vote_id:
+                label += f" ({vote_id})"
+            failures.append(label + ": " + ", ".join(reasons))
+            continue
+        valid_votes_by_id[vote_id] = raw_record
+    if not valid_votes_by_id:
+        failures.append(
+            "verifier_votes.jsonl contains no release-valid verifier vote records"
+        )
+    if len(records) != len(raw_records):
+        failures.append(
+            "verifier_votes.jsonl contains non-object verifier vote records"
+        )
+    return {
+        "valid": not failures,
+        "valid_votes_by_id": valid_votes_by_id,
+        "failures": failures,
+    }
+
+
+def _release_verifier_vote_invalid_reasons(
+    vote: Mapping[str, Any],
+    *,
+    claims_by_id: Mapping[str, Mapping[str, Any]],
+    known_evidence_ids: set[str],
+    seen_vote_ids: set[str],
+) -> list[str]:
+    reasons: list[str] = []
+    missing = [
+        field
+        for field in RELEASE_VERIFIER_VOTE_REQUIRED_STRING_FIELDS
+        if not isinstance(vote.get(field), str) or not vote.get(field).strip()
+    ]
+    if missing:
+        reasons.append("missing required field(s): " + ", ".join(missing))
+    vote_id = str(vote.get("id") or "").strip()
+    if vote_id and vote_id in seen_vote_ids:
+        reasons.append("duplicate verifier vote id")
+    claim_id = str(vote.get("claim_id") or "").strip()
+    if claim_id and claim_id not in claims_by_id:
+        reasons.append("claim_id does not reference a merged claim")
+    verifier_type = str(vote.get("verifier_type") or "").strip()
+    if verifier_type and verifier_type not in VERIFIER_TYPES:
+        reasons.append("verifier_type is not release-valid")
+    method = str(vote.get("method") or "").strip()
+    if method and method not in VERIFIER_METHODS:
+        reasons.append("method is not release-valid")
+    vote_value = str(vote.get("vote") or "").strip()
+    if vote_value and vote_value not in VERIFIER_VOTES:
+        reasons.append("vote is not release-valid")
+    confidence = vote.get("confidence")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0 <= confidence <= 1
+    ):
+        reasons.append("confidence must be a number between 0 and 1")
+    evidence_refs = vote.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        reasons.append("evidence_refs must be a non-empty list")
+    elif not known_evidence_ids:
+        reasons.append(
+            "evidence_refs cannot be verified without merged source or image ids"
+        )
+    else:
+        invalid_refs = [
+            ref
+            for ref in evidence_refs
+            if not isinstance(ref, str) or not ref.strip()
+        ]
+        if invalid_refs:
+            reasons.append("evidence_refs must contain only non-empty strings")
+        dangling_refs = [
+            str(ref)
+            for ref in evidence_refs
+            if isinstance(ref, str) and ref.strip() and ref not in known_evidence_ids
+        ]
+        if dangling_refs:
+            reasons.append(
+                "evidence_refs reference unmerged source/image id(s): "
+                + ", ".join(sorted(set(dangling_refs)))
+            )
+    return reasons
+
+
 def _report_cited_visual_claims(
     *,
     evidence: Mapping[str, Any],
@@ -6736,7 +6906,7 @@ def _report_cited_visual_claims(
     candidates: Sequence[Mapping[str, Any]],
     fetches: Sequence[Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
-    verifier_votes: Sequence[Mapping[str, Any]],
+    verifier_votes_by_id: Mapping[str, Mapping[str, Any]],
     report_text: str,
 ) -> list[dict[str, Any]]:
     used_images = {
@@ -6762,11 +6932,6 @@ def _report_cited_visual_claims(
         if isinstance(image, Mapping)
         and isinstance(image.get("id"), str)
         and image.get("id")
-    }
-    verifier_vote_ids = {
-        str(vote.get("id"))
-        for vote in verifier_votes
-        if isinstance(vote.get("id"), str) and vote.get("id")
     }
     cited: list[dict[str, Any]] = []
     claims = evidence.get("claims") if isinstance(evidence.get("claims"), list) else []
@@ -6803,7 +6968,7 @@ def _report_cited_visual_claims(
                 fetches_by_id=fetches_by_id,
                 images_by_id=images_by_id,
                 observations=observations,
-                verifier_vote_ids=verifier_vote_ids,
+                verifier_votes_by_id=verifier_votes_by_id,
             )
         ]
         if release_images:
@@ -6820,7 +6985,7 @@ def _has_real_report_cited_observation(
     fetches_by_id: Mapping[str, Mapping[str, Any]],
     images_by_id: Mapping[str, Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
-    verifier_vote_ids: set[str],
+    verifier_votes_by_id: Mapping[str, Mapping[str, Any]],
 ) -> bool:
     image = images_by_id.get(image_id)
     if image is None:
@@ -6841,7 +7006,12 @@ def _has_real_report_cited_observation(
             continue
         if not _has_report_link(observation, claim_id):
             continue
-        if not _has_verifier_vote_link(observation, claim_id, verifier_vote_ids):
+        if not _has_verifier_vote_link(
+            observation,
+            claim_id=claim_id,
+            image_id=image_id,
+            verifier_votes_by_id=verifier_votes_by_id,
+        ):
             continue
         candidate_id = _observation_linked_candidate_id(observation)
         fetch_id = _observation_linked_fetch_id(observation)
@@ -6937,17 +7107,30 @@ def _has_report_link(observation: Mapping[str, Any], claim_id: str) -> bool:
 
 def _has_verifier_vote_link(
     observation: Mapping[str, Any],
+    *,
     claim_id: str,
-    verifier_vote_ids: set[str],
+    image_id: str,
+    verifier_votes_by_id: Mapping[str, Mapping[str, Any]],
 ) -> bool:
-    if not verifier_vote_ids:
+    if not verifier_votes_by_id:
         return False
     for link in observation.get("verifier_links", []):
         if not isinstance(link, Mapping):
             continue
         vote_id = link.get("verifier_vote_id")
-        if link.get("claim_id") == claim_id and isinstance(vote_id, str):
-            return vote_id in verifier_vote_ids
+        if link.get("claim_id") != claim_id or not isinstance(vote_id, str):
+            continue
+        vote = verifier_votes_by_id.get(vote_id)
+        if not isinstance(vote, Mapping):
+            continue
+        evidence_refs = vote.get("evidence_refs")
+        if (
+            vote.get("claim_id") == claim_id
+            and vote.get("verifier_type") == "visual"
+            and isinstance(evidence_refs, list)
+            and image_id in evidence_refs
+        ):
+            return True
     return False
 
 
