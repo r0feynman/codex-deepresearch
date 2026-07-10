@@ -289,25 +289,56 @@ def ingest_vision_observations(
     elif (
         normalized_provider == CODEX_INTERACTIVE_PROVIDER
         and observations is None
-        and not records
         and _has_openai_vision_handoff(run_dir)
     ):
-        automated_result = _run_codex_interactive_vision_analysis(
-            run_dir=run_dir,
-            evidence=evidence,
-            now=now,
-            provider_mode=provider_mode,
-            codex_config=codex_config,
-            codex_client=codex_client,
-        )
-        if isinstance(automated_result, dict):
+        supplemental_tasks: list[dict[str, Any]] | None = None
+        if records:
+            supplemental_tasks = _codex_interactive_supplemental_vision_tasks(
+                run_dir=run_dir,
+                evidence=evidence,
+                records=records,
+                codex_config=codex_config,
+                provider_mode=provider_mode,
+            )
+            if not supplemental_tasks:
+                automated_result = None
+            else:
+                automated_result = _run_codex_interactive_vision_analysis(
+                    run_dir=run_dir,
+                    evidence=evidence,
+                    now=now,
+                    provider_mode=provider_mode,
+                    codex_config=codex_config,
+                    codex_client=codex_client,
+                    tasks=supplemental_tasks,
+                )
+        else:
+            automated_result = _run_codex_interactive_vision_analysis(
+                run_dir=run_dir,
+                evidence=evidence,
+                now=now,
+                provider_mode=provider_mode,
+                codex_config=codex_config,
+                codex_client=codex_client,
+            )
+        if automated_result is None:
+            pass
+        elif isinstance(automated_result, dict):
             return automated_result
-        automated_analysis = automated_result
-        records = list(automated_analysis.records)
-        input_path = automated_analysis.observations_path
+        else:
+            automated_analysis = automated_result
+            if supplemental_tasks is not None:
+                records = _merge_existing_and_automated_codex_records(
+                    records,
+                    automated_analysis.records,
+                )
+            else:
+                records = list(automated_analysis.records)
+            input_path = automated_analysis.observations_path
 
     errors: list[dict[str, Any]] = []
     normalized_images: list[dict[str, Any]] = []
+    normalized_records: list[Mapping[str, Any]] = []
     fetch_lineage_records_reconciled = 0
     existing_image_ids = _existing_ids(evidence["images"])
     used_image_ids: set[str] = set()
@@ -319,18 +350,18 @@ def ingest_vision_observations(
             errors.append({"code": "invalid_record", "record_index": index})
             continue
         try:
-            normalized_images.append(
-                _normalize_visual_record(
-                    record,
-                    provider=normalized_provider,
-                    index=index,
-                    run_dir=run_dir,
-                    sources_by_id=sources_by_id,
-                    existing_image_ids=existing_image_ids,
-                    used_image_ids=used_image_ids,
-                    now=now,
-                )
+            normalized_image = _normalize_visual_record(
+                record,
+                provider=normalized_provider,
+                index=index,
+                run_dir=run_dir,
+                sources_by_id=sources_by_id,
+                existing_image_ids=existing_image_ids,
+                used_image_ids=used_image_ids,
+                now=now,
             )
+            normalized_images.append(normalized_image)
+            normalized_records.append(record)
         except VisionAdapterError as exc:
             errors.append(
                 {
@@ -340,7 +371,7 @@ def ingest_vision_observations(
                 }
             )
 
-    if errors:
+    if errors and not normalized_images:
         status = _base_status(run_dir, evidence, "failed_normalization")
         status["errors"] = errors
         status["artifacts"] = {
@@ -358,6 +389,7 @@ def ingest_vision_observations(
         )
         _write_json(run_dir / "vision_ingest_status.json", status)
         return status
+    dropped_invalid_observation_records = len(errors)
 
     evidence["claims"] = [
         claim
@@ -396,7 +428,7 @@ def ingest_vision_observations(
             + image_acquisition_metadata_reconciled
         )
         phase3_observations = _phase3_observation_records(
-            records,
+            normalized_records,
             normalized_images,
             provider=normalized_provider,
             now=now,
@@ -549,6 +581,11 @@ def ingest_vision_observations(
         ),
         "external_vlm_call": automated_analysis is not None,
     }
+    if dropped_invalid_observation_records:
+        evidence["vision_adapter"]["dropped_invalid_observation_records"] = (
+            dropped_invalid_observation_records
+        )
+        evidence["vision_adapter"]["dropped_invalid_observation_diagnostics"] = errors
     if automated_analysis is not None:
         evidence["vision_adapter"].update(
             {
@@ -613,6 +650,11 @@ def ingest_vision_observations(
             "external_vlm_call": False,
         }
     )
+    if dropped_invalid_observation_records:
+        status["dropped_invalid_observation_records"] = (
+            dropped_invalid_observation_records
+        )
+        status["dropped_invalid_observation_diagnostics"] = errors
     if automated_analysis is not None:
         status.update(
             {
@@ -1178,17 +1220,21 @@ def _run_codex_interactive_vision_analysis(
     provider_mode: str | None,
     codex_config: Mapping[str, Any] | None,
     codex_client: CodexInteractiveVisionClient | None,
+    tasks: Sequence[Mapping[str, Any]] | None = None,
 ) -> _AutomatedVisionAnalysis | dict[str, Any]:
     config = _codex_interactive_vision_config(
         overrides=codex_config,
         provider_mode=provider_mode,
         evidence=evidence,
     )
-    tasks = _codex_interactive_vision_tasks(
-        run_dir=run_dir,
-        evidence=evidence,
-        max_images=config.max_images,
-    )
+    if tasks is None:
+        tasks = _codex_interactive_vision_tasks(
+            run_dir=run_dir,
+            evidence=evidence,
+            max_images=config.max_images,
+        )
+    else:
+        tasks = [dict(task) for task in tasks if isinstance(task, Mapping)]
     if not tasks:
         return _write_blocked_missing_codex_vlm_provider(
             run_dir=run_dir,
@@ -1326,6 +1372,231 @@ def _run_codex_interactive_vision_analysis(
         provider=CODEX_INTERACTIVE_PROVIDER,
         external_vlm_call=False,
     )
+
+
+def _codex_interactive_supplemental_vision_tasks(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    records: Sequence[Any],
+    codex_config: Mapping[str, Any] | None,
+    provider_mode: str | None,
+) -> list[dict[str, Any]]:
+    minimums = visual_minimums_for_run(run_dir)
+    required = _int_or_zero(minimums.get("required_vlm_images"))
+    if required <= 0:
+        return []
+    existing_artifact_backed_image_ids = _release_eligible_codex_observation_image_ids(
+        records,
+        run_dir=run_dir,
+    )
+    if len(existing_artifact_backed_image_ids) >= required:
+        return []
+    if _int_or_zero(minimums.get("fetched_artifacts")) < required:
+        return []
+
+    config = _codex_interactive_vision_config(
+        overrides=codex_config,
+        provider_mode=provider_mode,
+        evidence=evidence,
+    )
+    tasks = _codex_interactive_vision_tasks(
+        run_dir=run_dir,
+        evidence=evidence,
+        max_images=None,
+    )
+    represented_keys = _release_eligible_codex_observation_identity_keys(
+        records,
+        run_dir=run_dir,
+    )
+    pending = [
+        task
+        for task in tasks
+        if not (_codex_visual_identity_keys(task) & represented_keys)
+    ]
+    if config.max_images is not None and config.max_images > 0:
+        return pending[: config.max_images]
+    return pending
+
+
+def _release_eligible_codex_observation_identity_keys(
+    records: Sequence[Any],
+    *,
+    run_dir: Path,
+) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if not _is_release_eligible_existing_codex_observation(
+            record,
+            run_dir=run_dir,
+        ):
+            continue
+        keys.update(_codex_visual_identity_keys(record))
+    return keys
+
+
+def _release_eligible_codex_observation_image_ids(
+    records: Sequence[Any],
+    *,
+    run_dir: Path,
+) -> set[str]:
+    image_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if not _is_release_eligible_existing_codex_observation(
+            record,
+            run_dir=run_dir,
+        ):
+            continue
+        image = record.get("image") if isinstance(record.get("image"), Mapping) else {}
+        image_id = _first_optional_string(
+            record,
+            "evidence_image_id",
+            "image_id",
+            "id",
+        ) or _first_optional_string(
+            image,
+            "evidence_image_id",
+            "image_id",
+            "id",
+        )
+        if image_id:
+            image_ids.add(image_id)
+    return image_ids
+
+
+def _is_release_eligible_existing_codex_observation(
+    record: Mapping[str, Any],
+    *,
+    run_dir: Path,
+) -> bool:
+    if record.get("provider") != CODEX_INTERACTIVE_PROVIDER:
+        return False
+    if record.get("provider_kind") != "vlm":
+        return False
+    if record.get("provider_mode") != "real":
+        return False
+    if record.get("observation_status") != "analyzed":
+        return False
+    if not _first_optional_string(record, "evidence_image_id", "image_id", "id"):
+        return False
+    return _is_artifact_backed_codex_observation(record, run_dir=run_dir)
+
+
+def _is_artifact_backed_codex_observation(
+    record: Mapping[str, Any],
+    *,
+    run_dir: Path,
+) -> bool:
+    if _is_metadata_only_codex_observation(record):
+        return False
+    image = record.get("image") if isinstance(record.get("image"), Mapping) else {}
+    local_artifact_path = _first_optional_string(
+        record,
+        "local_artifact_path",
+        "artifact_path",
+        "image_path",
+    ) or _first_optional_string(
+        image,
+        "local_artifact_path",
+        "artifact_path",
+        "image_path",
+        "path",
+    )
+    if not local_artifact_path:
+        return False
+    path = Path(local_artifact_path)
+    if path.is_absolute():
+        return False
+    try:
+        artifact_path = _resolve_run_relative_path(run_dir, local_artifact_path)
+    except VisionAdapterError:
+        return False
+    return artifact_path.is_file()
+
+
+def _is_metadata_only_codex_observation(record: Mapping[str, Any]) -> bool:
+    image = record.get("image") if isinstance(record.get("image"), Mapping) else {}
+    local_artifact_path = _first_optional_string(
+        record,
+        "local_artifact_path",
+        "artifact_path",
+        "image_path",
+    ) or _first_optional_string(
+        image,
+        "local_artifact_path",
+        "artifact_path",
+        "image_path",
+        "path",
+    )
+    if _metadata_only_artifact_path(local_artifact_path):
+        return True
+    return any(
+        str(caveat) == "metadata-only visual record; no local image artifact was provided"
+        for caveat in (_string_list(record, "caveats") + _string_list(image, "caveats"))
+    )
+
+
+def _merge_existing_and_automated_codex_records(
+    existing_records: Sequence[Any],
+    automated_records: Sequence[Mapping[str, Any]],
+) -> list[Any]:
+    automated_keys = {
+        key
+        for record in automated_records
+        for key in _codex_visual_identity_keys(record)
+    }
+    merged: list[Any] = []
+    for record in existing_records:
+        if (
+            isinstance(record, Mapping)
+            and _is_metadata_only_codex_observation(record)
+            and _codex_visual_identity_keys(record) & automated_keys
+        ):
+            continue
+        merged.append(record)
+    merged.extend(dict(record) for record in automated_records)
+    return merged
+
+
+def _codex_visual_identity_keys(record: Mapping[str, Any]) -> set[tuple[str, str]]:
+    image = record.get("image") if isinstance(record.get("image"), Mapping) else {}
+    keys: set[tuple[str, str]] = set()
+    image_id = _first_optional_string(
+        record,
+        "evidence_image_id",
+        "image_id",
+        "id",
+    ) or _first_optional_string(
+        image,
+        "evidence_image_id",
+        "image_id",
+        "id",
+    )
+    for field, value in (
+        ("evidence_image_id", image_id),
+        (
+            "fetch_id",
+            _first_optional_string(record, "fetch_id")
+            or _first_optional_string(image, "fetch_id"),
+        ),
+        (
+            "candidate_id",
+            _first_optional_string(record, "candidate_id")
+            or _first_optional_string(image, "candidate_id"),
+        ),
+        (
+            "local_artifact_path",
+            _first_optional_string(record, "local_artifact_path")
+            or _first_optional_string(image, "local_artifact_path"),
+        ),
+    ):
+        if value:
+            keys.add((field, value))
+    return keys
 
 
 def _openai_responses_vision_config(
@@ -1550,6 +1821,13 @@ def _codex_interactive_vision_tasks(
     for task in _openai_vision_tasks(run_dir=run_dir, evidence=evidence, max_images=None):
         local_path = _first_optional_string(task, "local_artifact_path")
         if not local_path:
+            continue
+        raw_fetch = task.get("raw_fetch")
+        if isinstance(raw_fetch, Mapping):
+            fetch_status = _first_optional_string(raw_fetch, "fetch_status")
+            if fetch_status and fetch_status != "fetched":
+                continue
+        if _metadata_only_artifact_path(local_path):
             continue
         artifact = _resolve_run_relative_path(run_dir, local_path)
         if artifact.is_file():
@@ -2932,13 +3210,51 @@ def _semantic_task_has_visual_obligation(task: Mapping[str, Any]) -> bool:
     max_images = _int_or_zero(max_images_value)
     if route == "text_only":
         return False
+    if _string_list(task, "expected_visual_targets"):
+        return True
+    if _semantic_task_expected_visual_artifacts(task):
+        return True
+    if max_images > 0:
+        return True
     if max_images_present and max_images <= 0:
         return False
     if route in {"visual_required", "visual_optional"}:
         return True
-    if _string_list(task, "expected_visual_targets"):
-        return True
-    return max_images > 0
+    return False
+
+
+def _semantic_task_expected_visual_artifacts(task: Mapping[str, Any]) -> bool:
+    for field in ("expected_artifacts", "expected_source_types", "expected_evidence"):
+        for value in _string_list(task, field):
+            normalized = re.sub(r"\s+", " ", str(value).strip().lower()).replace("-", "_")
+            if normalized in {
+                "image",
+                "images",
+                "visual",
+                "visual_search_plan",
+                "visual_candidates",
+                "image_fetch_status",
+                "visual_observations",
+                "vlm_analysis",
+                "screenshot",
+                "screenshots",
+                "chart",
+                "charts",
+                "diagram",
+                "diagrams",
+                "figure",
+                "figures",
+                "photo",
+                "photos",
+            }:
+                return True
+            if any(token in normalized for token in ("image", "visual", "screenshot", "vlm")):
+                return True
+    return (_first_optional_string(task, "evidence_need") or "") in {
+        "visual_example",
+        "visual_observation",
+        "vlm_analysis",
+    }
 
 
 def _int_or_zero(value: Any) -> int:

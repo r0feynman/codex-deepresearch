@@ -3500,13 +3500,51 @@ def _semantic_task_has_visual_obligation(task: Mapping[str, Any]) -> bool:
     max_images = _int_or_zero(max_images_value)
     if route == "text_only":
         return False
+    if _string_list(task.get("expected_visual_targets")):
+        return True
+    if _semantic_task_expected_visual_artifacts(task):
+        return True
+    if max_images > 0:
+        return True
     if max_images_present and max_images <= 0:
         return False
     if route in {"visual_required", "visual_optional"}:
         return True
-    if _string_list(task.get("expected_visual_targets")):
-        return True
-    return max_images > 0
+    return False
+
+
+def _semantic_task_expected_visual_artifacts(task: Mapping[str, Any]) -> bool:
+    for field in ("expected_artifacts", "expected_source_types", "expected_evidence"):
+        for value in _string_list(task.get(field)):
+            normalized = re.sub(r"\s+", " ", str(value).strip().lower()).replace("-", "_")
+            if normalized in {
+                "image",
+                "images",
+                "visual",
+                "visual_search_plan",
+                "visual_candidates",
+                "image_fetch_status",
+                "visual_observations",
+                "vlm_analysis",
+                "screenshot",
+                "screenshots",
+                "chart",
+                "charts",
+                "diagram",
+                "diagrams",
+                "figure",
+                "figures",
+                "photo",
+                "photos",
+            }:
+                return True
+            if any(token in normalized for token in ("image", "visual", "screenshot", "vlm")):
+                return True
+    return (_string(task.get("evidence_need")) or "") in {
+        "visual_example",
+        "visual_observation",
+        "vlm_analysis",
+    }
 
 
 def _visual_provider_status(

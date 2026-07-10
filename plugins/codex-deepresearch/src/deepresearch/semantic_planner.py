@@ -42,7 +42,7 @@ PLANNER_MODE_FIXTURE = "fixture"
 PLANNER_MODE_BLOCKED = "blocked"
 BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE = "blocked_semantic_planner_unavailable"
 CODEX_SEMANTIC_ADAPTER_NAME = "codex_native_semantic_candidate_adapter"
-CODEX_SEMANTIC_PROMPT_VERSION = "p3-sp2-candidate-v1"
+CODEX_SEMANTIC_PROMPT_VERSION = "p3-sp2-candidate-v2"
 CODEX_SEMANTIC_ORACLE_ADAPTER_NAME = "codex_native_semantic_expectation_oracle"
 CODEX_SEMANTIC_ORACLE_PROMPT_VERSION = "p3-sp3-oracle-v1"
 CODEX_SEMANTIC_REVIEWER_ADAPTER_NAME = "codex_native_semantic_fit_reviewer"
@@ -155,8 +155,138 @@ ALLOWED_EVIDENCE_NEEDS = (
 )
 
 VISUAL_EXPECTED_EVIDENCE = {"visual_example", "visual_observation", "vlm_analysis"}
+TEXT_ONLY_VISUAL_WORK_TEXT_PATTERNS = (
+    ("vlm_analysis", r"\bvlm(?:[-_\s]+analysis)?\b"),
+    ("visual_example", r"\bvisual[-_\s]+examples?\b"),
+    ("visual_observation", r"\bvisual[-_\s]+observations?\b"),
+    (
+        "visual_work",
+        r"\bvisual[-_\s]+(?:evidence|artifacts?|inspection|analysis|comparison|targets?|sources?|interpretation|review)\b",
+    ),
+    ("image", r"\bimages?\b"),
+    ("photo", r"\bphotos?\b"),
+    ("screenshot", r"\bscreenshots?\b"),
+    ("chart", r"\bcharts?\b|\bflowcharts?\b"),
+    ("diagram", r"\bdiagrams?\b"),
+    ("figure", r"\bfigures?\b(?!\s+out\b)"),
+)
+TEXT_ONLY_VISUAL_WORK_NEGATION_PATTERN = re.compile(
+    r"(?:\bno\b|\bnot\b|\bwithout\b|\bexclude(?:s|d|ing)?\b|"
+    r"\bavoid(?:s|ed|ing)?\b|\bdo not\b|\bdon't\b)[\w\s-]{0,30}$"
+)
+TEXT_ONLY_ANGLE_VISUAL_WORK_FIELDS = (
+    "evidence_need",
+    "title",
+    "research_question",
+    "why_this_angle_matters",
+    "included_scope",
+    "expected_source_types",
+    "expected_artifacts",
+    "search_queries",
+    "success_criteria",
+    "report_section",
+    "risk_or_contradiction_checks",
+)
+TEXT_ONLY_TASK_VISUAL_WORK_FIELDS = (
+    "query",
+    "source_policy",
+    "expected_source_types",
+    "expected_artifacts",
+    "success_criteria",
+    "done_condition",
+)
 MATERIAL_ORIGINAL_OVERLAP_LIMIT = 0.72
 MATERIAL_PEER_OVERLAP_LIMIT = 0.84
+SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS = 2
+SEMANTIC_RELEASE_MIN_ANGLE_UNIQUE_TOKENS = 4
+SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD = 0.85
+SEMANTIC_RELEASE_GENERIC_ANGLE_TEXTS = {
+    "primary source discovery",
+    "find authoritative sources that directly answer the research question",
+}
+SEMANTIC_RELEASE_GENERIC_PLACEHOLDER_PATTERNS = (
+    r"\bangle\s*\d+\b",
+    r"\bangle_\d+\b",
+    r"\bevidence\s+angle\b",
+    r"\bsupport\s+angle\b",
+)
+SEMANTIC_RELEASE_GENERIC_TOKENS = {
+    "and",
+    "answer",
+    "authoritative",
+    "compare",
+    "directly",
+    "does",
+    "discovery",
+    "do",
+    "evidence",
+    "find",
+    "for",
+    "from",
+    "how",
+    "official",
+    "primary",
+    "public",
+    "question",
+    "research",
+    "source",
+    "sources",
+    "support",
+    "supports",
+    "supporting",
+    "that",
+    "the",
+    "what",
+    "with",
+    "which",
+}
+SEMANTIC_RELEASE_NON_SUBSTANTIVE_SUFFIX_TOKENS = {
+    "current",
+    "latest",
+    "new",
+    "overview",
+    "recap",
+    "recent",
+    "revision",
+    "revised",
+    "status",
+    "summary",
+    "update",
+    "updated",
+    "updates",
+}
+KOREAN_SEMANTIC_PARTICLE_SUFFIXES = (
+    "께서는",
+    "에서는",
+    "에게는",
+    "으로는",
+    "로는",
+    "에는",
+    "과는",
+    "와는",
+    "에서",
+    "에게",
+    "께서",
+    "으로",
+    "로",
+    "부터",
+    "까지",
+    "처럼",
+    "보다",
+    "마다",
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "의",
+    "와",
+    "과",
+    "도",
+    "만",
+    "에",
+)
 
 GENERIC_LENS_PHRASES = (
     "official documentation",
@@ -520,6 +650,7 @@ def codex_semantic_candidate_plan(
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
                 candidate=candidate,
+                visual_preference=str(raw_request.get("visual_preference") or "auto"),
             )
             raw_response["candidate_validation"] = candidate_validation
             if candidate_validation.get("ok") is True:
@@ -943,11 +1074,13 @@ def _codex_semantic_candidate_validation(
     *,
     original_question: str,
     candidate: Mapping[str, Any],
+    visual_preference: str | None = None,
 ) -> dict[str, Any]:
     try:
         validation = validate_semantic_candidate_plan(
             original_question=original_question,
             plan=candidate,
+            visual_preference=visual_preference,
         )
     except Exception as exc:  # pragma: no cover - defensive boundary guard
         validation = {
@@ -1038,6 +1171,43 @@ def _codex_semantic_retry_raw_request(
         for failure in _list(validation.get("failures"))[:8]
         if isinstance(failure, Mapping)
     ]
+    visual_preference = _normalized_visual_preference(
+        retry_request.get("visual_preference")
+    )
+    visual_guidance = (
+        "Because visual_preference is text_only, all angles and bounded_tasks must "
+        "use route=text_only, max_images=0, expected_visual_targets=[], and no image, "
+        "chart, screenshot, diagram, visual-example, visual-observation, or VLM work "
+        "may be introduced."
+        if visual_preference == "text_only"
+        else (
+            "If the question requires visual evidence, include at least one visual "
+            "angle with evidence_need `visual_example` for collecting representative "
+            "source images and at least one visual angle with evidence_need "
+            "`visual_observation` or `vlm_analysis` for image interpretation. Every "
+            "visual route, visual target, image/chart/figure/screenshot artifact, or "
+            "visual expected evidence task must set max_images between 1 and 3; "
+            "text-only tasks should keep max_images=0."
+        )
+    )
+    semantic_angle_guidance = (
+        " If `semantic_angle_release_depth_failed` appears, rewrite the failing "
+        "angle titles and research_questions so they are prompt-specific, preserve "
+        "the user's subject, modality, source-quality, geography/time, and "
+        "output-shape anchors, and share at least 2 meaningful non-generic tokens "
+        "with the original question. Avoid generic, copied-original, placeholder, "
+        "or shallow angle text."
+        if "semantic_angle_release_depth_failed" in failure_codes
+        else ""
+    )
+    semantic_angle_duplicate_guidance = (
+        " If `semantic_angle_release_duplicate_failed` appears, produce materially "
+        "distinct semantic angles with different evidence needs, source families, "
+        "comparison axes, constraints, and report sections. Do not repeat the same "
+        "wording with numeric suffixes, reordered phrasing, or synonym-only variants."
+        if "semantic_angle_release_duplicate_failed" in failure_codes
+        else ""
+    )
     retry_request["planner_retry_instructions"] = (
         "The previous Codex semantic candidate did not pass release validation. "
         "Generate a fresh semantic decomposition that fixes these failure codes "
@@ -1048,16 +1218,110 @@ def _codex_semantic_retry_raw_request(
         "distribution by adding or reassigning specific bounded tasks so each broad "
         "angle has at least 2 tasks while the total remains 20 to 40. Preserve the "
         "user's domain, modality, source-quality, "
-        "geography/time, and deliverable requirements. If the question requires "
-        "visual evidence, include at least one visual angle with evidence_need "
-        "`visual_example` for collecting representative source images and at least "
-        "one visual angle with evidence_need `visual_observation` or `vlm_analysis` "
-        "for image interpretation. Every visual route, visual target, image/chart/"
-        "figure/screenshot artifact, or visual expected evidence task must set "
-        "max_images between 1 and 3; text-only tasks should keep max_images=0."
+        f"geography/time, and deliverable requirements. {visual_guidance}"
+        f"{semantic_angle_guidance}"
+        f"{semantic_angle_duplicate_guidance}"
     )
     retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
     return retry_request
+
+
+def _normalized_visual_preference(value: Any) -> str:
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"text_only", "visual_required", "visual_optional"}:
+        return normalized
+    return "auto"
+
+
+def _text_only_visual_contract_instruction() -> str:
+    return (
+        "When visual_preference is text_only, all angles and bounded_tasks must use "
+        "route=text_only, max_images=0, expected_visual_targets=[], and no image, "
+        "chart, screenshot, diagram, visual-example, visual-observation, or VLM work "
+        "may be introduced."
+    )
+
+
+def _append_text_only_visual_work_violations(
+    violations: list[dict[str, Any]],
+    *,
+    record_type: str,
+    record: Mapping[str, Any],
+    fields: Sequence[str],
+) -> None:
+    record_details: dict[str, Any] = {"record_type": record_type}
+    if record_type == "angle":
+        record_details["angle_id"] = record.get("angle_id")
+    if record_type == "task":
+        record_details["task_id"] = record.get("task_id")
+        record_details["angle_id"] = record.get("angle_id")
+    for field_name in fields:
+        raw_value = record.get(field_name)
+        if field_name == "evidence_need":
+            evidence_need = str(raw_value or "").strip()
+            if evidence_need in VISUAL_EXPECTED_EVIDENCE:
+                violations.append(
+                    {
+                        **record_details,
+                        "field": field_name,
+                        "value": evidence_need,
+                        "matches": [evidence_need],
+                        "reason": "visual_evidence_need",
+                    }
+                )
+            continue
+        for value in _text_only_visual_work_field_values(raw_value):
+            matches = _text_only_visual_work_matches(value)
+            if not matches:
+                continue
+            violations.append(
+                {
+                    **record_details,
+                    "field": field_name,
+                    "value": _preview_text(str(value)),
+                    "matches": matches,
+                    "reason": "visual_work_term",
+                }
+            )
+
+
+def _text_only_visual_work_field_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        values: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, Mapping):
+                values.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
+            else:
+                values.append(str(item))
+        return values
+    return [str(value)]
+
+
+def _text_only_visual_work_matches(value: str) -> list[str]:
+    text = _normalize_text(str(value or "")).lower()
+    if not text:
+        return []
+    matches: list[str] = []
+    for label, pattern in TEXT_ONLY_VISUAL_WORK_TEXT_PATTERNS:
+        for match in re.finditer(pattern, text):
+            if _text_only_visual_work_match_negated(text, match.start()):
+                continue
+            matches.append(label)
+            break
+    return list(dict.fromkeys(matches))
+
+
+def _text_only_visual_work_match_negated(text: str, start_index: int) -> bool:
+    prefix = text[max(0, start_index - 48):start_index]
+    return TEXT_ONLY_VISUAL_WORK_NEGATION_PATTERN.search(prefix) is not None
 
 
 def _adapter_model_or_surface(raw_response: Mapping[str, Any]) -> str:
@@ -1641,7 +1905,9 @@ def _semantic_adapter_prompt(role_label: str) -> str:
             "For narrow questions produce 6 to 12 bounded_tasks. Every bounded_task must have "
             "max_sources as an integer from 1 to 5. Text-only tasks must have max_images=0. "
             "Visual-required or visual-optional tasks must have max_images from 1 to 3 and "
-            "non-empty expected_visual_targets. Do not copy angle titles as task queries. Make "
+            "non-empty expected_visual_targets. "
+            f"{_text_only_visual_contract_instruction()} "
+            "Do not copy angle titles as task queries. Make "
             "every task executable with source policy, concrete success criteria, expected artifacts, "
             "and done_condition. Preserve the user intent, language, domain, modality, geography/time "
             "constraints, and requested deliverable. Do not drift into Codex internals unless the user "
@@ -3196,11 +3462,15 @@ def validate_semantic_candidate_plan(
     *,
     original_question: str,
     plan: Mapping[str, Any],
+    visual_preference: str | None = None,
 ) -> dict[str, Any]:
     """Validate P3-SP2 candidate semantics before independent review exists."""
 
     failures: list[dict[str, Any]] = []
     question = original_question.strip()
+    request_visual_preference = _normalized_visual_preference(
+        visual_preference or plan.get("visual_preference")
+    )
     raw_requirements = plan.get("requirement_coverage_map", [])
     if not isinstance(raw_requirements, list):
         failures.append({"code": "requirement_coverage_map_not_list"})
@@ -3389,6 +3659,18 @@ def validate_semantic_candidate_plan(
                         "expected_type": "list",
                     }
                 )
+    failures.extend(
+        _candidate_semantic_angle_release_depth_failures(
+            question=question,
+            angles=angles,
+        )
+    )
+    failures.extend(
+        _candidate_semantic_angle_release_duplicate_failures(
+            question=question,
+            angles=angles,
+        )
+    )
     required_task_fields = (
         "task_id",
         "angle_id",
@@ -3468,10 +3750,103 @@ def validate_semantic_candidate_plan(
                         "task_id": task.get("task_id"),
                     }
                 )
-    visual_required = any(
-        str(requirement.get("requirement_type") or "") == "visual_modality"
-        for requirement in requirements
-    ) or question_mentions_visual_evidence(question)
+    if request_visual_preference == "text_only":
+        text_only_violations: list[dict[str, Any]] = []
+        for angle in angles:
+            angle_id = angle.get("angle_id")
+            route = str(angle.get("route") or "text_only")
+            if route in {"visual_required", "visual_optional"}:
+                text_only_violations.append(
+                    {
+                        "record_type": "angle",
+                        "angle_id": angle_id,
+                        "field": "route",
+                        "value": route,
+                    }
+                )
+            visual_targets = _string_list(angle.get("expected_visual_targets"))
+            if visual_targets:
+                text_only_violations.append(
+                    {
+                        "record_type": "angle",
+                        "angle_id": angle_id,
+                        "field": "expected_visual_targets",
+                        "value_count": len(visual_targets),
+                    }
+                )
+        for task in tasks:
+            task_id = task.get("task_id")
+            route = str(task.get("route") or "text_only")
+            if route in {"visual_required", "visual_optional"}:
+                text_only_violations.append(
+                    {
+                        "record_type": "task",
+                        "task_id": task_id,
+                        "angle_id": task.get("angle_id"),
+                        "field": "route",
+                        "value": route,
+                    }
+                )
+            visual_targets = _string_list(task.get("expected_visual_targets"))
+            if visual_targets:
+                text_only_violations.append(
+                    {
+                        "record_type": "task",
+                        "task_id": task_id,
+                        "angle_id": task.get("angle_id"),
+                        "field": "expected_visual_targets",
+                        "value_count": len(visual_targets),
+                    }
+                )
+            try:
+                max_images = int(task.get("max_images") or 0)
+            except (TypeError, ValueError):
+                max_images = 0
+            if max_images > 0:
+                text_only_violations.append(
+                    {
+                        "record_type": "task",
+                        "task_id": task_id,
+                        "angle_id": task.get("angle_id"),
+                        "field": "max_images",
+                        "value": max_images,
+                    }
+                )
+        for angle in angles:
+            _append_text_only_visual_work_violations(
+                text_only_violations,
+                record_type="angle",
+                record=angle,
+                fields=TEXT_ONLY_ANGLE_VISUAL_WORK_FIELDS,
+            )
+        for task in tasks:
+            _append_text_only_visual_work_violations(
+                text_only_violations,
+                record_type="task",
+                record=task,
+                fields=TEXT_ONLY_TASK_VISUAL_WORK_FIELDS,
+            )
+        if text_only_violations:
+            failures.append(
+                {
+                    "code": "text_only_visual_preference_violation",
+                    "visual_preference": request_visual_preference,
+                    "message": (
+                        "visual_preference=text_only forbids visual routes, visual "
+                        "targets, positive image budgets, visual evidence needs, "
+                        "and explicit visual work in executable fields."
+                    ),
+                    "violations": text_only_violations[:20],
+                    "violation_count": len(text_only_violations),
+                }
+            )
+    visual_required = request_visual_preference != "text_only" and (
+        any(
+            str(requirement.get("requirement_type") or "") == "visual_modality"
+            for requirement in requirements
+        )
+        or question_mentions_visual_evidence(question)
+    )
     if visual_required:
         visual_angles = [
             angle for angle in angles if str(angle.get("route") or "") != "text_only"
@@ -3539,6 +3914,373 @@ def validate_semantic_candidate_plan(
     }
 
 
+def _candidate_semantic_angle_release_depth_failures(
+    *,
+    question: str,
+    angles: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    original_tokens = _semantic_release_meaningful_tokens(question)
+    if angles and not original_tokens:
+        return [
+            {
+                "code": "semantic_angle_release_depth_failed",
+                "angle_id": None,
+                "angle_index": None,
+                "reasons": ["original_question_missing_meaningful_tokens"],
+                "minimum_meaningful_overlap": SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS,
+            }
+        ]
+
+    failures: list[dict[str, Any]] = []
+    for index, angle in enumerate(angles, start=1):
+        angle_id = str(angle.get("angle_id") or f"angle_{index:03d}")
+        title = str(angle.get("title") or "").strip()
+        research_question = str(angle.get("research_question") or "").strip()
+        reasons: list[str] = []
+        missing_string_fields = [
+            field_name
+            for field_name in (
+                "angle_id",
+                "title",
+                "research_question",
+                "evidence_need",
+                "report_section",
+            )
+            if not _semantic_release_non_empty_string(angle.get(field_name))
+        ]
+        missing_list_fields = [
+            field_name
+            for field_name in ("expected_artifacts", "success_criteria")
+            if not _semantic_release_non_empty_string_list(angle.get(field_name))
+        ]
+        if missing_string_fields:
+            reasons.append("required_release_string_field_missing")
+        if missing_list_fields:
+            reasons.append("required_release_list_field_missing")
+        if title and _semantic_release_generic_or_original_text(title, question):
+            reasons.append("title_generic_or_original")
+        if research_question and _semantic_release_generic_or_original_text(
+            research_question,
+            question,
+        ):
+            reasons.append("research_question_generic_or_original")
+
+        combined_text = f"{title} {research_question}".strip()
+        if combined_text and _semantic_release_placeholder_text(combined_text):
+            reasons.append("placeholder_angle_text")
+
+        all_tokens = _semantic_release_token_list(combined_text)
+        meaningful_tokens = _semantic_release_meaningful_token_list(combined_text)
+        unique_meaningful_tokens = set(meaningful_tokens)
+        if len(unique_meaningful_tokens) < SEMANTIC_RELEASE_MIN_ANGLE_UNIQUE_TOKENS:
+            reasons.append("too_few_unique_meaningful_tokens")
+        if all_tokens and len(meaningful_tokens) * 2 < len(all_tokens):
+            reasons.append("too_much_generic_or_shallow_text")
+        overlap_tokens = unique_meaningful_tokens & original_tokens
+        if len(overlap_tokens) < SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS:
+            reasons.append("meaningful_overlap_too_low")
+
+        if reasons:
+            failures.append(
+                {
+                    "code": "semantic_angle_release_depth_failed",
+                    "angle_id": angle_id,
+                    "angle_index": index,
+                    "message": (
+                        "Candidate semantic angle title+research_question is too "
+                        "shallow for release semantic angle validation."
+                    ),
+                    "reasons": list(dict.fromkeys(reasons)),
+                    "missing_string_fields": missing_string_fields,
+                    "missing_list_fields": missing_list_fields,
+                    "meaningful_overlap_count": len(overlap_tokens),
+                    "minimum_meaningful_overlap": (
+                        SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS
+                    ),
+                    "overlap_tokens": sorted(overlap_tokens),
+                    "unique_meaningful_token_count": len(unique_meaningful_tokens),
+                    "minimum_unique_meaningful_tokens": (
+                        SEMANTIC_RELEASE_MIN_ANGLE_UNIQUE_TOKENS
+                    ),
+                    "title": _preview_text(title),
+                    "research_question": _preview_text(research_question),
+                }
+            )
+    return failures
+
+
+def _candidate_semantic_angle_release_duplicate_failures(
+    *,
+    question: str,
+    angles: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    original_tokens = _semantic_release_meaningful_tokens(question)
+    angle_token_records = [
+        {
+            "angle_id": str(angle.get("angle_id") or f"angle_{index:03d}"),
+            "angle_index": index,
+            "tokens": _semantic_release_angle_content_tokens(angle),
+        }
+        for index, angle in enumerate(angles, start=1)
+    ]
+    duplicate_pairs: list[dict[str, Any]] = []
+    for left_index, left_record in enumerate(angle_token_records):
+        for right_record in angle_token_records[left_index + 1:]:
+            similarity = _semantic_release_angle_token_similarity(
+                left_record["tokens"],
+                right_record["tokens"],
+            )
+            shared_prompt_anchor_tokens = (
+                left_record["tokens"] & right_record["tokens"] & original_tokens
+            )
+            left_distinguishing_tokens = (
+                left_record["tokens"] - shared_prompt_anchor_tokens
+            )
+            right_distinguishing_tokens = (
+                right_record["tokens"] - shared_prompt_anchor_tokens
+            )
+            distinguishing_similarity = _semantic_release_angle_token_similarity(
+                left_distinguishing_tokens,
+                right_distinguishing_tokens,
+            )
+            distinguishing_delta_tokens = (
+                left_distinguishing_tokens ^ right_distinguishing_tokens
+            )
+            substantive_distinguishing_tokens = (
+                _semantic_release_substantive_distinguishing_tokens(
+                    distinguishing_delta_tokens
+                )
+            )
+            exact_duplicate = (
+                tuple(sorted(left_record["tokens"]))
+                == tuple(sorted(right_record["tokens"]))
+            )
+            distinguishing_near_duplicate = (
+                distinguishing_similarity["jaccard"]
+                >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+                or distinguishing_similarity["containment"]
+                >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+            )
+            near_duplicate = (
+                (
+                    similarity["jaccard"] >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+                    or similarity["containment"]
+                    >= SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD
+                )
+                and distinguishing_near_duplicate
+            )
+            contained_suffix_duplicate = (
+                _semantic_release_contained_prompt_anchor_suffix_duplicate(
+                    similarity=similarity,
+                    distinguishing_delta_tokens=distinguishing_delta_tokens,
+                    substantive_distinguishing_tokens=(
+                        substantive_distinguishing_tokens
+                    ),
+                )
+            )
+            if (
+                not exact_duplicate
+                and not near_duplicate
+                and not contained_suffix_duplicate
+            ):
+                continue
+            reason = "near_duplicate_token_overlap"
+            if contained_suffix_duplicate:
+                reason = "contained_prompt_anchor_suffix_duplicate"
+            if exact_duplicate:
+                reason = "exact_token_signature"
+            duplicate_pairs.append(
+                {
+                    "left_angle_id": left_record["angle_id"],
+                    "left_angle_index": left_record["angle_index"],
+                    "right_angle_id": right_record["angle_id"],
+                    "right_angle_index": right_record["angle_index"],
+                    "reason": reason,
+                    "jaccard": similarity["jaccard"],
+                    "containment": similarity["containment"],
+                    "distinguishing_jaccard": distinguishing_similarity["jaccard"],
+                    "distinguishing_containment": distinguishing_similarity[
+                        "containment"
+                    ],
+                    "threshold": SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD,
+                    "shared_tokens": sorted(
+                        left_record["tokens"] & right_record["tokens"]
+                    )[:20],
+                    "shared_prompt_anchor_tokens": sorted(
+                        shared_prompt_anchor_tokens
+                    )[:20],
+                    "shared_distinguishing_tokens": sorted(
+                        left_distinguishing_tokens & right_distinguishing_tokens
+                    )[:20],
+                    "distinguishing_delta_tokens": sorted(
+                        distinguishing_delta_tokens
+                    )[:20],
+                    "substantive_distinguishing_tokens": sorted(
+                        substantive_distinguishing_tokens
+                    )[:20],
+                    "non_substantive_distinguishing_tokens": sorted(
+                        distinguishing_delta_tokens
+                        - substantive_distinguishing_tokens
+                    )[:20],
+                    "left_unique_meaningful_token_count": len(left_record["tokens"]),
+                    "right_unique_meaningful_token_count": len(
+                        right_record["tokens"]
+                    ),
+                }
+            )
+    if not duplicate_pairs:
+        return []
+    return [
+        {
+            "code": "semantic_angle_release_duplicate_failed",
+            "message": (
+                "Candidate semantic angle title+research_question values contain "
+                "duplicate or near-duplicate release content."
+            ),
+            "duplicate_pair_count": len(duplicate_pairs),
+            "duplicate_pairs": duplicate_pairs[:10],
+            "colliding_angle_ids": sorted(
+                {
+                    str(pair["left_angle_id"])
+                    for pair in duplicate_pairs
+                }
+                | {
+                    str(pair["right_angle_id"])
+                    for pair in duplicate_pairs
+                }
+            ),
+            "colliding_angle_indexes": sorted(
+                {
+                    int(pair["left_angle_index"])
+                    for pair in duplicate_pairs
+                }
+                | {
+                    int(pair["right_angle_index"])
+                    for pair in duplicate_pairs
+                }
+            ),
+            "threshold": SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD,
+        }
+    ]
+
+
+def _semantic_release_angle_content_tokens(angle: Mapping[str, Any]) -> set[str]:
+    return set(
+        _semantic_release_meaningful_token_list(
+            f"{angle.get('title') or ''} {angle.get('research_question') or ''}"
+        )
+    )
+
+
+def _semantic_release_angle_token_similarity(
+    left: set[str],
+    right: set[str],
+) -> dict[str, float]:
+    intersection = len(left & right)
+    union = len(left | right)
+    smaller = min(len(left), len(right))
+    if not union:
+        return {"jaccard": 1.0, "containment": 1.0}
+    return {
+        "jaccard": intersection / union,
+        "containment": intersection / smaller if smaller else 0.0,
+    }
+
+
+def _semantic_release_contained_prompt_anchor_suffix_duplicate(
+    *,
+    similarity: Mapping[str, float],
+    distinguishing_delta_tokens: set[str],
+    substantive_distinguishing_tokens: set[str],
+) -> bool:
+    if similarity["containment"] < SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD:
+        return False
+    return not substantive_distinguishing_tokens
+
+
+def _semantic_release_substantive_distinguishing_tokens(
+    tokens: set[str],
+) -> set[str]:
+    return {
+        token
+        for token in tokens
+        if token not in SEMANTIC_RELEASE_GENERIC_TOKENS
+        and token not in SEMANTIC_RELEASE_NON_SUBSTANTIVE_SUFFIX_TOKENS
+        and not token.isdigit()
+    }
+
+
+def _semantic_release_non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _semantic_release_non_empty_string_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_semantic_release_non_empty_string(item) for item in value)
+    )
+
+
+def _semantic_release_generic_or_original_text(
+    text: str,
+    original_question: str,
+) -> bool:
+    normalized = _semantic_release_normalized_text(text)
+    if normalized in SEMANTIC_RELEASE_GENERIC_ANGLE_TEXTS:
+        return True
+    return bool(original_question) and normalized == _semantic_release_normalized_text(
+        original_question
+    )
+
+
+def _semantic_release_placeholder_text(text: str) -> bool:
+    normalized = _semantic_release_normalized_text(text)
+    return any(
+        re.search(pattern, normalized)
+        for pattern in SEMANTIC_RELEASE_GENERIC_PLACEHOLDER_PATTERNS
+    )
+
+
+def _semantic_release_token_list(text: str) -> list[str]:
+    tokens: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower()):
+        if _semantic_release_token_has_hangul(token):
+            normalized = _normalize_korean_semantic_token(token)
+            if len(normalized) >= 2:
+                tokens.append(normalized)
+        elif len(token) > 2:
+            tokens.append(token)
+    return tokens
+
+
+def _semantic_release_token_has_hangul(token: str) -> bool:
+    return any("\uac00" <= char <= "\ud7a3" for char in token)
+
+
+def _normalize_korean_semantic_token(token: str) -> str:
+    for suffix in KOREAN_SEMANTIC_PARTICLE_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 2:
+            return token[: -len(suffix)]
+    return token
+
+
+def _semantic_release_meaningful_token_list(text: str) -> list[str]:
+    return [
+        token
+        for token in _semantic_release_token_list(text)
+        if token not in SEMANTIC_RELEASE_GENERIC_TOKENS
+    ]
+
+
+def _semantic_release_meaningful_tokens(text: str) -> set[str]:
+    return set(_semantic_release_meaningful_token_list(text))
+
+
+def _semantic_release_normalized_text(text: str) -> str:
+    return " ".join(re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower()))
+
+
 def _candidate_validation_question_class(
     *,
     plan: Mapping[str, Any],
@@ -3602,6 +4344,17 @@ def _codex_semantic_raw_request(
     provided_sources: Sequence[Mapping[str, Any]],
     provided_images: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    normalized_visual_preference = _normalized_visual_preference(visual_preference)
+    request_budget_cap = dict(budget_cap)
+    planner_instructions = [
+        "Decompose the user's raw question into prompt-specific research angles.",
+        "Preserve every explicit requirement and justified inferred constraint.",
+        "Create bounded executable research tasks with source, visual, and done-condition fields.",
+        "Do not use hidden template classes, fixed domain menus, canned task lists, or copied angle titles.",
+    ]
+    if normalized_visual_preference == "text_only":
+        request_budget_cap["max_images"] = 0
+        planner_instructions.append(_text_only_visual_contract_instruction())
     return {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "artifact_type": "semantic_planner_raw_request",
@@ -3612,16 +4365,11 @@ def _codex_semantic_raw_request(
         "original_question": question,
         "user_constraints": [str(item) for item in user_constraints],
         "depth_preset": depth_preset,
-        "visual_preference": visual_preference or "auto",
-        "budget_cap": dict(budget_cap),
+        "visual_preference": normalized_visual_preference,
+        "budget_cap": request_budget_cap,
         "provided_sources": [dict(item) for item in provided_sources],
         "provided_images": [dict(item) for item in provided_images],
-        "planner_instructions": [
-            "Decompose the user's raw question into prompt-specific research angles.",
-            "Preserve every explicit requirement and justified inferred constraint.",
-            "Create bounded executable research tasks with source, visual, and done-condition fields.",
-            "Do not use hidden template classes, fixed domain menus, canned task lists, or copied angle titles.",
-        ],
+        "planner_instructions": planner_instructions,
         "response_schema_shape": {
             "intent_summary": "string",
             "domain_entities": "list",
@@ -4675,7 +5423,7 @@ def _question_class_from_candidate(
 
 def classify_question(question: str) -> str:
     text = question.lower()
-    if _mentions_explicit_visual_evidence(text):
+    if _mentions_strong_visual_route_evidence(text):
         return _CLASS_VISUAL
     if _contains_any(
         text,
@@ -4717,7 +5465,7 @@ def classify_question(question: str) -> str:
         ),
     ):
         return _CLASS_POLICY
-    if _contains_any(text, _VISUAL_KEYWORDS):
+    if _mentions_explicit_visual_evidence(text):
         return _CLASS_VISUAL
     if _contains_any(
         text,
@@ -5535,15 +6283,72 @@ def _semantic_task_ids_with_duplicates(
 
 
 def _semantic_task_has_visual_obligation(task: Mapping[str, Any]) -> bool:
-    route = str(task.get("route") or "")
-    if route in {"visual_required", "visual_optional"}:
-        return True
+    route = str(task.get("route") or task.get("modality") or "")
+    max_images_value = task.get("max_images")
+    max_images_present = max_images_value is not None
+    max_images = _nonnegative_int(max_images_value)
+    if route == "text_only":
+        return False
     if _string_list(task.get("expected_visual_targets")):
         return True
-    try:
-        return int(task.get("max_images") or 0) > 0
-    except (TypeError, ValueError):
+    if _semantic_task_expected_visual_artifacts(task):
+        return True
+    if max_images > 0:
+        return True
+    if max_images_present and max_images <= 0:
         return False
+    if route == "visual_required":
+        return True
+    if route == "visual_optional" and not max_images_present:
+        return True
+    return False
+
+
+def _semantic_task_expected_visual_artifacts(task: Mapping[str, Any]) -> bool:
+    visual_tokens = {
+        "image",
+        "images",
+        "visual",
+        "visual_search_plan",
+        "visual_candidates",
+        "image_fetch_status",
+        "visual_observations",
+        "vlm_analysis",
+        "screenshot",
+        "screenshots",
+        "chart",
+        "charts",
+        "diagram",
+        "diagrams",
+        "figure",
+        "figures",
+        "photo",
+        "photos",
+    }
+    for field in ("expected_artifacts", "expected_source_types", "expected_evidence"):
+        for value in _string_list(task.get(field)):
+            normalized = _normalize_text(value).replace("-", "_")
+            if normalized in visual_tokens:
+                return True
+            if any(token in normalized for token in ("image", "visual", "screenshot", "vlm")):
+                return True
+    evidence_need = str(task.get("evidence_need") or "")
+    return evidence_need in VISUAL_EXPECTED_EVIDENCE
+
+
+def _nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    if isinstance(value, str) and value.strip():
+        try:
+            return max(0, int(float(value)))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _read_materialization_json_records(path: Path) -> tuple[list[Mapping[str, Any]], bool]:
@@ -6081,15 +6886,35 @@ def _demote_json_artifact_semantic_release(path: Path, demotion: Mapping[str, An
 
 
 def question_mentions_visual_evidence(question: str) -> bool:
-    return _contains_any(question.lower(), _VISUAL_KEYWORDS)
+    return _mentions_explicit_visual_evidence(question.lower())
 
 
 def _mentions_explicit_visual_evidence(text: str) -> bool:
     return bool(
         re.search(
             r"\b("
-            r"ui|screenshot(s)?|screen(s)?|interface|chart(s)?|graph(s)?|"
-            r"image[- ]quality|visual evidence|visual comparison|image comparison"
+            r"visual|ui|screenshot(s)?|screen(s)?|interface(s)?|chart(s)?|"
+            r"graph(s)?|diagram(s)?|image(s)?|photo(s)?|"
+            r"image[- ](quality|evidence|comparison|source(s)?|artifact(s)?)|"
+            r"visual[- ](evidence|comparison|inspection|analysis|observation(s)?|example(s)?|style)"
+            r")\b",
+            text,
+        )
+        or _contains_any(
+            text,
+            ("\uc0ac\uc9c4", "\uc774\ubbf8\uc9c0", "\uc2a4\ub0c5\uc0ac\uc9c4", "\uc2dc\uac01", "\ud654\uba74", "\ucc28\ud2b8"),
+        )
+    )
+
+
+def _mentions_strong_visual_route_evidence(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b("
+            r"ui|screenshot(s)?|screen(s)?|interface(s)?|chart(s)?|"
+            r"graph(s)?|diagram(s)?|"
+            r"image[- ](quality|evidence|comparison|source(s)?|artifact(s)?)|"
+            r"visual[- ](evidence|comparison|inspection|analysis|observation(s)?|example(s)?|style)"
             r")\b",
             text,
         )

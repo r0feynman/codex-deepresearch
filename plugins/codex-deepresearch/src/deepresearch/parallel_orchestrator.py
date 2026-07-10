@@ -1063,16 +1063,14 @@ def _expected_evidence_for_task(task: Mapping[str, Any], *, route: str) -> list[
     expected = _string_list(task.get("expected_evidence"))
     evidence_need = str(task.get("evidence_need") or "")
     visual_expected = {"visual_example", "visual_observation", "vlm_analysis"}
-    visual_obligation = (
-        route != "text_only"
-        or bool(_string_list(task.get("expected_visual_targets")))
-        or _nonnegative_int(task.get("max_images")) > 0
-    )
+    visual_obligation_task = dict(task)
+    visual_obligation_task["route"] = route
+    visual_obligation = _task_requests_visual_evidence(visual_obligation_task)
     if evidence_need in visual_expected and not visual_obligation:
         evidence_need = ""
     if evidence_need and evidence_need not in expected:
         expected.insert(0, evidence_need)
-    if route != "text_only" and "visual_observation" not in expected:
+    if visual_obligation and "visual_observation" not in expected:
         expected.append("visual_observation")
     return list(dict.fromkeys(expected or ["primary_source"]))
 
@@ -3336,7 +3334,12 @@ def _clear_dangling_visual_observation_verifier_links(
 
 def _write_release_validation_visual_provider_status(run_dir: Path) -> None:
     minimums = visual_minimums_for_run(run_dir)
-    status = "completed_auto_visual" if minimums.get("satisfied") is True else "partial_auto_visual"
+    materialization = _release_validation_visual_materialization_gate(run_dir)
+    status = (
+        "completed_auto_visual"
+        if minimums.get("satisfied") is True and materialization.get("valid") is True
+        else "partial_auto_visual"
+    )
     envelope = automatic_visual_status_envelope(status)
     candidates = _read_jsonl(run_dir / "visual_candidates.jsonl")
     fetches = _read_jsonl(run_dir / "image_fetch_status.jsonl")
@@ -3416,11 +3419,61 @@ def _write_release_validation_visual_provider_status(run_dir: Path) -> None:
             }
         )
     payload["minimums"] = minimums
+    payload["semantic_materialization"] = materialization
+    if materialization.get("valid") is not True:
+        diagnostics = (
+            dict(payload.get("diagnostics", {}))
+            if isinstance(payload.get("diagnostics"), Mapping)
+            else {}
+        )
+        diagnostics["actionable_cause"] = (
+            "release validation visual handoff did not cover all downstream "
+            "semantic visual obligations"
+        )
+        diagnostics["failure_category"] = "semantic_materialization_missing"
+        diagnostics["failure_code"] = "semantic_materialization_diff_invalid"
+        diagnostics["missing_semantic_materialization_task_ids"] = list(
+            materialization.get("missing_task_ids") or []
+        )
+        diagnostics["dropped_visual_obligations"] = list(
+            materialization.get("dropped_visual_obligations") or []
+        )
+        payload["diagnostics"] = diagnostics
     if evidence_run_id:
         payload["run_id"] = evidence_run_id
     if identity:
         apply_release_validation_identity(payload, identity)
     _write_json(run_dir / "visual_provider_status.json", payload)
+
+
+def _release_validation_visual_materialization_gate(run_dir: Path) -> dict[str, Any]:
+    try:
+        diff = write_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+    except Exception as exc:  # pragma: no cover - defensive status boundary
+        return {
+            "valid": False,
+            "require_downstream": True,
+            "failure_codes": ["semantic_materialization_diff_exception"],
+            "error": exc.__class__.__name__,
+            "missing_task_ids": [],
+            "dropped_visual_obligations": [],
+        }
+    return {
+        "valid": diff.get("valid") is True,
+        "require_downstream": diff.get("require_downstream"),
+        "missing_task_ids": list(diff.get("missing_task_ids") or []),
+        "dropped_visual_obligations": list(diff.get("dropped_visual_obligations") or []),
+        "visual_obligation_task_ids": list(diff.get("visual_obligation_task_ids") or []),
+        "failure_codes": [
+            failure.get("code")
+            for failure in diff.get("failures", [])
+            if isinstance(failure, Mapping) and failure.get("code")
+        ],
+    }
 
 
 def _merged_release_jsonl_records(
@@ -4575,12 +4628,59 @@ def _canonicalize_release_visual_observation_links(
 
 
 def _task_requests_visual_evidence(task: Mapping[str, Any]) -> bool:
-    try:
-        if int(task.get("max_images") or 0) > 0:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return str(task.get("route") or "") in {"visual_optional", "visual_required"}
+    route = str(task.get("route") or task.get("modality") or "")
+    max_images_value = task.get("max_images")
+    max_images_present = max_images_value is not None
+    max_images = _nonnegative_int(max_images_value)
+    if route == "text_only":
+        return False
+    if _string_list(task.get("expected_visual_targets")):
+        return True
+    if _task_expected_visual_artifacts(task):
+        return True
+    if max_images > 0:
+        return True
+    if max_images_present and max_images <= 0:
+        return False
+    if route == "visual_required":
+        return True
+    if route == "visual_optional" and not max_images_present:
+        return True
+    return False
+
+
+def _task_expected_visual_artifacts(task: Mapping[str, Any]) -> bool:
+    for field in ("expected_artifacts", "expected_source_types", "expected_evidence"):
+        for value in _string_list(task.get(field)):
+            normalized = re.sub(r"\s+", " ", str(value).strip().lower()).replace("-", "_")
+            if normalized in {
+                "image",
+                "images",
+                "visual",
+                "visual_search_plan",
+                "visual_candidates",
+                "image_fetch_status",
+                "visual_observations",
+                "vlm_analysis",
+                "screenshot",
+                "screenshots",
+                "chart",
+                "charts",
+                "diagram",
+                "diagrams",
+                "figure",
+                "figures",
+                "photo",
+                "photos",
+            }:
+                return True
+            if any(token in normalized for token in ("image", "visual", "screenshot", "vlm")):
+                return True
+    return str(task.get("evidence_need") or "") in {
+        "visual_example",
+        "visual_observation",
+        "vlm_analysis",
+    }
 
 
 def _write_release_validation_visual_search_plan(
@@ -7169,11 +7269,18 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
     release_identity = release_validation_identity_from_payload(task)
     release_instruction = ""
     if release_identity:
+        release_freshness_values = ", ".join(f"`{value}`" for value in FRESHNESS_REQUIREMENTS)
         release_instruction = (
             "This is a Public Beta release-validation run. For every SearchResult record, "
             f"set task_id `{task.get('search_task_id') or task.get('id')}`, "
             f"angle_id `{task.get('angle_id')}`, route `{task.get('route')}`, "
             "provider `codex-native`, provider_mode `real`, retrieval_status `fetched`, "
+            "and include non-empty release-required fields `query`, `result_type`, `rank`, and `accessed_at`. "
+            f"`freshness_requirement` is a schema enum and must be one of {release_freshness_values}; "
+            "set it to `any` if uncertain. Put natural-language task freshness wording in "
+            "`semantic_task_freshness_requirement`, not in `freshness_requirement`. "
+            "Include `semantic_task_query`, `semantic_task_route`, and "
+            "`semantic_task_freshness_requirement` lineage whenever the task provides those values. "
             "policy_decision `allowed`, handoff_artifact `search_results.jsonl`, "
             f"prompt_id `{release_identity['prompt_id']}`, "
             f"suite_id `{release_identity['suite_id']}`, "

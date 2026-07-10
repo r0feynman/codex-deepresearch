@@ -34,6 +34,9 @@ from .search_handoff import (
 from .semantic_planner import (
     BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
     CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV,
+    SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+    SEMANTIC_PLAN_FILENAME,
+    build_semantic_materialization_diff,
 )
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
@@ -1501,6 +1504,7 @@ def _completed_auto_visual_release_gate(
         observations=observations,
         visual_provider_status=provider_status,
     )
+    semantic_materialization = _semantic_materialization_release_gate(run_dir)
     failures: list[str] = []
     if counts["real_candidates"] < MIN_COMPLETED_AUTO_VISUAL_CANDIDATES:
         failures.append(
@@ -1510,11 +1514,14 @@ def _completed_auto_visual_release_gate(
         failures.append("at_least_3_codex_interactive_real_analyzed_images")
     if minimums["report_cited_images"] < 1:
         failures.append("report_cited_supported_real_visual_or_mixed_claim")
+    if semantic_materialization.get("applicable") is True and semantic_materialization.get("valid") is not True:
+        failures.append("semantic_materialization_diff_valid")
     diagnostics = _visual_release_gate_diagnostics(
         {
             "valid": not failures,
             "failures": failures,
             "minimums": minimums,
+            "semantic_materialization": semantic_materialization,
         },
         suppress_shortfall=suppress_shortfall_diagnostics,
         blocked_status=blocked_status,
@@ -1530,6 +1537,7 @@ def _completed_auto_visual_release_gate(
         "report_cited_images": minimums["report_cited_images"],
         "shortfall_reason": diagnostics["shortfall_reason"],
         "diagnostics": diagnostics,
+        "semantic_materialization": semantic_materialization,
         "counts": {
             **counts,
             "codex_interactive_real_analyzed_images": minimums["vlm_images_analyzed"],
@@ -1544,6 +1552,74 @@ def _completed_auto_visual_release_gate(
             minimums["report_cited_images"]
         ),
     }
+
+
+def _semantic_materialization_release_gate(run_dir: Path) -> dict[str, Any]:
+    plan_artifact = _read_optional_json(run_dir / SEMANTIC_PLAN_FILENAME)
+    existing_diff = _read_optional_json(run_dir / SEMANTIC_MATERIALIZATION_DIFF_FILENAME)
+    if not _semantic_materialization_gate_applies(
+        plan_artifact=plan_artifact,
+        existing_diff=existing_diff,
+    ):
+        return {"applicable": False, "valid": True}
+    try:
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+    except Exception as exc:  # pragma: no cover - defensive gate boundary
+        return {
+            "applicable": True,
+            "valid": False,
+            "failure_codes": ["semantic_materialization_diff_exception"],
+            "error": exc.__class__.__name__,
+        }
+    failures = [
+        failure.get("code")
+        for failure in diff.get("failures", [])
+        if isinstance(failure, Mapping) and failure.get("code")
+    ]
+    artifact_failures = [
+        check
+        for check in diff.get("artifact_checks", [])
+        if isinstance(check, Mapping) and check.get("valid") is not True
+    ]
+    return {
+        "applicable": True,
+        "valid": diff.get("valid") is True,
+        "require_downstream": diff.get("require_downstream"),
+        "missing_task_ids": list(diff.get("missing_task_ids") or []),
+        "dropped_visual_obligations": list(diff.get("dropped_visual_obligations") or []),
+        "visual_obligation_task_ids": list(diff.get("visual_obligation_task_ids") or []),
+        "failure_codes": failures,
+        "failed_artifacts": [
+            str(check.get("artifact"))
+            for check in artifact_failures
+            if check.get("artifact")
+        ],
+    }
+
+
+def _semantic_materialization_gate_applies(
+    *,
+    plan_artifact: Mapping[str, Any],
+    existing_diff: Mapping[str, Any],
+) -> bool:
+    semantic_plan = (
+        plan_artifact.get("semantic_plan")
+        if isinstance(plan_artifact.get("semantic_plan"), Mapping)
+        else {}
+    )
+    release_eligible = (
+        plan_artifact.get("semantic_release_eligible") is True
+        or semantic_plan.get("semantic_release_eligible") is True
+    )
+    strict_existing_diff = (
+        existing_diff.get("full_materialization_validation_implemented") is True
+        and existing_diff.get("require_downstream") is True
+    )
+    return release_eligible or strict_existing_diff
 
 
 def _release_gate_from_validation(
@@ -1610,6 +1686,9 @@ def _visual_release_gate_diagnostics(
         if isinstance(raw_failures, list):
             failures = [str(item) for item in raw_failures if isinstance(item, str)]
         valid = release_gate.get("valid") is True
+        semantic_materialization = release_gate.get("semantic_materialization")
+    else:
+        semantic_materialization = None
     if minimums is None:
         minimums = fallback_minimums
     reason = _visual_release_gate_shortfall_reason(
@@ -1618,6 +1697,14 @@ def _visual_release_gate_diagnostics(
         valid=valid,
     )
     diagnostics: dict[str, Any] = {"shortfall_reason": reason}
+    if isinstance(semantic_materialization, Mapping) and semantic_materialization.get("valid") is not True:
+        diagnostics["semantic_materialization"] = dict(semantic_materialization)
+        diagnostics["missing_semantic_materialization_task_ids"] = list(
+            semantic_materialization.get("missing_task_ids") or []
+        )
+        diagnostics["dropped_visual_obligations"] = list(
+            semantic_materialization.get("dropped_visual_obligations") or []
+        )
     if reason != "none":
         diagnostics["failure_category"] = reason
         failure_code = visual_failure_code_for_shortfall_reason(reason)
@@ -1644,6 +1731,8 @@ def _visual_release_gate_shortfall_reason(
         return "vlm_failures"
     if "at_least_10_real_image_centric_candidates" in failures:
         return "insufficient_candidates"
+    if "semantic_materialization_diff_valid" in failures:
+        return "semantic_materialization_missing"
     return "none"
 
 

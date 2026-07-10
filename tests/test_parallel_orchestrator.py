@@ -338,6 +338,42 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("`freshness` for recency/currentness claims", prompt)
         self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", prompt)
 
+    def test_codex_exec_adapter_release_prompt_requires_release_search_handoff_schema_fields(self) -> None:
+        prepared = prepare_run(
+            question="Release prompt SearchResult handoff contract fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-search-handoff-contract",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        task["freshness_requirement"] = "newest agency pages only"
+
+        command = CodexExecAdapter(project_root=ROOT).build_command(task, max_threads=8, run_dir=run_dir)
+        prompt = command[-1]
+
+        self.assertIn("For every SearchResult record", prompt)
+        for field in ("query", "result_type", "rank", "accessed_at"):
+            self.assertIn(f"`{field}`", prompt)
+        freshness_values = ", ".join(
+            f"`{value}`" for value in parallel_orchestrator.FRESHNESS_REQUIREMENTS
+        )
+        self.assertIn(
+            f"`freshness_requirement` is a schema enum and must be one of {freshness_values}",
+            prompt,
+        )
+        self.assertIn("set it to `any` if uncertain", prompt)
+        self.assertIn(
+            "Put natural-language task freshness wording in `semantic_task_freshness_requirement`, "
+            "not in `freshness_requirement`",
+            prompt,
+        )
+        self.assertIn("`semantic_task_query`", prompt)
+        self.assertIn("`semantic_task_route`", prompt)
+        self.assertIn("`semantic_task_freshness_requirement` lineage", prompt)
+        self.assertIn('"freshness_requirement": "newest agency pages only"', prompt)
+
     def test_codex_exec_adapter_default_timeout_remains_300_seconds(self) -> None:
         adapter = CodexExecAdapter(project_root=ROOT)
 
@@ -4174,6 +4210,59 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["fetch_claims"]["status"], "skipped")
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
         self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
+
+    def test_release_visual_obligation_classifier_ignores_zero_image_visual_helpers(self) -> None:
+        helper_task = {
+            "id": "task_helper_visual",
+            "route": "visual_required",
+            "evidence_need": "primary_source",
+            "expected_visual_targets": [],
+            "expected_evidence": [],
+            "expected_artifacts": ["source list"],
+            "max_images": 0,
+        }
+        zero_image_target_task = {
+            **helper_task,
+            "id": "task_zero_image_target",
+            "expected_visual_targets": ["representative image"],
+        }
+        zero_image_expected_evidence_task = {
+            **helper_task,
+            "id": "task_zero_image_expected_evidence",
+            "expected_evidence": ["visual_observation", "vlm_analysis"],
+        }
+
+        self.assertFalse(parallel_orchestrator._task_requests_visual_evidence(helper_task))
+        self.assertEqual(
+            parallel_orchestrator._expected_evidence_for_task(
+                helper_task,
+                route="visual_required",
+            ),
+            ["primary_source"],
+        )
+        self.assertTrue(
+            parallel_orchestrator._task_requests_visual_evidence(
+                zero_image_target_task,
+            )
+        )
+        self.assertIn(
+            "visual_observation",
+            parallel_orchestrator._expected_evidence_for_task(
+                zero_image_target_task,
+                route="visual_required",
+            ),
+        )
+        self.assertTrue(
+            parallel_orchestrator._task_requests_visual_evidence(
+                zero_image_expected_evidence_task,
+            )
+        )
+        expected_evidence = parallel_orchestrator._expected_evidence_for_task(
+            zero_image_expected_evidence_task,
+            route="visual_required",
+        )
+        self.assertIn("visual_observation", expected_evidence)
+        self.assertIn("vlm_analysis", expected_evidence)
 
     def test_fixture_cli_smoke_materializes_non_release_tasks_after_blocked_prepare(self) -> None:
         runs_dir = self.temp_runs_dir()

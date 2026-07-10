@@ -1483,6 +1483,104 @@ class InvocationRouterTests(unittest.TestCase):
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         self.assertEqual(provider_status["status"], "partial_auto_visual")
 
+    def test_completed_auto_visual_finalization_rejects_invalid_semantic_materialization(self) -> None:
+        class PassingVisualValidation:
+            valid = True
+
+            def to_dict(self) -> dict:
+                return {"valid": True, "errors": []}
+
+        run_dir = self.temp_runs_dir() / "run_semantic_materialization_gate"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "visual_provider_status.json",
+            {
+                "status": "codex_interactive_visual_worker_analyzed",
+                "providers": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_materialization_diff.json",
+            {
+                "valid": False,
+                "require_downstream": True,
+                "full_materialization_validation_implemented": True,
+            },
+        )
+        minimums = {
+            "candidate_count": 10,
+            "selected_candidates": 10,
+            "fetched_artifacts": 3,
+            "vlm_images_analyzed": 3,
+            "report_cited_images": 1,
+            "required_vlm_images": 3,
+            "satisfied": True,
+            "shortfall_reason": "none",
+        }
+        computed_diff = {
+            "valid": False,
+            "require_downstream": True,
+            "missing_task_ids": ["task_006", "task_016"],
+            "dropped_visual_obligations": [],
+            "visual_obligation_task_ids": ["task_006", "task_016"],
+            "failures": [
+                {
+                    "code": "semantic_materialization_difference",
+                    "missing_task_ids": ["task_006", "task_016"],
+                }
+            ],
+            "artifact_checks": [
+                {"artifact": "visual_candidates", "valid": False},
+                {"artifact": "image_fetch_status", "valid": False},
+                {"artifact": "visual_observations", "valid": False},
+                {"artifact": "evidence.images", "valid": False},
+            ],
+        }
+
+        with (
+            mock.patch(
+                "deepresearch.invocation_router.validate_visual_artifacts",
+                return_value=PassingVisualValidation(),
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.visual_minimums_for_run",
+                return_value=minimums,
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.real_automatic_visual_release_counts",
+                return_value={"real_candidates": 10},
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.build_semantic_materialization_diff",
+                return_value=computed_diff,
+            ),
+        ):
+            result = invocation_router._finalize_automatic_visual_completion(
+                run_dir=run_dir,
+                visual_stage_status={},
+            )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["visual_release_gate"]["valid"])
+        self.assertIn(
+            "semantic_materialization_diff_valid",
+            result["visual_release_gate"]["failures"],
+        )
+        self.assertEqual(
+            result["visual_release_gate"]["semantic_materialization"]["missing_task_ids"],
+            ["task_006", "task_016"],
+        )
+        self.assertEqual(
+            result["diagnostics"]["missing_semantic_materialization_task_ids"],
+            ["task_006", "task_016"],
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertEqual(
+            provider_status["diagnostics"]["missing_semantic_materialization_task_ids"],
+            ["task_006", "task_016"],
+        )
+
     def test_visual_lineage_failure_wins_over_satisfied_minimums(self) -> None:
         runs_dir = self.temp_runs_dir()
 

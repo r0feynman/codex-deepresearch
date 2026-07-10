@@ -42,8 +42,10 @@ from deepresearch.semantic_planner import (  # noqa: E402
     SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
     SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX,
     SemanticPlannerAdapterUnavailable,
+    build_codex_semantic_raw_request,
     build_semantic_materialization_diff,
     heuristic_template_planner,
+    question_mentions_visual_evidence,
     semantic_planner_validation,
     validate_semantic_candidate_plan,
     validate_codex_semantic_adapter_provenance,
@@ -52,6 +54,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
     _semantic_adapter_command,
+    _semantic_adapter_prompt,
     _semantic_substitute_implementation_check,
 )
 
@@ -341,6 +344,117 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         return run_dir
 
+    def realign_semantic_materialization_fixture(self, run_dir: Path) -> tuple[str, list[dict]]:
+        plan = self.load_json(run_dir / "semantic_plan.json")
+        tasks = plan["semantic_plan"]["bounded_tasks"]
+        semantic_plan_hash = hashlib.sha256(
+            (run_dir / "semantic_plan.json").read_bytes()
+        ).hexdigest()
+        task_by_id = {task["task_id"]: task for task in tasks}
+
+        def record_task_id(record: dict) -> str:
+            return str(
+                record.get("semantic_plan_task_id")
+                or record.get("task_id")
+                or record.get("search_task_id")
+                or record.get("id")
+                or ""
+            )
+
+        def align_record(record: dict) -> dict:
+            task = task_by_id.get(record_task_id(record))
+            record["semantic_plan_hash"] = semantic_plan_hash
+            if task is None:
+                return record
+            record["semantic_plan_task_id"] = task["task_id"]
+            record.setdefault("approved_delta_id", "base_plan")
+            for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
+                if field in task:
+                    record[field] = task[field]
+            return record
+
+        for artifact_name in (
+            "search_tasks.json",
+            "research_tasks.json",
+            "visual_tasks.json",
+            "visual_search_plan.json",
+        ):
+            path = run_dir / artifact_name
+            if not path.exists():
+                continue
+            payload = self.load_json(path)
+            payload["tasks"] = [align_record(dict(record)) for record in payload["tasks"]]
+            self.write_json(path, payload)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["search_tasks"] = [
+            align_record(dict(record)) for record in evidence["search_tasks"]
+        ]
+        evidence["images"] = [
+            align_record(dict(record)) for record in evidence.get("images", [])
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        search_results = []
+        for record in self.read_jsonl(run_dir / "search_results.jsonl"):
+            task = task_by_id[record["semantic_plan_task_id"]]
+            record["semantic_plan_hash"] = semantic_plan_hash
+            for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
+                record[f"{SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX}{field}"] = task.get(field)
+            search_results.append(record)
+        self.write_jsonl(run_dir / "search_results.jsonl", search_results)
+
+        for artifact_name in (
+            "subagent_assignments.jsonl",
+            "visual_candidates.jsonl",
+            "image_fetch_status.jsonl",
+            "visual_observations.jsonl",
+        ):
+            path = run_dir / artifact_name
+            if not path.exists():
+                continue
+            records = [align_record(dict(record)) for record in self.read_jsonl(path)]
+            self.write_jsonl(path, records)
+
+        return semantic_plan_hash, tasks
+
+    def drop_visual_materialization_records(
+        self,
+        run_dir: Path,
+        task_ids: set[str],
+    ) -> None:
+        for artifact_name in ("visual_tasks.json", "visual_search_plan.json"):
+            payload = self.load_json(run_dir / artifact_name)
+            payload["tasks"] = [
+                record
+                for record in payload["tasks"]
+                if record.get("semantic_plan_task_id") not in task_ids
+                and record.get("task_id") not in task_ids
+            ]
+            self.write_json(run_dir / artifact_name, payload)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [
+            record
+            for record in evidence.get("images", [])
+            if record.get("semantic_plan_task_id") not in task_ids
+            and record.get("task_id") not in task_ids
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        for artifact_name in (
+            "visual_candidates.jsonl",
+            "image_fetch_status.jsonl",
+            "visual_observations.jsonl",
+        ):
+            records = [
+                record
+                for record in self.read_jsonl(run_dir / artifact_name)
+                if record.get("semantic_plan_task_id") not in task_ids
+                and record.get("task_id") not in task_ids
+            ]
+            self.write_jsonl(run_dir / artifact_name, records)
+
     def test_semantic_materialization_diff_validates_exact_task_sets(self) -> None:
         run_dir = self.write_semantic_materialization_fixture()
         diff = write_semantic_materialization_diff(
@@ -356,6 +470,189 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(diff["duplicate_semantic_task_ids"], [])
         self.assertEqual(diff["dropped_search_obligations"], [])
         self.assertEqual(diff["dropped_visual_obligations"], [])
+
+    def test_semantic_materialization_diff_excludes_zero_image_visual_helpers_from_visual_obligations(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        plan = self.load_json(run_dir / "semantic_plan.json")
+        tasks = plan["semantic_plan"]["bounded_tasks"]
+        for task in tasks[1:]:
+            task["route"] = "visual_optional"
+            task["expected_visual_targets"] = []
+            task["expected_artifacts"] = ["source list"]
+            task["max_images"] = 0
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        semantic_plan_hash = hashlib.sha256(
+            (run_dir / "semantic_plan.json").read_bytes()
+        ).hexdigest()
+        task_by_id = {task["task_id"]: task for task in tasks}
+
+        def align_record(record: dict) -> dict:
+            task_id = record.get("semantic_plan_task_id") or record.get("task_id") or record.get("id")
+            task = task_by_id.get(task_id)
+            record["semantic_plan_hash"] = semantic_plan_hash
+            if task is None:
+                return record
+            for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
+                if field in task:
+                    record[field] = task[field]
+            return record
+
+        for artifact_name in ("search_tasks.json", "research_tasks.json"):
+            payload = self.load_json(run_dir / artifact_name)
+            payload["tasks"] = [align_record(dict(record)) for record in payload["tasks"]]
+            self.write_json(run_dir / artifact_name, payload)
+
+        visual_payload = self.load_json(run_dir / "visual_tasks.json")
+        visual_payload["tasks"] = [
+            align_record(dict(record))
+            for record in visual_payload["tasks"]
+            if record.get("task_id") == "task_search_001"
+        ]
+        self.write_json(run_dir / "visual_tasks.json", visual_payload)
+        self.write_json(run_dir / "visual_search_plan.json", visual_payload)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["search_tasks"] = [
+            align_record(dict(record)) for record in evidence["search_tasks"]
+        ]
+        evidence["images"] = [
+            {
+                **image,
+                "semantic_plan_hash": semantic_plan_hash,
+            }
+            for image in evidence["images"]
+            if image.get("semantic_plan_task_id") == "task_search_001"
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        search_results = []
+        for record in self.read_jsonl(run_dir / "search_results.jsonl"):
+            task = task_by_id[record["semantic_plan_task_id"]]
+            record["semantic_plan_hash"] = semantic_plan_hash
+            for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
+                record[f"{SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX}{field}"] = task.get(field)
+            search_results.append(record)
+        self.write_jsonl(run_dir / "search_results.jsonl", search_results)
+
+        for artifact_name in (
+            "subagent_assignments.jsonl",
+            "visual_candidates.jsonl",
+            "image_fetch_status.jsonl",
+            "visual_observations.jsonl",
+        ):
+            records = []
+            for record in self.read_jsonl(run_dir / artifact_name):
+                if artifact_name != "subagent_assignments.jsonl" and record.get("semantic_plan_task_id") != "task_search_001":
+                    continue
+                record["semantic_plan_hash"] = semantic_plan_hash
+                records.append(record)
+            self.write_jsonl(run_dir / artifact_name, records)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertTrue(diff["valid"], diff)
+        self.assertEqual(diff["visual_obligation_task_ids"], ["task_search_001"])
+        self.assertEqual(diff["missing_task_ids"], [])
+        self.assertEqual(diff["dropped_visual_obligations"], [])
+        visual_artifacts = {
+            check["artifact"]: check["planned_task_ids"]
+            for check in diff["artifact_checks"]
+            if check["artifact"]
+            in {
+                "visual_tasks",
+                "visual_search_plan",
+                "visual_candidates",
+                "image_fetch_status",
+                "visual_observations",
+                "evidence.images",
+            }
+        }
+        self.assertEqual(
+            visual_artifacts,
+            {
+                "visual_tasks": ["task_search_001"],
+                "visual_search_plan": ["task_search_001"],
+                "visual_candidates": ["task_search_001"],
+                "image_fetch_status": ["task_search_001"],
+                "visual_observations": ["task_search_001"],
+                "evidence.images": ["task_search_001"],
+            },
+        )
+
+    def test_semantic_materialization_diff_keeps_zero_image_target_visual_obligation(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        plan = self.load_json(run_dir / "semantic_plan.json")
+        task = plan["semantic_plan"]["bounded_tasks"][1]
+        task["route"] = "visual_required"
+        task["expected_visual_targets"] = ["representative image evidence"]
+        task["expected_artifacts"] = ["source list"]
+        task["max_images"] = 0
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        self.realign_semantic_materialization_fixture(run_dir)
+        self.drop_visual_materialization_records(run_dir, {"task_search_002"})
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"], diff)
+        self.assertIn("task_search_002", diff["visual_obligation_task_ids"])
+        self.assertIn("task_search_002", diff["missing_task_ids"])
+        self.assertIn("task_search_002", diff["dropped_visual_obligations"])
+
+    def test_semantic_materialization_diff_keeps_zero_image_expected_evidence_visual_obligation(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        plan = self.load_json(run_dir / "semantic_plan.json")
+        task = plan["semantic_plan"]["bounded_tasks"][1]
+        task["route"] = "visual_required"
+        task["expected_visual_targets"] = []
+        task["expected_artifacts"] = ["source list"]
+        task["expected_evidence"] = ["visual_observation", "vlm_analysis"]
+        task["max_images"] = 0
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        self.realign_semantic_materialization_fixture(run_dir)
+        self.drop_visual_materialization_records(run_dir, {"task_search_002"})
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"], diff)
+        self.assertIn("task_search_002", diff["visual_obligation_task_ids"])
+        self.assertIn("task_search_002", diff["missing_task_ids"])
+        self.assertIn("task_search_002", diff["dropped_visual_obligations"])
+
+    def test_semantic_materialization_diff_keeps_positive_image_visual_required_obligation(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        plan = self.load_json(run_dir / "semantic_plan.json")
+        task = plan["semantic_plan"]["bounded_tasks"][1]
+        task["route"] = "visual_required"
+        task["expected_visual_targets"] = []
+        task["expected_artifacts"] = ["source list"]
+        task["expected_evidence"] = ["primary_source"]
+        task["max_images"] = 2
+        self.write_json(run_dir / "semantic_plan.json", plan)
+        self.realign_semantic_materialization_fixture(run_dir)
+        self.drop_visual_materialization_records(run_dir, {"task_search_002"})
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"], diff)
+        self.assertIn("task_search_002", diff["visual_obligation_task_ids"])
+        self.assertIn("task_search_002", diff["missing_task_ids"])
+        self.assertIn("task_search_002", diff["dropped_visual_obligations"])
 
     def test_semantic_materialization_diff_allows_executed_search_query_to_differ_from_semantic_lineage(self) -> None:
         run_dir = self.write_semantic_materialization_fixture(visual=False)
@@ -673,19 +970,69 @@ class SemanticPlannerTests(unittest.TestCase):
             "comparative_analysis": ("jurisdiction comparison implications", "comparison matrix"),
             "counter_evidence": ("counter evidence caveats", "counter-evidence register"),
         }
+        generic_angle_tokens = {
+            "and",
+            "answer",
+            "authoritative",
+            "compare",
+            "directly",
+            "does",
+            "discovery",
+            "do",
+            "evidence",
+            "find",
+            "for",
+            "from",
+            "how",
+            "official",
+            "primary",
+            "public",
+            "question",
+            "research",
+            "source",
+            "sources",
+            "support",
+            "supports",
+            "supporting",
+            "that",
+            "the",
+            "what",
+            "with",
+            "which",
+        }
+        question_anchor_tokens = [
+            token.strip(".,:;!?()[]{}\"'").lower()
+            for token in question.split()
+            if len(token.strip(".,:;!?()[]{}\"'")) > 2
+            and token.strip(".,:;!?()[]{}\"'").lower() not in generic_angle_tokens
+        ] or ["requested", "subject"]
+
+        def angle_anchor_phrase(angle_index: int) -> str:
+            first_index = ((angle_index - 1) * 2) % len(question_anchor_tokens)
+            second_index = (first_index + 1) % len(question_anchor_tokens)
+            return " ".join(
+                dict.fromkeys(
+                    [
+                        question_anchor_tokens[first_index],
+                        question_anchor_tokens[second_index],
+                    ]
+                )
+            )
+
         for angle_index in range(1, angle_count + 1):
             angle_id = f"angle_{angle_index:03d}"
             route = "visual_required" if angle_index in visual_angle_indexes else "text_only"
             visual_targets = [f"{question} image evidence"] if route != "text_only" else []
             evidence_need = evidence_needs[(angle_index - 1) % len(evidence_needs)]
             focus_text, artifact_name = angle_focus[evidence_need]
+            anchor_phrase = angle_anchor_phrase(angle_index)
             expected_artifacts = [artifact_name, f"adapter evidence notes {angle_index}"]
             angles.append(
                 {
                     "angle_id": angle_id,
-                    "title": f"{question} adapter angle {angle_index}",
+                    "title": f"{focus_text.title()} for {anchor_phrase.title()}",
                     "research_question": (
-                        f"Which {focus_text} are required for the requested subject?"
+                        f"How does the {artifact_name} resolve {anchor_phrase}?"
                     ),
                     "why_this_angle_matters": f"Angle {angle_index} covers a distinct part of {question}.",
                     "included_scope": [question],
@@ -964,6 +1311,7 @@ class SemanticPlannerTests(unittest.TestCase):
         reviewer_configured: bool = True,
         command_env_configured: bool = True,
         default_codex_available: bool = False,
+        route: str | None = None,
         **adapter_kwargs: object,
     ) -> tuple[dict, dict]:
         captured = {"commands": []}
@@ -1078,10 +1426,87 @@ class SemanticPlannerTests(unittest.TestCase):
             "deepresearch.semantic_planner.shutil.which",
             return_value="codex" if default_codex_available else None,
         ):
-            result = prepare_run(question=question, runs_dir=self.temp_runs_dir())
+            result = prepare_run(
+                question=question,
+                runs_dir=self.temp_runs_dir(),
+                route=route,
+            )
         request = dict(captured["request"])
         request["_commands"] = list(captured["commands"])
         return result, request
+
+    def text_only_oauth_candidate(self, *, question: str) -> dict:
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "c" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        subject = "OAuth device-flow provider documentation"
+        angle_texts = [
+            (
+                "OAuth Device Flow Authorization Endpoint Documentation",
+                "Which provider documentation defines OAuth device flow authorization endpoint behavior?",
+            ),
+            (
+                "Implementation Error Handling Guidance",
+                "Which OAuth provider guidance describes device flow polling errors and recovery?",
+            ),
+            (
+                "Token Response Timing Requirements",
+                "Which OAuth device flow documentation explains provider token timing and expiration?",
+            ),
+            (
+                "Client Verification and User Code Steps",
+                "Which provider implementation guidance covers device flow user code verification?",
+            ),
+            (
+                "Security Caveats and Rate Limit Policies",
+                "Which OAuth provider documentation states device flow security caveats and rate limits?",
+            ),
+        ]
+        for index, angle in enumerate(candidate["angles"], start=1):
+            angle["route"] = "text_only"
+            angle["expected_visual_targets"] = []
+            angle["evidence_need"] = "primary_source"
+            angle["title"], angle["research_question"] = angle_texts[index - 1]
+            angle["why_this_angle_matters"] = (
+                "This preserves the official documentation comparison."
+            )
+            angle["included_scope"] = [subject]
+            angle["excluded_scope"] = ["Out-of-scope provider implementation details."]
+            angle["expected_source_types"] = ["official provider documentation"]
+            angle["expected_artifacts"] = ["source-backed guidance notes"]
+            angle["search_queries"] = [f"{subject} official documentation"]
+            angle["success_criteria"] = [
+                "Use official provider documentation as evidence."
+            ]
+            angle["report_section"] = f"Official Source Angle {index}"
+            angle["risk_or_contradiction_checks"] = [
+                "Check provider guidance differences."
+            ]
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task["query"] = f"{subject} official provider documentation task {index}"
+            task["expected_source_types"] = ["official provider documentation"]
+            task["expected_artifacts"] = ["source-backed guidance notes"]
+            task["success_criteria"] = [
+                "Use official provider documentation as evidence."
+            ]
+            task["done_condition"] = "Stop when source-backed guidance notes are ready."
+        return candidate
 
     def prepare_fixture(self, fixture: dict) -> Path:
         fallback_plan = heuristic_template_planner(question=fixture["question"])
@@ -1913,6 +2338,340 @@ class SemanticPlannerTests(unittest.TestCase):
         for token in forbidden:
             self.assertNotIn(token, request_text)
 
+    def test_text_only_planner_request_and_prompt_include_no_visual_contract(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        raw_request = build_codex_semantic_raw_request(
+            question=question,
+            visual_preference="text_only",
+            budget_cap={"max_images": 4, "max_sources": 5},
+        )
+
+        self.assertEqual(raw_request["visual_preference"], "text_only")
+        self.assertEqual(raw_request["budget_cap"]["max_images"], 0)
+        request_contract = json.dumps(
+            raw_request["planner_instructions"],
+            ensure_ascii=False,
+        ).lower()
+        prompt_contract = _semantic_adapter_prompt("semantic planner").lower()
+        for contract_text in (request_contract, prompt_contract):
+            self.assertIn("visual_preference is text_only", contract_text)
+            self.assertIn("all angles", contract_text)
+            self.assertIn("bounded_tasks", contract_text)
+            self.assertIn("route=text_only", contract_text)
+            self.assertIn("max_images=0", contract_text)
+            self.assertIn("expected_visual_targets=[]", contract_text)
+            for forbidden_visual_work in (
+                "no image",
+                "chart",
+                "screenshot",
+                "diagram",
+            ):
+                self.assertIn(forbidden_visual_work, contract_text)
+
+    def test_text_only_visual_preference_rejects_visual_candidate_before_review(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="text_only",
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(2, 3),
+        )
+
+        self.assert_invalid_adapter_response_blocked(
+            result,
+            expected_failure_codes={"text_only_visual_preference_violation"},
+        )
+        self.assertEqual(adapter_request["visual_preference"], "text_only")
+        run_dir = Path(result["run_dir"])
+        self.assertFalse(
+            (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
+        )
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        candidate_validation = raw_response["adapter_response"]["candidate_validation"]
+        failure = next(
+            failure
+            for failure in candidate_validation["failures"]
+            if failure["code"] == "text_only_visual_preference_violation"
+        )
+        self.assertGreater(failure["violation_count"], 0)
+        self.assertTrue(
+            any(
+                violation.get("field") == "route"
+                and violation.get("value") == "visual_required"
+                for violation in failure["violations"]
+            ),
+            failure,
+        )
+
+    def test_text_only_validation_rejects_visual_work_terms_without_visual_route(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "b" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        for index, angle in enumerate(candidate["angles"], start=1):
+            angle["route"] = "text_only"
+            angle["expected_visual_targets"] = []
+            angle["evidence_need"] = "primary_source"
+            angle["title"] = f"{question} official source focus {index}"
+            angle["research_question"] = f"Which official source guidance addresses {question}?"
+            angle["why_this_angle_matters"] = "This preserves the official documentation comparison."
+            angle["expected_source_types"] = ["official provider documentation"]
+            angle["expected_artifacts"] = ["source-backed guidance notes"]
+            angle["search_queries"] = [f"{question} official documentation"]
+            angle["success_criteria"] = ["Use official provider documentation as evidence."]
+            angle["report_section"] = f"Official Source Angle {index}"
+            angle["risk_or_contradiction_checks"] = ["Check provider guidance differences."]
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task["query"] = f"{question} official provider documentation task {index}"
+            task["expected_source_types"] = ["official provider documentation"]
+            task["expected_artifacts"] = ["source-backed guidance notes"]
+            task["success_criteria"] = ["Use official provider documentation as evidence."]
+            task["done_condition"] = "Stop when source-backed guidance notes are ready."
+
+        candidate["angles"][0]["evidence_need"] = "visual_example"
+        candidate["angles"][1]["evidence_need"] = "visual_observation"
+        candidate["angles"][2]["evidence_need"] = "vlm_analysis"
+        candidate["angles"][3]["title"] = "Screenshot artifact comparison"
+        candidate["angles"][4]["search_queries"] = [
+            "OAuth provider device flow diagram documentation"
+        ]
+        candidate["bounded_tasks"][0][
+            "query"
+        ] = "Compare OAuth provider screenshot evidence in device-flow docs"
+        candidate["bounded_tasks"][1]["expected_artifacts"] = [
+            "provider chart evidence register"
+        ]
+        candidate["bounded_tasks"][2]["success_criteria"] = [
+            "Compare diagram evidence using official provider docs."
+        ]
+        candidate["bounded_tasks"][3][
+            "done_condition"
+        ] = "Stop after VLM analysis is summarized."
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "text_only_visual_preference_violation"
+        )
+        self.assertFalse(
+            any(
+                violation.get("field")
+                in {"route", "expected_visual_targets", "max_images"}
+                for violation in failure["violations"]
+            ),
+            failure,
+        )
+        violation_fields = {
+            (violation.get("record_type"), violation.get("field"))
+            for violation in failure["violations"]
+        }
+        self.assertTrue(
+            {
+                ("angle", "evidence_need"),
+                ("angle", "title"),
+                ("angle", "search_queries"),
+                ("task", "query"),
+                ("task", "expected_artifacts"),
+                ("task", "success_criteria"),
+                ("task", "done_condition"),
+            }.issubset(violation_fields),
+            failure,
+        )
+        evidence_need_matches = {
+            match
+            for violation in failure["violations"]
+            if violation.get("field") == "evidence_need"
+            for match in violation.get("matches", [])
+        }
+        self.assertTrue(
+            {"visual_example", "visual_observation", "vlm_analysis"}.issubset(
+                evidence_need_matches
+            ),
+            failure,
+        )
+
+    def test_text_only_visual_work_terms_block_adapter_candidate_before_review(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+
+        def hide_visual_work_in_text_fields(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            for index, angle in enumerate(candidate["angles"], start=1):
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+                angle["evidence_need"] = "primary_source"
+                angle["title"] = f"{question} official source focus {index}"
+                angle["research_question"] = f"Which official source guidance addresses {question}?"
+                angle["why_this_angle_matters"] = "This preserves the official documentation comparison."
+                angle["expected_source_types"] = ["official provider documentation"]
+                angle["expected_artifacts"] = ["source-backed guidance notes"]
+                angle["search_queries"] = [f"{question} official documentation"]
+                angle["success_criteria"] = ["Use official provider documentation as evidence."]
+                angle["report_section"] = f"Official Source Angle {index}"
+                angle["risk_or_contradiction_checks"] = ["Check provider guidance differences."]
+            for index, task in enumerate(candidate["bounded_tasks"], start=1):
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task["query"] = f"{question} official provider documentation task {index}"
+                task["expected_source_types"] = ["official provider documentation"]
+                task["expected_artifacts"] = ["source-backed guidance notes"]
+                task["success_criteria"] = ["Use official provider documentation as evidence."]
+                task["done_condition"] = "Stop when source-backed guidance notes are ready."
+            candidate["angles"][0]["evidence_need"] = "visual_example"
+            candidate["angles"][0]["expected_artifacts"] = [
+                "provider screenshot evidence register"
+            ]
+            candidate["bounded_tasks"][0][
+                "query"
+            ] = "Compare OAuth provider diagram evidence in device-flow docs"
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="text_only",
+            requirement_types=("subject", "source_quality"),
+            response_mutator=hide_visual_work_in_text_fields,
+        )
+
+        self.assert_invalid_adapter_response_blocked(
+            result,
+            expected_failure_codes={"text_only_visual_preference_violation"},
+        )
+        self.assertEqual(adapter_request["visual_preference"], "text_only")
+        run_dir = Path(result["run_dir"])
+        self.assertFalse(
+            (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
+        )
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        failure = next(
+            failure
+            for failure in raw_response["adapter_response"]["candidate_validation"][
+                "failures"
+            ]
+            if failure["code"] == "text_only_visual_preference_violation"
+        )
+        self.assertFalse(
+            any(
+                violation.get("field")
+                in {"route", "expected_visual_targets", "max_images"}
+                for violation in failure["violations"]
+            ),
+            failure,
+        )
+        self.assertTrue(
+            any(
+                violation.get("field") == "evidence_need"
+                and "visual_example" in violation.get("matches", [])
+                for violation in failure["violations"]
+            ),
+            failure,
+        )
+        self.assertTrue(
+            any(
+                violation.get("field") == "query"
+                and "diagram" in violation.get("matches", [])
+                for violation in failure["violations"]
+            ),
+            failure,
+        )
+
+    def test_visual_keyword_detection_is_token_aware_for_oauth_guidance(self) -> None:
+        self.assertFalse(
+            question_mentions_visual_evidence(
+                "Compare OAuth device-flow implementation guidance across official provider documentation."
+            )
+        )
+        self.assertFalse(question_mentions_visual_evidence("Review device-flow guidance."))
+        explicit_visual_questions = (
+            "Compare OAuth provider screenshots.",
+            "Review the provider UI.",
+            "Find image evidence in provider docs.",
+            "Compare provider chart examples.",
+            "Inspect provider flow diagrams.",
+        )
+        for question in explicit_visual_questions:
+            with self.subTest(question=question):
+                self.assertTrue(question_mentions_visual_evidence(question))
+
+    def test_text_only_allows_visual_terms_in_excluded_scope(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        candidate = self.text_only_oauth_candidate(question=question)
+        for angle in candidate["angles"]:
+            angle["excluded_scope"] = [
+                "Visual inspection of provider login pages.",
+                "Screenshots, UI review, and page diagrams are out of scope.",
+            ]
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("text_only_visual_preference_violation", failure_codes)
+
+    def test_text_only_suppresses_visual_missing_failures_for_visual_exclusion_text(self) -> None:
+        question = (
+            "Compare OAuth device-flow implementation guidance across official provider "
+            "documentation, excluding visual inspection and screenshots."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        for angle in candidate["angles"]:
+            angle["excluded_scope"] = [
+                "Visual inspection of provider login pages.",
+                "Screenshots and UI review are excluded.",
+            ]
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertFalse(
+            {
+                "visual_requirement_missing_visual_route",
+                "visual_requirement_missing_targets",
+                "visual_example_expected_evidence_missing",
+                "visual_observation_expected_evidence_missing",
+            }
+            & failure_codes,
+            validation,
+        )
+        self.assertNotIn("text_only_visual_preference_violation", failure_codes)
+
     def test_default_codex_semantic_adapter_commands_use_schemas_when_env_absent(self) -> None:
         question = "Research lunar habitat material tests using official images and source records"
         result, adapter_request = self.prepare_with_codex_adapter(
@@ -2630,7 +3389,7 @@ class SemanticPlannerTests(unittest.TestCase):
             "original_question": question,
             "depth_preset": "standard",
             "planner_adapter": "codex_native_semantic_candidate_adapter",
-            "prompt_version": "p3-sp2-candidate-v1",
+            "prompt_version": "p3-sp2-candidate-v2",
             "adapter_request_hash": "a" * 64,
         }
         response = self.codex_adapter_response(
@@ -2653,6 +3412,610 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(validation["question_class"], "visual_style")
         self.assertEqual(validation["angle_count"], 5)
         self.assertEqual(validation["task_count"], 20)
+
+    def test_validate_semantic_candidate_plan_rejects_shallow_release_angle_overlap(self) -> None:
+        question = (
+            "Compare flood-zone map images and textual guidance for homeowners "
+            "using official sources, focusing on risk communication in a decision table"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality", "visual_modality", "deliverable_shape"),
+            visual_angle_indexes=(2, 3),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        candidate["angles"][3]["title"] = "Homeowner Actionability"
+        candidate["angles"][3]["research_question"] = (
+            "Which modality better helps homeowners decide what to do?"
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "semantic_angle_release_depth_failed"
+        )
+        self.assertEqual(failure["angle_id"], "angle_004")
+        self.assertIn("meaningful_overlap_too_low", failure["reasons"])
+        self.assertEqual(failure["minimum_meaningful_overlap"], 2)
+        self.assertLess(failure["meaningful_overlap_count"], 2)
+
+    def test_validate_semantic_candidate_plan_accepts_repaired_release_angle_overlap(self) -> None:
+        question = (
+            "Compare flood-zone map images and textual guidance for homeowners "
+            "using official sources, focusing on risk communication in a decision table"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality", "visual_modality", "deliverable_shape"),
+            visual_angle_indexes=(2, 3),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        candidate["angles"][3]["title"] = (
+            "Flood-Zone Map Images and Textual Guidance Risk Communication"
+        )
+        candidate["angles"][3]["research_question"] = (
+            "How do flood-zone map images and textual guidance communicate risk "
+            "to homeowners in official sources?"
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        self.assertNotIn(
+            "semantic_angle_release_depth_failed",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_validate_semantic_candidate_plan_rejects_anchor_heavy_suffix_duplicate_release_angle(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance compliance "
+            "matrix using official sources and agency notices"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "2" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "time_range",
+                "geography",
+                "deliverable_shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        anchor_heavy_title = (
+            "2026 Korea AI Safety Regulation Enforcement Guidance Compliance Matrix"
+        )
+        anchor_heavy_question = (
+            "Which 2026 Korea AI safety regulation enforcement guidance compliance matrix?"
+        )
+        candidate["angles"][3]["title"] = anchor_heavy_title
+        candidate["angles"][3]["research_question"] = anchor_heavy_question
+        candidate["angles"][4]["title"] = f"{anchor_heavy_title} Update"
+        candidate["angles"][4]["research_question"] = anchor_heavy_question
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "semantic_angle_release_duplicate_failed"
+        )
+        self.assertEqual(failure["colliding_angle_ids"], ["angle_004", "angle_005"])
+        duplicate_pair = failure["duplicate_pairs"][0]
+        self.assertEqual(
+            duplicate_pair["reason"],
+            "contained_prompt_anchor_suffix_duplicate",
+        )
+        self.assertEqual(duplicate_pair["distinguishing_delta_tokens"], ["update"])
+        self.assertEqual(duplicate_pair["substantive_distinguishing_tokens"], [])
+        self.assertEqual(
+            duplicate_pair["non_substantive_distinguishing_tokens"],
+            ["update"],
+        )
+
+    def test_validate_semantic_candidate_plan_rejects_anchor_heavy_three_token_suffix_duplicate_release_angle(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance compliance "
+            "matrix using official sources and agency notices"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "3" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "time_range",
+                "geography",
+                "deliverable_shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        anchor_heavy_title = (
+            "2026 Korea AI Safety Regulation Enforcement Guidance Compliance Matrix"
+        )
+        anchor_heavy_question = (
+            "Which 2026 Korea AI safety regulation enforcement guidance compliance matrix?"
+        )
+        candidate["angles"][3]["title"] = anchor_heavy_title
+        candidate["angles"][3]["research_question"] = anchor_heavy_question
+        candidate["angles"][4]["title"] = (
+            f"{anchor_heavy_title} Latest Status Update"
+        )
+        candidate["angles"][4]["research_question"] = anchor_heavy_question
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "semantic_angle_release_duplicate_failed"
+        )
+        self.assertEqual(failure["colliding_angle_ids"], ["angle_004", "angle_005"])
+        duplicate_pair = failure["duplicate_pairs"][0]
+        self.assertEqual(
+            duplicate_pair["reason"],
+            "contained_prompt_anchor_suffix_duplicate",
+        )
+        self.assertEqual(
+            duplicate_pair["distinguishing_delta_tokens"],
+            ["latest", "status", "update"],
+        )
+        self.assertEqual(duplicate_pair["substantive_distinguishing_tokens"], [])
+        self.assertEqual(
+            duplicate_pair["non_substantive_distinguishing_tokens"],
+            ["latest", "status", "update"],
+        )
+
+    def test_validate_semantic_candidate_plan_rejects_direct_and_reordered_release_angle_duplicates(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance compliance "
+            "matrix using official sources and agency notices"
+        )
+        anchor_heavy_title = (
+            "2026 Korea AI Safety Regulation Enforcement Guidance Compliance Matrix"
+        )
+        anchor_heavy_question = (
+            "Which 2026 Korea AI safety regulation enforcement guidance compliance matrix?"
+        )
+        cases = {
+            "direct": (anchor_heavy_title, anchor_heavy_question),
+            "reordered": (
+                "Compliance Matrix Guidance Enforcement Regulation Safety Korea 2026",
+                "Which compliance matrix guidance enforcement regulation safety Korea 2026?",
+            ),
+        }
+        for label, (right_title, right_question) in cases.items():
+            with self.subTest(label=label):
+                request = {
+                    "original_question": question,
+                    "depth_preset": "standard",
+                    "planner_adapter": "codex_native_semantic_candidate_adapter",
+                    "prompt_version": "p3-sp2-candidate-v2",
+                    "adapter_request_hash": label[0] * 64,
+                }
+                response = self.codex_adapter_response(
+                    request,
+                    question_scope="broad",
+                    angle_count=5,
+                    tasks_per_angle=4,
+                    requirement_types=(
+                        "subject",
+                        "source_quality",
+                        "time_range",
+                        "geography",
+                        "deliverable_shape",
+                    ),
+                )
+                candidate = json.loads(json.dumps(response["candidate_plan"]))
+                candidate["angles"][3]["title"] = anchor_heavy_title
+                candidate["angles"][3]["research_question"] = anchor_heavy_question
+                candidate["angles"][4]["title"] = right_title
+                candidate["angles"][4]["research_question"] = right_question
+
+                validation = validate_semantic_candidate_plan(
+                    original_question=question,
+                    plan=candidate,
+                )
+
+                self.assertFalse(validation["ok"], validation)
+                failure_codes = {failure["code"] for failure in validation["failures"]}
+                self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
+                failure = next(
+                    failure
+                    for failure in validation["failures"]
+                    if failure["code"] == "semantic_angle_release_duplicate_failed"
+                )
+                self.assertEqual(
+                    failure["colliding_angle_ids"],
+                    ["angle_004", "angle_005"],
+                )
+                duplicate_pair = failure["duplicate_pairs"][0]
+                self.assertEqual(duplicate_pair["reason"], "exact_token_signature")
+
+    def test_validate_semantic_candidate_plan_rejects_deep_duplicate_release_angles(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance using "
+            "official sources, court decisions, compliance deadlines, and a matrix deliverable"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "f" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "time_range",
+                "geography",
+                "deliverable_shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        sem_reg_angles = [
+            (
+                "Statutory Authority and Agency Enforcement Channels",
+                "Which Korea regulation agencies publish 2026 enforcement guidance for AI safety compliance?",
+            ),
+            (
+                "Court Decisions and Appeal Precedents",
+                "Which court decisions interpret Korea AI safety regulation obligations and enforcement disputes?",
+            ),
+            (
+                "Compliance Deadlines and Transition Milestones",
+                "Which 2026 deadlines and transition dates drive AI safety compliance sequencing?",
+            ),
+            (
+                "Korea 2026 AI Safety Regulation Enforcement Guidance Deadlines",
+                "Which 2026 Korea AI safety regulation enforcement deadlines and guidance constrain compliance matrix decisions?",
+            ),
+            (
+                "2026 Korea AI Safety Regulation Enforcement Guidance Deadlines Update",
+                "Which guidance and enforcement deadlines for Korea 2026 AI safety regulation constrain compliance matrix decisions?",
+            ),
+        ]
+        for angle, (title, research_question) in zip(candidate["angles"], sem_reg_angles):
+            angle["title"] = title
+            angle["research_question"] = research_question
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "semantic_angle_release_duplicate_failed"
+        )
+        self.assertEqual(failure["threshold"], 0.85)
+        self.assertEqual(failure["colliding_angle_ids"], ["angle_004", "angle_005"])
+        self.assertEqual(failure["colliding_angle_indexes"], [4, 5])
+        duplicate_pair = failure["duplicate_pairs"][0]
+        self.assertEqual(duplicate_pair["left_angle_id"], "angle_004")
+        self.assertEqual(duplicate_pair["right_angle_id"], "angle_005")
+        self.assertGreaterEqual(duplicate_pair["containment"], 0.85)
+        self.assertIn("regulation", duplicate_pair["shared_tokens"])
+        self.assertIn("regulation", duplicate_pair["shared_prompt_anchor_tokens"])
+        self.assertGreaterEqual(
+            duplicate_pair["distinguishing_containment"],
+            0.85,
+        )
+
+    def test_validate_semantic_candidate_plan_accepts_distinct_anchor_heavy_release_angles(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance compliance "
+            "sequencing using official sources, court decisions, compliance deadlines, "
+            "and a matrix deliverable"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "1" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "time_range",
+                "geography",
+                "deliverable_shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        sem_reg_angles = [
+            (
+                "Agency Publication Channels and Authority",
+                "Which Korea agencies publish 2026 AI safety regulation enforcement guidance for compliance sequencing?",
+                "official_source",
+                ["official agency guidance", "regulatory notices"],
+                "Agency Guidance Evidence",
+            ),
+            (
+                "2026 Korea AI Safety Regulation Enforcement Guidance Compliance Sequencing Deadlines",
+                "Which compliance deadlines shape 2026 Korea AI safety regulation enforcement guidance sequencing?",
+                "recent_change",
+                ["official compliance calendars", "agency transition schedules"],
+                "Compliance Deadline Evidence",
+            ),
+            (
+                "2026 Korea AI Safety Regulation Enforcement Guidance Compliance Sequencing Court Decisions",
+                "Which court decisions shape 2026 Korea AI safety regulation enforcement guidance compliance sequencing?",
+                "policy_or_legal",
+                ["court decisions", "legal databases"],
+                "Court Decision Evidence",
+            ),
+            (
+                "Source Versioning and Update Traceability",
+                "Which official sources show 2026 Korea AI safety guidance updates for compliance sequencing?",
+                "primary_source",
+                ["official source archives", "regulatory update pages"],
+                "Version Traceability Evidence",
+            ),
+            (
+                "Matrix Caveats and Evidence Weighting",
+                "How should the matrix separate deadlines, court decisions, guidance updates, and caveats for Korea AI safety regulation?",
+                "comparative_analysis",
+                ["official guidance", "court decisions", "deadline schedules"],
+                "Matrix Evidence Weighting",
+            ),
+        ]
+        for angle, (
+            title,
+            research_question,
+            evidence_need,
+            expected_source_types,
+            report_section,
+        ) in zip(candidate["angles"], sem_reg_angles):
+            angle["title"] = title
+            angle["research_question"] = research_question
+            angle["evidence_need"] = evidence_need
+            angle["expected_source_types"] = expected_source_types
+            angle["expected_artifacts"] = [f"{report_section} table"]
+            angle["report_section"] = report_section
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
+        self.assertNotIn("semantic_angle_release_duplicate_failed", failure_codes)
+
+    def test_validate_semantic_candidate_plan_accepts_distinct_release_angles(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance using "
+            "official sources, court decisions, compliance deadlines, and a matrix deliverable"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "0" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "time_range",
+                "geography",
+                "deliverable_shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        sem_reg_angles = [
+            (
+                "Statutory Authority and Agency Enforcement Channels",
+                "Which Korea regulation agencies publish 2026 enforcement guidance for AI safety compliance?",
+            ),
+            (
+                "Court Decisions and Appeal Precedents",
+                "Which court decisions interpret Korea AI safety regulation obligations and enforcement disputes?",
+            ),
+            (
+                "Compliance Deadlines and Transition Milestones",
+                "Which 2026 deadlines and transition dates drive AI safety compliance sequencing?",
+            ),
+            (
+                "Korea 2026 AI Safety Regulation Enforcement Guidance Deadlines",
+                "Which 2026 Korea AI safety regulation enforcement deadlines and guidance constrain compliance matrix decisions?",
+            ),
+            (
+                "Matrix Deliverable Evidence Weighting and Source Traceability",
+                "How should the compliance matrix separate guidance, court decisions, deadlines, and risk caveats for AI safety?",
+            ),
+        ]
+        for angle, (title, research_question) in zip(candidate["angles"], sem_reg_angles):
+            angle["title"] = title
+            angle["research_question"] = research_question
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        self.assertNotIn(
+            "semantic_angle_release_duplicate_failed",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_codex_semantic_retry_instructions_include_release_angle_repair_hint(self) -> None:
+        question = (
+            "Compare flood-zone map images and textual guidance for homeowners "
+            "using official sources, focusing on risk communication in a decision table"
+        )
+        attempts = {"count": 0}
+
+        def first_response_has_shallow_angle(response: dict) -> dict:
+            attempts["count"] += 1
+            response = json.loads(json.dumps(response))
+            if attempts["count"] == 1:
+                response["candidate_plan"]["angles"][3]["title"] = "Homeowner Actionability"
+                response["candidate_plan"]["angles"][3]["research_question"] = (
+                    "Which modality better helps homeowners decide what to do?"
+                )
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=first_response_has_shallow_angle,
+            requirement_types=("subject", "source_quality", "visual_modality", "deliverable_shape"),
+            visual_angle_indexes=(2, 3),
+        )
+        run_dir = Path(result["run_dir"])
+        raw_request = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_request.json"
+        )
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(raw_response["adapter_attempt"], 2)
+        self.assertIn(
+            "semantic_angle_release_depth_failed",
+            raw_request["previous_candidate_validation_failure_codes"],
+        )
+        instructions = raw_request["planner_retry_instructions"]
+        self.assertIn("prompt-specific", instructions)
+        self.assertIn("at least 2 meaningful non-generic tokens", instructions)
+        self.assertIn("subject, modality, source-quality, geography/time", instructions)
+        self.assertTrue(result["semantic_release_eligible"], result)
+
+    def test_codex_semantic_retry_instructions_include_duplicate_angle_repair_hint(self) -> None:
+        question = (
+            "Compare 2026 Korea AI safety regulation enforcement guidance using "
+            "official sources, court decisions, compliance deadlines, and a matrix deliverable"
+        )
+        attempts = {"count": 0}
+
+        def first_response_has_duplicate_angle(response: dict) -> dict:
+            attempts["count"] += 1
+            response = json.loads(json.dumps(response))
+            if attempts["count"] == 1:
+                duplicate_source = response["candidate_plan"]["angles"][3]
+                duplicate_target = response["candidate_plan"]["angles"][4]
+                duplicate_target["title"] = f"{duplicate_source['title']} Update"
+                duplicate_target["research_question"] = duplicate_source[
+                    "research_question"
+                ]
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=first_response_has_duplicate_angle,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "time_range",
+                "geography",
+                "deliverable_shape",
+            ),
+        )
+        run_dir = Path(result["run_dir"])
+        raw_request = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_request.json"
+        )
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(raw_response["adapter_attempt"], 2)
+        self.assertIn(
+            "semantic_angle_release_duplicate_failed",
+            raw_request["previous_candidate_validation_failure_codes"],
+        )
+        instructions = raw_request["planner_retry_instructions"]
+        self.assertIn("materially distinct semantic angles", instructions)
+        self.assertIn("numeric suffixes", instructions)
+        self.assertIn("reordered phrasing", instructions)
+        self.assertTrue(result["semantic_release_eligible"], result)
 
     def test_codex_semantic_retries_candidate_validation_failures_until_third_attempt(self) -> None:
         question = "Compare official public health poster images for handwashing guidance"

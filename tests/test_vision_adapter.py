@@ -431,6 +431,46 @@ class VisionAdapterTests(unittest.TestCase):
                 source["robots_policy"] = "allowed"
         self.write_json(run_dir / "evidence.json", evidence)
 
+    def append_codex_vlm_handoff_artifact(self, run_dir: Path, index: int) -> None:
+        image_id = f"img_checkout_{index:03d}"
+        candidate_id = f"cand_checkout_{index:03d}"
+        fetch_id = f"fetch_checkout_{index:03d}"
+        local_artifact_path = f"images/checkout_{index}.png"
+        (run_dir / local_artifact_path).write_bytes(PNG_1X1)
+        candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidate = dict(candidates[0])
+        candidate.update(
+            {
+                "candidate_id": candidate_id,
+                "rank": index,
+                "local_artifact_path": local_artifact_path,
+                "hash": f"sha256:fixture-checkout-{index}",
+                "phash": f"checkout-phash-{index}",
+            }
+        )
+        fetch = dict(fetches[0])
+        fetch.update(
+            {
+                "fetch_id": fetch_id,
+                "candidate_id": candidate_id,
+                "local_artifact_path": local_artifact_path,
+                "evidence_image_id": image_id,
+                "hash": f"sha256:fixture-checkout-{index}",
+                "phash": f"checkout-phash-{index}",
+            }
+        )
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", [*candidates, candidate])
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", [*fetches, fetch])
+
     def write_codex_interactive_observation(
         self,
         run_dir: Path,
@@ -3379,6 +3419,278 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertFalse(provider_status["providers"][-1]["external_vlm_call"])
         visual_validation = validate_visual_artifacts(run_dir=run_dir)
         self.assertTrue(visual_validation.valid, [error.to_dict() for error in visual_validation.errors])
+
+    def test_codex_interactive_supplements_existing_metadata_only_observations(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+        self.append_codex_vlm_handoff_artifact(run_dir, 3)
+        metadata_only_observations = []
+        for index in (1, 2, 3):
+            image_id = f"img_checkout_{index:03d}"
+            metadata_only_observations.append(
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": "https://example.com/checkout.png",
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": f"images/{image_id}.json",
+                    "mime_type": "application/json",
+                    "candidate_id": f"cand_checkout_{index:03d}",
+                    "fetch_id": f"fetch_checkout_{index:03d}",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["Metadata-only child visual note."],
+                    "inferences": [],
+                    "visual_tasks": ["layout_review"],
+                    "caveats": [
+                        "metadata-only visual record; no local image artifact was provided"
+                    ],
+                    "codex_interactive_handoff": True,
+                    "codex_native_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "codex_native_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            )
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            metadata_only_observations,
+        )
+        before = visual_minimums_for_run(run_dir, required_vlm_images=3)
+        self.assertEqual(before["fetched_artifacts"], 3)
+        client = FakeCodexInteractiveVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(
+            {
+                call["metadata"]["evidence_image_id"]
+                for call in client.calls
+            },
+            {"img_checkout_001", "img_checkout_002", "img_checkout_003"},
+        )
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(observations), 3)
+        self.assertNotIn(
+            "images/img_checkout_001.json",
+            {item.get("local_artifact_path") for item in observations},
+        )
+        self.assertNotIn(
+            "images/img_checkout_002.json",
+            {item.get("local_artifact_path") for item in observations},
+        )
+        self.assertNotIn(
+            "images/img_checkout_003.json",
+            {item.get("local_artifact_path") for item in observations},
+        )
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=3)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertGreaterEqual(minimums["vlm_images_analyzed"], 3)
+        self.assertNotEqual(minimums["shortfall_reason"], "vlm_failures")
+
+    def test_codex_interactive_supplements_child_observations_without_artifacts(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+        self.append_codex_vlm_handoff_artifact(run_dir, 3)
+        stale_observations = []
+        for index in (1, 2, 3):
+            image_id = f"img_checkout_{index:03d}"
+            stale_observations.append(
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": "https://example.com/checkout.png",
+                    "page_url": "https://example.com/checkout",
+                    "local_artifact_path": f"images/missing_child_{index}.png",
+                    "mime_type": "image/png",
+                    "candidate_id": f"cand_checkout_{index:03d}",
+                    "fetch_id": f"fetch_checkout_{index:03d}",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["Stale child observation without an artifact."],
+                    "inferences": [],
+                    "caveats": [],
+                    "codex_interactive_handoff": True,
+                    "codex_native_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                }
+            )
+        self.write_jsonl(run_dir / "visual_observations.jsonl", stale_observations)
+        client = FakeCodexInteractiveVisionClient()
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_client=client,
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(result["dropped_invalid_observation_records"], 3)
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(observations), 3)
+        self.assertFalse(
+            {
+                item.get("local_artifact_path")
+                for item in observations
+                if str(item.get("local_artifact_path", "")).startswith("images/missing_child_")
+            }
+        )
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=3)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertEqual(minimums["vlm_images_analyzed"], 3)
+
+    def test_codex_interactive_drops_invalid_child_observations_when_supplemented(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+        self.append_codex_vlm_handoff_artifact(run_dir, 3)
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                {
+                    "id": "img_checkout_001",
+                    "image_id": "img_checkout_001",
+                    "evidence_image_id": "img_checkout_001",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": "https://example.com/checkout.png",
+                    "local_artifact_path": "images/missing_child.png",
+                    "mime_type": "image/png",
+                    "candidate_id": "cand_checkout_001",
+                    "fetch_id": "fetch_checkout_001",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["Invalid child observation without a file."],
+                }
+            ],
+        )
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_config={"max_images": 1},
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["dropped_invalid_observation_records"], 1)
+        diagnostics = result["dropped_invalid_observation_diagnostics"]
+        self.assertEqual(diagnostics[0]["code"], "normalization_failed")
+        self.assertIn("does not reference an existing run-local file", diagnostics[0]["detail"])
+        evidence = self.assert_valid_run(run_dir)
+        self.assertEqual(evidence["vision_adapter"]["dropped_invalid_observation_records"], 1)
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["local_artifact_path"], "images/checkout.png")
+
+    def test_codex_interactive_release_minimum_ignores_invalid_child_observations(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+        self.append_codex_vlm_handoff_artifact(run_dir, 3)
+        invalid_observations = []
+        for index in (1, 2, 3):
+            image_id = f"img_checkout_{index:03d}"
+            invalid_observations.append(
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "evidence_image_id": image_id,
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "image_url": "https://example.com/checkout.png",
+                    "local_artifact_path": f"images/missing_release_{index}.png",
+                    "mime_type": "image/png",
+                    "candidate_id": f"cand_checkout_{index:03d}",
+                    "fetch_id": f"fetch_checkout_{index:03d}",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_required",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_status": "analyzed",
+                    "observation_status": "analyzed",
+                    "observations": ["Invalid child observation must not satisfy release."],
+                }
+            )
+        self.write_jsonl(run_dir / "visual_observations.jsonl", invalid_observations)
+
+        result = ingest_vision_observations(
+            run=run_dir,
+            provider="codex-interactive",
+            codex_config={"max_images": 1},
+            codex_client=FakeCodexInteractiveVisionClient(),
+        )
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertEqual(result["vlm_images_analyzed"], 1)
+        self.assertEqual(result["dropped_invalid_observation_records"], 3)
+        minimums = visual_minimums_for_run(run_dir, required_vlm_images=3)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertEqual(minimums["vlm_images_analyzed"], 1)
+        self.assertFalse(minimums["satisfied"])
+        self.assertEqual(minimums["shortfall_reason"], "vlm_failures")
 
     def test_codex_interactive_subprocess_stdout_jsonl_ingests_worker_observations(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
