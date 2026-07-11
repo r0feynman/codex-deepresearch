@@ -109,6 +109,7 @@ SEMANTIC_BOUNDED_TASK_ALIGNMENT_FIELDS = (
     "expected_visual_targets",
     "expected_artifacts",
     "success_criteria",
+    "max_results",
     "max_sources",
     "max_images",
     "done_condition",
@@ -755,6 +756,8 @@ def plan_research_tasks(
                 question=str(evidence.get("question") or ""),
                 occurrence=angle_occurrences[angle_id],
             )
+        max_results = max(1, int(base.get("max_results") or base.get("max_sources") or 3))
+        max_sources = max(1, int(base.get("max_sources") or max_results))
         task = ResearchTask(
             id=task_id,
             angle_id=angle_id,
@@ -767,12 +770,13 @@ def plan_research_tasks(
             assigned_subagent_id=None,
             attempt=0,
             max_attempts=CAPACITY_RETRY_MAX_ATTEMPTS,
-            max_sources=max(1, int(base.get("max_sources") or base.get("max_results") or 3)),
+            max_sources=max_sources,
             max_images=max_images if route != "text_only" else 0,
             source_policy=dict(base.get("source_policy") or {"decision": "allowed", "flags": []}),
             output_shard_path=f"{EVIDENCE_SHARDS_DIRNAME}/{task_id}/evidence_shard.json",
             trace_event_ids=[],
         ).to_dict()
+        task["max_results"] = max_results
         task["task_id"] = task_id
         task["semantic_plan_task_id"] = str(
             base.get("semantic_plan_task_id") or task_id
@@ -1010,7 +1014,7 @@ def _semantic_alignment_value(task: Mapping[str, Any], field: str) -> Any:
         return _string_list(value)
     if field == "source_policy":
         return dict(value) if isinstance(value, Mapping) else {}
-    if field in {"max_sources", "max_images"}:
+    if field in {"max_results", "max_sources", "max_images"}:
         return _nonnegative_int(value)
     if field in {"query", "route", "freshness_requirement", "done_condition"}:
         return str(value or "")

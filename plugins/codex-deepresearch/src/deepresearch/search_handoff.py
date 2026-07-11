@@ -1811,6 +1811,7 @@ def _search_task_from_bounded_task(
     )
     route = str(bounded_task.get("route") or route_record.get("modality") or "text_only")
     max_sources = int(bounded_task.get("max_sources") or fallback_max_results or 1)
+    max_results = int(bounded_task.get("max_results") or fallback_max_results or 1)
     max_images = int(bounded_task.get("max_images") or 0)
     if route == "text_only":
         max_images = 0
@@ -1845,7 +1846,7 @@ def _search_task_from_bounded_task(
         "freshness_requirement": str(bounded_task.get("freshness_requirement") or "any"),
         "modality": route,
         "route": route,
-        "max_results": max_sources,
+        "max_results": max_results,
         "max_sources": max_sources,
         "visual_tasks": list(bounded_task.get("expected_visual_targets") or []),
         "max_images": max_images,
@@ -1872,6 +1873,7 @@ def _visual_task_from_search_task(search_task: Mapping[str, Any], index: int) ->
         "freshness_requirement": str(search_task.get("freshness_requirement") or "any"),
         "source_policy": dict(search_task.get("source_policy") or {"decision": "allowed", "flags": []}),
         "visual_tasks": list(search_task.get("visual_tasks") or []),
+        "max_results": int(search_task.get("max_results") or 0),
         "max_sources": int(search_task.get("max_sources") or search_task.get("max_results") or 0),
         "max_images": search_task["max_images"],
         "status": "planned",

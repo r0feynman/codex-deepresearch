@@ -116,6 +116,7 @@ SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
     "expected_artifacts",
     "success_criteria",
     "done_condition",
+    "max_results",
     "max_sources",
     "max_images",
 )
@@ -776,10 +777,21 @@ def codex_semantic_candidate_plan(
             candidate, source_cap_normalizations = (
                 _normalize_candidate_executable_source_caps(candidate)
             )
+            candidate, budget_cap_materializations = (
+                _materialize_candidate_budget_caps(
+                    candidate,
+                    budget_cap=raw_request.get("budget_cap"),
+                )
+            )
             if source_cap_normalizations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_source_cap_normalizations"] = (
                     source_cap_normalizations
+                )
+            if budget_cap_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_budget_cap_materializations"] = (
+                    budget_cap_materializations
                 )
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
@@ -1259,6 +1271,87 @@ def _semantic_task_source_cap_int(value: Any) -> int | None:
         if numeric.is_integer():
             return int(numeric)
     return None
+
+
+def _materialize_candidate_budget_caps(
+    candidate: Mapping[str, Any],
+    *,
+    budget_cap: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    if not isinstance(budget_cap, Mapping):
+        return normalized, []
+    max_results = _semantic_task_source_cap_int(budget_cap.get("max_results"))
+    if max_results is None or max_results < 1:
+        return normalized, []
+
+    materializations: list[dict[str, Any]] = []
+    raw_constraints = normalized.get("constraints")
+    if isinstance(raw_constraints, list):
+        if not _candidate_constraints_mention_search_result_cap(
+            raw_constraints,
+            max_results=max_results,
+        ):
+            normalized["constraints"] = [
+                *raw_constraints,
+                f"Budget cap: search results per task must not exceed max_results={max_results}.",
+            ]
+            materializations.append(
+                {
+                    "field": "constraints",
+                    "max_results": max_results,
+                    "materialization": "appended_search_result_cap_constraint",
+                }
+            )
+
+    raw_tasks = normalized.get("bounded_tasks")
+    if isinstance(raw_tasks, list):
+        normalized_tasks: list[Any] = []
+        task_materializations: list[dict[str, Any]] = []
+        for index, task in enumerate(raw_tasks, start=1):
+            if not isinstance(task, Mapping):
+                normalized_tasks.append(task)
+                continue
+            normalized_task = dict(task)
+            previous = _semantic_task_source_cap_int(task.get("max_results"))
+            if previous != max_results:
+                normalized_task["max_results"] = max_results
+                task_materializations.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "task_index": index,
+                        "previous_max_results": previous,
+                        "materialized_max_results": max_results,
+                    }
+                )
+            normalized_tasks.append(normalized_task)
+        normalized["bounded_tasks"] = normalized_tasks
+        if task_materializations:
+            materializations.append(
+                {
+                    "field": "bounded_tasks.max_results",
+                    "max_results": max_results,
+                    "task_count": len(task_materializations),
+                    "tasks": task_materializations,
+                }
+            )
+
+    return normalized, materializations
+
+
+def _candidate_constraints_mention_search_result_cap(
+    constraints: Sequence[Any],
+    *,
+    max_results: int,
+) -> bool:
+    text = json.dumps(list(constraints), ensure_ascii=False).lower()
+    patterns = (
+        rf"\bmax_results\b\s*[:=]\s*{max_results}\b",
+        rf"\bmax[_ -]?results\b[^0-9]{{0,40}}\b{max_results}\b",
+        rf"\bsearch results\b[^0-9]{{0,80}}\b{max_results}\b",
+        rf"\b검색 결과\b[^0-9]{{0,80}}\b{max_results}\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
 
 
 def _candidate_task_min_executable_sources(
@@ -4602,6 +4695,7 @@ def _codex_semantic_raw_request(
         "Decompose the user's raw question into prompt-specific research angles.",
         "Preserve every explicit requirement and justified inferred constraint.",
         "Create bounded executable research tasks with source, visual, and done-condition fields.",
+        "Materialize budget_cap.max_results as a search result cap in plan constraints and bounded_tasks.max_results.",
         "Do not use hidden template classes, fixed domain menus, canned task lists, or copied angle titles.",
     ]
     if normalized_visual_preference == "text_only":
@@ -4632,6 +4726,7 @@ def _codex_semantic_raw_request(
             "negative_scope": "list",
             "angles": "list",
             "bounded_tasks": "list",
+            "bounded_tasks[].max_results": "integer from budget_cap.max_results",
         },
     }
 
@@ -5090,6 +5185,7 @@ def _fixture_build_candidate_bounded_tasks(
     if scope == "broad":
         target = max(20, min(target, 40 if depth_preset not in {"deep", "exhaustive"} else target))
     source_cap = max(1, int(budget_cap.get("max_sources") or 20))
+    max_results = max(1, int(budget_cap.get("max_results") or source_cap))
     image_cap = max(0, int(budget_cap.get("max_images") or 12))
     tasks: list[dict[str, Any]] = []
     task_index = 1
@@ -5142,6 +5238,7 @@ def _fixture_build_candidate_bounded_tasks(
                     "expected_visual_targets": visual_targets,
                     "expected_artifacts": expected_artifacts,
                     "success_criteria": success_criteria,
+                    "max_results": max_results,
                     "max_sources": max(1, min(5, source_cap)),
                     "max_images": max_images,
                     "done_condition": (
@@ -6884,7 +6981,7 @@ def _semantic_materialization_value(
         return _string_list(value)
     if comparison_field == "source_policy":
         return _normalize_mapping_value(value)
-    if comparison_field in {"max_sources", "max_images"}:
+    if comparison_field in {"max_results", "max_sources", "max_images"}:
         try:
             return max(0, int(value or 0))
         except (TypeError, ValueError):

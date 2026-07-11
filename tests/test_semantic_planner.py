@@ -200,6 +200,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 "expected_artifacts": ["source list"],
                 "success_criteria": ["Claims are source linked."],
                 "done_condition": "At least one supported claim is available.",
+                "max_results": 8,
                 "max_sources": 3,
                 "max_images": 2 if visual else 0,
             }
@@ -3217,6 +3218,7 @@ class SemanticPlannerTests(unittest.TestCase):
             "expected_visual_targets",
             "expected_artifacts",
             "success_criteria",
+            "max_results",
             "max_sources",
             "max_images",
             "done_condition",
@@ -4704,6 +4706,7 @@ class SemanticPlannerTests(unittest.TestCase):
             "expected_visual_targets",
             "expected_artifacts",
             "success_criteria",
+            "max_results",
             "max_sources",
             "max_images",
             "done_condition",
@@ -4725,6 +4728,7 @@ class SemanticPlannerTests(unittest.TestCase):
             "expected_visual_targets",
             "expected_artifacts",
             "success_criteria",
+            "max_results",
             "max_sources",
             "max_images",
             "done_condition",
@@ -4736,6 +4740,56 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ParallelOrchestrationError, "cannot be truncated"):
             plan_research_tasks(run=Path(second_result["run_dir"]), min_tasks=1, max_tasks=1)
+
+    def test_codex_semantic_materializes_request_max_results_cap_into_plan_and_lineage(self) -> None:
+        question = "Research official public health poster image guidance in Korea"
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "visual_modality", "source_quality"),
+            visual_angle_indexes=(2, 3),
+        )
+        run_dir = Path(result["run_dir"])
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+
+        self.assertEqual(adapter_request["budget_cap"]["max_results"], 8)
+        constraint_text = json.dumps(
+            semantic_plan["constraints"],
+            ensure_ascii=False,
+        )
+        self.assertIn("max_results=8", constraint_text)
+        self.assertIn("candidate_plan_budget_cap_materializations", raw_response)
+        self.assertTrue(semantic_plan["bounded_tasks"])
+        self.assertTrue(search_tasks)
+        for bounded_task, search_task in zip(
+            semantic_plan["bounded_tasks"],
+            search_tasks,
+        ):
+            self.assertEqual(bounded_task["max_results"], 8)
+            self.assertEqual(search_task["max_results"], 8)
+            self.assertEqual(search_task["max_sources"], bounded_task["max_sources"])
+
+        planned = plan_research_tasks(run=run_dir, min_tasks=1)
+        research_tasks = planned["tasks"]
+        self.assertEqual(len(research_tasks), len(semantic_plan["bounded_tasks"]))
+        for bounded_task, research_task in zip(
+            semantic_plan["bounded_tasks"],
+            research_tasks,
+        ):
+            self.assertEqual(research_task["max_results"], 8)
+            self.assertEqual(research_task["max_sources"], bounded_task["max_sources"])
+
+        diff = self.load_json(run_dir / "semantic_materialization_diff.json")
+        self.assertTrue(diff["valid"], diff)
+        search_check = next(
+            check
+            for check in diff["artifact_checks"]
+            if check["artifact"] == "search_tasks"
+        )
+        self.assertIn("max_results", search_check["compared_fields"])
 
     def test_plan_research_tasks_rejects_stale_semantic_search_tasks(self) -> None:
         result, _adapter_request = self.prepare_with_codex_adapter(

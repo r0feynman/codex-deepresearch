@@ -4175,6 +4175,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                 "expected_artifacts": ["source list", "supporting quotes"],
                 "success_criteria": ["Claims remain tied to source spans."],
                 "done_condition": "At least one source-backed claim is ready for synthesis.",
+                "max_results": 8,
                 "max_sources": 3,
                 "max_images": 3 if is_visual else 0,
             }
@@ -4197,6 +4198,7 @@ class PublicBetaValidationTests(unittest.TestCase):
             "expected_artifacts": task["expected_artifacts"],
             "success_criteria": task["success_criteria"],
             "done_condition": task["done_condition"],
+            "max_results": task["max_results"],
             "max_sources": task["max_sources"],
             "max_images": task["max_images"],
             "provider": "codex-native",
