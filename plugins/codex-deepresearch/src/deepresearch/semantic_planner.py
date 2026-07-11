@@ -195,6 +195,132 @@ TEXT_ONLY_TASK_VISUAL_WORK_FIELDS = (
     "success_criteria",
     "done_condition",
 )
+SEMANTIC_TASK_MIN_SOURCES = 1
+SEMANTIC_TASK_MAX_SOURCES = 5
+SEMANTIC_MULTI_SOURCE_CAP_FIELDS = (
+    "query",
+    "source_policy",
+    "expected_source_types",
+    "success_criteria",
+    "done_condition",
+    "freshness_requirement",
+)
+SEMANTIC_MULTI_SOURCE_CAP_NEEDLES = {
+    "comparison": (
+        "compare",
+        "comparison",
+        "comparative",
+        "contrast",
+        "cross check",
+        "cross-check",
+        "cross verification",
+        "cross-verify",
+        "verify against",
+        "reconcile",
+        "between",
+        "across",
+        "mapping",
+        "map",
+        "\ube44\uad50",
+        "\ub300\uc870",
+        "\uad50\ucc28",
+        "\uac80\uc99d",
+        "\ub9e4\ud551",
+        "\ub300\uc751",
+    ),
+    "official_record": (
+        "official",
+        "regulatory",
+        "regulator",
+        "primary source",
+        "primary record",
+        "government",
+        "agency",
+        "ministry",
+        "public institution",
+        "record",
+        "database",
+        "notice",
+        "statute",
+        "law",
+        "\uacf5\uc2dd",
+        "\uaddc\uc81c",
+        "\uc815\ubd80",
+        "\uacf5\uacf5\uae30\uad00",
+        "\uae30\uad00",
+        "\uae30\ub85d",
+        "\ub370\uc774\ud130\ubca0\uc774\uc2a4",
+        "\uacf5\uc9c0",
+        "\ubc95\ub839",
+        "\uace0\uc2dc",
+        "\uc6d0\ubb38",
+        "\ubcf4\ub3c4\uc790\ub8cc",
+        "\ub9ac\ucf5c",
+    ),
+    "freshness": (
+        "latest",
+        "current",
+        "recent",
+        "freshness",
+        "updated",
+        "update",
+        "amended",
+        "amendment",
+        "revision",
+        "revised",
+        "as of",
+        "effective date",
+        "published date",
+        "\ucd5c\uc2e0",
+        "\ud604\ud589",
+        "\ud604\uc7ac",
+        "\ucd5c\uadfc",
+        "\uc2e0\uaddc",
+        "\uac1c\uc815",
+        "\uc815\uc815",
+        "\ubcc0\uacbd",
+        "\uc2dc\ud589\uc77c",
+        "\uac8c\uc2dc\uc77c",
+        "\uc774\ub825",
+    ),
+    "contradiction": (
+        "contradiction",
+        "contradictory",
+        "conflict",
+        "conflicting",
+        "caveat",
+        "counter evidence",
+        "counter-evidence",
+        "discrepancy",
+        "inconsistency",
+        "mismatch",
+        "unknown",
+        "uncertain",
+        "uncertainty",
+        "unresolved",
+        "omission",
+        "duplicate",
+        "correction",
+        "\uc0c1\ucda9",
+        "\uc774\uc0c1",
+        "\ubd88\uc77c\uce58",
+        "\ucc28\uc774",
+        "\ubbf8\ud655\uc815",
+        "\ud55c\uacc4",
+        "\ub204\ub77d",
+        "\uc911\ubcf5",
+        "\uc815\uc815",
+        "\ubc18\ub840",
+        "\uc8fc\uc758\uc0ac\ud56d",
+    ),
+}
+SEMANTIC_SOURCE_FAMILY_POLICY_KEYS = (
+    "required_source_quality",
+    "quality_requirements",
+    "required_source_types",
+    "required_sources",
+    "source_types",
+)
 MATERIAL_ORIGINAL_OVERLAP_LIMIT = 0.72
 MATERIAL_PEER_OVERLAP_LIMIT = 0.84
 SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS = 2
@@ -647,6 +773,14 @@ def codex_semantic_candidate_plan(
                 raw_response["previous_adapter_attempts"] = list(previous_attempts)
             parsed_raw_response = raw_response
             candidate = _candidate_plan_from_adapter_response(raw_response)
+            candidate, source_cap_normalizations = (
+                _normalize_candidate_executable_source_caps(candidate)
+            )
+            if source_cap_normalizations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_source_cap_normalizations"] = (
+                    source_cap_normalizations
+                )
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
                 candidate=candidate,
@@ -1028,7 +1162,7 @@ def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> di
         raise SemanticPlannerAdapterUnavailable(
             "Codex semantic planner adapter response is missing candidate_plan"
         )
-    candidate_plan = dict(candidate)
+    candidate_plan = copy.deepcopy(dict(candidate))
     candidate_plan.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
     candidate_plan.setdefault("planner_mode", PLANNER_MODE_CODEX_SEMANTIC)
     candidate_plan.setdefault("semantic_release_eligible", False)
@@ -1068,6 +1202,124 @@ def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> di
             "Codex semantic candidate_plan must include non-empty bounded_tasks"
         )
     return candidate_plan
+
+
+def _normalize_candidate_executable_source_caps(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized, []
+    normalized_tasks: list[Any] = []
+    normalizations: list[dict[str, Any]] = []
+    for index, task in enumerate(raw_tasks, start=1):
+        if not isinstance(task, Mapping):
+            normalized_tasks.append(task)
+            continue
+        normalized_task = dict(task)
+        current_cap = _semantic_task_source_cap_int(task.get("max_sources"))
+        if current_cap is None:
+            normalized_tasks.append(normalized_task)
+            continue
+        required_cap, reasons = _candidate_task_min_executable_sources(task)
+        repaired_cap = min(
+            SEMANTIC_TASK_MAX_SOURCES,
+            max(SEMANTIC_TASK_MIN_SOURCES, current_cap, required_cap),
+        )
+        if repaired_cap != current_cap:
+            normalized_task["max_sources"] = repaired_cap
+            normalizations.append(
+                {
+                    "task_id": task.get("task_id"),
+                    "task_index": index,
+                    "previous_max_sources": current_cap,
+                    "normalized_max_sources": repaired_cap,
+                    "minimum_executable_sources": required_cap,
+                    "reasons": reasons,
+                }
+            )
+        normalized_tasks.append(normalized_task)
+    normalized["bounded_tasks"] = normalized_tasks
+    return normalized, normalizations
+
+
+def _semantic_task_source_cap_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            numeric = float(value.strip())
+        except ValueError:
+            return None
+        if numeric.is_integer():
+            return int(numeric)
+    return None
+
+
+def _candidate_task_min_executable_sources(
+    task: Mapping[str, Any],
+) -> tuple[int, list[str]]:
+    text = _candidate_task_source_cap_text(task)
+    source_family_count = _candidate_task_declared_source_family_count(task)
+    reasons = [
+        label
+        for label, needles in SEMANTIC_MULTI_SOURCE_CAP_NEEDLES.items()
+        if _semantic_source_cap_text_has_any(text, needles)
+    ]
+    if source_family_count >= 2:
+        reasons.append("multiple_declared_source_families")
+    reason_set = set(reasons)
+    minimum = SEMANTIC_TASK_MIN_SOURCES
+    if reason_set & {"comparison", "freshness", "contradiction"}:
+        minimum = max(minimum, 2)
+    if "official_record" in reason_set and (
+        "multiple_declared_source_families" in reason_set
+        or reason_set & {"comparison", "freshness", "contradiction"}
+    ):
+        minimum = max(minimum, 2)
+    if source_family_count >= 2 and reason_set:
+        minimum = max(minimum, source_family_count)
+    return min(SEMANTIC_TASK_MAX_SOURCES, minimum), list(dict.fromkeys(reasons))
+
+
+def _candidate_task_source_cap_text(task: Mapping[str, Any]) -> str:
+    values = [task.get(field_name) for field_name in SEMANTIC_MULTI_SOURCE_CAP_FIELDS]
+    return json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
+
+
+def _candidate_task_declared_source_family_count(task: Mapping[str, Any]) -> int:
+    groups = [_string_list(task.get("expected_source_types"))]
+    source_policy = task.get("source_policy")
+    if isinstance(source_policy, Mapping):
+        for key in SEMANTIC_SOURCE_FAMILY_POLICY_KEYS:
+            groups.append(_string_list(source_policy.get(key)))
+    counts = []
+    for values in groups:
+        normalized = {
+            _normalize_text(value)
+            for value in values
+            if _normalize_text(value)
+        }
+        counts.append(len(normalized))
+    return max(counts or [0])
+
+
+def _semantic_source_cap_text_has_any(text: str, needles: Sequence[str]) -> bool:
+    normalized_text = _normalize_text(text)
+    lower_text = text.lower()
+    for needle in needles:
+        lower_needle = str(needle).lower()
+        normalized_needle = _normalize_text(lower_needle)
+        if lower_needle and lower_needle in lower_text:
+            return True
+        if normalized_needle and normalized_needle in normalized_text:
+            return True
+    return False
 
 
 def _codex_semantic_candidate_validation(

@@ -4465,6 +4465,211 @@ class SemanticPlannerTests(unittest.TestCase):
             },
         )
 
+    def test_codex_semantic_multi_source_caps_normalized_before_review_and_fanout(self) -> None:
+        question = (
+            "Korea EV battery fire safety standards and official recall records "
+            "비교 최신 상충 caveat 조사"
+        )
+        multi_source_tasks = {
+            "task_semantic_001": {
+                "query": (
+                    "Compare official ministry recall records against regulatory "
+                    "database entries for Korea EV battery fire safety."
+                ),
+                "freshness_requirement": "any",
+                "expected_source_types": [
+                    "official ministry recall notice",
+                    "regulatory recall database record",
+                ],
+                "source_policy": {
+                    "decision": "allowed",
+                    "allow_secondary": False,
+                    "required_source_quality": [
+                        "official ministry record",
+                        "regulatory database record",
+                    ],
+                    "flags": [],
+                },
+                "success_criteria": [
+                    "Compare the official and regulatory records before making claims.",
+                    "Use official, regulatory, or primary sources for support.",
+                ],
+                "done_condition": "Stop after cross-checking both official records.",
+            },
+            "task_semantic_002": {
+                "query": "공식 리콜 자료와 규제 고시를 비교하고 최신 개정 여부를 확인하라.",
+                "freshness_requirement": "recent",
+                "expected_source_types": ["공식 리콜 기록", "규제 고시 원문"],
+                "source_policy": {
+                    "decision": "allowed",
+                    "allow_secondary": False,
+                    "required_source_quality": ["공식 기록", "규제 원문"],
+                    "flags": [],
+                },
+                "success_criteria": [
+                    "최신 개정 여부와 공식 근거를 함께 기록한다.",
+                    "Use official, regulatory, or primary sources for support.",
+                ],
+                "done_condition": "상충 또는 정정 사항이 확인되면 근거와 함께 완료한다.",
+            },
+            "task_semantic_003": {
+                "query": (
+                    "Audit contradiction, caveat, correction, and unresolved limits "
+                    "across primary recall records."
+                ),
+                "freshness_requirement": "any",
+                "expected_source_types": ["primary recall record", "official correction notice"],
+                "source_policy": {
+                    "decision": "allowed",
+                    "allow_secondary": False,
+                    "required_source_quality": [
+                        "primary recall record",
+                        "official correction notice",
+                    ],
+                    "flags": [],
+                },
+                "success_criteria": [
+                    "Record contradiction caveats and unresolved limits.",
+                    "Use official, regulatory, or primary sources for support.",
+                ],
+                "done_condition": "Stop after contradiction and caveat checks cite both records.",
+            },
+            "task_semantic_004": {
+                "query": (
+                    "Compare latest official, regulatory, primary, database, notice, "
+                    "statute, and correction records for source-cap clamping."
+                ),
+                "freshness_requirement": "recent",
+                "expected_source_types": [
+                    "official record",
+                    "regulatory record",
+                    "primary record",
+                    "database record",
+                    "correction notice",
+                    "statute record",
+                ],
+                "source_policy": {
+                    "decision": "allowed",
+                    "allow_secondary": False,
+                    "required_source_quality": [
+                        "official record",
+                        "regulatory record",
+                        "primary record",
+                        "database record",
+                        "correction notice",
+                        "statute record",
+                    ],
+                    "flags": [],
+                },
+                "success_criteria": [
+                    "Confirm latestness and correction status across official records.",
+                    "Use official, regulatory, or primary sources for support.",
+                ],
+                "done_condition": "Stop after the latest record set is cross-checked.",
+            },
+        }
+
+        def lower_multi_source_caps(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            angle_specs = [
+                (
+                    "official recall baseline",
+                    "Which official recall records establish the Korea EV battery fire safety baseline?",
+                ),
+                (
+                    "regulatory amendment latestness",
+                    "What latest regulatory amendments change the Korean battery safety standard?",
+                ),
+                (
+                    "primary record contradiction",
+                    "Where do primary recall records conflict with agency safety explanations?",
+                ),
+                (
+                    "source caveat audit",
+                    "Which unresolved caveats limit conclusions about recall evidence quality?",
+                ),
+                (
+                    "comparison table synthesis",
+                    "How should standards and recall records be organized into a comparison table?",
+                ),
+            ]
+            for index, angle in enumerate(response["candidate_plan"]["angles"], start=1):
+                focus, research_question = angle_specs[index - 1]
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+                angle["evidence_need"] = "primary_source"
+                angle["title"] = f"{question} {focus}"
+                angle["research_question"] = research_question
+                angle["why_this_angle_matters"] = (
+                    "This angle keeps the text-only source-cap normalization fixture on subject."
+                )
+                angle["included_scope"] = [question, focus]
+                angle["excluded_scope"] = ["Visual inspection and image evidence."]
+                angle["expected_source_types"] = ["official source records"]
+                angle["expected_artifacts"] = [f"{focus} notes"]
+                angle["search_queries"] = [f"{question} {focus} official sources"]
+                angle["success_criteria"] = [
+                    "Findings must cite official source metadata."
+                ]
+                angle["report_section"] = f"Source Cap {index}"
+                angle["risk_or_contradiction_checks"] = [
+                    "Check whether source caps permit required cross-checks."
+                ]
+            for task in response["candidate_plan"]["bounded_tasks"]:
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task["max_sources"] = 1
+                task["freshness_requirement"] = "any"
+                task["query"] = f"{question} single source bounded task {task['task_id']}"
+                task["expected_source_types"] = ["single source note"]
+                task["expected_artifacts"] = ["source-backed note"]
+                task["source_policy"] = {"decision": "allowed", "flags": []}
+                task["success_criteria"] = [
+                    f"Task must preserve the subject: {question}."
+                ]
+                task["done_condition"] = "Stop after one source-backed note is recorded."
+                if task["task_id"] in multi_source_tasks:
+                    task.update(multi_source_tasks[task["task_id"]])
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "time_range"),
+            response_mutator=lower_multi_source_caps,
+        )
+        run_dir = Path(result["run_dir"])
+        self.assertEqual(result["semantic_planning_status"], "semantic_review_passed")
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        plan_by_id = {task["task_id"]: task for task in semantic_plan["bounded_tasks"]}
+        search_by_id = {task["task_id"]: task for task in search_tasks}
+
+        self.assertIn("candidate_plan_source_cap_normalizations", raw_response)
+        normalized_ids = {
+            record["task_id"]
+            for record in raw_response["candidate_plan_source_cap_normalizations"]
+        }
+        self.assertTrue(set(multi_source_tasks).issubset(normalized_ids))
+        for task in semantic_plan["bounded_tasks"]:
+            self.assertGreaterEqual(task["max_sources"], 1)
+            self.assertLessEqual(task["max_sources"], 5)
+            if task["route"] == "text_only":
+                self.assertEqual(task["max_images"], 0)
+        for task_id in multi_source_tasks:
+            with self.subTest(task_id=task_id):
+                plan_task = plan_by_id[task_id]
+                search_task = search_by_id[task_id]
+                self.assertGreater(plan_task["max_sources"], 1)
+                self.assertLessEqual(plan_task["max_sources"], 5)
+                self.assertEqual(search_task["max_sources"], plan_task["max_sources"])
+                self.assertEqual(plan_task["max_images"], 0)
+                self.assertEqual(search_task["max_images"], 0)
+        self.assertEqual(plan_by_id["task_semantic_004"]["max_sources"], 5)
+
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
         with self.assertRaisesRegex(
             SemanticPlannerAdapterUnavailable,
