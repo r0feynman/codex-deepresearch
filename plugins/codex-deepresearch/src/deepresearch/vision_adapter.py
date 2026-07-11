@@ -4327,10 +4327,15 @@ def _visual_lineage_from_image(image: Mapping[str, Any]) -> dict[str, str]:
     for field in (
         "plan_id",
         "task_id",
+        "semantic_plan_task_id",
+        "semantic_plan_hash",
+        "approved_delta_id",
+        "visual_task_id",
         "angle_id",
         "route",
         "candidate_id",
         "fetch_id",
+        "source_id",
     ):
         value = _first_optional_string(image, field)
         if value:
@@ -4402,7 +4407,12 @@ def _link_visual_evidence_to_claims(evidence: dict[str, Any]) -> int:
                     observation_index=observation_index,
                     observation_text=observation_text,
                 )
-                support["rationale"] = _visual_support_rationale(claim, image)
+                support["rationale"] = _visual_support_rationale(
+                    claim,
+                    image,
+                    routing_by_angle=routing_by_angle,
+                    sources_by_id=sources_by_id,
+                )
                 supports.append(support)
                 support_keys.add(key)
                 created += 1
@@ -4616,22 +4626,87 @@ def _image_matches_claim(
         return False
     if _string_list(image, "policy_flags"):
         return False
-    if claim.get("extraction_stage") == "vision_adapter_observation_claim":
-        return image.get("id") == claim.get("source_image_id")
-
-    source_id = image.get("source_id")
-    if isinstance(source_id, str) and source_id in _string_list(claim, "supporting_sources"):
-        return True
-    claim_angle = claim.get("angle_id")
-    image_angle = image.get("angle_id")
-    if isinstance(claim_angle, str) and claim_angle and claim_angle == image_angle:
-        return True
-    claim_route = _claim_route(
+    return _image_claim_match_reason(
         claim,
+        image,
         routing_by_angle=routing_by_angle,
         sources_by_id=sources_by_id,
+    ) is not None
+
+
+def _image_claim_match_reason(
+    claim: Mapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    routing_by_angle: Mapping[str, str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> str | None:
+    if claim.get("extraction_stage") == "vision_adapter_observation_claim":
+        image_id = _first_optional_string(image, "id")
+        if image_id and image_id == _first_optional_string(claim, "source_image_id"):
+            return f"source_image_id '{image_id}'"
+        return None
+
+    claim_task_ids = _claim_lineage_task_ids(claim, sources_by_id=sources_by_id)
+    image_task_ids = _lineage_task_ids(image)
+    shared_task_ids = claim_task_ids & image_task_ids
+    if shared_task_ids:
+        return f"task_id '{_first_sorted_value(shared_task_ids)}'"
+
+    task_lineage_conflict = bool(claim_task_ids and image_task_ids and not shared_task_ids)
+    if task_lineage_conflict:
+        return None
+
+    source_id = _first_optional_string(image, "source_id")
+    claim_source_ids = set(_string_list(claim, "supporting_sources"))
+    if source_id and source_id in claim_source_ids:
+        return f"source_id '{source_id}'"
+
+    shared_visual_tasks = set(_string_list(claim, "visual_tasks")) & set(
+        _string_list(image, "visual_tasks")
     )
-    return claim_route == "visual_required" and image.get("route") == "visual_required"
+    if shared_visual_tasks:
+        return f"visual_tasks '{_first_sorted_value(shared_visual_tasks)}'"
+
+    claim_angle = _first_optional_string(claim, "angle_id")
+    image_angle = _first_optional_string(image, "angle_id")
+    if claim_angle and image_angle and claim_angle == image_angle:
+        return f"angle_id '{claim_angle}'"
+
+    return None
+
+
+def _claim_lineage_task_ids(
+    claim: Mapping[str, Any],
+    *,
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    task_ids = _lineage_task_ids(claim)
+    if task_ids:
+        return task_ids
+    for source_id in _string_list(claim, "supporting_sources"):
+        source = sources_by_id.get(source_id)
+        if isinstance(source, Mapping):
+            task_ids.update(_lineage_task_ids(source))
+    return task_ids
+
+
+def _lineage_task_ids(record: Mapping[str, Any]) -> set[str]:
+    return {
+        task_id
+        for task_id in _string_list(
+            record,
+            "task_id",
+            "search_task_id",
+            "source_task_id",
+            "semantic_plan_task_id",
+            "visual_task_id",
+        )
+    }
+
+
+def _first_sorted_value(values: set[str]) -> str:
+    return sorted(values)[0]
 
 
 def _claim_route(
@@ -4702,14 +4777,22 @@ def _visual_support_provider(image: Mapping[str, Any]) -> str:
     )
 
 
-def _visual_support_rationale(claim: Mapping[str, Any], image: Mapping[str, Any]) -> str:
-    source_id = image.get("source_id")
-    if isinstance(source_id, str) and source_id in _string_list(claim, "supporting_sources"):
-        return f"Linked because claim and image cite source_id '{source_id}'."
-    claim_angle = claim.get("angle_id")
-    if isinstance(claim_angle, str) and claim_angle == image.get("angle_id"):
-        return f"Linked because claim and image share angle_id '{claim_angle}'."
-    return "Linked because both claim and image belong to a visual-required route."
+def _visual_support_rationale(
+    claim: Mapping[str, Any],
+    image: Mapping[str, Any],
+    *,
+    routing_by_angle: Mapping[str, str],
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+) -> str:
+    reason = _image_claim_match_reason(
+        claim,
+        image,
+        routing_by_angle=routing_by_angle,
+        sources_by_id=sources_by_id,
+    )
+    if reason:
+        return f"Linked because claim and image share {reason}."
+    return "Linked because claim and image share explicit visual lineage."
 
 
 def _normalize_visual_record(

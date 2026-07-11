@@ -26,6 +26,7 @@ from deepresearch import (
 from deepresearch.vision_adapter import (
     OpenAIResponsesVisionResult,
     _codex_interactive_supplemental_vision_tasks,
+    _link_visual_evidence_to_claims,
     _openai_result_from_response_payload,
 )
 from deepresearch.visual_artifacts import visual_minimums_for_run
@@ -556,6 +557,193 @@ class VisionAdapterTests(unittest.TestCase):
         )
         self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
         return self.load_json(run_dir / "evidence.json")
+
+    def test_visual_linking_rejects_same_route_unrelated_visual_required_images(self) -> None:
+        evidence = {
+            "sources": [
+                {"id": "src_task_010", "route": "visual_required"},
+                {"id": "src_task_011", "route": "visual_required"},
+            ],
+            "images": [
+                {
+                    "id": "img_task_010",
+                    "source_id": "src_task_010",
+                    "task_id": "task_010",
+                    "semantic_plan_task_id": "task_010",
+                    "angle_id": "angle_003",
+                    "route": "visual_required",
+                    "analysis_status": "analyzed",
+                    "observations": ["Task 010 visual evidence is present."],
+                    "policy_flags": [],
+                },
+                {
+                    "id": "img_task_011",
+                    "source_id": "src_task_011",
+                    "task_id": "task_011",
+                    "semantic_plan_task_id": "task_011",
+                    "angle_id": "angle_004",
+                    "route": "visual_required",
+                    "analysis_status": "analyzed",
+                    "observations": ["Task 011 visual evidence is unrelated."],
+                    "policy_flags": [],
+                },
+            ],
+            "claims": [
+                {
+                    "id": "claim_task_010_mixed",
+                    "text": "Task 010 has visual support.",
+                    "claim_type": "mixed",
+                    "supporting_sources": ["src_task_010"],
+                    "supporting_images": [],
+                    "visual_supports": [],
+                    "task_id": "task_010",
+                    "source_task_id": "task_010",
+                    "semantic_plan_task_id": "task_010",
+                    "angle_id": "angle_003",
+                    "route": "visual_required",
+                }
+            ],
+        }
+
+        created = _link_visual_evidence_to_claims(evidence)
+
+        self.assertEqual(created, 1)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["supporting_images"], ["img_task_010"])
+        self.assertEqual(
+            [support["image_id"] for support in claim["visual_supports"]],
+            ["img_task_010"],
+        )
+        self.assertEqual(claim["visual_supports"][0]["semantic_plan_task_id"], "task_010")
+        self.assertNotIn("img_task_011", claim["supporting_images"])
+
+    def test_visual_linking_rejects_shared_source_when_task_lineage_conflicts(self) -> None:
+        evidence = {
+            "sources": [
+                {
+                    "id": "src_shared",
+                    "route": "visual_required",
+                    "task_id": "task_010",
+                    "semantic_plan_task_id": "task_010",
+                }
+            ],
+            "images": [
+                {
+                    "id": "img_same_task",
+                    "source_id": "src_shared",
+                    "task_id": "task_010",
+                    "semantic_plan_task_id": "task_010",
+                    "angle_id": "angle_003",
+                    "route": "visual_required",
+                    "analysis_status": "analyzed",
+                    "observations": ["Task 010 visual evidence is present."],
+                    "policy_flags": [],
+                },
+                {
+                    "id": "img_shared_source_other_task",
+                    "source_id": "src_shared",
+                    "task_id": "task_011",
+                    "semantic_plan_task_id": "task_011",
+                    "angle_id": "angle_003",
+                    "route": "visual_required",
+                    "analysis_status": "analyzed",
+                    "observations": ["The same source was reused by another task."],
+                    "policy_flags": [],
+                },
+            ],
+            "claims": [
+                {
+                    "id": "claim_task_010_mixed",
+                    "text": "Task 010 has visual support.",
+                    "claim_type": "mixed",
+                    "supporting_sources": ["src_shared"],
+                    "supporting_images": [],
+                    "visual_supports": [],
+                    "task_id": "task_010",
+                    "source_task_id": "task_010",
+                    "semantic_plan_task_id": "task_010",
+                    "angle_id": "angle_003",
+                    "route": "visual_required",
+                }
+            ],
+        }
+
+        created = _link_visual_evidence_to_claims(evidence)
+
+        self.assertEqual(created, 1)
+        claim = evidence["claims"][0]
+        self.assertEqual(claim["supporting_images"], ["img_same_task"])
+        self.assertEqual(
+            [support["image_id"] for support in claim["visual_supports"]],
+            ["img_same_task"],
+        )
+        self.assertIn("task_id 'task_010'", claim["visual_supports"][0]["rationale"])
+
+    def test_visual_linking_accepts_source_task_angle_and_visual_task_lineage(self) -> None:
+        cases = [
+            (
+                "source",
+                {"supporting_sources": ["src_shared"]},
+                {"source_id": "src_shared"},
+                "source_id 'src_shared'",
+            ),
+            (
+                "task",
+                {"task_id": "task_shared", "semantic_plan_task_id": "task_shared"},
+                {"source_id": "src_other", "task_id": "task_shared"},
+                "task_id 'task_shared'",
+            ),
+            (
+                "angle",
+                {"angle_id": "angle_shared"},
+                {"source_id": "src_other", "angle_id": "angle_shared"},
+                "angle_id 'angle_shared'",
+            ),
+            (
+                "visual_tasks",
+                {"visual_tasks": ["specific_visual_target"]},
+                {"source_id": "src_other", "visual_tasks": ["specific_visual_target"]},
+                "visual_tasks 'specific_visual_target'",
+            ),
+        ]
+        for case_name, claim_overrides, image_overrides, expected_reason in cases:
+            with self.subTest(case_name=case_name):
+                evidence = {
+                    "sources": [
+                        {"id": "src_shared", "route": "visual_required"},
+                        {"id": "src_other", "route": "visual_required"},
+                    ],
+                    "images": [
+                        {
+                            "id": f"img_{case_name}",
+                            "route": "visual_required",
+                            "analysis_status": "analyzed",
+                            "observations": [f"{case_name} visual evidence is present."],
+                            "policy_flags": [],
+                            **image_overrides,
+                        }
+                    ],
+                    "claims": [
+                        {
+                            "id": f"claim_{case_name}",
+                            "text": f"{case_name} claim.",
+                            "claim_type": "mixed",
+                            "supporting_sources": [],
+                            "supporting_images": [],
+                            "visual_supports": [],
+                            "route": "visual_required",
+                            **claim_overrides,
+                        }
+                    ],
+                }
+
+                created = _link_visual_evidence_to_claims(evidence)
+
+                self.assertEqual(created, 1)
+                claim = evidence["claims"][0]
+                self.assertEqual(claim["supporting_images"], [f"img_{case_name}"])
+                self.assertEqual(claim["visual_supports"][0]["image_id"], f"img_{case_name}")
+                self.assertIn(expected_reason, claim["visual_supports"][0]["rationale"])
 
     def test_codex_interactive_accepts_handoff_observations(self) -> None:
         run_dir = self.prepared_visual_run()
