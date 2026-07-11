@@ -437,6 +437,7 @@ def ingest_vision_observations(
             run_dir,
             phase3_observations,
         )
+        _ensure_unique_phase3_observation_ids(phase3_observations)
         if automated_analysis is None:
             codex_handoff_provider_status = _codex_interactive_handoff_provider_status(
                 phase3_observations,
@@ -1390,7 +1391,11 @@ def _codex_interactive_supplemental_vision_tasks(
         records,
         run_dir=run_dir,
     )
-    if len(existing_artifact_backed_image_ids) >= required:
+    missing_obligation_task_ids = (
+        _visual_obligation_task_ids(run_dir)
+        - _release_eligible_codex_observation_task_ids(records, run_dir=run_dir)
+    )
+    if len(existing_artifact_backed_image_ids) >= required and not missing_obligation_task_ids:
         return []
     if _int_or_zero(minimums.get("fetched_artifacts")) < required:
         return []
@@ -1414,6 +1419,21 @@ def _codex_interactive_supplemental_vision_tasks(
         for task in tasks
         if not (_codex_visual_identity_keys(task) & represented_keys)
     ]
+    if missing_obligation_task_ids:
+        missing_tasks = [
+            task
+            for task in pending
+            if _visual_obligation_task_id(task) in missing_obligation_task_ids
+        ]
+        other_tasks = [
+            task
+            for task in pending
+            if _visual_obligation_task_id(task) not in missing_obligation_task_ids
+        ]
+        pending = [
+            *_fair_visual_obligation_task_order(missing_tasks),
+            *_fair_visual_obligation_task_order(other_tasks),
+        ]
     if config.max_images is not None and config.max_images > 0:
         return pending[: config.max_images]
     return pending
@@ -1466,6 +1486,35 @@ def _release_eligible_codex_observation_image_ids(
         if image_id:
             image_ids.add(image_id)
     return image_ids
+
+
+def _release_eligible_codex_observation_task_ids(
+    records: Sequence[Any],
+    *,
+    run_dir: Path,
+) -> set[str]:
+    task_by_id = _codex_interactive_task_by_id(run_dir)
+    task_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if not _is_release_eligible_existing_codex_observation(record, run_dir=run_dir):
+            continue
+        record_copy = dict(record)
+        _apply_task_lineage_to_visual_record(record_copy, task_by_id=task_by_id)
+        task_id = _visual_record_semantic_task_id(record_copy)
+        if task_id:
+            task_ids.add(task_id)
+    return task_ids
+
+
+def _visual_obligation_task_ids(run_dir: Path) -> set[str]:
+    return {
+        task_id
+        for task in _codex_interactive_task_by_id(run_dir).values()
+        for task_id in [_semantic_task_id_for_lineage(task)]
+        if task_id and _semantic_task_has_visual_obligation(task)
+    }
 
 
 def _is_release_eligible_existing_codex_observation(
@@ -1808,6 +1857,7 @@ def _openai_vision_tasks(
         task = _task_from_url_candidate(run_dir, candidate, evidence=evidence)
         if task is not None:
             tasks.append(task)
+    tasks = _fair_visual_obligation_task_order(tasks)
     return tasks[:max_images] if max_images is not None and max_images > 0 else tasks
 
 
@@ -1833,6 +1883,36 @@ def _codex_interactive_vision_tasks(
         if artifact.is_file():
             tasks.append(task)
     return tasks[:max_images] if max_images is not None and max_images > 0 else tasks
+
+
+def _fair_visual_obligation_task_order(
+    tasks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    pending = [dict(task) for task in tasks if isinstance(task, Mapping)]
+    ordered: list[dict[str, Any]] = []
+    covered_task_ids: set[str] = set()
+    while pending:
+        selected_index = 0
+        for index, task in enumerate(pending):
+            task_id = _visual_obligation_task_id(task)
+            if task_id and task_id not in covered_task_ids:
+                selected_index = index
+                break
+        task = pending.pop(selected_index)
+        ordered.append(task)
+        task_id = _visual_obligation_task_id(task)
+        if task_id:
+            covered_task_ids.add(task_id)
+    return ordered
+
+
+def _visual_obligation_task_id(record: Mapping[str, Any]) -> str:
+    return (
+        _first_optional_string(record, "semantic_plan_task_id")
+        or _first_optional_string(record, "task_id")
+        or _first_optional_string(record, "angle_id")
+        or ""
+    )
 
 
 def _candidate_allows_openai_url_analysis(
@@ -7106,6 +7186,61 @@ def _phase3_observation_records(
     return observations
 
 
+def _ensure_unique_phase3_observation_ids(
+    observations: Sequence[MutableMapping[str, Any]],
+) -> None:
+    id_counts: dict[str, int] = {}
+    for observation in observations:
+        if not isinstance(observation, MutableMapping):
+            continue
+        observation_id = _first_optional_string(observation, "observation_id")
+        if observation_id:
+            id_counts[observation_id] = id_counts.get(observation_id, 0) + 1
+
+    unavailable_ids = set(id_counts)
+    used_ids: set[str] = set()
+    for index, observation in enumerate(observations, start=1):
+        if not isinstance(observation, MutableMapping):
+            continue
+        observation_id = _first_optional_string(observation, "observation_id")
+        if (
+            not observation_id
+            or id_counts.get(observation_id, 0) > 1
+            or observation_id in used_ids
+        ):
+            replacement = _unique_phase3_observation_id(
+                observation,
+                index,
+                unavailable_ids | used_ids,
+            )
+            if observation_id and observation_id != replacement:
+                observation.setdefault("raw_child_observation_id", observation_id)
+            observation["observation_id"] = replacement
+            observation_id = replacement
+        used_ids.add(observation_id)
+        unavailable_ids.add(observation_id)
+
+
+def _unique_phase3_observation_id(
+    observation: Mapping[str, Any],
+    index: int,
+    unavailable_ids: set[str],
+) -> str:
+    parts = [
+        _sanitize_identifier(value)
+        for field in ("task_id", "evidence_image_id", "candidate_id", "fetch_id")
+        for value in [_first_optional_string(observation, field)]
+        if value
+    ]
+    base = "obs_" + "_".join(parts) if parts else f"obs_record_{index:03d}"
+    candidate = base
+    suffix = 2
+    while candidate in unavailable_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def _restore_phase3_normalized_image_fields(
     phase3: MutableMapping[str, Any],
     image: Mapping[str, Any],
@@ -7172,7 +7307,8 @@ def _codex_interactive_handoff_provider_status(
     fetched_artifacts = [
         observation
         for observation in analyzed
-        if _codex_interactive_handoff_local_artifact_exists(run_dir, observation)
+        if not _is_metadata_only_codex_observation(observation)
+        and _codex_interactive_handoff_local_artifact_exists(run_dir, observation)
     ]
     provider_run_ids = sorted(
         {

@@ -374,6 +374,38 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("`semantic_task_freshness_requirement` lineage", prompt)
         self.assertIn('"freshness_requirement": "newest agency pages only"', prompt)
 
+    def test_codex_exec_retry_prompt_includes_visual_handoff_feedback(self) -> None:
+        prepared = prepare_run(
+            question="Release visual retry feedback fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-retry-feedback",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        task = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"][0]
+        task["attempt"] = 2
+        task["failure_category"] = "invalid_release_visual_handoff"
+        task["child_failure_code"] = "codex_child_release_handoff_invalid"
+        task["last_error"] = "missing_child_visual_images"
+        task["release_visual_handoff_validation"] = {
+            "reason": "missing_child_visual_images",
+        }
+
+        command = CodexExecAdapter(project_root=ROOT).build_command(
+            task,
+            max_threads=8,
+            run_dir=run_dir,
+        )
+        prompt = command[-1]
+
+        self.assertIn("previous attempt failed because visual evidence was missing/invalid", prompt)
+        self.assertIn("reason: missing_child_visual_images", prompt)
+        self.assertIn("allowed public HTTP(S) image_url records", prompt)
+        self.assertIn("release-grade visual_observations.jsonl records", prompt)
+        self.assertIn("or do not claim success", prompt)
+        self.assertIn("Do not fabricate images", prompt)
+
     def test_codex_exec_adapter_default_timeout_remains_300_seconds(self) -> None:
         adapter = CodexExecAdapter(project_root=ROOT)
 
@@ -2541,6 +2573,128 @@ class ParallelOrchestratorTests(unittest.TestCase):
         )
         invalid_record = failed_task["release_visual_handoff_validation"]["invalid_records"][0]
         self.assertEqual(invalid_record["reason"], "candidate_id_missing")
+
+    def test_record_runner_result_rejects_zero_image_visual_release_child_as_retryable(self) -> None:
+        prepared = prepare_run(
+            question="Release validation zero-image visual child fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-zero-image-child",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        task["state"] = "running"
+        task["attempt"] = 1
+        task["max_attempts"] = 3
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "visual_required"
+        task["max_images"] = 2
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        source = shard["sources"][0]
+        shard["images"] = []
+        claim = shard["claims"][0]
+        claim["claim_type"] = "text"
+        claim["supporting_images"] = []
+        claim["visual_supports"] = []
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task, url=source["url"])],
+        )
+        result = parallel_orchestrator.RunnerResult(
+            task_id=task["id"],
+            status="completed",
+            child_thread_id="codex-zero-image-child",
+            events=(),
+            shard_path=str(shard_path),
+        )
+
+        parallel_orchestrator._record_runner_result(run_dir, task, result)
+
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(task["child_failure_code"], "codex_child_release_handoff_invalid")
+        self.assertEqual(
+            task["release_visual_handoff_validation"]["reason"],
+            "missing_child_visual_images",
+        )
+        self.assertIn("missing_child_visual_images", task["last_error"])
+        attempt = task["attempt_diagnostics"][0]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            attempt["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+
+        retry_plan = parallel_orchestrator._maybe_retry_capacity_failure(
+            task,
+            capacity_retry_policy={
+                "max_attempts": 3,
+                "initial_delay_seconds": 5.0,
+                "backoff_multiplier": 2.0,
+                "max_delay_seconds": 30.0,
+                "jitter_ratio": 0.0,
+                "max_retry_elapsed_seconds": 60.0,
+            },
+        )
+
+        self.assertTrue(retry_plan["should_retry"])
+        self.assertEqual(retry_plan["retry_decision"], "retry")
+        self.assertEqual(task["state"], "retryable")
+        self.assertEqual(task["attempt_diagnostics"][0]["retry_decision"], "retry")
+
+    def test_record_runner_result_allows_zero_image_nonvisual_release_child(self) -> None:
+        prepared = prepare_run(
+            question="Release validation zero-image text child fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-zero-image-child",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        task = self.load_json(run_dir / "research_tasks.json")["tasks"][0]
+        task["state"] = "running"
+        task["attempt"] = 1
+        task["max_attempts"] = 3
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "text_only"
+        task["max_images"] = 0
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        source = shard["sources"][0]
+        shard["images"] = []
+        claim = shard["claims"][0]
+        claim["claim_type"] = "text"
+        claim["supporting_images"] = []
+        claim["visual_supports"] = []
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task, url=source["url"])],
+        )
+        result = parallel_orchestrator.RunnerResult(
+            task_id=task["id"],
+            status="completed",
+            child_thread_id="codex-text-child",
+            events=(),
+            shard_path=str(shard_path),
+        )
+
+        parallel_orchestrator._record_runner_result(run_dir, task, result)
+
+        self.assertEqual(task["state"], "completed")
+        self.assertIsNone(task["failure_category"])
+        self.assertIsNone(task["child_failure_code"])
+        self.assertNotIn("release_visual_handoff_validation", task)
 
     def test_release_validation_invalid_child_search_sidecar_retry_exhaustion_fails(self) -> None:
         prepared = prepare_run(

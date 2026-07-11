@@ -1719,6 +1719,8 @@ def _visual_release_gate_shortfall_reason(
     minimums: Mapping[str, Any] | None,
     valid: bool,
 ) -> str:
+    if "semantic_materialization_diff_valid" in failures:
+        return "semantic_materialization_missing"
     if isinstance(minimums, Mapping):
         minimum_reason = str(minimums.get("shortfall_reason") or "none")
         if minimum_reason != "none":
@@ -1731,8 +1733,6 @@ def _visual_release_gate_shortfall_reason(
         return "vlm_failures"
     if "at_least_10_real_image_centric_candidates" in failures:
         return "insufficient_candidates"
-    if "semantic_materialization_diff_valid" in failures:
-        return "semantic_materialization_missing"
     return "none"
 
 

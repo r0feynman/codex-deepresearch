@@ -735,7 +735,15 @@ def _fetch_candidates(
     seen_urls: dict[str, dict[str, Any]] = {}
     seen_hashes: dict[str, dict[str, Any]] = {}
     seen_phashes: dict[str, dict[str, Any]] = {}
-    for candidate in candidates:
+    pending_candidates = list(candidates)
+    covered_task_ids: set[str] = set()
+    attempt_counts_by_task_id: dict[str, int] = {}
+    while pending_candidates:
+        candidate = _pop_next_visual_candidate_for_attempt(
+            pending_candidates,
+            covered_task_ids=covered_task_ids,
+            attempt_counts_by_task_id=attempt_counts_by_task_id,
+        )
         candidate_id = str(candidate["candidate_id"])
         fetch_id = _fetch_id(candidate_id)
         base_record = _base_fetch_record(candidate, fetch_id)
@@ -1001,6 +1009,7 @@ def _fetch_candidates(
         )
         image["cache_key"] = image_cache_key(image, source=source)
         evidence_images.append(image)
+        _mark_visual_candidate_covered(covered_task_ids, candidate)
         target = _dedupe_target(candidate, fetch_id, image_id)
         seen_urls[normalized_url] = target
         seen_hashes[content_hash] = target
@@ -1023,6 +1032,54 @@ def _fetch_candidates(
             )
         )
     return fetch_records, evidence_images
+
+
+def _pop_next_visual_candidate_for_attempt(
+    pending_candidates: list[dict[str, Any]],
+    *,
+    covered_task_ids: set[str],
+    attempt_counts_by_task_id: dict[str, int],
+) -> dict[str, Any]:
+    selected_index = 0
+    selected_priority: tuple[int, int, int] | None = None
+    for index, candidate in enumerate(pending_candidates):
+        task_id = _visual_obligation_task_id(candidate)
+        attempts = attempt_counts_by_task_id.get(task_id, 0) if task_id else 0
+        already_covered = bool(task_id and task_id in covered_task_ids)
+        priority = (attempts, 1 if already_covered else 0, index)
+        if selected_priority is None or priority < selected_priority:
+            selected_priority = priority
+            selected_index = index
+    candidate = pending_candidates.pop(selected_index)
+    _mark_visual_candidate_attempted(attempt_counts_by_task_id, candidate)
+    return candidate
+
+
+def _mark_visual_candidate_attempted(
+    attempt_counts_by_task_id: dict[str, int],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        attempt_counts_by_task_id[task_id] = attempt_counts_by_task_id.get(task_id, 0) + 1
+
+
+def _mark_visual_candidate_covered(
+    covered_task_ids: set[str],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        covered_task_ids.add(task_id)
+
+
+def _visual_obligation_task_id(record: Mapping[str, Any]) -> str:
+    return (
+        _string(record.get("semantic_plan_task_id"))
+        or _string(record.get("task_id"))
+        or _string(record.get("angle_id"))
+        or ""
+    )
 
 
 def _base_fetch_record(candidate: Mapping[str, Any], fetch_id: str) -> dict[str, Any]:

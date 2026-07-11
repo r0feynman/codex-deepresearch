@@ -25,6 +25,7 @@ from deepresearch import (
 )
 from deepresearch.vision_adapter import (
     OpenAIResponsesVisionResult,
+    _codex_interactive_supplemental_vision_tasks,
     _openai_result_from_response_payload,
 )
 from deepresearch.visual_artifacts import visual_minimums_for_run
@@ -675,6 +676,96 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertFalse(provider["external_vlm_call"])
         minimums = visual_minimums_for_run(run_dir, required_vlm_images=1)
         self.assertEqual(minimums["vlm_images_analyzed"], 1)
+
+    def test_codex_interactive_ingest_uniquifies_duplicate_observation_ids(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+
+        def observation(image_id: str, candidate_id: str, fetch_id: str, local_path: str) -> dict:
+            return {
+                "id": image_id,
+                "image_id": image_id,
+                "evidence_image_id": image_id,
+                "observation_id": "obs_img_001_001",
+                "source_id": "src_checkout",
+                "origin": "screenshot",
+                "local_artifact_path": local_path,
+                "mime_type": "image/png",
+                "width": 1,
+                "height": 1,
+                "candidate_id": candidate_id,
+                "fetch_id": fetch_id,
+                "task_id": "task_visual_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "provider_run_id": "codex-child:duplicate-observation-id",
+                "analysis_provider": "codex-interactive",
+                "analysis_status": "analyzed",
+                "observation_status": "analyzed",
+                "observations": [f"The screenshot {image_id} has visible UI content."],
+                "inferences": [f"The analyzed image {image_id} supports the visual claim."],
+                "visual_tasks": ["layout_review"],
+                "codex_interactive_handoff": True,
+                "handoff_artifact": "visual_observations.jsonl",
+                "external_vlm_call": False,
+                "provider_provenance": {
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "provider_run_id": "codex-child:duplicate-observation-id",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "external_vlm_call": False,
+                },
+            }
+
+        self.write_jsonl(
+            run_dir / "visual_observations.jsonl",
+            [
+                observation(
+                    "img_checkout_001",
+                    "cand_checkout_001",
+                    "fetch_checkout_001",
+                    "images/checkout.png",
+                ),
+                observation(
+                    "img_checkout_002",
+                    "cand_checkout_002",
+                    "fetch_checkout_002",
+                    "images/checkout_2.png",
+                ),
+            ],
+        )
+
+        result = ingest_vision_observations(run=run_dir, provider="codex-interactive")
+
+        self.assertEqual(result["status"], "visual_evidence_ingested")
+        self.assertTrue(
+            result["visual_artifact_validation"]["valid"],
+            result["visual_artifact_validation"],
+        )
+        observations = [
+            json.loads(line)
+            for line in (run_dir / "visual_observations.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        observation_ids = [record["observation_id"] for record in observations]
+        self.assertEqual(len(observation_ids), len(set(observation_ids)))
+        self.assertNotIn("obs_img_001_001", observation_ids)
+        by_image = {record["evidence_image_id"]: record for record in observations}
+        for image_id in ("img_checkout_001", "img_checkout_002"):
+            self.assertEqual(
+                by_image[image_id]["raw_child_observation_id"],
+                "obs_img_001_001",
+            )
+            self.assertEqual(by_image[image_id]["task_id"], "task_visual_001")
+            self.assertEqual(by_image[image_id]["angle_id"], "angle_001")
 
     def test_codex_interactive_handoff_uses_fetch_canonical_image_id(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
@@ -3517,6 +3608,192 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(minimums["fetched_artifacts"], 3)
         self.assertGreaterEqual(minimums["vlm_images_analyzed"], 3)
         self.assertNotEqual(minimums["shortfall_reason"], "vlm_failures")
+
+    def test_codex_interactive_supplement_prioritizes_missing_semantic_obligations(self) -> None:
+        run_dir = self.temp_runs_dir() / "supplement_missing_semantic_obligation"
+        run_dir.mkdir()
+        (run_dir / "images").mkdir()
+        for image_name in ("task1_a", "task1_b", "task1_c", "task2_a"):
+            (run_dir / "images" / f"{image_name}.png").write_bytes(PNG_1X1)
+
+        semantic_tasks = [
+            {
+                "task_id": "task_001",
+                "angle_id": "angle_001",
+                "query": "covered task",
+                "route": "visual_required",
+                "expected_visual_targets": ["poster image"],
+                "max_images": 3,
+            },
+            {
+                "task_id": "task_002",
+                "angle_id": "angle_002",
+                "query": "missing task",
+                "route": "visual_required",
+                "expected_visual_targets": ["poster image"],
+                "max_images": 1,
+            },
+        ]
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "artifact_type": "semantic_plan",
+                "semantic_plan": {"bounded_tasks": semantic_tasks},
+            },
+        )
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "run_id": run_dir.name,
+                "sources": [
+                    {
+                        "id": "src_supplement",
+                        "type": "web",
+                        "url": "https://example.com/supplement",
+                        "license_policy": "allowed",
+                        "robots_policy": "allowed",
+                        "policy_decision": "allowed",
+                    }
+                ],
+                "routing": [
+                    {"id": "angle_001", "modality": "visual_required", "max_images": 3},
+                    {"id": "angle_002", "modality": "visual_required", "max_images": 1},
+                ],
+                "images": [],
+                "claims": [],
+            },
+        )
+
+        image_specs = [
+            ("task_001", "angle_001", "task1_a", "img_task1_a"),
+            ("task_001", "angle_001", "task1_b", "img_task1_b"),
+            ("task_001", "angle_001", "task1_c", "img_task1_c"),
+            ("task_002", "angle_002", "task2_a", "img_task2_a"),
+        ]
+        candidates = []
+        fetches = []
+        observations = []
+        for index, (task_id, angle_id, image_name, image_id) in enumerate(image_specs, start=1):
+            candidate_id = f"cand_{image_name}"
+            fetch_id = f"fetch_{image_name}"
+            local_artifact_path = f"images/{image_name}.png"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "id": candidate_id,
+                    "plan_id": f"plan_{task_id}",
+                    "task_id": task_id,
+                    "semantic_plan_task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": "visual_required",
+                    "source_id": "src_supplement",
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": run_dir.name,
+                    "provider_provenance": {
+                        "provider": "browser-screenshot",
+                        "provider_kind": "screenshot",
+                        "provider_mode": "real",
+                    },
+                    "origin": "screenshot",
+                    "page_url": "https://example.com/supplement",
+                    "image_url": None,
+                    "rank": index,
+                    "score": 1.0 / index,
+                    "candidate_class": "screenshot",
+                    "local_artifact_path": local_artifact_path,
+                    "mime_type": "image/png",
+                    "width": 1,
+                    "height": 1,
+                    "hash": f"sha256:{image_name}",
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "candidate_status": "fetched",
+                    "rejection_reason": None,
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                }
+            )
+            fetches.append(
+                {
+                    "fetch_id": fetch_id,
+                    "candidate_id": candidate_id,
+                    "plan_id": f"plan_{task_id}",
+                    "task_id": task_id,
+                    "semantic_plan_task_id": task_id,
+                    "angle_id": angle_id,
+                    "route": "visual_required",
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": run_dir.name,
+                    "provider_provenance": {
+                        "provider": "browser-screenshot",
+                        "provider_kind": "screenshot",
+                        "provider_mode": "real",
+                    },
+                    "fetch_status": "fetched",
+                    "http_status": 200,
+                    "mime_type": "image/png",
+                    "byte_size": len(PNG_1X1),
+                    "width": 1,
+                    "height": 1,
+                    "hash": f"sha256:{image_name}",
+                    "phash": f"phash:{image_name}",
+                    "local_artifact_path": local_artifact_path,
+                    "evidence_image_id": image_id,
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                    "failure_code": None,
+                    "estimated_cost_usd": 0.0,
+                    "actual_cost_usd": 0.0,
+                }
+            )
+            if task_id == "task_001":
+                observations.append(
+                    {
+                        "id": image_id,
+                        "image_id": image_id,
+                        "evidence_image_id": image_id,
+                        "source_id": "src_supplement",
+                        "origin": "screenshot",
+                        "local_artifact_path": local_artifact_path,
+                        "mime_type": "image/png",
+                        "candidate_id": candidate_id,
+                        "fetch_id": fetch_id,
+                        "plan_id": f"plan_{task_id}",
+                        "task_id": task_id,
+                        "semantic_plan_task_id": task_id,
+                        "angle_id": angle_id,
+                        "route": "visual_required",
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "observation_status": "analyzed",
+                        "observations": ["Existing analyzed image."],
+                        "inferences": [],
+                        "policy_decision": "allowed",
+                        "policy_flags": [],
+                    }
+                )
+
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        tasks = _codex_interactive_supplemental_vision_tasks(
+            run_dir=run_dir,
+            evidence=self.load_json(run_dir / "evidence.json"),
+            records=observations,
+            codex_config={"max_images": 1},
+            provider_mode="real",
+        )
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["semantic_plan_task_id"], "task_002")
+        self.assertEqual(tasks[0]["evidence_image_id"], "img_task2_a")
 
     def test_codex_interactive_supplements_child_observations_without_artifacts(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")

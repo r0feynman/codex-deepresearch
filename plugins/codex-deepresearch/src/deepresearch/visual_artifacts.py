@@ -416,6 +416,8 @@ def visual_failure_code_for_shortfall_reason(reason: str | None) -> str | None:
         return None
     if reason == "report_linkage_missing":
         return "visual_report_linkage_missing"
+    if reason == "semantic_materialization_missing":
+        return "semantic_materialization_diff_invalid"
     return "visual_minimum_shortfall"
 
 

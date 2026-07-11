@@ -789,6 +789,63 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertTrue(diff["lineage_failures"], diff)
 
+    def test_semantic_materialization_diff_requires_observed_image_for_each_visual_obligation(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture()
+        self.realign_semantic_materialization_fixture(run_dir)
+        missing_task_id = "task_search_002"
+
+        candidates = []
+        for record in self.read_jsonl(run_dir / "visual_candidates.jsonl"):
+            if record["semantic_plan_task_id"] == missing_task_id:
+                record["candidate_status"] = "budget_pruned"
+                record["policy_decision"] = "budget_pruned"
+                record["rejection_reason"] = "budget_pruned"
+            candidates.append(record)
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+
+        fetches = []
+        for record in self.read_jsonl(run_dir / "image_fetch_status.jsonl"):
+            if record["semantic_plan_task_id"] == missing_task_id:
+                record["fetch_status"] = "budget_pruned"
+                record["policy_decision"] = "budget_pruned"
+                record["failure_code"] = "budget_pruned"
+                record["local_artifact_path"] = None
+                record["evidence_image_id"] = None
+            fetches.append(record)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+
+        observations = [
+            record
+            for record in self.read_jsonl(run_dir / "visual_observations.jsonl")
+            if record["semantic_plan_task_id"] != missing_task_id
+        ]
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["images"] = [
+            record
+            for record in evidence["images"]
+            if record["semantic_plan_task_id"] != missing_task_id
+        ]
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+
+        self.assertFalse(diff["valid"])
+        self.assertIn(missing_task_id, diff["missing_task_ids"])
+        failed_artifacts = {
+            check["artifact"]
+            for check in diff["artifact_checks"]
+            if check.get("valid") is not True
+        }
+        self.assertIn("visual_observations", failed_artifacts)
+        self.assertIn("evidence.images", failed_artifacts)
+        self.assertNotIn(missing_task_id, diff["dropped_visual_obligations"])
+
     def test_semantic_materialization_diff_rejects_missing_and_mismatched_lineage_hashes(self) -> None:
         run_dir = self.write_semantic_materialization_fixture(visual=False)
         search = self.load_json(run_dir / "search_tasks.json")

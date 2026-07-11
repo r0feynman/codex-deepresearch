@@ -23,11 +23,15 @@ from deepresearch import (  # noqa: E402
     verify_claims,
 )
 from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E402
-from deepresearch.page_image_extraction import FetchResponse  # noqa: E402
+from deepresearch.page_image_extraction import (  # noqa: E402
+    FetchResponse,
+    _fetch_candidates as _fetch_page_image_candidates,
+)
 from deepresearch.visual_acquisition import (  # noqa: E402
     _BraveImageSearchResponse,
     _merge_visual_observation_records,
     _release_visible_visual_records_if_needed,
+    _validate_and_select_candidates,
 )
 from deepresearch.visual_artifacts import visual_minimums_for_run  # noqa: E402
 
@@ -943,6 +947,198 @@ class VisualAcquisitionTests(unittest.TestCase):
         self.assertEqual(filtered[0]["semantic_plan_task_id"], "task_001")
         self.assertTrue(filtered[0]["semantic_plan_hash"])
         self.assertEqual(filtered[0]["approved_delta_id"], "base_plan")
+
+    def test_fetch_budget_prioritizes_uncovered_semantic_visual_obligations(self) -> None:
+        run_dir = self.temp_runs_dir() / "fair_fetch_budget"
+        run_dir.mkdir()
+        source = {
+            "id": "src_fair_fetch",
+            "url": "https://example.com/fair-fetch",
+            "license_policy": "allowed",
+            "robots_policy": "allowed",
+        }
+
+        def candidate(candidate_id: str, task_id: str, image_url: str) -> dict:
+            return {
+                "candidate_id": candidate_id,
+                "id": candidate_id,
+                "plan_id": f"plan_{task_id}",
+                "task_id": task_id,
+                "semantic_plan_task_id": task_id,
+                "angle_id": f"angle_{task_id[-3:]}",
+                "route": "visual_required",
+                "source_id": source["id"],
+                "source_search_result_id": f"search_{task_id}",
+                "provider": "page-image-extractor",
+                "provider_kind": "page_extractor",
+                "provider_mode": "real",
+                "provider_run_id": run_dir.name,
+                "provider_provenance": {
+                    "provider": "page-image-extractor",
+                    "provider_kind": "page_extractor",
+                    "provider_mode": "real",
+                    "provider_run_id": run_dir.name,
+                },
+                "origin": "page_image",
+                "candidate_origin": "page_image",
+                "page_url": source["url"],
+                "image_url": image_url,
+                "rank": 1,
+                "score": 1.0,
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+            }
+
+        candidates = [
+            candidate("cand_task_001_a", "task_001", "https://images.example.com/a1.png"),
+            candidate("cand_task_001_b", "task_001", "https://images.example.com/a2.png"),
+            candidate("cand_task_002_a", "task_002", "https://images.example.com/b1.png"),
+        ]
+
+        transport_calls: list[str] = []
+
+        def transport(url: str) -> FetchResponse:
+            transport_calls.append(url)
+            if url.endswith("/a1.png"):
+                return FetchResponse(
+                    content=None,
+                    mime_type=None,
+                    status_code=503,
+                    final_url=url,
+                    error_code="fetch_failed:task_001_first_attempt",
+                )
+            return FetchResponse(
+                content=(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                    b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                    + url.encode("ascii")
+                ),
+                mime_type="image/png",
+                status_code=200,
+                final_url=url,
+            )
+
+        fetches, evidence_images = _fetch_page_image_candidates(
+            run_dir=run_dir,
+            candidates=candidates,
+            source_by_id={source["id"]: source},
+            transport=transport,
+            max_image_bytes=1_000_000,
+            max_fetches=1,
+            timeout_seconds=1.0,
+        )
+
+        fetched = [record for record in fetches if record["fetch_status"] == "fetched"]
+        self.assertEqual(
+            [record["semantic_plan_task_id"] for record in fetched],
+            ["task_002"],
+        )
+        self.assertEqual(len(evidence_images), 1)
+        self.assertEqual(
+            transport_calls,
+            ["https://images.example.com/a1.png", "https://images.example.com/b1.png"],
+        )
+        fetch_by_candidate = {record["candidate_id"]: record for record in fetches}
+        self.assertEqual(
+            fetch_by_candidate["cand_task_001_a"]["fetch_status"],
+            "failed",
+        )
+        self.assertEqual(
+            fetch_by_candidate["cand_task_001_b"]["fetch_status"],
+            "budget_pruned",
+        )
+
+    def test_selection_budget_prioritizes_uncovered_semantic_visual_obligations(self) -> None:
+        run_dir = self.temp_runs_dir() / "fair_selection_budget"
+        run_dir.mkdir()
+        image_dir = run_dir / "images"
+        image_dir.mkdir()
+
+        def write_artifact(name: str, *, valid: bool) -> str:
+            suffix = ".png" if valid else ".txt"
+            relative = Path("images") / f"{name}{suffix}"
+            (run_dir / relative).write_bytes(
+                (
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    b"\x00\x00\x02\x80\x00\x00\x01\xe0\x08\x04\x00\x00\x00"
+                    b"\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x03\x03\x02\x00"
+                    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+                    + name.encode("ascii")
+                )
+                if valid
+                else b"not an image"
+            )
+            return relative.as_posix()
+
+        def candidate(candidate_id: str, task_id: str, *, valid: bool = True) -> dict:
+            return {
+                "candidate_id": candidate_id,
+                "id": candidate_id,
+                "plan_id": f"plan_{task_id}",
+                "task_id": task_id,
+                "semantic_plan_task_id": task_id,
+                "angle_id": f"angle_{task_id[-3:]}",
+                "route": "visual_required",
+                "source_id": "src_selection_budget",
+                "provider": "browser-screenshot",
+                "provider_kind": "screenshot",
+                "provider_mode": "real",
+                "provider_run_id": run_dir.name,
+                "provider_provenance": {
+                    "provider": "browser-screenshot",
+                    "provider_kind": "screenshot",
+                    "provider_mode": "real",
+                    "provider_run_id": run_dir.name,
+                },
+                "candidate_class": "screenshot",
+                "origin": "screenshot",
+                "page_url": "https://example.com/fair-selection",
+                "image_url": None,
+                "local_artifact_path": write_artifact(candidate_id, valid=valid),
+                "mime_type": "image/png" if valid else "text/plain",
+                "width": 640,
+                "height": 480,
+                "status": "accepted",
+                "candidate_status": "discovered",
+                "policy_decision": "allowed",
+                "policy_flags": [],
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": 0.0,
+            }
+
+        selected, records, _groups = _validate_and_select_candidates(
+            run_dir=run_dir,
+            evidence={
+                "run_id": run_dir.name,
+                "budget": {"max_images": 1},
+                "vlm_provider": "codex-interactive",
+            },
+            candidates=[
+                candidate("cand_task_001_a", "task_001", valid=False),
+                candidate("cand_task_001_b", "task_001"),
+                candidate("cand_task_002_a", "task_002"),
+            ],
+            max_image_bytes=1_000_000,
+            created_at="2026-07-11T00:00:00Z",
+        )
+
+        self.assertEqual(
+            [record["semantic_plan_task_id"] for record in selected],
+            ["task_002"],
+        )
+        record_by_candidate = {record["candidate_id"]: record for record in records}
+        self.assertEqual(
+            record_by_candidate["cand_task_001_a"]["candidate_status"],
+            "rejected",
+        )
+        self.assertEqual(
+            record_by_candidate["cand_task_001_b"]["candidate_status"],
+            "budget_pruned",
+        )
 
     def test_real_brave_image_search_provider_normalizes_candidates(self) -> None:
         prepared = prepare_run(

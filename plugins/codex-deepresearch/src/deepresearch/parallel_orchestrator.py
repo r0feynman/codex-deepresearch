@@ -2801,8 +2801,29 @@ def _release_validation_child_visual_sidecar_status(
 ) -> dict[str, Any]:
     images = [image for image in _list(shard.get("images")) if isinstance(image, Mapping)]
     visual_required = _task_requests_visual_evidence(task)
-    observations_required = bool(images) and visual_required
+    required_image_count = _release_validation_required_child_visual_image_count(task)
+    images_required = visual_required and required_image_count > 0
     sidecar = shard_path.parent / "visual_observations.jsonl"
+    if images_required and not images:
+        records = (
+            [
+                record
+                for record in _read_jsonl(sidecar)
+                if isinstance(record, Mapping)
+            ]
+            if sidecar.exists()
+            else []
+        )
+        return {
+            "valid": False,
+            "required": True,
+            "reason": "missing_child_visual_images",
+            "path": str(sidecar),
+            "image_count": 0,
+            "required_image_count": required_image_count,
+            "records": len(records),
+        }
+    observations_required = bool(images) and visual_required
     if not sidecar.exists():
         if not observations_required:
             return {"valid": True, "required": False, "reason": None, "records": 0}
@@ -2907,6 +2928,14 @@ def _release_validation_child_visual_sidecar_status(
         "image_count": len(images),
         "records": len(records),
     }
+
+
+def _release_validation_required_child_visual_image_count(
+    task: Mapping[str, Any],
+) -> int:
+    if not _task_requests_visual_evidence(task):
+        return 0
+    return _nonnegative_int(task.get("max_images"))
 
 
 def _release_validation_child_visual_extra_image_refs(
@@ -3645,11 +3674,7 @@ def _normalize_release_visual_observation_ids(
             id_counts[observation_id] = id_counts.get(observation_id, 0) + 1
 
     used_ids: set[str] = set()
-    unavailable_ids = {
-        observation_id
-        for observation_id, count in id_counts.items()
-        if count == 1
-    }
+    unavailable_ids = set(id_counts)
     for index, record in enumerate(records, start=1):
         observation_id = _string_or_none(record.get("observation_id"))
         if not observation_id or id_counts.get(observation_id, 0) > 1 or observation_id in used_ids:
@@ -5902,12 +5927,44 @@ def _record_runner_result(run_dir: Path, task: dict[str, Any], result: RunnerRes
             validation=validation_payload,
             child_failure_code=attempt_record.get("child_failure_code"),
         )
+        if (
+            release_identity
+            and str(task.get("last_adapter") or "") == "codex-exec"
+        ):
+            shard = _read_json(shard_path)
+            visual_sidecar_status = _release_validation_child_visual_sidecar_status(
+                task=task,
+                shard=shard,
+                shard_path=shard_path,
+            )
+            if not visual_sidecar_status["valid"]:
+                diagnostic = _release_validation_child_visual_handoff_message(
+                    visual_sidecar_status
+                )
+                task["failure_category"] = "invalid_release_visual_handoff"
+                task["child_failure_code"] = CODEX_CHILD_RELEASE_HANDOFF_INVALID
+                task["last_error"] = diagnostic
+                task["release_visual_handoff_validation"] = visual_sidecar_status
+                attempt_record["status"] = "failed"
+                attempt_record["failure_category"] = "invalid_release_visual_handoff"
+                attempt_record[
+                    "release_visual_handoff_validation"
+                ] = visual_sidecar_status
+                attempt_record["last_message_text_preview"] = _bounded_preview(diagnostic)
+                _update_attempt_diagnostic(
+                    attempt_record,
+                    child_failure_code=CODEX_CHILD_RELEASE_HANDOFF_INVALID,
+                    retry_decision="do_not_retry",
+                )
+                task["state"] = "failed"
+                return
         task["state"] = "completed"
         task["failure_category"] = None
         task["child_failure_code"] = None
         _update_attempt_diagnostic(attempt_record, retry_decision="do_not_retry")
         task.pop("validation", None)
         task.pop("release_search_handoff_validation", None)
+        task.pop("release_visual_handoff_validation", None)
         return
     if result.status == "blocked":
         task["state"] = "blocked"
@@ -7230,6 +7287,31 @@ def _invalid_output_shard_result(
     )
 
 
+def _child_visual_handoff_retry_feedback(task: Mapping[str, Any]) -> str:
+    if _nonnegative_int(task.get("attempt")) <= 1:
+        return ""
+    visual_validation = task.get("release_visual_handoff_validation")
+    failure_category = str(task.get("failure_category") or "")
+    if (
+        failure_category != "invalid_release_visual_handoff"
+        and not isinstance(visual_validation, Mapping)
+    ):
+        return ""
+    reason = ""
+    if isinstance(visual_validation, Mapping):
+        reason = str(visual_validation.get("reason") or "")
+    if not reason:
+        reason = str(task.get("last_error") or "invalid_release_visual_handoff")
+    return (
+        "Retry feedback: the previous attempt failed because visual evidence was "
+        f"missing/invalid for release validation (reason: {reason}). "
+        "For this attempt, find allowed public HTTP(S) image_url records and "
+        "release-grade visual_observations.jsonl records with matching "
+        "evidence_image_id, candidate_id, and fetch_id, or do not claim success. "
+        "Do not fabricate images, observations, VLM analysis, or provenance. "
+    )
+
+
 def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | None = None) -> str:
     shard_path = shard_path or _resolve_task_shard_path(task, run_dir)
     shard_dir = shard_path.parent
@@ -7295,6 +7377,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "policy/guardrail claims, and `freshness` for recency/currentness claims. "
             "`evidence_refs` must reference only source or image IDs present in the same shard. "
         )
+    retry_feedback = _child_visual_handoff_retry_feedback(task)
     # Child shard contract: the parent accepts only Evidence Schema v0 envelopes
     # validated by evidence_schema.validate_artifacts; legacy shard-specific
     # schema_version values are intentionally rejected.
@@ -7320,6 +7403,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         "Prioritize a compact shard with decision-ready claims and do not read repository docs or skills unless the schema is otherwise impossible to satisfy. "
         f"{release_instruction}"
         f"{visual_instruction}"
+        f"{retry_feedback}"
         "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
         "Verifier vote `method` must be one of `codex-subagent`, `runner-agent`, `model-call`, or `manual-review`; "
         "`vote` must be one of `support`, `refute`, `uncertain`, or `blocked`; "

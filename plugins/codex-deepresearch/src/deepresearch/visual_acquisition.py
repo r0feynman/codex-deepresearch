@@ -2224,7 +2224,18 @@ def _validate_and_select_candidates(
     seen_phashes: dict[str, str] = {}
     near_duplicate_groups: dict[str, dict[str, Any]] = {}
 
-    for index, raw_candidate in enumerate(candidates, start=1):
+    pending_candidates = [
+        (index, raw_candidate)
+        for index, raw_candidate in enumerate(candidates, start=1)
+    ]
+    covered_task_ids: set[str] = set()
+    attempt_counts_by_task_id: dict[str, int] = {}
+    while pending_candidates:
+        index, raw_candidate = _pop_next_visual_candidate_for_attempt(
+            pending_candidates,
+            covered_task_ids=covered_task_ids,
+            attempt_counts_by_task_id=attempt_counts_by_task_id,
+        )
         record = dict(raw_candidate)
         record["rank"] = index
         record["acquired_at"] = created_at
@@ -2440,6 +2451,7 @@ def _validate_and_select_candidates(
             else:
                 record["candidate_status"] = "analyzed"
                 selected.append(_observation_from_candidate(record))
+            _mark_visual_candidate_covered(covered_task_ids, record)
         record["rejection_reason"] = (
             record["removal_reasons"][0] if record.get("removal_reasons") else None
         )
@@ -2447,6 +2459,54 @@ def _validate_and_select_candidates(
         records.append(_persistable_candidate(record))
 
     return selected, records, list(near_duplicate_groups.values())
+
+
+def _pop_next_visual_candidate_for_attempt(
+    pending_candidates: list[tuple[int, Mapping[str, Any]]],
+    *,
+    covered_task_ids: set[str],
+    attempt_counts_by_task_id: dict[str, int],
+) -> tuple[int, Mapping[str, Any]]:
+    selected_index = 0
+    selected_priority: tuple[int, int, int] | None = None
+    for index, (_rank, candidate) in enumerate(pending_candidates):
+        task_id = _visual_obligation_task_id(candidate)
+        attempts = attempt_counts_by_task_id.get(task_id, 0) if task_id else 0
+        already_covered = bool(task_id and task_id in covered_task_ids)
+        priority = (attempts, 1 if already_covered else 0, index)
+        if selected_priority is None or priority < selected_priority:
+            selected_priority = priority
+            selected_index = index
+    selected = pending_candidates.pop(selected_index)
+    _mark_visual_candidate_attempted(attempt_counts_by_task_id, selected[1])
+    return selected
+
+
+def _mark_visual_candidate_attempted(
+    attempt_counts_by_task_id: dict[str, int],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        attempt_counts_by_task_id[task_id] = attempt_counts_by_task_id.get(task_id, 0) + 1
+
+
+def _mark_visual_candidate_covered(
+    covered_task_ids: set[str],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        covered_task_ids.add(task_id)
+
+
+def _visual_obligation_task_id(record: Mapping[str, Any]) -> str:
+    return (
+        _string(record.get("semantic_plan_task_id"))
+        or _string(record.get("task_id"))
+        or _string(record.get("angle_id"))
+        or ""
+    )
 
 
 def _mark_pdf_budget_pruned(record: dict[str, Any]) -> None:

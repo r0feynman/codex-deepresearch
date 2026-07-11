@@ -1574,11 +1574,23 @@ class InvocationRouterTests(unittest.TestCase):
             result["diagnostics"]["missing_semantic_materialization_task_ids"],
             ["task_006", "task_016"],
         )
+        self.assertEqual(
+            result["diagnostics"]["failure_code"],
+            "semantic_materialization_diff_invalid",
+        )
+        self.assertNotEqual(
+            result["diagnostics"].get("failure_code"),
+            "visual_minimum_shortfall",
+        )
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         self.assertEqual(provider_status["status"], "partial_auto_visual")
         self.assertEqual(
             provider_status["diagnostics"]["missing_semantic_materialization_task_ids"],
             ["task_006", "task_016"],
+        )
+        self.assertEqual(
+            provider_status["diagnostics"]["failure_code"],
+            "semantic_materialization_diff_invalid",
         )
 
     def test_visual_lineage_failure_wins_over_satisfied_minimums(self) -> None:
