@@ -3140,9 +3140,16 @@ def _combined_visual_search_plan(
             continue
         plan_id = _string(task.get("plan_id"))
         task_id = _string(task.get("task_id"))
+        semantic_task_id = _string(task.get("semantic_plan_task_id")) or task_id
         angle_id = _string(task.get("angle_id"))
-        if plan_id and task_id and angle_id:
-            grouped[(plan_id, task_id, angle_id)] = dict(task)
+        key = _visual_search_plan_task_key(
+            plan_id=plan_id,
+            task_id=task_id,
+            semantic_task_id=semantic_task_id,
+            angle_id=angle_id,
+        )
+        if key is not None:
+            grouped[key] = dict(task)
     for candidate in candidate_records:
         plan_id = _string(candidate.get("plan_id"))
         task_id = _string(candidate.get("task_id"))
@@ -3156,7 +3163,14 @@ def _combined_visual_search_plan(
             or route_name == "text_only"
         ):
             continue
-        key = (plan_id, task_id, angle_id)
+        key = _visual_search_plan_task_key(
+            plan_id=plan_id,
+            task_id=task_id,
+            semantic_task_id=semantic_task_id,
+            angle_id=angle_id,
+        )
+        if key is None:
+            continue
         task = grouped.setdefault(
             key,
             {
@@ -3221,6 +3235,22 @@ def _combined_visual_search_plan(
         payload,
         _release_validation_identity_for_visual_run(run_dir, evidence),
     )
+
+
+def _visual_search_plan_task_key(
+    *,
+    plan_id: str,
+    task_id: str,
+    semantic_task_id: str,
+    angle_id: str,
+) -> tuple[str, str, str] | None:
+    if semantic_task_id:
+        return ("semantic", semantic_task_id, "")
+    if task_id:
+        return ("task", task_id, angle_id)
+    if plan_id:
+        return ("plan", plan_id, angle_id)
+    return None
 
 
 def _release_visible_visual_records_if_needed(

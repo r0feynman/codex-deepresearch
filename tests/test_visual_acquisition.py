@@ -26,9 +26,11 @@ from deepresearch.browser_screenshot import BrowserScreenshotCapture  # noqa: E4
 from deepresearch.page_image_extraction import (  # noqa: E402
     FetchResponse,
     _fetch_candidates as _fetch_page_image_candidates,
+    _visual_search_plan as _page_visual_search_plan,
 )
 from deepresearch.visual_acquisition import (  # noqa: E402
     _BraveImageSearchResponse,
+    _combined_visual_search_plan,
     _merge_visual_observation_records,
     _release_visible_visual_records_if_needed,
     _validate_and_select_candidates,
@@ -214,6 +216,105 @@ class VisualAcquisitionTests(unittest.TestCase):
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def test_combined_visual_search_plan_dedupes_by_semantic_task_id(self) -> None:
+        run_dir = self.temp_runs_dir()
+        evidence = {"run_id": "run_visual_plan_dedupe", "question": "Compare signs"}
+        candidate_records = [
+            {
+                "plan_id": "plan_task_002_angle_001_visual_optional",
+                "task_id": "task_002",
+                "semantic_plan_task_id": "task_002",
+                "semantic_plan_hash": "a" * 64,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_001",
+                "route": "visual_optional",
+                "provider": "child-discovered-image-url",
+                "candidate_status": "fetched",
+                "source_search_result_id": "src_child",
+            },
+            {
+                "plan_id": "plan_task_002_angle_001_visual_required",
+                "task_id": "task_002",
+                "semantic_plan_task_id": "task_002",
+                "semantic_plan_hash": "a" * 64,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_001",
+                "route": "visual_optional",
+                "provider": "page-image-extractor",
+                "candidate_status": "fetched",
+                "source_search_result_id": "src_page",
+            },
+        ]
+
+        plan = _combined_visual_search_plan(
+            run_dir=run_dir,
+            evidence=evidence,
+            routes=[
+                {
+                    "id": "angle_001",
+                    "task_id": "task_002",
+                    "semantic_plan_task_id": "task_002",
+                    "modality": "visual_optional",
+                    "query": "Compare signs",
+                    "max_images": 1,
+                }
+            ],
+            provider_names=["child-discovered-image-url", "page-image-extractor"],
+            candidate_records=candidate_records,
+            created_at="2026-07-12T00:00:00Z",
+            selected_observations=2,
+            state="completed",
+        )
+
+        task_ids = [task["semantic_plan_task_id"] for task in plan["tasks"]]
+        self.assertEqual(task_ids, ["task_002"])
+        self.assertEqual(
+            sorted(plan["tasks"][0]["source_search_result_ids"]),
+            ["src_child", "src_page"],
+        )
+
+    def test_page_visual_search_plan_dedupes_by_semantic_task_id(self) -> None:
+        run_dir = self.temp_runs_dir()
+        evidence = {"run_id": "run_page_plan_dedupe", "question": "Compare signs"}
+        candidates = [
+            {
+                "plan_id": "plan_task_002_angle_001_visual_optional",
+                "task_id": "task_002",
+                "semantic_plan_task_id": "task_002",
+                "semantic_plan_hash": "b" * 64,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_001",
+                "route": "visual_optional",
+                "source_search_result_id": "src_page_1",
+            },
+            {
+                "plan_id": "plan_task_002_angle_001_visual_required",
+                "task_id": "task_002",
+                "semantic_plan_task_id": "task_002",
+                "semantic_plan_hash": "b" * 64,
+                "approved_delta_id": "base_plan",
+                "angle_id": "angle_001",
+                "route": "visual_optional",
+                "source_search_result_id": "src_page_2",
+            },
+        ]
+
+        plan = _page_visual_search_plan(
+            run_dir=run_dir,
+            evidence=evidence,
+            candidates=candidates,
+            provider_mode="real",
+            created_at="2026-07-12T00:00:00Z",
+            max_fetches=2,
+        )
+
+        task_ids = [task["semantic_plan_task_id"] for task in plan["tasks"]]
+        self.assertEqual(task_ids, ["task_002"])
+        self.assertEqual(
+            sorted(plan["tasks"][0]["source_search_result_ids"]),
+            ["src_page_1", "src_page_2"],
+        )
 
     def assert_no_fixture_sources(self, run_dir: Path) -> None:
         evidence = self.read_json(run_dir / "evidence.json")

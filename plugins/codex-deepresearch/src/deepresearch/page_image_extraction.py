@@ -1545,10 +1545,11 @@ def _visual_search_plan(
         if not task_id:
             continue
         semantic_task_id = _string(candidate.get("semantic_plan_task_id")) or task_id
-        key = (
-            str(candidate.get("plan_id")),
-            task_id,
-            str(candidate.get("angle_id")),
+        key = _visual_search_plan_task_key(
+            plan_id=_string(candidate.get("plan_id")),
+            task_id=task_id,
+            semantic_task_id=semantic_task_id,
+            angle_id=_string(candidate.get("angle_id")),
         )
         task = task_keys.setdefault(
             key,
@@ -1597,6 +1598,20 @@ def _visual_search_plan(
         payload,
         release_validation_identity_from_payload(evidence),
     )
+
+
+def _visual_search_plan_task_key(
+    *,
+    plan_id: str,
+    task_id: str,
+    semantic_task_id: str,
+    angle_id: str,
+) -> tuple[str, str, str]:
+    if semantic_task_id:
+        return ("semantic", semantic_task_id, "")
+    if task_id:
+        return ("task", task_id, angle_id)
+    return ("plan", plan_id, angle_id)
 
 
 def _visual_provider_status(
