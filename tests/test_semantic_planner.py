@@ -55,6 +55,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     write_semantic_planner_validation,
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
+    _repair_candidate_requirement_coverage,
     _semantic_adapter_command,
     _semantic_adapter_prompt,
     _semantic_substitute_implementation_check,
@@ -513,6 +514,62 @@ class SemanticPlannerTests(unittest.TestCase):
 
         self.assertTrue(diff["valid"], diff)
         self.assertEqual(diff["semantic_plan_hash"], stable_hash)
+
+    def test_requirement_coverage_repair_adds_visual_consistency_tasks(self) -> None:
+        candidate = {
+            "requirement_coverage_map": [
+                {
+                    "requirement_id": "req_004",
+                    "requirement_text": (
+                        "대한민국 공공건축을 잠정 범위로 삼고, 최신 유효 기준과 "
+                        "입찰 시점의 문서 버전을 구분하며, 필요한 경우 모델·도면의 "
+                        "시각 정합성을 선택적으로 검토한다."
+                    ),
+                    "requirement_type": "modality_geography_time_scope_filters",
+                    "non_negotiable": True,
+                    "coverage_status": "covered",
+                    "covered_by_angle_ids": ["angle_001"],
+                    "covered_by_task_ids": ["task_002"],
+                }
+            ],
+            "bounded_tasks": [
+                {
+                    "task_id": "task_002",
+                    "angle_id": "angle_001",
+                    "route": "text_only",
+                    "query": "건축 BIM 모델의 객체 분류와 속성 기준을 확인한다.",
+                    "expected_visual_targets": [],
+                },
+                {
+                    "task_id": "task_003",
+                    "angle_id": "angle_001",
+                    "route": "visual_optional",
+                    "query": "공공 설계 성과품에서 모델과 도면 사이의 정합성 점검 항목을 수집한다.",
+                    "expected_visual_targets": ["모델 뷰와 평면·입면·단면 대응"],
+                },
+                {
+                    "task_id": "task_016",
+                    "angle_id": "angle_004",
+                    "route": "visual_optional",
+                    "query": "제공 가능한 건축 모델 뷰와 도면을 사용해 시각 정합성 증거를 수집한다.",
+                    "expected_visual_targets": ["모델과 평면의 공간·벽체·개구부 대응"],
+                },
+            ],
+        }
+
+        repaired, materializations = _repair_candidate_requirement_coverage(candidate)
+
+        coverage = repaired["requirement_coverage_map"][0]
+        self.assertEqual(
+            set(coverage["covered_by_task_ids"]),
+            {"task_002", "task_003", "task_016"},
+        )
+        self.assertIn("angle_004", coverage["covered_by_angle_ids"])
+        self.assertEqual(materializations[0]["requirement_id"], "req_004")
+        self.assertEqual(
+            set(materializations[0]["added_task_ids"]),
+            {"task_003", "task_016"},
+        )
 
     def test_semantic_materialization_diff_excludes_zero_image_visual_helpers_from_visual_obligations(self) -> None:
         run_dir = self.write_semantic_materialization_fixture()

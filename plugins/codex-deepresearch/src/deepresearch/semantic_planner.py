@@ -790,6 +790,9 @@ def codex_semantic_candidate_plan(
                     original_question=original_question,
                 )
             )
+            candidate, requirement_coverage_repairs = (
+                _repair_candidate_requirement_coverage(candidate)
+            )
             if source_cap_normalizations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_source_cap_normalizations"] = (
@@ -804,6 +807,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_angle_title_materializations"] = (
                     angle_title_materializations
+                )
+            if requirement_coverage_repairs:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_requirement_coverage_repairs"] = (
+                    requirement_coverage_repairs
                 )
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
@@ -1476,6 +1484,186 @@ def _materialize_candidate_angle_title_prompt_anchors(
         normalized_angles.append(normalized_angle)
     normalized["angles"] = normalized_angles
     return normalized, materializations
+
+
+def _repair_candidate_requirement_coverage(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_coverage = normalized.get("requirement_coverage_map")
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_coverage, list) or not isinstance(raw_tasks, list):
+        return normalized, []
+    tasks = [task for task in raw_tasks if isinstance(task, Mapping)]
+    if not tasks:
+        return normalized, []
+
+    task_records = [
+        {
+            "task": task,
+            "task_id": str(task.get("task_id") or ""),
+            "angle_id": str(task.get("angle_id") or ""),
+            "tokens": _semantic_coverage_tokens(_semantic_coverage_task_text(task)),
+            "visual": _semantic_coverage_task_is_visual(task),
+        }
+        for task in tasks
+    ]
+    materializations: list[dict[str, Any]] = []
+    normalized_coverage: list[Any] = []
+    for index, coverage in enumerate(raw_coverage, start=1):
+        if not isinstance(coverage, Mapping):
+            normalized_coverage.append(coverage)
+            continue
+        repaired = dict(coverage)
+        requirement_text = _semantic_coverage_requirement_text(repaired)
+        requirement_tokens = _semantic_coverage_tokens(requirement_text)
+        if not requirement_tokens:
+            normalized_coverage.append(repaired)
+            continue
+        requirement_visual = _semantic_coverage_requirement_is_visual(
+            repaired,
+            requirement_text,
+        )
+        covered_task_ids = _string_list(repaired.get("covered_by_task_ids"))
+        covered_angle_ids = _string_list(repaired.get("covered_by_angle_ids"))
+        added_task_ids: list[str] = []
+        added_angle_ids: list[str] = []
+        for record in task_records:
+            task_id = record["task_id"]
+            if not task_id or task_id in covered_task_ids:
+                continue
+            overlap = requirement_tokens & record["tokens"]
+            if not _semantic_coverage_overlap_supports_task(
+                overlap=overlap,
+                requirement_visual=requirement_visual,
+                task_visual=bool(record["visual"]),
+            ):
+                continue
+            covered_task_ids.append(task_id)
+            added_task_ids.append(task_id)
+            angle_id = record["angle_id"]
+            if angle_id and angle_id not in covered_angle_ids:
+                covered_angle_ids.append(angle_id)
+                added_angle_ids.append(angle_id)
+        if added_task_ids:
+            repaired["covered_by_task_ids"] = covered_task_ids
+            repaired["covered_by_angle_ids"] = covered_angle_ids
+            repaired["coverage_status"] = repaired.get("coverage_status") or "covered"
+            materializations.append(
+                {
+                    "requirement_id": repaired.get("requirement_id")
+                    or f"req_{index:03d}",
+                    "field": "requirement_coverage_map.covered_by_task_ids",
+                    "materialization": "added_semantically_overlapping_tasks",
+                    "added_task_ids": added_task_ids,
+                    "added_angle_ids": added_angle_ids,
+                }
+            )
+        normalized_coverage.append(repaired)
+    normalized["requirement_coverage_map"] = normalized_coverage
+    return normalized, materializations
+
+
+def _semantic_coverage_requirement_text(requirement: Mapping[str, Any]) -> str:
+    return json.dumps(
+        [
+            requirement.get("prompt_text"),
+            requirement.get("requirement_text"),
+            requirement.get("requirement_type"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _semantic_coverage_task_text(task: Mapping[str, Any]) -> str:
+    return json.dumps(
+        [
+            task.get("query"),
+            task.get("route"),
+            task.get("expected_source_types"),
+            task.get("expected_visual_targets"),
+            task.get("expected_artifacts"),
+            task.get("success_criteria"),
+            task.get("done_condition"),
+            task.get("source_policy"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _semantic_coverage_tokens(text: str) -> set[str]:
+    return set(_semantic_release_meaningful_token_list(text)) - {
+        "any",
+        "covered",
+        "task",
+        "tasks",
+        "angle",
+        "angles",
+        "requirement",
+        "requirements",
+        "source",
+        "sources",
+        "근거",
+        "공식",
+        "자료",
+        "항목",
+        "기준",
+        "비교",
+    }
+
+
+def _semantic_coverage_requirement_is_visual(
+    requirement: Mapping[str, Any],
+    requirement_text: str,
+) -> bool:
+    requirement_type = str(requirement.get("requirement_type") or "").lower()
+    lowered = requirement_text.lower()
+    return (
+        "visual" in requirement_type
+        or "modality" in requirement_type
+        or any(
+            token in lowered
+            for token in (
+                "visual",
+                "image",
+                "model",
+                "drawing",
+                "diagram",
+                "screenshot",
+                "시각",
+                "이미지",
+                "모델",
+                "도면",
+                "정합성",
+            )
+        )
+    )
+
+
+def _semantic_coverage_task_is_visual(task: Mapping[str, Any]) -> bool:
+    if str(task.get("route") or "") != "text_only":
+        return True
+    if _string_list(task.get("expected_visual_targets")):
+        return True
+    max_images = _semantic_task_source_cap_int(task.get("max_images"))
+    if max_images is not None and max_images > 0:
+        return True
+    return False
+
+
+def _semantic_coverage_overlap_supports_task(
+    *,
+    overlap: set[str],
+    requirement_visual: bool,
+    task_visual: bool,
+) -> bool:
+    if len(overlap) >= 3:
+        return True
+    if requirement_visual and task_visual and len(overlap) >= 2:
+        return True
+    return False
 
 
 def _semantic_release_ordered_meaningful_token_records(text: str) -> list[dict[str, str]]:
