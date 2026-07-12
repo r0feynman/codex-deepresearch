@@ -46,6 +46,7 @@ from .search_handoff import (
     release_validation_identity_from_payload,
     resolve_run_dir,
 )
+from .semantic_planner import semantic_materialization_plan_hash_for_file
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
     VISUAL_ARTIFACT_SCHEMA_VERSION,
@@ -3499,7 +3500,9 @@ def _semantic_plan_bounded_tasks(plan_payload: Mapping[str, Any]) -> list[Mappin
 def _semantic_plan_hash(path: Path) -> str | None:
     if not path.exists():
         return None
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return semantic_materialization_plan_hash_for_file(path) or hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
 
 
 def _approved_delta_id_for_visual_materialization(run_dir: Path) -> str:

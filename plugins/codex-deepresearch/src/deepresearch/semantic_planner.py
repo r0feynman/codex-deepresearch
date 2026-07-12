@@ -121,6 +121,7 @@ SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
     "max_images",
 )
 SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX = "semantic_task_"
+SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD = "semantic_materialization_plan_hash"
 SEMANTIC_MATERIALIZATION_SEARCH_RESULT_ALIGNMENT_FIELD_MAP = {
     field: f"{SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX}{field}"
     for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS
@@ -6248,6 +6249,9 @@ def write_semantic_integrity_artifacts(
     oracle_payload.setdefault("schema_version", SEMANTIC_PLANNER_SCHEMA_VERSION)
     oracle_payload.setdefault("run_id", run_path.name)
     oracle_payload.setdefault("created_at", timestamp)
+    materialization_plan_hash = semantic_materialization_plan_hash_for_tasks(
+        plan.bounded_tasks
+    )
 
     artifacts = {
         SEMANTIC_EXPECTATION_ORACLE_FILENAME: oracle_payload,
@@ -6255,6 +6259,7 @@ def write_semantic_integrity_artifacts(
             **base,
             "artifact_type": "semantic_plan",
             "semantic_release_eligible": plan.semantic_release_eligible,
+            SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD: materialization_plan_hash,
             "semantic_plan": plan.to_dict(),
             "intent_summary": plan.intent_summary,
             "domain_entities": list(plan.domain_entities),
@@ -6415,7 +6420,10 @@ def build_semantic_materialization_diff(
     generated_at = created_at or _utc_now_from_run(run_path)
     plan_path = run_path / SEMANTIC_PLAN_FILENAME
     plan_artifact = _read_optional_json(plan_path)
-    plan_hash = _sha256_file(plan_path) if plan_path.exists() else None
+    plan_hash = semantic_materialization_plan_hash_for_artifact(
+        plan_artifact,
+        fallback_path=plan_path,
+    )
     semantic_plan = _semantic_plan_mapping(plan_artifact)
     bounded_tasks = _semantic_plan_bounded_tasks(semantic_plan, plan_artifact)
     plan_task_ids, duplicate_plan_task_ids = _semantic_task_ids_with_duplicates(
@@ -6794,6 +6802,62 @@ def _semantic_plan_bounded_tasks(
     ):
         candidates = list(plan_artifact.get("bounded_tasks") or [])
     return [task for task in candidates if isinstance(task, Mapping)]
+
+
+def semantic_materialization_plan_hash_for_tasks(
+    tasks: Sequence[Mapping[str, Any]],
+) -> str:
+    projected_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, Mapping):
+            continue
+        projected: dict[str, Any] = {
+            "task_id": str(task.get("task_id") or task.get("id") or ""),
+            "angle_id": str(task.get("angle_id") or ""),
+        }
+        for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
+            projected[field] = _canonical_json_value(task.get(field))
+        projected_tasks.append(projected)
+    payload = {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_materialization_plan_hash",
+        "bounded_tasks": projected_tasks,
+    }
+    return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+
+
+def _canonical_json_value(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True, ensure_ascii=True))
+
+
+def semantic_materialization_plan_hash_for_artifact(
+    plan_artifact: Any,
+    *,
+    fallback_path: Path | None = None,
+) -> str | None:
+    if isinstance(plan_artifact, Mapping):
+        value = plan_artifact.get(SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD)
+        if _is_sha256_hex(value):
+            return str(value)
+        semantic_plan = _semantic_plan_mapping(plan_artifact)
+        nested_value = semantic_plan.get(SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD)
+        if _is_sha256_hex(nested_value):
+            return str(nested_value)
+    if fallback_path is not None and fallback_path.exists():
+        return _sha256_file(fallback_path)
+    return None
+
+
+def semantic_materialization_plan_hash_for_file(path: Path) -> str | None:
+    payload = _read_optional_json(path)
+    return semantic_materialization_plan_hash_for_artifact(payload, fallback_path=path)
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
 def _semantic_task_ids_with_duplicates(

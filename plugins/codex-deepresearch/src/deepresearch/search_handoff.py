@@ -45,6 +45,7 @@ from .semantic_planner import (
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
     build_codex_semantic_raw_request,
     plan_semantic_angles,
+    semantic_materialization_plan_hash_for_file,
     semantic_plan_with_review_result,
     semantic_review_release_eligible,
     write_semantic_integrity_artifacts,
@@ -332,7 +333,10 @@ def prepare_run(
         locked_oracle=locked_oracle,
         semantic_review=semantic_review,
     )
-    accepted_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+    accepted_semantic_plan_hash = (
+        semantic_materialization_plan_hash_for_file(run_dir / SEMANTIC_PLAN_FILENAME)
+        or _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+    )
     _record_semantic_artifact_trace(
         run_dir,
         event_type="semantic_review_completed",
@@ -573,7 +577,10 @@ def prepare_run(
         locked_oracle=locked_oracle,
         semantic_review=semantic_review,
     )
-    final_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+    final_semantic_plan_hash = (
+        semantic_materialization_plan_hash_for_file(run_dir / SEMANTIC_PLAN_FILENAME)
+        or _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+    )
     _stamp_semantic_materialization_lineage(
         run_dir,
         semantic_plan_hash=final_semantic_plan_hash,
@@ -1901,7 +1908,7 @@ def _stamp_semantic_materialization_lineage(
         record["semantic_plan_hash"] = semantic_plan_hash
         record["approved_delta_id"] = str(record.get("approved_delta_id") or approved_delta_id)
 
-    for filename in ("search_tasks.json", "visual_tasks.json"):
+    for filename in ("search_tasks.json", "research_tasks.json", "visual_tasks.json"):
         path = run_dir / filename
         if not path.exists():
             continue

@@ -40,12 +40,14 @@ from deepresearch.semantic_planner import (  # noqa: E402
     SemanticAngle,
     SemanticPlan,
     SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
+    SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD,
     SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX,
     SemanticPlannerAdapterUnavailable,
     build_codex_semantic_raw_request,
     build_semantic_materialization_diff,
     heuristic_template_planner,
     question_mentions_visual_evidence,
+    semantic_materialization_plan_hash_for_tasks,
     semantic_planner_validation,
     validate_semantic_candidate_plan,
     validate_codex_semantic_adapter_provenance,
@@ -471,6 +473,46 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(diff["duplicate_semantic_task_ids"], [])
         self.assertEqual(diff["dropped_search_obligations"], [])
         self.assertEqual(diff["dropped_visual_obligations"], [])
+
+    def test_semantic_materialization_diff_uses_stable_plan_hash(self) -> None:
+        run_dir = self.write_semantic_materialization_fixture(visual=False)
+        plan = self.load_json(run_dir / "semantic_plan.json")
+        tasks = plan["semantic_plan"]["bounded_tasks"]
+        stable_hash = semantic_materialization_plan_hash_for_tasks(tasks)
+        plan[SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD] = stable_hash
+        self.write_json(run_dir / "semantic_plan.json", plan)
+
+        self.realign_semantic_materialization_fixture(run_dir)
+        for artifact_name in ("search_tasks.json", "research_tasks.json"):
+            payload = self.load_json(run_dir / artifact_name)
+            for record in payload["tasks"]:
+                record["semantic_plan_hash"] = stable_hash
+            self.write_json(run_dir / artifact_name, payload)
+        evidence = self.load_json(run_dir / "evidence.json")
+        for record in evidence["search_tasks"]:
+            record["semantic_plan_hash"] = stable_hash
+        self.write_json(run_dir / "evidence.json", evidence)
+        for artifact_name in ("search_results.jsonl", "subagent_assignments.jsonl"):
+            records = self.read_jsonl(run_dir / artifact_name)
+            for record in records:
+                record["semantic_plan_hash"] = stable_hash
+            self.write_jsonl(run_dir / artifact_name, records)
+
+        mutated_plan = self.load_json(run_dir / "semantic_plan.json")
+        mutated_plan["semantic_release_eligible"] = False
+        mutated_plan["semantic_planner_validation_ok"] = False
+        mutated_plan["semantic_planner_validation_failure_codes"] = [
+            "post_materialization_validation_failure"
+        ]
+        self.write_json(run_dir / "semantic_plan.json", mutated_plan)
+
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_downstream=True,
+        )
+
+        self.assertTrue(diff["valid"], diff)
+        self.assertEqual(diff["semantic_plan_hash"], stable_hash)
 
     def test_semantic_materialization_diff_excludes_zero_image_visual_helpers_from_visual_obligations(self) -> None:
         run_dir = self.write_semantic_materialization_fixture()
