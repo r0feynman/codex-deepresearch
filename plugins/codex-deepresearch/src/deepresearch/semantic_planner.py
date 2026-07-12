@@ -783,6 +783,12 @@ def codex_semantic_candidate_plan(
                     budget_cap=raw_request.get("budget_cap"),
                 )
             )
+            candidate, angle_title_materializations = (
+                _materialize_candidate_angle_title_prompt_anchors(
+                    candidate,
+                    original_question=original_question,
+                )
+            )
             if source_cap_normalizations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_source_cap_normalizations"] = (
@@ -792,6 +798,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_budget_cap_materializations"] = (
                     budget_cap_materializations
+                )
+            if angle_title_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_angle_title_materializations"] = (
+                    angle_title_materializations
                 )
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
@@ -1352,6 +1363,169 @@ def _candidate_constraints_mention_search_result_cap(
         rf"\b검색 결과\b[^0-9]{{0,80}}\b{max_results}\b",
     )
     return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _materialize_candidate_angle_title_prompt_anchors(
+    candidate: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Add prompt-specific anchors to shallow angle titles before validation.
+
+    This preserves the strict validator: the repaired candidate must still pass
+    the same release-depth checks. The materialization only edits a short title,
+    never the research question, route, scope, source policy, or bounded tasks.
+    """
+
+    normalized = copy.deepcopy(dict(candidate))
+    prompt_anchor_records = _semantic_release_ordered_meaningful_token_records(
+        original_question
+    )
+    prompt_tokens = [record["token"] for record in prompt_anchor_records]
+    if len(prompt_tokens) < SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS:
+        return normalized, []
+    raw_angles = normalized.get("angles")
+    if not isinstance(raw_angles, list):
+        return normalized, []
+
+    repairable_count = 0
+    mapping_angle_count = 0
+    for angle in raw_angles:
+        if not isinstance(angle, Mapping):
+            continue
+        mapping_angle_count += 1
+        title = str(angle.get("title") or "").strip()
+        research_question = str(angle.get("research_question") or "").strip()
+        if not title or not research_question:
+            continue
+        if _semantic_release_generic_or_original_text(title, original_question):
+            continue
+        combined_text = f"{title} {research_question}".strip()
+        if _semantic_release_placeholder_text(combined_text):
+            continue
+        overlap_tokens = (
+            set(_semantic_release_meaningful_token_list(combined_text))
+            & set(prompt_tokens)
+        )
+        if len(overlap_tokens) < SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS:
+            repairable_count += 1
+    if repairable_count > max(2, math.floor(mapping_angle_count * 0.4)):
+        return normalized, []
+
+    materializations: list[dict[str, Any]] = []
+    normalized_angles: list[Any] = []
+    for index, angle in enumerate(raw_angles, start=1):
+        if not isinstance(angle, Mapping):
+            normalized_angles.append(angle)
+            continue
+        normalized_angle = dict(angle)
+        title = str(normalized_angle.get("title") or "").strip()
+        research_question = str(normalized_angle.get("research_question") or "").strip()
+        if not title or not research_question:
+            normalized_angles.append(normalized_angle)
+            continue
+        if _semantic_release_generic_or_original_text(title, original_question):
+            normalized_angles.append(normalized_angle)
+            continue
+        combined_text = f"{title} {research_question}".strip()
+        if _semantic_release_placeholder_text(combined_text):
+            normalized_angles.append(normalized_angle)
+            continue
+        overlap_tokens = (
+            set(_semantic_release_meaningful_token_list(combined_text))
+            & set(prompt_tokens)
+        )
+        if len(overlap_tokens) >= SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS:
+            normalized_angles.append(normalized_angle)
+            continue
+
+        anchor_tokens = _semantic_release_angle_title_anchor_tokens(
+            prompt_tokens=prompt_tokens,
+            existing_overlap=overlap_tokens,
+        )
+        if len(set(anchor_tokens) | overlap_tokens) < SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS:
+            normalized_angles.append(normalized_angle)
+            continue
+        anchor_display_tokens = _semantic_release_anchor_display_tokens(
+            prompt_anchor_records=prompt_anchor_records,
+            anchor_tokens=anchor_tokens,
+        )
+        anchor_phrase = " ".join(anchor_display_tokens)
+        repaired_title = f"{anchor_phrase}: {title}"
+        if repaired_title == title:
+            normalized_angles.append(normalized_angle)
+            continue
+        normalized_angle["title"] = repaired_title
+        materializations.append(
+            {
+                "angle_id": normalized_angle.get("angle_id"),
+                "angle_index": index,
+                "field": "angles.title",
+                "previous_title": title,
+                "materialized_title": repaired_title,
+                "materialization": "prepended_prompt_anchor_tokens",
+                "previous_meaningful_overlap_count": len(overlap_tokens),
+                "minimum_meaningful_overlap": (
+                    SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS
+                ),
+                "anchor_tokens": anchor_tokens,
+                "anchor_display_tokens": anchor_display_tokens,
+            }
+        )
+        normalized_angles.append(normalized_angle)
+    normalized["angles"] = normalized_angles
+    return normalized, materializations
+
+
+def _semantic_release_ordered_meaningful_token_records(text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower()):
+        if _semantic_release_token_has_hangul(raw_token):
+            token = _normalize_korean_semantic_token(raw_token)
+            if len(token) < 2:
+                continue
+        elif len(raw_token) > 2:
+            token = raw_token
+        else:
+            continue
+        if token in SEMANTIC_RELEASE_GENERIC_TOKENS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        records.append({"token": token, "display": raw_token})
+    return records
+
+
+def _semantic_release_anchor_display_tokens(
+    *,
+    prompt_anchor_records: Sequence[Mapping[str, str]],
+    anchor_tokens: Sequence[str],
+) -> list[str]:
+    display_by_token = {
+        str(record.get("token")): str(record.get("display"))
+        for record in prompt_anchor_records
+    }
+    return [display_by_token.get(token, token) for token in anchor_tokens]
+
+
+def _semantic_release_angle_title_anchor_tokens(
+    *,
+    prompt_tokens: Sequence[str],
+    existing_overlap: set[str],
+) -> list[str]:
+    anchors: list[str] = []
+    for token in prompt_tokens:
+        if token in anchors:
+            continue
+        anchors.append(token)
+        if len(set(anchors) | existing_overlap) >= max(
+            SEMANTIC_RELEASE_MIN_ANGLE_OVERLAP_TOKENS,
+            min(3, len(prompt_tokens)),
+        ):
+            break
+    return anchors
 
 
 def _candidate_task_min_executable_sources(
@@ -2251,6 +2425,10 @@ def _semantic_adapter_prompt(role_label: str) -> str:
             "max_sources as an integer from 1 to 5. Text-only tasks must have max_images=0. "
             "Visual-required or visual-optional tasks must have max_images from 1 to 3 and "
             "non-empty expected_visual_targets. "
+            "Every angle title plus research_question must be prompt-specific and share at least "
+            "2 meaningful non-generic domain/source/comparison tokens with the original question; "
+            "avoid generic labels such as comparison, implications, latestness, or limitations "
+            "unless the title also names the user's actual domain entities. "
             f"{_text_only_visual_contract_instruction()} "
             "Do not copy angle titles as task queries. Make "
             "every task executable with source policy, concrete success criteria, expected artifacts, "
@@ -4696,6 +4874,7 @@ def _codex_semantic_raw_request(
         "Preserve every explicit requirement and justified inferred constraint.",
         "Create bounded executable research tasks with source, visual, and done-condition fields.",
         "Materialize budget_cap.max_results as a search result cap in plan constraints and bounded_tasks.max_results.",
+        "Every angle title plus research_question must be prompt-specific and share at least 2 meaningful non-generic domain/source/comparison tokens with the original question.",
         "Do not use hidden template classes, fixed domain menus, canned task lists, or copied angle titles.",
     ]
     if normalized_visual_preference == "text_only":

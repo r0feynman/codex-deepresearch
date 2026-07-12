@@ -2418,6 +2418,7 @@ class SemanticPlannerTests(unittest.TestCase):
             self.assertIn("route=text_only", contract_text)
             self.assertIn("max_images=0", contract_text)
             self.assertIn("expected_visual_targets=[]", contract_text)
+            self.assertIn("at least 2 meaningful non-generic", contract_text)
             for forbidden_visual_work in (
                 "no image",
                 "chart",
@@ -3992,7 +3993,7 @@ class SemanticPlannerTests(unittest.TestCase):
             attempts["count"] += 1
             response = json.loads(json.dumps(response))
             if attempts["count"] == 1:
-                response["candidate_plan"]["angles"][3]["title"] = "Homeowner Actionability"
+                response["candidate_plan"]["angles"][3]["title"] = question
                 response["candidate_plan"]["angles"][3]["research_question"] = (
                     "Which modality better helps homeowners decide what to do?"
                 )
@@ -4024,6 +4025,83 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("at least 2 meaningful non-generic tokens", instructions)
         self.assertIn("subject, modality, source-quality, geography/time", instructions)
         self.assertTrue(result["semantic_release_eligible"], result)
+
+    def test_codex_semantic_materializes_shallow_angle_titles_with_prompt_anchors(self) -> None:
+        question = "국내 개인정보 영향평가 제도와 해외 규제기관 가이드를 비교해줘."
+
+        def sem_reg_006_style_shallow_titles(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            response["candidate_plan"]["angles"][3]["title"] = (
+                "동일 비교축에 따른 제도 대조"
+            )
+            response["candidate_plan"]["angles"][3]["research_question"] = (
+                "선정 관할들은 법적 지위, 발동 요건, 평가 과정, 참여, "
+                "감독기관 관여, 투명성 및 사후관리 측면에서 어떤 공통점과 "
+                "차이를 보이는가?"
+            )
+            response["candidate_plan"]["angles"][4]["title"] = (
+                "최신성·한계 검증과 국내 실무 시사점"
+            )
+            response["candidate_plan"]["angles"][4]["research_question"] = (
+                "비교 결과에서 확인되는 최신 개정, 상충, 적용 한계는 "
+                "무엇이며 국내 공공·민간 실무에 어떤 신중한 시사점을 "
+                "도출할 수 있는가?"
+            )
+            return response
+
+        raw_candidate = self.codex_adapter_response(
+            build_codex_semantic_raw_request(question=question),
+            requirement_types=("subject", "source_quality"),
+        )
+        raw_candidate = sem_reg_006_style_shallow_titles(raw_candidate)
+        raw_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=raw_candidate["candidate_plan"],
+        )
+        self.assertFalse(raw_validation["ok"], raw_validation)
+        self.assertIn(
+            "semantic_angle_release_depth_failed",
+            {failure["code"] for failure in raw_validation["failures"]},
+        )
+
+        result, raw_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=sem_reg_006_style_shallow_titles,
+            requirement_types=("subject", "source_quality"),
+        )
+        run_dir = Path(result["run_dir"])
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+        repaired_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=semantic_plan,
+        )
+
+        self.assertEqual(raw_request["budget_cap"]["max_results"], 8)
+        self.assertTrue(result["semantic_release_eligible"], result)
+        self.assertTrue(repaired_validation["ok"], repaired_validation)
+        materializations = raw_response[
+            "candidate_plan_angle_title_materializations"
+        ]
+        self.assertEqual(
+            [item["angle_id"] for item in materializations],
+            ["angle_004", "angle_005"],
+        )
+        self.assertIn("국내 개인정보", materializations[0]["materialized_title"])
+        self.assertIn("국내 개인정보 영향평가", materializations[1]["materialized_title"])
+        self.assertEqual(
+            materializations[0]["materialization"],
+            "prepended_prompt_anchor_tokens",
+        )
+        failure_codes = {
+            failure["code"] for failure in repaired_validation["failures"]
+        }
+        self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
 
     def test_codex_semantic_retry_instructions_include_duplicate_angle_repair_hint(self) -> None:
         question = (
