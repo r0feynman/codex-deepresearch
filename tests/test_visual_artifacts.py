@@ -27,6 +27,7 @@ from deepresearch.visual_artifacts import (  # noqa: E402
     validate_visual_artifacts,
     visual_failure_code_for_minimums,
     visual_minimum_diagnostics,
+    visual_minimums_for_run,
     visual_release_minimums,
 )
 
@@ -206,6 +207,60 @@ class VisualArtifactTests(unittest.TestCase):
         support = included_claim["visual_supports"][0]
         image = image_by_id[support["image_id"]]
         self.assert_lineage(support, image)
+
+    def test_visual_minimums_detect_visual_required_from_plan_artifact(self) -> None:
+        run_dir = self.temp_dir()
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "schema_version": "0.1.0",
+                "run_id": run_dir.name,
+                "question": "Inspect plan-bound visual work",
+                "routing": [{"id": "angle_001", "modality": "text_only"}],
+                "sources": [],
+                "images": [],
+                "claims": [],
+            },
+        )
+        self.write_json(
+            run_dir / VISUAL_SEARCH_PLAN_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": "2026-07-12T00:00:00Z",
+                "tasks": [
+                    {
+                        "plan_id": "plan_task_016_angle_004_visual_required",
+                        "task_id": "task_016",
+                        "semantic_plan_task_id": "task_016",
+                        "angle_id": "angle_004",
+                        "route": "visual_required",
+                        "target_evidence_type": "web_image",
+                        "query": "visual consistency",
+                        "providers": ["child-discovered-image-url"],
+                        "source_search_result_ids": [],
+                        "caps": {
+                            "max_candidates": 10,
+                            "max_fetches": 3,
+                            "max_vlm_images": 3,
+                            "max_cost_usd": 0.0,
+                        },
+                        "policy_constraints": {"policy_decision": "allowed"},
+                        "estimated_cost_usd": 0.0,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, [])
+        self.write_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME, [])
+        self.write_jsonl(run_dir / "visual_observations.jsonl", [])
+
+        minimums = visual_minimums_for_run(run_dir)
+
+        self.assertEqual(minimums["required_vlm_images"], 3)
+        self.assertFalse(minimums["satisfied"])
+        self.assertEqual(minimums["shortfall_reason"], "insufficient_candidates")
 
     def test_multi_angle_visual_lineage_reports_specific_error_classes(self) -> None:
         cases = {

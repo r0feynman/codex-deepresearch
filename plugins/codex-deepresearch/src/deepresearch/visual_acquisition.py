@@ -3551,7 +3551,7 @@ def _apply_semantic_task_lineage_to_visual_record(
         record["approved_delta_id"] = "base_plan"
     angle_id = _string(record.get("angle_id"))
     route = _string(record.get("route"))
-    if semantic_task_id and angle_id and route and not _string(record.get("plan_id")):
+    if semantic_task_id and angle_id and route:
         record["plan_id"] = _plan_id_for_visual_task(
             task_id=semantic_task_id,
             angle_id=angle_id,

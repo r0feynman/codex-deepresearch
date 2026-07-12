@@ -274,6 +274,74 @@ class VisualAcquisitionTests(unittest.TestCase):
             ["src_child", "src_page"],
         )
 
+    def test_release_visible_records_recompute_plan_id_after_route_lineage(self) -> None:
+        run_dir = self.temp_runs_dir()
+        evidence = {
+            "run_id": run_dir.name,
+            "question": "Inspect visual consistency",
+            "prompt_id": "sem-reg-plan-route",
+            "suite_id": "semantic-release-validation",
+            "prompt_hash": "hash-plan-route",
+            "original_question": "Inspect visual consistency",
+            "images": [],
+            "claims": [],
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "semantic_materialization_plan_hash": "stable-plan-hash",
+                "semantic_plan": {
+                    "bounded_tasks": [
+                        {
+                            "id": "task_016",
+                            "angle_id": "angle_004",
+                            "route": "visual_required",
+                            "query": "Inspect drawing consistency",
+                            "max_images": 3,
+                        }
+                    ]
+                },
+            },
+        )
+        record = {
+            "candidate_id": "cand_page_001",
+            "plan_id": "plan_task_016_angle_004_visual_optional",
+            "task_id": "task_016",
+            "semantic_plan_task_id": "task_016",
+            "angle_id": "angle_004",
+            "route": "visual_optional",
+            "provider": "page-image-extractor",
+            "provider_kind": "page_extractor",
+            "provider_mode": "real",
+            "provider_run_id": "page-image-extractor:test",
+            "provider_provenance": {
+                "provider": "page-image-extractor",
+                "provider_kind": "page_extractor",
+                "provider_mode": "real",
+            },
+            "origin": "page_image",
+            "page_url": "https://example.test/page",
+            "image_url": "https://example.test/image.png",
+            "rank": 1,
+            "score": 1.0,
+            "policy_decision": "allowed",
+            "policy_flags": [],
+            "candidate_status": "fetched",
+            "rejection_reason": None,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+        }
+
+        [visible] = _release_visible_visual_records_if_needed(run_dir, evidence, [record])
+
+        self.assertEqual(visible["route"], "visual_required")
+        self.assertEqual(
+            visible["plan_id"],
+            "plan_task_016_angle_004_visual_required",
+        )
+
     def test_page_visual_search_plan_dedupes_by_semantic_task_id(self) -> None:
         run_dir = self.temp_runs_dir()
         evidence = {"run_id": "run_page_plan_dedupe", "question": "Compare signs"}

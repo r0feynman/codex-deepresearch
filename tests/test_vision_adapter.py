@@ -4052,6 +4052,55 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(minimums["fetched_artifacts"], 3)
         self.assertEqual(minimums["vlm_images_analyzed"], 3)
 
+    def test_codex_interactive_supplemental_tasks_use_visual_plan_minimum(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+        self.append_codex_vlm_handoff_artifact(run_dir, 3)
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["routing"] = [{"id": "angle_001", "modality": "text_only"}]
+        self.write_json(run_dir / "evidence.json", evidence)
+        metadata_only_records = [
+            {
+                "id": "img_checkout_001",
+                "image_id": "img_checkout_001",
+                "evidence_image_id": "img_checkout_001",
+                "source_id": "src_checkout",
+                "origin": "screenshot",
+                "local_artifact_path": "images/img_checkout_001.json",
+                "mime_type": "image/png",
+                "candidate_id": "cand_checkout_001",
+                "fetch_id": "fetch_checkout_001",
+                "plan_id": "plan_task_visual_001",
+                "task_id": "task_visual_001",
+                "angle_id": "angle_001",
+                "route": "visual_required",
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "observation_status": "analyzed",
+                "observations": ["Metadata-only child observation."],
+                "caveats": ["metadata-only visual record; no local image artifact was provided"],
+            }
+        ]
+
+        minimums = visual_minimums_for_run(run_dir)
+        tasks = _codex_interactive_supplemental_vision_tasks(
+            run_dir=run_dir,
+            evidence=evidence,
+            records=metadata_only_records,
+            codex_config={"max_images": 2},
+            provider_mode="real",
+        )
+
+        self.assertEqual(minimums["required_vlm_images"], 3)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(
+            {task["evidence_image_id"] for task in tasks},
+            {"img_checkout_001", "img_checkout_002"},
+        )
+
     def test_codex_interactive_drops_invalid_child_observations_when_supplemented(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
         self.write_codex_vlm_handoff(run_dir)
