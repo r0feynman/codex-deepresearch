@@ -273,7 +273,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("Write claim text, caveats, rationales, and synthesized source snippets in English", command[-1])
         self.assertIn("Every source must include a non-empty `local_artifact_path`", command[-1])
         self.assertIn("Verifier vote `method` must be one of", command[-1])
-        self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", command[-1])
+        self.assertIn("`evidence_refs` must be non-empty and reference only source or image IDs present in the same shard", command[-1])
 
         visual_task = dict(task)
         visual_task["route"] = "visual_required"
@@ -336,7 +336,7 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertIn("`text` for source/quote-backed claims", prompt)
         self.assertIn("`policy` for policy/guardrail claims", prompt)
         self.assertIn("`freshness` for recency/currentness claims", prompt)
-        self.assertIn("`evidence_refs` must reference only source or image IDs present in the same shard", prompt)
+        self.assertIn("`evidence_refs` must be non-empty and reference only source or image IDs present in the same shard", prompt)
 
     def test_codex_exec_adapter_release_prompt_requires_release_search_handoff_schema_fields(self) -> None:
         prepared = prepare_run(
@@ -2247,6 +2247,106 @@ class ParallelOrchestratorTests(unittest.TestCase):
         handoff = merge["codex_native_visual_handoff"]
         self.assertEqual(handoff["verifier_vote_records"], 0)
         self.assertEqual(handoff["verifier_vote_rejections"][0]["reason"], "invalid_method")
+        evidence = self.load_json(run_dir / "evidence.json")
+        self.assertEqual(evidence["claims"], [])
+
+    def test_release_visual_merge_rejects_empty_ref_child_visual_verifier_vote(self) -> None:
+        prepared = prepare_run(
+            question="Release validation empty-ref child verifier vote fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="visual_required",
+            prompt_id="pb-visual-empty-ref-verifier",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        task["route"] = "visual_required"
+        task["max_images"] = 1
+
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        shard = self.shard(run_dir, task)
+        image = shard["images"][0]
+        claim = shard["claims"][0]
+        self.write_json(shard_path, shard)
+        self.write_jsonl(
+            shard_path.parent / "search_results.jsonl",
+            [self.release_search_result(task)],
+        )
+        self.write_jsonl(
+            shard_path.parent / "visual_observations.jsonl",
+            [
+                {
+                    "observation_id": f"obs_{task['id']}_visual_001",
+                    "image_id": image["id"],
+                    "evidence_image_id": image["id"],
+                    "candidate_id": f"child_candidate_{image['id']}",
+                    "fetch_id": f"child_fetch_{image['id']}",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "analysis_provider": "codex-interactive",
+                    "codex_interactive_handoff": True,
+                    "handoff_artifact": "visual_observations.jsonl",
+                    "observation_status": "analyzed",
+                    "observations": ["A visible fixture image."],
+                    "inferences": ["The image supports the claim."],
+                    "policy_decision": "allowed",
+                    "provider_provenance": {
+                        "provider": "codex-interactive",
+                        "provider_kind": "vlm",
+                        "provider_mode": "real",
+                        "codex_interactive_handoff": True,
+                        "handoff_artifact": "visual_observations.jsonl",
+                        "external_vlm_call": False,
+                    },
+                }
+            ],
+        )
+        self.write_jsonl(
+            shard_path.parent / "verifier_votes.jsonl",
+            [
+                {
+                    "id": f"vote_{task['id']}_empty_refs",
+                    "claim_id": claim["id"],
+                    "verifier_type": "visual",
+                    "agent_name": "issue-133-child-verifier",
+                    "method": "runner-agent",
+                    "model_or_tool": "codex-exec-child",
+                    "vote": "support",
+                    "confidence": 0.91,
+                    "evidence_refs": [],
+                    "rationale": "The child visual observation lacks linked evidence refs.",
+                    "created_at": "2026-06-23T00:00:00Z",
+                }
+            ],
+        )
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(merge["accepted_shards"], [])
+        failed_task = merge["failed_tasks"][0]
+        self.assertEqual(failed_task["failure_category"], "invalid_release_visual_handoff")
+        self.assertEqual(
+            failed_task["child_failure_code"],
+            "codex_child_release_handoff_invalid",
+        )
+        self.assertIn("evidence_refs_empty", failed_task["diagnostic"])
+        validation = failed_task["release_visual_handoff_validation"]
+        self.assertEqual(validation["reason"], "child_verifier_votes_invalid")
+        self.assertEqual(validation["rejections"][0]["reason"], "evidence_refs_empty")
+        handoff = merge["codex_native_visual_handoff"]
+        self.assertEqual(handoff["verifier_vote_records"], 0)
+        self.assertEqual(
+            handoff["verifier_vote_rejections"][0]["reason"],
+            "evidence_refs_empty",
+        )
         evidence = self.load_json(run_dir / "evidence.json")
         self.assertEqual(evidence["claims"], [])
 

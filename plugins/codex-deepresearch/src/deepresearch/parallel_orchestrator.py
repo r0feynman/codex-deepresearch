@@ -2656,6 +2656,8 @@ def _release_validation_child_verifier_vote_invalid_reason(
     evidence_refs = vote.get("evidence_refs")
     if not isinstance(evidence_refs, list):
         return "evidence_refs_missing"
+    if not evidence_refs:
+        return "evidence_refs_empty"
     for evidence_ref in evidence_refs:
         if not isinstance(evidence_ref, str) or not evidence_ref:
             return "invalid_evidence_ref"
@@ -7379,7 +7381,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "`verifier_type` must be one of `text`, `visual`, `policy`, or `freshness`; use `visual` "
             "for image/VLM-backed claims, `text` for source/quote-backed claims, `policy` for "
             "policy/guardrail claims, and `freshness` for recency/currentness claims. "
-            "`evidence_refs` must reference only source or image IDs present in the same shard. "
+            "`evidence_refs` must be non-empty and reference only source or image IDs present in the same shard. "
         )
     retry_feedback = _child_visual_handoff_retry_feedback(task)
     # Child shard contract: the parent accepts only Evidence Schema v0 envelopes
@@ -7411,7 +7413,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
         "Verifier vote `method` must be one of `codex-subagent`, `runner-agent`, `model-call`, or `manual-review`; "
         "`vote` must be one of `support`, `refute`, `uncertain`, or `blocked`; "
-        "`evidence_refs` must reference only source or image IDs present in the same shard. "
+        "`evidence_refs` must be non-empty and reference only source or image IDs present in the same shard. "
         f"Write per-task search results exactly to {search_results_path}. "
         f"Write visual observations exactly to {visual_observations_path} when applicable. "
         f"Write verifier votes exactly to {verifier_votes_path} when applicable. "
