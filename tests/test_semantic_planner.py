@@ -4810,6 +4810,13 @@ class SemanticPlannerTests(unittest.TestCase):
                 task["done_condition"] = "Stop after one source-backed note is recorded."
                 if task["task_id"] in multi_source_tasks:
                     task.update(multi_source_tasks[task["task_id"]])
+            response["candidate_plan"]["constraints"] = [
+                *response["candidate_plan"].get("constraints", []),
+                (
+                    "Overall source budget is 20 and each bounded task max_sources "
+                    "must remain 1 to force reuse."
+                ),
+            ]
             return response
 
         result, _adapter_request = self.prepare_with_codex_adapter(
@@ -4828,11 +4835,21 @@ class SemanticPlannerTests(unittest.TestCase):
         search_by_id = {task["task_id"]: task for task in search_tasks}
 
         self.assertIn("candidate_plan_source_cap_normalizations", raw_response)
+        self.assertIn(
+            "candidate_plan_source_cap_constraint_materializations",
+            raw_response,
+        )
         normalized_ids = {
             record["task_id"]
             for record in raw_response["candidate_plan_source_cap_normalizations"]
         }
         self.assertTrue(set(multi_source_tasks).issubset(normalized_ids))
+        constraints_text = json.dumps(
+            semantic_plan["constraints"],
+            ensure_ascii=False,
+        )
+        self.assertIn("bounded_tasks.max_sources is authoritative", constraints_text)
+        self.assertNotIn("must remain 1", constraints_text)
         for task in semantic_plan["bounded_tasks"]:
             self.assertGreaterEqual(task["max_sources"], 1)
             self.assertLessEqual(task["max_sources"], 5)

@@ -778,6 +778,12 @@ def codex_semantic_candidate_plan(
             candidate, source_cap_normalizations = (
                 _normalize_candidate_executable_source_caps(candidate)
             )
+            candidate, source_cap_constraint_materializations = (
+                _materialize_candidate_source_cap_constraints(
+                    candidate,
+                    source_cap_normalizations=source_cap_normalizations,
+                )
+            )
             candidate, budget_cap_materializations = (
                 _materialize_candidate_budget_caps(
                     candidate,
@@ -798,6 +804,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan_source_cap_normalizations"] = (
                     source_cap_normalizations
                 )
+            if source_cap_constraint_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response[
+                    "candidate_plan_source_cap_constraint_materializations"
+                ] = source_cap_constraint_materializations
             if budget_cap_materializations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_budget_cap_materializations"] = (
@@ -1274,6 +1285,108 @@ def _normalize_candidate_executable_source_caps(
         normalized_tasks.append(normalized_task)
     normalized["bounded_tasks"] = normalized_tasks
     return normalized, normalizations
+
+
+def _materialize_candidate_source_cap_constraints(
+    candidate: Mapping[str, Any],
+    *,
+    source_cap_normalizations: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not source_cap_normalizations:
+        return copy.deepcopy(dict(candidate)), []
+    normalized = copy.deepcopy(dict(candidate))
+    raw_constraints = normalized.get("constraints")
+    if not isinstance(raw_constraints, list):
+        return normalized, []
+
+    tasks = [
+        task
+        for task in normalized.get("bounded_tasks") or []
+        if isinstance(task, Mapping)
+    ]
+    caps = [
+        cap
+        for cap in (
+            _semantic_task_source_cap_int(task.get("max_sources"))
+            for task in tasks
+        )
+        if cap is not None
+    ]
+    if not caps:
+        return normalized, []
+
+    kept_constraints: list[Any] = []
+    removed_constraints: list[str] = []
+    for constraint in raw_constraints:
+        if _candidate_source_cap_constraint_conflicts_with_normalization(
+            constraint,
+            normalized_caps=caps,
+        ):
+            removed_constraints.append(str(constraint))
+            continue
+        kept_constraints.append(constraint)
+
+    if not removed_constraints:
+        return normalized, []
+
+    min_cap = min(caps)
+    max_cap = max(caps)
+    replacement = (
+        "Executable source caps are task-specific: bounded_tasks.max_sources "
+        f"is authoritative after source-cap normalization and ranges from "
+        f"{min_cap} to {max_cap}. Earlier single-source per-task caps must not "
+        "override tasks that require multiple official, freshness, or "
+        "contradiction-check sources."
+    )
+    kept_constraints.append(replacement)
+    normalized["constraints"] = kept_constraints
+    return normalized, [
+        {
+            "field": "constraints",
+            "materialization": "replaced_stale_source_cap_constraint",
+            "removed_constraints": removed_constraints,
+            "normalized_min_sources": min_cap,
+            "normalized_max_sources": max_cap,
+            "normalized_task_count": len(source_cap_normalizations),
+            "replacement_constraint": replacement,
+        }
+    ]
+
+
+def _candidate_source_cap_constraint_conflicts_with_normalization(
+    constraint: Any,
+    *,
+    normalized_caps: Sequence[int],
+) -> bool:
+    text = str(constraint)
+    lowered = text.lower()
+    max_normalized_cap = max(normalized_caps) if normalized_caps else 1
+    if max_normalized_cap <= 1:
+        return False
+    mentions_source_cap = (
+        "max_sources" in lowered
+        or "source cap" in lowered
+        or "source budget" in lowered
+        or "per-task source" in lowered
+        or "출처 예산" in text
+        or ("출처" in text and "제한" in text)
+        or ("출처" in text and "최대" in text)
+    )
+    if not mentions_source_cap:
+        return False
+    single_source_patterns = (
+        r"\bmax_sources\b[^0-9]{0,80}\b1\b",
+        r"\b1\b[^0-9]{0,80}\bmax_sources\b",
+        r"\bper[- ]?task\b[^0-9]{0,80}\b1\b",
+        r"\beach\b[^0-9]{0,80}\btask\b[^0-9]{0,80}\b1\b",
+        r"\bsingle[- ]?source\b",
+        r"각\s*bounded\s*task[^0-9]{0,80}1",
+        r"max_sources[^0-9]{0,80}1",
+    )
+    return any(
+        re.search(pattern, lowered if pattern.isascii() else text)
+        for pattern in single_source_patterns
+    )
 
 
 def _semantic_task_source_cap_int(value: Any) -> int | None:
