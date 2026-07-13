@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 import shutil
 import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,7 +31,13 @@ from .search_handoff import (
     prepare_run,
     release_validation_identity_from_payload,
 )
-from .semantic_planner import BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+from .semantic_planner import (
+    BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+    CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV,
+    SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+    SEMANTIC_PLAN_FILENAME,
+    build_semantic_materialization_diff,
+)
 from .trace import TRACE_SCHEMA_VERSION, append_trace_record, trace_path
 from .verification_matrix import VerificationMatrixError, verify_claims
 from .visual_acquisition import VisualAcquisitionError, acquire_visual_candidates
@@ -66,6 +75,7 @@ DEFAULT_AUTOMATIC_VISUAL_PROVIDERS = (
 )
 MIN_COMPLETED_AUTO_VISUAL_CANDIDATES = 10
 MIN_COMPLETED_AUTO_VISUAL_VLM_IMAGES = 3
+_BLOCKED_SEMANTIC_STATUS_PREFIX = "blocked_semantic_"
 
 _QUICK_CHAT_MARKERS = (
     "quick answer",
@@ -74,6 +84,21 @@ _QUICK_CHAT_MARKERS = (
     "chat only",
     "chat-only",
 )
+
+
+@contextmanager
+def _default_semantic_adapter_enabled():
+    previous = os.environ.get(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV)
+    os.environ[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV, None)
+        else:
+            os.environ[CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV] = previous
+
+
 _FULL_RUNNER_INTENT_MARKERS = (
     "instead run full pipeline",
     "instead run the full pipeline",
@@ -261,35 +286,41 @@ def run_skill_invocation(
         return preflight
 
     try:
-        prepared = prepare_run(
-            question=question,
-            runs_dir=Path(runs_dir),
-            mode="codex-plugin",
-            search_provider="codex-native",
-            budget_preset=budget_preset,
-            route=route,
-            angles=angles,
-            max_results=max_results,
-            max_sources=max_sources,
-            max_images=max_images,
-            max_subagents=max_subagents,
-            max_agents=max_agents,
-            max_cost_usd=max_cost_usd,
-            codex_runner="codex-exec",
-            confirm_budget=confirm_budget,
-            prompt_id=release_identity.get("prompt_id"),
-            suite_id=release_identity.get("suite_id"),
-            prompt_hash=release_identity.get("prompt_hash"),
-            original_question=release_identity.get("original_question"),
-            manifest_oracle_hash=release_identity.get("manifest_oracle_hash"),
-            manifest_oracle_path=release_identity.get("manifest_oracle_path"),
-            manifest_oracle_fragment_id=release_identity.get(
-                "manifest_oracle_fragment_id"
-            ),
-            _allow_release_ineligible_materialization_for_tests=(
-                _allow_release_ineligible_materialization_for_tests
-            ),
+        semantic_adapter_context = (
+            _default_semantic_adapter_enabled()
+            if angles is None and adapter_name != "fixture"
+            else nullcontext()
         )
+        with semantic_adapter_context:
+            prepared = prepare_run(
+                question=question,
+                runs_dir=Path(runs_dir),
+                mode="codex-plugin",
+                search_provider="codex-native",
+                budget_preset=budget_preset,
+                route=route,
+                angles=angles,
+                max_results=max_results,
+                max_sources=max_sources,
+                max_images=max_images,
+                max_subagents=max_subagents,
+                max_agents=max_agents,
+                max_cost_usd=max_cost_usd,
+                codex_runner="codex-exec",
+                confirm_budget=confirm_budget,
+                prompt_id=release_identity.get("prompt_id"),
+                suite_id=release_identity.get("suite_id"),
+                prompt_hash=release_identity.get("prompt_hash"),
+                original_question=release_identity.get("original_question"),
+                manifest_oracle_hash=release_identity.get("manifest_oracle_hash"),
+                manifest_oracle_path=release_identity.get("manifest_oracle_path"),
+                manifest_oracle_fragment_id=release_identity.get(
+                    "manifest_oracle_fragment_id"
+                ),
+                _allow_release_ineligible_materialization_for_tests=(
+                    _allow_release_ineligible_materialization_for_tests
+                ),
+            )
     except (BudgetEstimateError, ConfigResolutionError, SearchHandoffError, OSError) as exc:
         return _blocked_preflight_with_status_dir(
             invocation=normalized_invocation,
@@ -299,29 +330,38 @@ def run_skill_invocation(
         )
 
     run_dir = Path(prepared["run_dir"])
-    if prepared.get("status") == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+    prepared_status = str(prepared.get("status") or "")
+    if _is_blocked_semantic_prepare_status(prepared_status):
+        prepared_diagnostics = prepared.get("diagnostics")
+        diagnostics = (
+            dict(prepared_diagnostics)
+            if isinstance(prepared_diagnostics, Mapping)
+            else {}
+        )
+        semantic_diagnostic = diagnostics.get("semantic_planning")
+        actionable_cause = semantic_diagnostic or (
+            "Codex-native semantic planner is unavailable."
+            if prepared_status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+            else f"Semantic planning stopped with terminal status {prepared_status}."
+        )
+        diagnostics["actionable_cause"] = str(actionable_cause)
         status = _base_run_status(
             invocation=normalized_invocation,
             question=question,
             selected_mode="blocked",
             run_dir=run_dir,
-            status=BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+            status=prepared_status,
             ok=False,
             terminal=True,
             provenance={
-                "type": BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE,
+                "type": prepared_status,
                 "adapter": adapter_name,
                 "fixture_only": False,
                 "manual_handoff": False,
                 "real_child_execution": False,
                 "real_use_e2e_eligible": False,
             },
-            diagnostics={
-                "actionable_cause": prepared.get("diagnostics", {}).get(
-                    "semantic_planning",
-                    "Codex-native semantic planner is unavailable.",
-                )
-            },
+            diagnostics=diagnostics,
             artifacts=_artifact_paths(run_dir, prepared.get("artifacts")),
         )
         if isinstance(prepared.get("semantic_planning"), Mapping):
@@ -587,6 +627,10 @@ def run_skill_invocation(
         )
         status["visual_summary"] = _visual_summary(run_dir)
     return _write_run_status(run_dir, status)
+
+
+def _is_blocked_semantic_prepare_status(status: str) -> bool:
+    return status.startswith(_BLOCKED_SEMANTIC_STATUS_PREFIX)
 
 
 def select_invocation_mode(
@@ -1460,6 +1504,7 @@ def _completed_auto_visual_release_gate(
         observations=observations,
         visual_provider_status=provider_status,
     )
+    semantic_materialization = _semantic_materialization_release_gate(run_dir)
     failures: list[str] = []
     if counts["real_candidates"] < MIN_COMPLETED_AUTO_VISUAL_CANDIDATES:
         failures.append(
@@ -1469,11 +1514,14 @@ def _completed_auto_visual_release_gate(
         failures.append("at_least_3_codex_interactive_real_analyzed_images")
     if minimums["report_cited_images"] < 1:
         failures.append("report_cited_supported_real_visual_or_mixed_claim")
+    if semantic_materialization.get("applicable") is True and semantic_materialization.get("valid") is not True:
+        failures.append("semantic_materialization_diff_valid")
     diagnostics = _visual_release_gate_diagnostics(
         {
             "valid": not failures,
             "failures": failures,
             "minimums": minimums,
+            "semantic_materialization": semantic_materialization,
         },
         suppress_shortfall=suppress_shortfall_diagnostics,
         blocked_status=blocked_status,
@@ -1489,6 +1537,7 @@ def _completed_auto_visual_release_gate(
         "report_cited_images": minimums["report_cited_images"],
         "shortfall_reason": diagnostics["shortfall_reason"],
         "diagnostics": diagnostics,
+        "semantic_materialization": semantic_materialization,
         "counts": {
             **counts,
             "codex_interactive_real_analyzed_images": minimums["vlm_images_analyzed"],
@@ -1503,6 +1552,74 @@ def _completed_auto_visual_release_gate(
             minimums["report_cited_images"]
         ),
     }
+
+
+def _semantic_materialization_release_gate(run_dir: Path) -> dict[str, Any]:
+    plan_artifact = _read_optional_json(run_dir / SEMANTIC_PLAN_FILENAME)
+    existing_diff = _read_optional_json(run_dir / SEMANTIC_MATERIALIZATION_DIFF_FILENAME)
+    if not _semantic_materialization_gate_applies(
+        plan_artifact=plan_artifact,
+        existing_diff=existing_diff,
+    ):
+        return {"applicable": False, "valid": True}
+    try:
+        diff = build_semantic_materialization_diff(
+            run_dir=run_dir,
+            require_research_tasks=True,
+            require_downstream=True,
+        )
+    except Exception as exc:  # pragma: no cover - defensive gate boundary
+        return {
+            "applicable": True,
+            "valid": False,
+            "failure_codes": ["semantic_materialization_diff_exception"],
+            "error": exc.__class__.__name__,
+        }
+    failures = [
+        failure.get("code")
+        for failure in diff.get("failures", [])
+        if isinstance(failure, Mapping) and failure.get("code")
+    ]
+    artifact_failures = [
+        check
+        for check in diff.get("artifact_checks", [])
+        if isinstance(check, Mapping) and check.get("valid") is not True
+    ]
+    return {
+        "applicable": True,
+        "valid": diff.get("valid") is True,
+        "require_downstream": diff.get("require_downstream"),
+        "missing_task_ids": list(diff.get("missing_task_ids") or []),
+        "dropped_visual_obligations": list(diff.get("dropped_visual_obligations") or []),
+        "visual_obligation_task_ids": list(diff.get("visual_obligation_task_ids") or []),
+        "failure_codes": failures,
+        "failed_artifacts": [
+            str(check.get("artifact"))
+            for check in artifact_failures
+            if check.get("artifact")
+        ],
+    }
+
+
+def _semantic_materialization_gate_applies(
+    *,
+    plan_artifact: Mapping[str, Any],
+    existing_diff: Mapping[str, Any],
+) -> bool:
+    semantic_plan = (
+        plan_artifact.get("semantic_plan")
+        if isinstance(plan_artifact.get("semantic_plan"), Mapping)
+        else {}
+    )
+    release_eligible = (
+        plan_artifact.get("semantic_release_eligible") is True
+        or semantic_plan.get("semantic_release_eligible") is True
+    )
+    strict_existing_diff = (
+        existing_diff.get("full_materialization_validation_implemented") is True
+        and existing_diff.get("require_downstream") is True
+    )
+    return release_eligible or strict_existing_diff
 
 
 def _release_gate_from_validation(
@@ -1569,6 +1686,9 @@ def _visual_release_gate_diagnostics(
         if isinstance(raw_failures, list):
             failures = [str(item) for item in raw_failures if isinstance(item, str)]
         valid = release_gate.get("valid") is True
+        semantic_materialization = release_gate.get("semantic_materialization")
+    else:
+        semantic_materialization = None
     if minimums is None:
         minimums = fallback_minimums
     reason = _visual_release_gate_shortfall_reason(
@@ -1577,6 +1697,14 @@ def _visual_release_gate_diagnostics(
         valid=valid,
     )
     diagnostics: dict[str, Any] = {"shortfall_reason": reason}
+    if isinstance(semantic_materialization, Mapping) and semantic_materialization.get("valid") is not True:
+        diagnostics["semantic_materialization"] = dict(semantic_materialization)
+        diagnostics["missing_semantic_materialization_task_ids"] = list(
+            semantic_materialization.get("missing_task_ids") or []
+        )
+        diagnostics["dropped_visual_obligations"] = list(
+            semantic_materialization.get("dropped_visual_obligations") or []
+        )
     if reason != "none":
         diagnostics["failure_category"] = reason
         failure_code = visual_failure_code_for_shortfall_reason(reason)
@@ -1591,6 +1719,8 @@ def _visual_release_gate_shortfall_reason(
     minimums: Mapping[str, Any] | None,
     valid: bool,
 ) -> str:
+    if "semantic_materialization_diff_valid" in failures:
+        return "semantic_materialization_missing"
     if isinstance(minimums, Mapping):
         minimum_reason = str(minimums.get("shortfall_reason") or "none")
         if minimum_reason != "none":
@@ -2431,11 +2561,17 @@ def _create_status_run_dir(runs_dir: Path) -> Path:
     timestamp = _utc_now().replace("-", "").replace(":", "").rstrip("Z")
     run_dir = runs_dir / f"dr_preflight_{timestamp}"
     suffix = 1
-    while run_dir.exists():
+    while True:
+        try:
+            run_dir.mkdir()
+            return run_dir.resolve()
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
         suffix += 1
         run_dir = runs_dir / f"dr_preflight_{timestamp}_{suffix}"
-    run_dir.mkdir()
-    return run_dir.resolve()
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

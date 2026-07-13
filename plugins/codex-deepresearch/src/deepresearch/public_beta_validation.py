@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .evidence_schema import VERIFIER_METHODS, VERIFIER_TYPES, VERIFIER_VOTES
 from .semantic_planner import (
     SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
     build_semantic_materialization_diff,
@@ -40,6 +41,12 @@ PUBLIC_BETA_SEMANTIC_MANIFEST_SCHEMA_VERSION = (
 BLIND_HOLDOUT_MANIFEST_SCHEMA_VERSION = (
     "codex-deepresearch.semantic-blind-holdout-manifest.v0"
 )
+BLIND_HOLDOUT_SELECTOR_AUDIT_SCHEMA_VERSION = (
+    "codex-deepresearch.semantic-blind-holdout-selector-audit.v0"
+)
+BLIND_HOLDOUT_SELECTOR_TRANSCRIPT_SCHEMA_VERSION = (
+    "codex-deepresearch.semantic-blind-holdout-selector-transcript.v0"
+)
 MANUAL_TRACE_AUDIT_MANIFEST_SCHEMA_VERSION = (
     "codex-deepresearch.manual-trace-audits.v0"
 )
@@ -60,6 +67,17 @@ SUPPLIED_RUN_MAX_AGE_DAYS = 30
 MIN_PUBLIC_BETA_REAL_VISUAL_CANDIDATES = 10
 MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED = 3
 MIN_PUBLIC_BETA_REPORT_CITED_VISUAL_OR_MIXED_CLAIMS = 1
+RELEASE_VERIFIER_VOTE_REQUIRED_STRING_FIELDS = (
+    "id",
+    "claim_id",
+    "verifier_type",
+    "agent_name",
+    "method",
+    "model_or_tool",
+    "vote",
+    "rationale",
+    "created_at",
+)
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST = (
@@ -686,6 +704,7 @@ def run_semantic_release_validation(
         shutil.rmtree(suite_dir)
     suite_dir.mkdir(parents=True)
     results_path = suite_dir / SEMANTIC_RELEASE_VALIDATION_RESULTS_FILENAME
+    semantic_report_path = suite_dir / SEMANTIC_RELEASE_REPORT_FILENAME
     generated_at = _utc_now()
 
     regression_manifest = load_semantic_regression_manifest(semantic_regression_manifest)
@@ -741,6 +760,18 @@ def run_semantic_release_validation(
         manual_audit_manifest,
         required=True,
     )
+    evaluated_runs = [
+        *regression_evaluated,
+        *public_beta_evaluated,
+        *holdout_evaluated,
+    ]
+    semantic_release_report = _semantic_release_report(
+        evaluated_runs=evaluated_runs,
+        report_path=semantic_report_path,
+        generated_at=generated_at,
+        manual_audit_manifest=manual_audit_manifest,
+        require_manual_trace_audits=True,
+    )
     holdout_selector_ready = holdout_manifest.get("release_gate_ready") is True
     valid = (
         all(gate.get("valid") is True for gate in suite_gates.values())
@@ -787,6 +818,7 @@ def run_semantic_release_validation(
         "semantic_suite_gates": suite_gates,
         "anti_overfit_scan": anti_overfit_scan,
         "manual_trace_audit_gate": manual_trace_audit_gate,
+        "semantic_release_report": semantic_release_report,
         "runs": {
             "semantic_regression_30": regression_evaluated,
             "public_beta_semantic_20": public_beta_evaluated,
@@ -800,8 +832,10 @@ def run_semantic_release_validation(
         ),
         "artifacts": {
             "results": str(results_path.resolve()),
+            "semantic_release_report": str(semantic_report_path.resolve()),
         },
     }
+    _write_json(semantic_report_path, semantic_release_report)
     _write_json(results_path, results)
     if not valid:
         raise PublicBetaValidationError(
@@ -1019,6 +1053,14 @@ def load_blind_holdout_manifest(
         failures.append("selector_not_independent")
     if selector.get("release_eligible") is not True:
         failures.append("selector_not_release_eligible")
+    selector_audit = _blind_holdout_selector_audit_failures(
+        manifest_path=manifest_path,
+        selector=selector,
+        freeze=freeze if isinstance(freeze, Mapping) else {},
+        prompts=checked["prompts"],
+        selection_checks=manifest.get("selection_checks"),
+    )
+    failures.extend(selector_audit)
     overlap_failures = _holdout_overlap_failures(
         holdout_prompts=checked["prompts"],
         known_manifests=known_manifests or [],
@@ -1034,6 +1076,150 @@ def load_blind_holdout_manifest(
         "release_gate_ready": release_gate_ready,
         "failures": failures,
     }
+
+
+def _blind_holdout_selector_audit_failures(
+    *,
+    manifest_path: Path,
+    selector: Mapping[str, Any],
+    freeze: Mapping[str, Any],
+    prompts: Sequence[Mapping[str, Any]],
+    selection_checks: Any,
+) -> list[str]:
+    failures: list[str] = []
+    audit_path_value = str(selector.get("audit_artifact_path") or "").strip()
+    audit_hash_value = str(selector.get("audit_artifact_hash") or "").strip()
+    if not audit_path_value:
+        return ["selector_audit_artifact_path_missing"]
+    if not _sha256_hex_string(audit_hash_value):
+        failures.append("selector_audit_artifact_hash_invalid")
+    audit_path = (manifest_path.parent / audit_path_value).resolve()
+    try:
+        audit_path.relative_to(manifest_path.parent.resolve())
+    except ValueError:
+        failures.append("selector_audit_artifact_outside_manifest_dir")
+        return failures
+    if not audit_path.exists():
+        failures.append("selector_audit_artifact_missing")
+        return failures
+    if _sha256_hex_string(audit_hash_value) and _file_sha256(audit_path) != audit_hash_value:
+        failures.append("selector_audit_artifact_hash_mismatch")
+    try:
+        audit = _read_json(audit_path)
+    except (OSError, json.JSONDecodeError):
+        failures.append("selector_audit_artifact_unreadable")
+        return failures
+    if audit.get("schema_version") != BLIND_HOLDOUT_SELECTOR_AUDIT_SCHEMA_VERSION:
+        failures.append("selector_audit_schema_version_invalid")
+    if audit.get("release_eligible") is not True:
+        failures.append("selector_audit_not_release_eligible")
+    if audit.get("selector_independent") is not True:
+        failures.append("selector_audit_not_independent")
+    freeze_commit = str(freeze.get("commit") or "").strip()
+    audit_freeze = audit.get("implementation_freeze")
+    if freeze_commit and (
+        not isinstance(audit_freeze, Mapping)
+        or str(audit_freeze.get("commit") or "").strip() != freeze_commit
+    ):
+        failures.append("selector_audit_freeze_commit_mismatch")
+    prompt_ids = [str(prompt.get("id") or "") for prompt in prompts]
+    if audit.get("prompt_ids") != prompt_ids:
+        failures.append("selector_audit_prompt_ids_mismatch")
+    if audit.get("prompt_count") != len(prompt_ids):
+        failures.append("selector_audit_prompt_count_mismatch")
+    audit_checks = audit.get("selection_checks")
+    manifest_checks = selection_checks if isinstance(selection_checks, Mapping) else {}
+    if not isinstance(audit_checks, Mapping):
+        failures.append("selector_audit_selection_checks_missing")
+    else:
+        for field in (
+            "exact_prompt_string_scan_found_matches",
+            "distinctive_keyword_scan_found_matches",
+            "known_manifest_overlap_detected",
+            "selected_after_implementation_freeze",
+        ):
+            if audit_checks.get(field) != manifest_checks.get(field):
+                failures.append(f"selector_audit_selection_check_mismatch:{field}")
+        if audit_checks.get("oracle_hashes_verified") is not True:
+            failures.append("selector_audit_oracle_hashes_not_verified")
+    failures.extend(
+        _blind_holdout_selector_raw_transcript_failures(
+            manifest_path=manifest_path,
+            selector=selector,
+            freeze=freeze,
+            prompt_ids=prompt_ids,
+        )
+    )
+    return failures
+
+
+def _blind_holdout_selector_raw_transcript_failures(
+    *,
+    manifest_path: Path,
+    selector: Mapping[str, Any],
+    freeze: Mapping[str, Any],
+    prompt_ids: Sequence[str],
+) -> list[str]:
+    failures: list[str] = []
+    transcript_path_value = str(
+        selector.get("raw_selector_transcript_path") or ""
+    ).strip()
+    transcript_hash_value = str(
+        selector.get("raw_selector_transcript_hash") or ""
+    ).strip()
+    if not transcript_path_value:
+        return ["selector_raw_transcript_path_missing"]
+    if not _sha256_hex_string(transcript_hash_value):
+        failures.append("selector_raw_transcript_hash_invalid")
+    transcript_path = (manifest_path.parent / transcript_path_value).resolve()
+    try:
+        transcript_path.relative_to(manifest_path.parent.resolve())
+    except ValueError:
+        failures.append("selector_raw_transcript_outside_manifest_dir")
+        return failures
+    if not transcript_path.exists():
+        failures.append("selector_raw_transcript_missing")
+        return failures
+    if (
+        _sha256_hex_string(transcript_hash_value)
+        and _file_sha256(transcript_path) != transcript_hash_value
+    ):
+        failures.append("selector_raw_transcript_hash_mismatch")
+    try:
+        transcript = _read_json(transcript_path)
+    except (OSError, json.JSONDecodeError):
+        failures.append("selector_raw_transcript_unreadable")
+        return failures
+    if transcript.get("schema_version") != BLIND_HOLDOUT_SELECTOR_TRANSCRIPT_SCHEMA_VERSION:
+        failures.append("selector_raw_transcript_schema_version_invalid")
+    if transcript.get("artifact_type") != "blind_holdout_selector_raw_transcript":
+        failures.append("selector_raw_transcript_artifact_type_invalid")
+    if transcript.get("release_eligible") is not True:
+        failures.append("selector_raw_transcript_not_release_eligible")
+    if transcript.get("selector_independent") is not True:
+        failures.append("selector_raw_transcript_not_independent")
+    freeze_commit = str(freeze.get("commit") or "").strip()
+    transcript_freeze = transcript.get("implementation_freeze")
+    if freeze_commit and (
+        not isinstance(transcript_freeze, Mapping)
+        or str(transcript_freeze.get("commit") or "").strip() != freeze_commit
+    ):
+        failures.append("selector_raw_transcript_freeze_commit_mismatch")
+    raw_request = transcript.get("raw_request")
+    raw_response = transcript.get("raw_response")
+    if not isinstance(raw_request, Mapping):
+        failures.append("selector_raw_transcript_raw_request_missing")
+    if not isinstance(raw_response, Mapping):
+        failures.append("selector_raw_transcript_raw_response_missing")
+        return failures
+    selected_prompt_ids = raw_response.get("selected_prompt_ids")
+    if selected_prompt_ids != list(prompt_ids):
+        failures.append("selector_raw_transcript_prompt_ids_mismatch")
+    if raw_response.get("prompt_count") != len(prompt_ids):
+        failures.append("selector_raw_transcript_prompt_count_mismatch")
+    if raw_response.get("selection_completed") is not True:
+        failures.append("selector_raw_transcript_selection_not_completed")
+    return failures
 
 
 def load_manual_trace_audits(
@@ -3015,6 +3201,7 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
             "run_trace",
             "report",
             "report_status",
+            "verifier_votes",
         }
     }
     semantic_checks = run.get("semantic_release_checks")
@@ -3047,6 +3234,7 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
                 "visual_candidates",
                 "image_fetch_status",
                 "visual_observations",
+                "verifier_votes",
             }
         )
     missing_required = sorted(
@@ -3085,6 +3273,7 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "holdout_or_regression_class": run.get("holdout_or_regression_class")
         or "public_beta_semantic_manifest",
+        "required_artifacts": sorted(required_names),
         "artifact_paths": dict(sorted(artifact_paths.items())),
         "artifact_hashes": artifact_hashes,
         "failure_category": run.get("failure_category"),
@@ -4278,55 +4467,98 @@ def _semantic_artifact_integrity_failures(
     artifacts: Mapping[str, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
+    plan = artifacts.get("semantic_plan")
+    validation = artifacts.get("semantic_planner_validation")
+    semantic_plan = (
+        plan.get("semantic_plan")
+        if isinstance(plan, Mapping) and isinstance(plan.get("semantic_plan"), Mapping)
+        else {}
+    )
+    fallback_question_scope = _first_valid_semantic_question_scope(
+        plan.get("question_scope") if isinstance(plan, Mapping) else None,
+        validation.get("question_scope") if isinstance(validation, Mapping) else None,
+    )
+    fallback_template_use = _first_valid_semantic_template_use(
+        plan.get("template_use") if isinstance(plan, Mapping) else None,
+        validation.get("template_use") if isinstance(validation, Mapping) else None,
+    )
     for artifact_name in SEMANTIC_RELEASE_REQUIRED_ARTIFACTS:
         if artifact_name == "semantic_materialization_diff":
             continue
         payload = artifacts.get(artifact_name)
         if not isinstance(payload, Mapping):
             continue
+        question_scope = _semantic_artifact_question_scope(
+            artifact_name=artifact_name,
+            payload=payload,
+            fallback_question_scope=fallback_question_scope,
+        )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="question_scope",
-            invalid=not _valid_semantic_question_scope(payload.get("question_scope")),
+            invalid=not _valid_semantic_question_scope(question_scope),
         )
         for field in ("raw_request_path", "raw_response_path"):
             _append_semantic_artifact_failure_if(
                 failures,
                 artifact_name=artifact_name,
                 field=field,
-                invalid=not _non_empty_string(payload.get(field)),
+                invalid=not _non_empty_string(
+                    _semantic_artifact_common_field(
+                        payload,
+                        artifact_name=artifact_name,
+                        field=field,
+                    )
+                ),
             )
         for field in ("raw_request_hash", "raw_response_hash"):
             _append_semantic_artifact_failure_if(
                 failures,
                 artifact_name=artifact_name,
                 field=field,
-                invalid=not _sha256_hex_string(payload.get(field)),
+                invalid=not _sha256_hex_string(
+                    _semantic_artifact_common_field(
+                        payload,
+                        artifact_name=artifact_name,
+                        field=field,
+                    )
+                ),
             )
+        provenance = _semantic_artifact_provenance(
+            payload,
+            artifact_name=artifact_name,
+        )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="provenance",
-            invalid=not _valid_semantic_provenance(payload.get("provenance")),
+            invalid=not _valid_semantic_provenance(
+                provenance,
+                artifact_name=artifact_name,
+                payload=payload,
+            ),
+        )
+        template_use = _semantic_artifact_template_use(
+            artifact_name=artifact_name,
+            payload=payload,
+            fallback_template_use=fallback_template_use,
         )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="template_use",
-            invalid=not _valid_semantic_template_use(payload.get("template_use")),
+            invalid=not _valid_semantic_template_use(template_use),
         )
         _append_semantic_artifact_failure_if(
             failures,
             artifact_name=artifact_name,
             field="session_id_unavailable_reason",
-            invalid=not _non_empty_string(payload.get("session_id_unavailable_reason")),
+            invalid=not _valid_semantic_session_availability(payload, provenance),
         )
 
     plan_angle_ids: set[str] = set()
-    plan = artifacts.get("semantic_plan")
     if isinstance(plan, Mapping):
-        semantic_plan = plan.get("semantic_plan")
         original_question = _semantic_original_question(plan, semantic_plan)
         _append_semantic_artifact_failure_if(
             failures,
@@ -4392,10 +4624,92 @@ def _semantic_artifact_integrity_failures(
             invalid=not _valid_oracle_requirement_map(
                 oracle.get("oracle_requirement_map"),
                 plan_angle_ids=plan_angle_ids,
+                requirement_coverage_map=(
+                    plan.get("requirement_coverage_map")
+                    if isinstance(plan, Mapping)
+                    else None
+                ),
             ),
         )
 
     return failures
+
+
+def _first_valid_semantic_question_scope(*values: Any) -> Mapping[str, Any] | None:
+    for value in values:
+        if isinstance(value, Mapping) and _valid_semantic_question_scope(value):
+            return value
+    return None
+
+
+def _first_valid_semantic_template_use(*values: Any) -> Mapping[str, Any] | None:
+    for value in values:
+        if isinstance(value, Mapping) and _valid_semantic_template_use(value):
+            return value
+    return None
+
+
+def _semantic_artifact_question_scope(
+    *,
+    artifact_name: str,
+    payload: Mapping[str, Any],
+    fallback_question_scope: Mapping[str, Any] | None,
+) -> Any:
+    value = payload.get("question_scope")
+    if _valid_semantic_question_scope(value):
+        return value
+    if (
+        artifact_name in {"semantic_expectation_oracle", "semantic_plan_review"}
+        and fallback_question_scope is not None
+    ):
+        return fallback_question_scope
+    return value
+
+
+def _semantic_artifact_template_use(
+    *,
+    artifact_name: str,
+    payload: Mapping[str, Any],
+    fallback_template_use: Mapping[str, Any] | None,
+) -> Any:
+    value = payload.get("template_use")
+    if _valid_semantic_template_use(value):
+        return value
+    if (
+        artifact_name in {"semantic_expectation_oracle", "semantic_plan_review"}
+        and fallback_template_use is not None
+    ):
+        return fallback_template_use
+    return value
+
+
+def _semantic_artifact_common_field(
+    payload: Mapping[str, Any],
+    *,
+    artifact_name: str,
+    field: str,
+) -> Any:
+    value = payload.get(field)
+    if value is not None:
+        return value
+    if artifact_name == "semantic_plan_review":
+        reviewer_field = f"reviewer_{field}"
+        return payload.get(reviewer_field)
+    return value
+
+
+def _semantic_artifact_provenance(
+    payload: Mapping[str, Any],
+    *,
+    artifact_name: str,
+) -> Any:
+    if artifact_name == "semantic_expectation_oracle":
+        return payload.get("provenance") or payload.get("oracle_provenance")
+    if artifact_name == "semantic_plan_review":
+        return payload.get("provenance") or payload.get("reviewer_provenance")
+    if artifact_name == "semantic_plan":
+        return payload.get("provenance") or payload.get("planner_provenance")
+    return payload.get("provenance")
 
 
 def _append_semantic_artifact_failure_if(
@@ -4432,15 +4746,55 @@ def _valid_semantic_question_scope(value: Any) -> bool:
     )
 
 
-def _valid_semantic_provenance(value: Any) -> bool:
+def _valid_semantic_provenance(
+    value: Any,
+    *,
+    artifact_name: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("non_release_fixture") is True:
+        return False
+    if not _semantic_provenance_has_codex_identity(value):
+        return False
+    if not (
+        _sha256_hex_string(value.get("raw_request_hash"))
+        and _sha256_hex_string(value.get("raw_response_hash"))
+    ):
+        return False
+    if artifact_name in {"semantic_plan", "semantic_planner_validation"}:
+        planner_mode = value.get("planner_mode") or payload.get("planner_mode")
+        planner_source = (
+            value.get("planner_source")
+            or payload.get("source")
+            or payload.get("planner_source")
+        )
+        return (
+            planner_mode == "codex_semantic"
+            and planner_source == "codex_semantic"
+            and value.get("raw_request_required") is True
+            and value.get("raw_response_required") is True
+        )
+    return True
+
+
+def _valid_semantic_session_availability(
+    payload: Mapping[str, Any],
+    provenance: Any,
+) -> bool:
+    if isinstance(provenance, Mapping) and _semantic_provenance_has_codex_identity(
+        provenance
+    ):
+        return True
+    if _semantic_provenance_has_codex_identity(payload):
+        return True
     return (
-        isinstance(value, Mapping)
-        and value.get("planner_mode") == "codex_semantic"
-        and value.get("planner_source") == "codex_semantic"
-        and value.get("raw_request_required") is True
-        and value.get("raw_response_required") is True
-        and _semantic_provenance_has_codex_identity(value)
-        and value.get("semantic_release_eligible") is True
+        _non_empty_string(payload.get("session_id_unavailable_reason"))
+        or (
+            isinstance(provenance, Mapping)
+            and _non_empty_string(provenance.get("session_id_unavailable_reason"))
+        )
     )
 
 
@@ -4488,6 +4842,7 @@ def _valid_oracle_requirement_map(
     value: Any,
     *,
     plan_angle_ids: set[str],
+    requirement_coverage_map: Any = None,
 ) -> bool:
     if (
         not isinstance(value, list)
@@ -4495,15 +4850,24 @@ def _valid_oracle_requirement_map(
         or not plan_angle_ids
     ):
         return False
+    coverage_by_requirement = _coverage_angle_ids_by_requirement(
+        requirement_coverage_map
+    )
     covered_angle_ids: set[str] = set()
     for requirement in value:
         if not _valid_oracle_requirement(requirement):
             return False
-        covered_angle_ids.update(
+        requirement_angle_ids = {
             str(angle_id).strip()
             for angle_id in requirement.get("covered_by_angle_ids", [])
             if _non_empty_string(angle_id)
-        )
+        }
+        if not requirement_angle_ids:
+            requirement_angle_ids = coverage_by_requirement.get(
+                str(requirement.get("requirement_id") or "").strip(),
+                set(),
+            )
+        covered_angle_ids.update(requirement_angle_ids)
     return (
         covered_angle_ids == plan_angle_ids
     )
@@ -4517,8 +4881,9 @@ def _valid_oracle_requirement(value: Any) -> bool:
         and (
             _non_empty_string(value.get("text"))
             or _non_empty_string(value.get("description"))
+            or _non_empty_string(value.get("requirement_text"))
+            or _non_empty_string(value.get("prompt_text"))
         )
-        and _non_empty_string_list(value.get("covered_by_angle_ids"))
     )
 
 
@@ -4561,7 +4926,6 @@ def _valid_semantic_angle(
         "angle_id",
         "title",
         "research_question",
-        "question_context",
         "evidence_need",
         "report_section",
     )
@@ -4574,12 +4938,9 @@ def _valid_semantic_angle(
 
     title = str(value["title"]).strip()
     research_question = str(value["research_question"]).strip()
-    question_context = str(value["question_context"]).strip()
     if _generic_or_original_semantic_text(title, original_question):
         return False
     if _generic_or_original_semantic_text(research_question, original_question):
-        return False
-    if _generic_or_original_semantic_text(question_context, original_question):
         return False
     combined_text = f"{title} {research_question}"
     if _semantic_placeholder_text(combined_text):
@@ -4667,7 +5028,7 @@ def _valid_requirement_coverage_map(
     for coverage in value:
         if not _valid_requirement_coverage(coverage):
             return False
-        covered_angle_ids.add(str(coverage["angle_id"]).strip())
+        covered_angle_ids.update(_coverage_angle_ids(coverage))
     return (
         covered_angle_ids == plan_angle_ids
     )
@@ -4678,9 +5039,34 @@ def _valid_requirement_coverage(value: Any) -> bool:
         return False
     return (
         _non_empty_string(value.get("requirement_id"))
-        and _non_empty_string(value.get("angle_id"))
+        and bool(_coverage_angle_ids(value))
         and _non_empty_string(value.get("coverage_status"))
     )
+
+
+def _coverage_angle_ids_by_requirement(value: Any) -> dict[str, set[str]]:
+    output: dict[str, set[str]] = {}
+    if not isinstance(value, list):
+        return output
+    for coverage in value:
+        if not isinstance(coverage, Mapping):
+            continue
+        requirement_id = str(coverage.get("requirement_id") or "").strip()
+        if not requirement_id:
+            continue
+        output.setdefault(requirement_id, set()).update(_coverage_angle_ids(coverage))
+    return output
+
+
+def _coverage_angle_ids(value: Mapping[str, Any]) -> set[str]:
+    angle_ids = {
+        str(angle_id).strip()
+        for angle_id in value.get("covered_by_angle_ids", [])
+        if _non_empty_string(angle_id)
+    }
+    if _non_empty_string(value.get("angle_id")):
+        angle_ids.add(str(value["angle_id"]).strip())
+    return angle_ids
 
 
 def _semantic_angle_ids(value: Any) -> set[str]:
@@ -4694,11 +5080,60 @@ def _semantic_angle_ids(value: Any) -> set[str]:
 
 
 def _semantic_token_list(text: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower())
-        if len(token) > 2
-    ]
+    tokens: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9\uac00-\ud7a3]+", text.lower()):
+        if _semantic_token_has_hangul(token):
+            normalized = _normalize_korean_semantic_token(token)
+            if len(normalized) >= 2:
+                tokens.append(normalized)
+        elif len(token) > 2:
+            tokens.append(token)
+    return tokens
+
+
+def _semantic_token_has_hangul(token: str) -> bool:
+    return any("\uac00" <= char <= "\ud7a3" for char in token)
+
+
+KOREAN_SEMANTIC_PARTICLE_SUFFIXES = (
+    "께서는",
+    "에서는",
+    "에게는",
+    "으로는",
+    "로는",
+    "에는",
+    "과는",
+    "와는",
+    "에서",
+    "에게",
+    "께서",
+    "으로",
+    "로",
+    "부터",
+    "까지",
+    "처럼",
+    "보다",
+    "마다",
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "의",
+    "와",
+    "과",
+    "도",
+    "만",
+    "에",
+)
+
+
+def _normalize_korean_semantic_token(token: str) -> str:
+    for suffix in KOREAN_SEMANTIC_PARTICLE_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 2:
+            return token[: -len(suffix)]
+    return token
 
 
 def _semantic_meaningful_token_list(text: str) -> list[str]:
@@ -4755,6 +5190,12 @@ def _semantic_planner_mode_sources(
         )
     for name, payload in artifacts.items():
         _add_string_source(sources, name, payload.get("planner_mode"))
+        if (
+            name == "semantic_expectation_oracle"
+            and name not in sources
+            and _oracle_release_support_artifact(payload)
+        ):
+            sources[name] = "codex_semantic"
         nested = payload.get("semantic_plan")
         if isinstance(nested, Mapping):
             _add_string_source(
@@ -4781,7 +5222,12 @@ def _semantic_release_eligible_sources(
             semantic_planner.get("semantic_release_eligible"),
         )
     for name, payload in artifacts.items():
-        _add_bool_source(sources, name, payload.get("semantic_release_eligible"))
+        if name == "semantic_expectation_oracle" and _oracle_release_support_artifact(
+            payload
+        ):
+            sources[name] = True
+        else:
+            _add_bool_source(sources, name, payload.get("semantic_release_eligible"))
         nested = payload.get("semantic_plan")
         if isinstance(nested, Mapping):
             _add_bool_source(
@@ -4815,6 +5261,29 @@ def _semantic_codex_source_sources(
                 nested.get("source"),
             )
     return sources
+
+
+def _oracle_release_support_artifact(payload: Mapping[str, Any]) -> bool:
+    if payload.get("artifact_type") != "semantic_expectation_oracle":
+        return False
+    for field in (
+        "plan_visible_to_oracle",
+        "used_production_planner_output",
+        "used_hidden_template_class",
+        "used_fixed_angle_inventory",
+    ):
+        if payload.get(field) is not False:
+            return False
+    provenance = payload.get("oracle_provenance") or payload.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    if provenance.get("non_release_fixture") is True:
+        return False
+    return (
+        _semantic_provenance_has_codex_identity(provenance)
+        and _sha256_hex_string(provenance.get("raw_request_hash") or payload.get("raw_request_hash"))
+        and _sha256_hex_string(provenance.get("raw_response_hash") or payload.get("raw_response_hash"))
+    )
 
 
 def _add_string_source(sources: dict[str, str], source: str, value: Any) -> None:
@@ -5390,7 +5859,14 @@ def _visual_release_checks(
     candidates = _mapping_list(_read_optional_jsonl(artifacts["visual_candidates"]))
     fetches = _mapping_list(_read_optional_jsonl(artifacts["image_fetch_status"]))
     observations = _mapping_list(_read_optional_jsonl(artifacts["visual_observations"]))
-    verifier_votes = _mapping_list(_read_optional_jsonl(artifacts["verifier_votes"]))
+    raw_verifier_votes = _read_optional_jsonl(artifacts["verifier_votes"])
+    verifier_votes = _mapping_list(raw_verifier_votes)
+    verifier_vote_validation = _release_verifier_vote_validation(
+        raw_records=raw_verifier_votes,
+        records=verifier_votes,
+        evidence=evidence,
+    )
+    release_verifier_votes_by_id = verifier_vote_validation["valid_votes_by_id"]
     counts = real_automatic_visual_release_counts(
         candidates=candidates,
         fetches=fetches,
@@ -5416,7 +5892,7 @@ def _visual_release_checks(
         candidates=candidates,
         fetches=fetches,
         observations=observations,
-        verifier_votes=verifier_votes,
+        verifier_votes_by_id=release_verifier_votes_by_id,
         report_text=report_text,
     )
 
@@ -5477,6 +5953,20 @@ def _visual_release_checks(
                 ),
             }
         )
+    if (
+        _terminal_status(run_status) == "completed_auto_visual"
+        and not verifier_vote_validation["valid"]
+    ):
+        failures.append(
+            {
+                "check": "release_verifier_vote_schema",
+                "classification": "report-linkage",
+                "detail": (
+                    "verifier_votes.jsonl has malformed release verifier vote records: "
+                    + "; ".join(verifier_vote_validation["failures"])
+                ),
+            }
+        )
     if len(real_vlm_image_ids) < MIN_PUBLIC_BETA_REAL_VLM_IMAGES_ANALYZED:
         failures.append(
             {
@@ -5489,7 +5979,14 @@ def _visual_release_checks(
                 ),
             }
         )
-    if _policy_blocks_release(candidates, fetches, observations):
+    if _policy_blocks_release(
+        candidates=candidates,
+        fetches=fetches,
+        observations=observations,
+        release_candidates=real_candidates,
+        release_fetches=real_fetches,
+        release_observations=real_observations,
+    ):
         failures.append(
             {
                 "check": "policy_allows_release_counting",
@@ -6121,8 +6618,8 @@ def _codex_interactive_observations(
     for observation in observations:
         if not _is_codex_interactive_vlm_observation(observation):
             continue
-        candidate_id = observation.get("candidate_id")
-        fetch_id = observation.get("fetch_id")
+        candidate_id = _observation_linked_candidate_id(observation)
+        fetch_id = _observation_linked_fetch_id(observation)
         image_id = observation.get("evidence_image_id")
         if not (
             isinstance(candidate_id, str)
@@ -6179,22 +6676,227 @@ def _has_codex_interactive_vlm_provider(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+_RELEASE_BLOCKING_POLICY_DECISIONS = {
+    "blocked",
+    "manual_review",
+    "disallowed",
+    "restricted",
+}
+
+
 def _policy_blocks_release(
+    *,
     candidates: Sequence[Mapping[str, Any]],
     fetches: Sequence[Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
+    release_candidates: Sequence[Mapping[str, Any]],
+    release_fetches: Sequence[Mapping[str, Any]],
+    release_observations: Sequence[Mapping[str, Any]],
 ) -> bool:
-    for record in list(candidates) + list(fetches) + list(observations):
-        if record.get("provider_mode") != "real":
+    release_candidate_ids = _release_record_ids(release_candidates, "candidate_id")
+    release_fetch_ids = _release_record_ids(release_fetches, "fetch_id")
+    release_image_ids = _release_record_ids(release_observations, "evidence_image_id")
+    release_observation_ids = _release_record_ids(release_observations, "observation_id")
+
+    for record in candidates:
+        if not _has_release_blocking_policy(record):
             continue
-        if record.get("policy_decision") in {
-            "blocked",
-            "manual_review",
-            "disallowed",
-            "restricted",
-        }:
+        if _string_record_field(record, "candidate_id") in release_candidate_ids:
+            return True
+    for record in fetches:
+        if not _has_release_blocking_policy(record):
+            continue
+        if _string_record_field(record, "fetch_id") in release_fetch_ids:
+            return True
+        if _string_record_field(record, "candidate_id") in release_candidate_ids:
+            return True
+        if _string_record_field(record, "evidence_image_id") in release_image_ids:
+            return True
+    for record in observations:
+        if not _has_release_blocking_policy(record):
+            continue
+        if _string_record_field(record, "observation_id") in release_observation_ids:
+            return True
+        if _string_record_field(record, "evidence_image_id") in release_image_ids:
+            return True
+        if _string_record_field(record, "candidate_id") in release_candidate_ids:
+            return True
+        if _string_record_field(record, "linked_candidate_id") in release_candidate_ids:
+            return True
+        if _string_record_field(record, "fetch_id") in release_fetch_ids:
+            return True
+        if _string_record_field(record, "linked_fetch_id") in release_fetch_ids:
             return True
     return False
+
+
+def _has_release_blocking_policy(record: Mapping[str, Any]) -> bool:
+    if record.get("provider_mode") != "real":
+        return False
+    if record.get("policy_decision") in _RELEASE_BLOCKING_POLICY_DECISIONS:
+        return True
+    return any(
+        record.get(status_field) == "policy_blocked"
+        for status_field in (
+            "analysis_status",
+            "candidate_status",
+            "fetch_status",
+            "observation_status",
+        )
+    )
+
+
+def _release_record_ids(
+    records: Sequence[Mapping[str, Any]],
+    field: str,
+) -> set[str]:
+    return {
+        value
+        for value in (_string_record_field(record, field) for record in records)
+        if value
+    }
+
+
+def _string_record_field(record: Mapping[str, Any], field: str) -> str:
+    value = record.get(field)
+    return value if isinstance(value, str) and value else ""
+
+
+def _release_verifier_vote_validation(
+    *,
+    raw_records: Any,
+    records: Sequence[Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    failures: list[str] = []
+    valid_votes_by_id: dict[str, Mapping[str, Any]] = {}
+    if raw_records is None:
+        failures.append("verifier_votes.jsonl is missing or invalid JSONL")
+        return {
+            "valid": False,
+            "valid_votes_by_id": valid_votes_by_id,
+            "failures": failures,
+        }
+    if not isinstance(raw_records, list):
+        failures.append("verifier_votes.jsonl must contain JSONL records")
+        return {
+            "valid": False,
+            "valid_votes_by_id": valid_votes_by_id,
+            "failures": failures,
+        }
+    claims_by_id = {
+        str(claim.get("id")): claim
+        for claim in _mapping_list(evidence.get("claims"))
+        if isinstance(claim.get("id"), str) and claim.get("id")
+    }
+    known_evidence_ids = {
+        str(source.get("id"))
+        for source in _mapping_list(evidence.get("sources"))
+        if isinstance(source.get("id"), str) and source.get("id")
+    } | {
+        str(image.get("id"))
+        for image in _mapping_list(evidence.get("images"))
+        if isinstance(image.get("id"), str) and image.get("id")
+    }
+    seen_vote_ids: set[str] = set()
+    for index, raw_record in enumerate(raw_records, start=1):
+        if not isinstance(raw_record, Mapping):
+            failures.append(f"record {index}: verifier vote must be an object")
+            continue
+        reasons = _release_verifier_vote_invalid_reasons(
+            raw_record,
+            claims_by_id=claims_by_id,
+            known_evidence_ids=known_evidence_ids,
+            seen_vote_ids=seen_vote_ids,
+        )
+        vote_id = str(raw_record.get("id") or "").strip()
+        if vote_id:
+            seen_vote_ids.add(vote_id)
+        if reasons:
+            label = f"record {index}"
+            if vote_id:
+                label += f" ({vote_id})"
+            failures.append(label + ": " + ", ".join(reasons))
+            continue
+        valid_votes_by_id[vote_id] = raw_record
+    if not valid_votes_by_id:
+        failures.append(
+            "verifier_votes.jsonl contains no release-valid verifier vote records"
+        )
+    if len(records) != len(raw_records):
+        failures.append(
+            "verifier_votes.jsonl contains non-object verifier vote records"
+        )
+    return {
+        "valid": not failures,
+        "valid_votes_by_id": valid_votes_by_id,
+        "failures": failures,
+    }
+
+
+def _release_verifier_vote_invalid_reasons(
+    vote: Mapping[str, Any],
+    *,
+    claims_by_id: Mapping[str, Mapping[str, Any]],
+    known_evidence_ids: set[str],
+    seen_vote_ids: set[str],
+) -> list[str]:
+    reasons: list[str] = []
+    missing = [
+        field
+        for field in RELEASE_VERIFIER_VOTE_REQUIRED_STRING_FIELDS
+        if not isinstance(vote.get(field), str) or not vote.get(field).strip()
+    ]
+    if missing:
+        reasons.append("missing required field(s): " + ", ".join(missing))
+    vote_id = str(vote.get("id") or "").strip()
+    if vote_id and vote_id in seen_vote_ids:
+        reasons.append("duplicate verifier vote id")
+    claim_id = str(vote.get("claim_id") or "").strip()
+    if claim_id and claim_id not in claims_by_id:
+        reasons.append("claim_id does not reference a merged claim")
+    verifier_type = str(vote.get("verifier_type") or "").strip()
+    if verifier_type and verifier_type not in VERIFIER_TYPES:
+        reasons.append("verifier_type is not release-valid")
+    method = str(vote.get("method") or "").strip()
+    if method and method not in VERIFIER_METHODS:
+        reasons.append("method is not release-valid")
+    vote_value = str(vote.get("vote") or "").strip()
+    if vote_value and vote_value not in VERIFIER_VOTES:
+        reasons.append("vote is not release-valid")
+    confidence = vote.get("confidence")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0 <= confidence <= 1
+    ):
+        reasons.append("confidence must be a number between 0 and 1")
+    evidence_refs = vote.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        reasons.append("evidence_refs must be a non-empty list")
+    elif not known_evidence_ids:
+        reasons.append(
+            "evidence_refs cannot be verified without merged source or image ids"
+        )
+    else:
+        invalid_refs = [
+            ref
+            for ref in evidence_refs
+            if not isinstance(ref, str) or not ref.strip()
+        ]
+        if invalid_refs:
+            reasons.append("evidence_refs must contain only non-empty strings")
+        dangling_refs = [
+            str(ref)
+            for ref in evidence_refs
+            if isinstance(ref, str) and ref.strip() and ref not in known_evidence_ids
+        ]
+        if dangling_refs:
+            reasons.append(
+                "evidence_refs reference unmerged source/image id(s): "
+                + ", ".join(sorted(set(dangling_refs)))
+            )
+    return reasons
 
 
 def _report_cited_visual_claims(
@@ -6204,7 +6906,7 @@ def _report_cited_visual_claims(
     candidates: Sequence[Mapping[str, Any]],
     fetches: Sequence[Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
-    verifier_votes: Sequence[Mapping[str, Any]],
+    verifier_votes_by_id: Mapping[str, Mapping[str, Any]],
     report_text: str,
 ) -> list[dict[str, Any]]:
     used_images = {
@@ -6230,11 +6932,6 @@ def _report_cited_visual_claims(
         if isinstance(image, Mapping)
         and isinstance(image.get("id"), str)
         and image.get("id")
-    }
-    verifier_vote_ids = {
-        str(vote.get("id"))
-        for vote in verifier_votes
-        if isinstance(vote.get("id"), str) and vote.get("id")
     }
     cited: list[dict[str, Any]] = []
     claims = evidence.get("claims") if isinstance(evidence.get("claims"), list) else []
@@ -6271,7 +6968,7 @@ def _report_cited_visual_claims(
                 fetches_by_id=fetches_by_id,
                 images_by_id=images_by_id,
                 observations=observations,
-                verifier_vote_ids=verifier_vote_ids,
+                verifier_votes_by_id=verifier_votes_by_id,
             )
         ]
         if release_images:
@@ -6288,7 +6985,7 @@ def _has_real_report_cited_observation(
     fetches_by_id: Mapping[str, Mapping[str, Any]],
     images_by_id: Mapping[str, Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
-    verifier_vote_ids: set[str],
+    verifier_votes_by_id: Mapping[str, Mapping[str, Any]],
 ) -> bool:
     image = images_by_id.get(image_id)
     if image is None:
@@ -6309,10 +7006,15 @@ def _has_real_report_cited_observation(
             continue
         if not _has_report_link(observation, claim_id):
             continue
-        if not _has_verifier_vote_link(observation, claim_id, verifier_vote_ids):
+        if not _has_verifier_vote_link(
+            observation,
+            claim_id=claim_id,
+            image_id=image_id,
+            verifier_votes_by_id=verifier_votes_by_id,
+        ):
             continue
-        candidate_id = observation.get("candidate_id")
-        fetch_id = observation.get("fetch_id")
+        candidate_id = _observation_linked_candidate_id(observation)
+        fetch_id = _observation_linked_fetch_id(observation)
         if not isinstance(candidate_id, str) or not isinstance(fetch_id, str):
             continue
         candidate = candidates_by_id.get(candidate_id)
@@ -6331,6 +7033,14 @@ def _has_real_report_cited_observation(
             continue
         return True
     return False
+
+
+def _observation_linked_candidate_id(observation: Mapping[str, Any]) -> Any:
+    return observation.get("linked_candidate_id") or observation.get("candidate_id")
+
+
+def _observation_linked_fetch_id(observation: Mapping[str, Any]) -> Any:
+    return observation.get("linked_fetch_id") or observation.get("fetch_id")
 
 
 def _is_codex_interactive_vlm_observation(record: Mapping[str, Any]) -> bool:
@@ -6397,17 +7107,30 @@ def _has_report_link(observation: Mapping[str, Any], claim_id: str) -> bool:
 
 def _has_verifier_vote_link(
     observation: Mapping[str, Any],
+    *,
     claim_id: str,
-    verifier_vote_ids: set[str],
+    image_id: str,
+    verifier_votes_by_id: Mapping[str, Mapping[str, Any]],
 ) -> bool:
-    if not verifier_vote_ids:
+    if not verifier_votes_by_id:
         return False
     for link in observation.get("verifier_links", []):
         if not isinstance(link, Mapping):
             continue
         vote_id = link.get("verifier_vote_id")
-        if link.get("claim_id") == claim_id and isinstance(vote_id, str):
-            return vote_id in verifier_vote_ids
+        if link.get("claim_id") != claim_id or not isinstance(vote_id, str):
+            continue
+        vote = verifier_votes_by_id.get(vote_id)
+        if not isinstance(vote, Mapping):
+            continue
+        evidence_refs = vote.get("evidence_refs")
+        if (
+            vote.get("claim_id") == claim_id
+            and vote.get("verifier_type") == "visual"
+            and isinstance(evidence_refs, list)
+            and image_id in evidence_refs
+        ):
+            return True
     return False
 
 
@@ -6628,10 +7351,13 @@ def _handoff_artifact_mentions(
 
 
 def _claims_hidden_codex_api(record: Mapping[str, Any]) -> bool:
-    return bool(
-        "hidden_codex_api_call" in record
-        or "codex_native_api_call" in record
-        or "hidden_api_call" in record
+    return any(
+        record.get(field) is True
+        for field in (
+            "hidden_codex_api_call",
+            "codex_native_api_call",
+            "hidden_api_call",
+        )
     )
 
 

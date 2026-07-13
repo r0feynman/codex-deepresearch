@@ -277,7 +277,7 @@ def visual_minimums_for_run(
     required = (
         required_vlm_images
         if required_vlm_images is not None
-        else required_vlm_images_for_evidence(evidence)
+        else _required_vlm_images_for_run_artifacts(base, evidence)
     )
     return visual_release_minimums(
         candidates=_read_optional_artifact_jsonl(base / VISUAL_CANDIDATES_FILENAME),
@@ -288,6 +288,69 @@ def visual_minimums_for_run(
         report_text=_read_optional_artifact_text(base / "report.md"),
         required_vlm_images=required,
     )
+
+
+def _required_vlm_images_for_run_artifacts(
+    run_dir: Path,
+    evidence: Mapping[str, Any] | None,
+) -> int:
+    evidence_required = required_vlm_images_for_evidence(evidence)
+    if evidence_required > 0:
+        return evidence_required
+    if _run_artifacts_have_visual_required_task(run_dir, evidence):
+        return DEFAULT_REQUIRED_VISUAL_VLM_IMAGES
+    return evidence_required
+
+
+def _run_artifacts_have_visual_required_task(
+    run_dir: Path,
+    evidence: Mapping[str, Any] | None,
+) -> bool:
+    for records in (
+        _artifact_tasks(run_dir / VISUAL_SEARCH_PLAN_FILENAME),
+        _artifact_tasks(run_dir / "visual_tasks.json"),
+        _artifact_tasks(run_dir / "research_tasks.json"),
+        _evidence_tasks(evidence),
+    ):
+        if any(_record_route(record) == "visual_required" for record in records):
+            return True
+    return any(
+        _record_route(record) == "visual_required"
+        for record in _read_optional_artifact_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+    )
+
+
+def _artifact_tasks(path: Path) -> list[Mapping[str, Any]]:
+    payload = _read_optional_artifact_json(path)
+    if not isinstance(payload, Mapping):
+        return []
+    tasks = payload.get("tasks")
+    if isinstance(tasks, list):
+        return [task for task in tasks if isinstance(task, Mapping)]
+    semantic_plan = payload.get("semantic_plan")
+    bounded_tasks = (
+        semantic_plan.get("bounded_tasks")
+        if isinstance(semantic_plan, Mapping)
+        else payload.get("bounded_tasks")
+    )
+    if isinstance(bounded_tasks, list):
+        return [task for task in bounded_tasks if isinstance(task, Mapping)]
+    return []
+
+
+def _evidence_tasks(evidence: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    if not isinstance(evidence, Mapping):
+        return []
+    records: list[Mapping[str, Any]] = []
+    for field in ("search_tasks", "routing"):
+        values = evidence.get(field)
+        if isinstance(values, list):
+            records.extend(item for item in values if isinstance(item, Mapping))
+    return records
+
+
+def _record_route(record: Mapping[str, Any]) -> str:
+    return str(record.get("route") or record.get("modality") or "").strip()
 
 
 def visual_release_minimums(
@@ -416,6 +479,8 @@ def visual_failure_code_for_shortfall_reason(reason: str | None) -> str | None:
         return None
     if reason == "report_linkage_missing":
         return "visual_report_linkage_missing"
+    if reason == "semantic_materialization_missing":
+        return "semantic_materialization_diff_invalid"
     return "visual_minimum_shortfall"
 
 

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +17,11 @@ PLUGIN_SRC = ROOT / "plugins" / "codex-deepresearch" / "src"
 sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ingest_run, prepare_run as prepare_search_handoff_run, validate_artifacts
+from deepresearch.search_handoff import _create_unique_run_dir, _search_task_from_bounded_task
 
 
 TEST_MANUAL_ANGLES = ("primary source discovery",)
+DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV = "CODEX_DEEPRESEARCH_DISABLE_DEFAULT_SEMANTIC_ADAPTER"
 
 
 def prepare_run(*args, **kwargs):
@@ -27,6 +31,18 @@ def prepare_run(*args, **kwargs):
 
 
 class SearchHandoffTests(unittest.TestCase):
+    def setUp(self) -> None:
+        previous = os.environ.get(DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV)
+        os.environ[DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV] = "1"
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop(DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV, None)
+            else:
+                os.environ[DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV] = previous
+
+        self.addCleanup(restore)
+
     def temp_runs_dir(self) -> Path:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -66,6 +82,36 @@ class SearchHandoffTests(unittest.TestCase):
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_create_unique_run_dir_retries_when_mkdir_collides(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        created_at = "2026-07-09T10:23:34Z"
+        base_name = "dr_20260709T102334"
+        original_mkdir = Path.mkdir
+        collided = {"done": False}
+        attempted_names: list[str] = []
+
+        def mkdir_with_collision(path: Path, *args, **kwargs):
+            attempted_names.append(path.name)
+            if path.name == base_name and not collided["done"]:
+                collided["done"] = True
+                raise FileExistsError("simulated concurrent run directory allocation")
+            return original_mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(
+            Path,
+            "mkdir",
+            autospec=True,
+            side_effect=mkdir_with_collision,
+        ):
+            run_dir = _create_unique_run_dir(runs_dir, created_at)
+
+        self.assertEqual(run_dir.name, f"{base_name}_2")
+        self.assertTrue(run_dir.is_dir())
+        self.assertEqual(
+            [name for name in attempted_names if name.startswith(base_name)],
+            [base_name, f"{base_name}_2"],
+        )
 
     def manual_source(self) -> dict:
         return {
@@ -232,7 +278,31 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(run_status["manifest_oracle_hash"], oracle_hash)
         self.assertEqual(run_status["manifest_oracle_fragment_id"], "pb_text_002")
 
-    def test_release_run_inputs_rejects_non_release_holdout_manifest(self) -> None:
+    def test_release_run_inputs_rejects_explicit_non_release_holdout_manifest(self) -> None:
+        holdout_manifest = self.load_json(
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "blind_holdout_semantic_prompts.json"
+        )
+        oracle_file = (
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_oracles.json"
+        ).resolve()
+        for prompt in holdout_manifest["prompts"]:
+            fragment = prompt["oracle_path"].split("#", 1)[1]
+            prompt["oracle_path"] = f"{oracle_file}#{fragment}"
+        holdout_manifest["selector_provenance"] = {
+            **holdout_manifest.get("selector_provenance", {}),
+            "release_eligible": False,
+        }
+        holdout_path = self.temp_runs_dir() / "non-release-holdout.json"
+        holdout_path.write_text(json.dumps(holdout_manifest), encoding="utf-8")
+
         completed = subprocess.run(
             [
                 str(RUNNER),
@@ -241,6 +311,8 @@ class SearchHandoffTests(unittest.TestCase):
                 str(self.temp_runs_dir()),
                 "--suite-id",
                 "issue-133-release-inputs",
+                "--blind-holdout-manifest",
+                str(holdout_path),
             ],
             check=False,
             capture_output=True,
@@ -278,7 +350,51 @@ class SearchHandoffTests(unittest.TestCase):
         for prompt in holdout_manifest["prompts"]:
             fragment = prompt["oracle_path"].split("#", 1)[1]
             prompt["oracle_path"] = f"{oracle_file}#{fragment}"
-        holdout_path = self.temp_runs_dir() / "release-ready-holdout.json"
+        temp_manifest_dir = self.temp_runs_dir()
+        prompt_ids = [prompt["id"] for prompt in holdout_manifest["prompts"]]
+        raw_path = temp_manifest_dir / "selector-raw-transcript.json"
+        raw_payload = {
+            "schema_version": "codex-deepresearch.semantic-blind-holdout-selector-transcript.v0",
+            "artifact_type": "blind_holdout_selector_raw_transcript",
+            "implementation_freeze": holdout_manifest["implementation_freeze"],
+            "selector_independent": True,
+            "release_eligible": True,
+            "raw_request": {
+                "task": "select blind holdout prompts",
+                "implementation_freeze": holdout_manifest["implementation_freeze"],
+            },
+            "raw_response": {
+                "selection_completed": True,
+                "prompt_count": len(prompt_ids),
+                "selected_prompt_ids": prompt_ids,
+            },
+        }
+        raw_path.write_text(json.dumps(raw_payload, sort_keys=True), encoding="utf-8")
+        audit_path = temp_manifest_dir / "selector-audit.json"
+        audit_payload = {
+            "schema_version": "codex-deepresearch.semantic-blind-holdout-selector-audit.v0",
+            "audit_type": "independent_selector_audit",
+            "manifest_path": "release-ready-holdout.json",
+            "implementation_freeze": holdout_manifest["implementation_freeze"],
+            "selector_independent": True,
+            "release_eligible": True,
+            "prompt_count": len(holdout_manifest["prompts"]),
+            "prompt_ids": prompt_ids,
+            "selection_checks": {
+                **holdout_manifest["selection_checks"],
+                "oracle_hashes_verified": True,
+            },
+        }
+        audit_path.write_text(json.dumps(audit_payload, sort_keys=True), encoding="utf-8")
+        holdout_manifest["selector_provenance"].update(
+            {
+                "audit_artifact_path": audit_path.name,
+                "audit_artifact_hash": hashlib.sha256(audit_path.read_bytes()).hexdigest(),
+                "raw_selector_transcript_path": raw_path.name,
+                "raw_selector_transcript_hash": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            }
+        )
+        holdout_path = temp_manifest_dir / "release-ready-holdout.json"
         holdout_path.write_text(json.dumps(holdout_manifest), encoding="utf-8")
 
         completed = subprocess.run(
@@ -303,6 +419,13 @@ class SearchHandoffTests(unittest.TestCase):
         payload = json.loads(completed.stdout)
         self.assertEqual(len(payload["prepare_commands"]), 62)
         first = payload["prepare_commands"][0]
+        self.assertEqual(first["command"][0], "env")
+        self.assertEqual(
+            first["environment"]["CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"],
+            "900.0",
+        )
+        self.assertEqual(first["semantic_adapter_timeout_seconds"], 900.0)
+        self.assertIsNone(first["codex_exec_timeout_seconds"])
         self.assertIn("--manifest-oracle-hash", first["command"])
         self.assertEqual(
             first["semantic_release_validation_input"]["flag"],
@@ -311,6 +434,38 @@ class SearchHandoffTests(unittest.TestCase):
         validation_command = payload["semantic_release_validation_command"]
         self.assertIn("--blind-holdout-manifest", validation_command)
         self.assertIn("--manual-audit-manifest", validation_command)
+
+        invoke_completed = subprocess.run(
+            [
+                str(RUNNER),
+                "semantic-release-run-inputs",
+                "--runs-dir",
+                str(self.temp_runs_dir()),
+                "--suite-id",
+                "issue-133-release-inputs",
+                "--mode",
+                "invoke",
+                "--blind-holdout-manifest",
+                str(holdout_path),
+                "--semantic-adapter-timeout-seconds",
+                "901",
+                "--codex-exec-timeout-seconds",
+                "902",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(invoke_completed.returncode, 0, invoke_completed.stderr)
+        invoke_payload = json.loads(invoke_completed.stdout)
+        invoke_first = invoke_payload["prepare_commands"][0]
+        self.assertEqual(
+            invoke_first["environment"]["CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS"],
+            "901.0",
+        )
+        self.assertEqual(invoke_first["codex_exec_timeout_seconds"], 902.0)
+        self.assertIn("--codex-exec-timeout-seconds", invoke_first["command"])
+        self.assertIn("902.0", invoke_first["command"])
 
     def test_prepare_exposes_release_ineligible_semantic_diagnostics(self) -> None:
         result = prepare_run(
@@ -389,6 +544,43 @@ class SearchHandoffTests(unittest.TestCase):
 
         validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
         self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+
+    def test_text_only_bounded_task_under_visual_angle_does_not_inherit_visual_evidence(self) -> None:
+        search_task = _search_task_from_bounded_task(
+            {
+                "task_id": "task_synthesis_001",
+                "angle_id": "angle_visual",
+                "query": "Synthesize already verified visual observations into report findings.",
+                "route": "text_only",
+                "expected_artifacts": ["visual appendix plan"],
+                "expected_source_types": ["verified evidence bundle"],
+                "expected_visual_targets": [],
+                "success_criteria": ["Use only already verified visual observations."],
+                "max_sources": 1,
+                "max_images": 0,
+                "done_condition": "Stop when the report outline is ready.",
+            },
+            1,
+            routing=[
+                {
+                    "id": "angle_visual",
+                    "angle": "Visual synthesis",
+                    "title": "Visual synthesis",
+                    "modality": "visual_required",
+                    "route": "visual_required",
+                    "evidence_need": "visual_observation",
+                    "report_section": "Visual Findings",
+                }
+            ],
+            fallback_max_results=3,
+            semantic_plan_hash="a" * 64,
+            approved_delta_id="base_plan",
+        )
+
+        self.assertEqual(search_task["route"], "text_only")
+        self.assertEqual(search_task["max_images"], 0)
+        self.assertEqual(search_task["expected_visual_targets"], [])
+        self.assertEqual(search_task["expected_evidence"], ["primary_source"])
 
     def test_ingest_search_results_into_sources_and_fetch_queue(self) -> None:
         prepared = prepare_run(

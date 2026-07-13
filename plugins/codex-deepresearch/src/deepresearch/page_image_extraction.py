@@ -13,15 +13,20 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from http.client import HTTPException
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse
+from urllib.parse import quote, unquote, unquote_to_bytes, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .cache_keys import image_cache_key, normalize_url
 from .evidence_schema import validate_artifacts
-from .search_handoff import resolve_run_dir
+from .search_handoff import (
+    apply_release_validation_identity,
+    release_validation_identity_from_payload,
+    resolve_run_dir,
+)
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
     VISUAL_ARTIFACT_SCHEMA_VERSION,
@@ -612,8 +617,25 @@ def _candidate_records_from_raw_images(
     route = _source_route(source, routes_by_angle)
     visual_task = visual_task_by_angle.get(str(route.get("id") or source.get("angle_id") or ""))
     task_id = (
-        _string(visual_task.get("id")) if isinstance(visual_task, Mapping) else None
-    ) or _string(source.get("task_id")) or _task_id_for_angle(route.get("id"))
+        _string(source.get("semantic_plan_task_id"))
+        or _string(source.get("task_id"))
+        or (
+            _string(visual_task.get("semantic_plan_task_id"))
+            if isinstance(visual_task, Mapping)
+            else None
+        )
+        or (
+            _string(visual_task.get("task_id"))
+            if isinstance(visual_task, Mapping)
+            else None
+        )
+        or (
+            _string(visual_task.get("id"))
+            if isinstance(visual_task, Mapping)
+            else None
+        )
+        or _task_id_for_angle(route.get("id"))
+    )
     angle_id = _string(route.get("id")) or _string(source.get("angle_id")) or "angle_001"
     route_name = _string(route.get("modality")) or _string(source.get("route")) or "visual_required"
     provider_provenance = {
@@ -693,6 +715,7 @@ def _candidate_records_from_raw_images(
         if policy_decision == "blocked":
             record["candidate_status"] = "policy_blocked"
             record["rejection_reason"] = "policy_blocked"
+        _apply_page_visual_semantic_lineage(record, source, visual_task or {}, route)
         records.append(record)
     return records
 
@@ -712,7 +735,15 @@ def _fetch_candidates(
     seen_urls: dict[str, dict[str, Any]] = {}
     seen_hashes: dict[str, dict[str, Any]] = {}
     seen_phashes: dict[str, dict[str, Any]] = {}
-    for candidate in candidates:
+    pending_candidates = list(candidates)
+    covered_task_ids: set[str] = set()
+    attempt_counts_by_task_id: dict[str, int] = {}
+    while pending_candidates:
+        candidate = _pop_next_visual_candidate_for_attempt(
+            pending_candidates,
+            covered_task_ids=covered_task_ids,
+            attempt_counts_by_task_id=attempt_counts_by_task_id,
+        )
         candidate_id = str(candidate["candidate_id"])
         fetch_id = _fetch_id(candidate_id)
         base_record = _base_fetch_record(candidate, fetch_id)
@@ -817,6 +848,21 @@ def _fetch_candidates(
                 )
             )
             continue
+        try:
+            request_url = _request_safe_image_url(image_url)
+        except (UnicodeError, ValueError) as exc:
+            failure_code = f"fetch_failed:{exc.__class__.__name__}"
+            candidate["candidate_status"] = "fetch_failed"
+            candidate["rejection_reason"] = failure_code
+            fetch_records.append(
+                _complete_fetch_record(
+                    base_record,
+                    fetch_status="failed",
+                    failure_code=failure_code,
+                    normalized_url=normalized_url,
+                )
+            )
+            continue
         seen_urls[normalized_url] = {
             "candidate_id": candidate.get("candidate_id"),
             "fetch_id": fetch_id,
@@ -825,7 +871,7 @@ def _fetch_candidates(
             "phash": None,
         }
         response = _fetch_image(
-            image_url,
+            request_url,
             transport=transport,
             max_image_bytes=max_image_bytes,
             timeout_seconds=timeout_seconds,
@@ -963,6 +1009,7 @@ def _fetch_candidates(
         )
         image["cache_key"] = image_cache_key(image, source=source)
         evidence_images.append(image)
+        _mark_visual_candidate_covered(covered_task_ids, candidate)
         target = _dedupe_target(candidate, fetch_id, image_id)
         seen_urls[normalized_url] = target
         seen_hashes[content_hash] = target
@@ -987,12 +1034,64 @@ def _fetch_candidates(
     return fetch_records, evidence_images
 
 
+def _pop_next_visual_candidate_for_attempt(
+    pending_candidates: list[dict[str, Any]],
+    *,
+    covered_task_ids: set[str],
+    attempt_counts_by_task_id: dict[str, int],
+) -> dict[str, Any]:
+    selected_index = 0
+    selected_priority: tuple[int, int, int] | None = None
+    for index, candidate in enumerate(pending_candidates):
+        task_id = _visual_obligation_task_id(candidate)
+        attempts = attempt_counts_by_task_id.get(task_id, 0) if task_id else 0
+        already_covered = bool(task_id and task_id in covered_task_ids)
+        priority = (attempts, 1 if already_covered else 0, index)
+        if selected_priority is None or priority < selected_priority:
+            selected_priority = priority
+            selected_index = index
+    candidate = pending_candidates.pop(selected_index)
+    _mark_visual_candidate_attempted(attempt_counts_by_task_id, candidate)
+    return candidate
+
+
+def _mark_visual_candidate_attempted(
+    attempt_counts_by_task_id: dict[str, int],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        attempt_counts_by_task_id[task_id] = attempt_counts_by_task_id.get(task_id, 0) + 1
+
+
+def _mark_visual_candidate_covered(
+    covered_task_ids: set[str],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        covered_task_ids.add(task_id)
+
+
+def _visual_obligation_task_id(record: Mapping[str, Any]) -> str:
+    return (
+        _string(record.get("semantic_plan_task_id"))
+        or _string(record.get("task_id"))
+        or _string(record.get("angle_id"))
+        or ""
+    )
+
+
 def _base_fetch_record(candidate: Mapping[str, Any], fetch_id: str) -> dict[str, Any]:
     return {
         "fetch_id": fetch_id,
         "candidate_id": candidate.get("candidate_id"),
         "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
+        "semantic_plan_task_id": candidate.get("semantic_plan_task_id"),
+        "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+        "approved_delta_id": candidate.get("approved_delta_id"),
+        "visual_task_id": candidate.get("visual_task_id"),
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
         "origin": candidate.get("origin"),
@@ -1081,6 +1180,10 @@ def _evidence_image(
         "id": image_id,
         "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
+        "semantic_plan_task_id": candidate.get("semantic_plan_task_id"),
+        "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+        "approved_delta_id": candidate.get("approved_delta_id"),
+        "visual_task_id": candidate.get("visual_task_id"),
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
         "candidate_id": candidate.get("candidate_id"),
@@ -1131,30 +1234,40 @@ def _fetch_image(
     max_image_bytes: int,
     timeout_seconds: float,
 ) -> FetchResponse:
+    try:
+        request_url = _request_safe_image_url(url)
+    except (UnicodeError, ValueError) as exc:
+        return FetchResponse(
+            content=None,
+            mime_type=None,
+            status_code=None,
+            final_url=url,
+            error_code=f"fetch_failed:{exc.__class__.__name__}",
+        )
     if transport is not None:
         try:
-            return transport(url)
+            return transport(request_url)
         except Exception as exc:  # pragma: no cover - exercised through public result
             return FetchResponse(
                 content=None,
                 mime_type=None,
                 status_code=None,
-                final_url=url,
+                final_url=request_url,
                 error_code=f"fetch_failed:{exc.__class__.__name__}",
             )
     try:
         return _default_fetch_image(
-            url,
+            request_url,
             timeout_seconds=timeout_seconds,
             max_image_bytes=max_image_bytes,
         )
-    except (OSError, ValueError, HTTPError, URLError) as exc:
+    except (OSError, ValueError, HTTPException, HTTPError, URLError) as exc:
         status = exc.code if isinstance(exc, HTTPError) else None
         return FetchResponse(
             content=None,
             mime_type=None,
             status_code=status,
-            final_url=url,
+            final_url=request_url,
             error_code=f"fetch_failed:{exc.__class__.__name__}",
         )
 
@@ -1166,32 +1279,99 @@ def _fetch_source_html(
     timeout_seconds: float,
     max_html_bytes: int,
 ) -> FetchResponse:
+    try:
+        request_url = _request_safe_http_url(url)
+    except (UnicodeError, ValueError) as exc:
+        return FetchResponse(
+            content=None,
+            mime_type=None,
+            status_code=None,
+            final_url=url,
+            error_code=f"fetch_failed:{exc.__class__.__name__}",
+        )
     if transport is not None:
         try:
-            return transport(url)
+            return transport(request_url)
         except Exception as exc:  # pragma: no cover - exercised through public result
             return FetchResponse(
                 content=None,
                 mime_type=None,
                 status_code=None,
-                final_url=url,
+                final_url=request_url,
                 error_code=f"fetch_failed:{exc.__class__.__name__}",
             )
     try:
         return _default_fetch_source_html(
-            url,
+            request_url,
             timeout_seconds=timeout_seconds,
             max_html_bytes=max_html_bytes,
         )
-    except (OSError, ValueError, HTTPError, URLError) as exc:
+    except (OSError, ValueError, HTTPException, HTTPError, URLError) as exc:
         status = exc.code if isinstance(exc, HTTPError) else None
         return FetchResponse(
             content=None,
             mime_type=None,
             status_code=status,
-            final_url=url,
+            final_url=request_url,
             error_code=f"fetch_failed:{exc.__class__.__name__}",
         )
+
+
+def _request_safe_http_url(url: str) -> str:
+    if _has_control_character(url):
+        raise ValueError("source URL contains control characters")
+    url = url.strip(" ")
+    if _has_invalid_percent_escape(url):
+        raise ValueError("source URL contains invalid percent escape")
+    raw_authority = _raw_http_authority(url)
+    if raw_authority is not None and _has_invalid_authority_character(raw_authority):
+        raise ValueError("source URL authority contains invalid characters")
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("malformed source URL") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("unsupported source URL scheme")
+    if not parsed.netloc or not hostname:
+        raise ValueError("missing source URL host")
+    return parsed._replace(
+        path=quote(parsed.path, safe="/%:@!$&'()*+,;="),
+        params=quote(parsed.params, safe="%:@!$&'()*+,;="),
+        query=quote(parsed.query, safe="/?%:@!$&'()*+,;="),
+        fragment=quote(parsed.fragment, safe="/?%:@!$&'()*+,;="),
+    ).geturl()
+
+
+def _request_safe_image_url(url: str) -> str:
+    if _is_http_like_url(url):
+        return _request_safe_http_url(url)
+    return url
+
+
+def _is_http_like_url(url: str) -> bool:
+    return re.match(r"(?i)^[\x00-\x20\x7f]*https?:", url) is not None
+
+
+def _raw_http_authority(url: str) -> str | None:
+    match = re.match(r"(?i)^https?://([^/?#]*)", url)
+    return match.group(1) if match else None
+
+
+def _has_control_character(value: str) -> bool:
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def _has_invalid_authority_character(value: str) -> bool:
+    return any(
+        char == "%" or char.isspace() or ord(char) <= 0x20 or ord(char) == 0x7F
+        for char in value
+    )
+
+
+def _has_invalid_percent_escape(value: str) -> bool:
+    return re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None
 
 
 def _default_fetch_image(
@@ -1200,6 +1380,8 @@ def _default_fetch_image(
     timeout_seconds: float,
     max_image_bytes: int,
 ) -> FetchResponse:
+    if _is_http_like_url(url):
+        url = _request_safe_http_url(url)
     parsed = urlparse(url)
     if parsed.scheme == "data":
         header, _, payload = url.partition(",")
@@ -1258,6 +1440,7 @@ def _default_fetch_source_html(
     timeout_seconds: float,
     max_html_bytes: int,
 ) -> FetchResponse:
+    url = _request_safe_http_url(url)
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("unsupported source URL scheme")
@@ -1338,10 +1521,10 @@ class _PrivateNetworkBlockingRedirectHandler(HTTPRedirectHandler):
         headers: Mapping[str, Any],
         newurl: str,
     ) -> Request | None:
-        redirect_url = urljoin(req.full_url, newurl)
+        redirect_url = _request_safe_http_url(urljoin(req.full_url, newurl))
         if _is_private_or_reserved_http_url(redirect_url, resolve_host=True):
             raise ValueError("private_network_redirect")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, redirect_url)
 
 
 def _visual_search_plan(
@@ -1355,18 +1538,30 @@ def _visual_search_plan(
 ) -> dict[str, Any]:
     task_keys: dict[tuple[str, str, str], dict[str, Any]] = {}
     for candidate in candidates:
-        key = (
-            str(candidate.get("plan_id")),
-            str(candidate.get("task_id")),
-            str(candidate.get("angle_id")),
+        route_name = _string(candidate.get("route")) or "visual_required"
+        if route_name == "text_only":
+            continue
+        task_id = _string(candidate.get("task_id"))
+        if not task_id:
+            continue
+        semantic_task_id = _string(candidate.get("semantic_plan_task_id")) or task_id
+        key = _visual_search_plan_task_key(
+            plan_id=_string(candidate.get("plan_id")),
+            task_id=task_id,
+            semantic_task_id=semantic_task_id,
+            angle_id=_string(candidate.get("angle_id")),
         )
-        task_keys.setdefault(
+        task = task_keys.setdefault(
             key,
             {
                 "plan_id": candidate.get("plan_id"),
-                "task_id": candidate.get("task_id"),
+                "task_id": task_id,
+                "semantic_plan_task_id": semantic_task_id,
+                "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+                "approved_delta_id": candidate.get("approved_delta_id"),
+                "visual_task_id": candidate.get("visual_task_id"),
                 "angle_id": candidate.get("angle_id"),
-                "route": candidate.get("route") or "visual_required",
+                "route": route_name,
                 "target_evidence_type": "page_image",
                 "query": str(evidence.get("question") or ""),
                 "providers": [PROVIDER_NAME],
@@ -1387,17 +1582,36 @@ def _visual_search_plan(
                 "state": "completed",
             },
         )
+        _apply_page_visual_semantic_lineage(task, candidate)
         result_id = candidate.get("source_search_result_id")
         if isinstance(result_id, str) and result_id:
             refs = task_keys[key]["source_search_result_ids"]
             if result_id not in refs:
                 refs.append(result_id)
-    return {
+    payload = {
         "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "created_at": created_at,
         "tasks": list(task_keys.values()),
     }
+    return apply_release_validation_identity(
+        payload,
+        release_validation_identity_from_payload(evidence),
+    )
+
+
+def _visual_search_plan_task_key(
+    *,
+    plan_id: str,
+    task_id: str,
+    semantic_task_id: str,
+    angle_id: str,
+) -> tuple[str, str, str]:
+    if semantic_task_id:
+        return ("semantic", semantic_task_id, "")
+    if task_id:
+        return ("task", task_id, angle_id)
+    return ("plan", plan_id, angle_id)
 
 
 def _visual_provider_status(
@@ -1566,12 +1780,15 @@ def _remote_source_html_fetch_allowed(
     source_url = _string(source.get("url"))
     if not source_url:
         return False
+    source_url = source_url.strip(" ")
     try:
         parsed = urlparse(source_url)
     except ValueError:
-        return False
-    if parsed.scheme not in {"http", "https"}:
-        return False
+        if not _raw_http_authority(source_url):
+            return False
+    else:
+        if parsed.scheme not in {"http", "https"}:
+            return False
     route = _source_route(source, routes_by_angle)
     route_name = _string(route.get("modality")) or _string(source.get("route"))
     if route_name == "text_only":
@@ -1601,7 +1818,12 @@ def _fetch_remote_source_html(
         "failure_code": None,
         "external_network_call": False,
     }
-    if _is_private_or_reserved_http_url(source_url, resolve_host=transport is None):
+    try:
+        request_url = _request_safe_http_url(source_url)
+    except (UnicodeError, ValueError) as exc:
+        base_record["failure_code"] = f"fetch_failed:{exc.__class__.__name__}"
+        return base_record, None, source_url
+    if _is_private_or_reserved_http_url(request_url, resolve_host=transport is None):
         base_record.update(
             {
                 "status": "blocked",
@@ -1609,9 +1831,9 @@ def _fetch_remote_source_html(
                 "external_network_call": False,
             }
         )
-        return base_record, None, source_url
+        return base_record, None, request_url
     response = _fetch_source_html(
-        source_url,
+        request_url,
         transport=transport,
         timeout_seconds=timeout_seconds,
         max_html_bytes=max_html_bytes,
@@ -1903,6 +2125,17 @@ def _image_url_fetch_block_reason(
     source_html_path: Path | None,
     resolve_hosts: bool,
 ) -> str | None:
+    if _is_http_like_url(url):
+        try:
+            request_url = _request_safe_http_url(url)
+        except (UnicodeError, ValueError):
+            return None
+        if (
+            _source_is_remote_page(source)
+            and _is_private_or_reserved_http_url(request_url, resolve_host=resolve_hosts)
+        ):
+            return "private_network_url_from_remote_page"
+        return None
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -1952,14 +2185,19 @@ def _source_allows_local_image_references(source: Mapping[str, Any]) -> bool:
 
 
 def _source_is_remote_page(source: Mapping[str, Any]) -> bool:
+    source_type = _string(source.get("type")) or ""
+    if source_type in {"local", "fixture"}:
+        return False
     source_url = _string(source.get("url"))
     if not source_url:
         return False
+    if _is_http_like_url(source_url):
+        return True
+    source_url = source_url.strip(" ")
     try:
         scheme = urlparse(source_url).scheme.lower()
     except ValueError:
-        return False
-    source_type = _string(source.get("type")) or ""
+        return _is_http_like_url(source_url)
     return scheme in {"http", "https"} and source_type not in {"local", "fixture"}
 
 
@@ -2023,10 +2261,22 @@ def _is_obvious_internal_hostname(host: str) -> bool:
 
 
 def _safe_join_url(page_url: str, image_url: str) -> str | None:
+    if _has_control_character_in_http_like_url(image_url):
+        return image_url or None
     try:
         return urljoin(page_url, image_url)
     except ValueError:
         return image_url or None
+
+
+def _has_control_character_in_http_like_url(value: str) -> bool:
+    return _has_control_character(value) and (
+        _is_http_like_url(value) or _is_network_path_like_url(value)
+    )
+
+
+def _is_network_path_like_url(value: str) -> bool:
+    return re.match(r"^[\x00-\x20\x7f]*//", value) is not None
 
 
 def _numeric_hostname_addresses(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
@@ -2225,6 +2475,65 @@ def _safe_id(value: str) -> str:
 
 def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
     return "plan_" + _safe_id(f"{task_id}_{angle_id}_{route}")
+
+
+def _apply_page_visual_semantic_lineage(
+    record: MutableMapping[str, Any],
+    *lineage_sources: Mapping[str, Any],
+) -> None:
+    current_task_id = _string(record.get("task_id"))
+    semantic_task_id = _first_lineage_value(
+        "semantic_plan_task_id",
+        *lineage_sources,
+        record,
+    )
+    if not semantic_task_id:
+        semantic_task_id = _string(record.get("semantic_plan_task_id")) or current_task_id
+    if not semantic_task_id:
+        semantic_task_id = _first_lineage_value("task_id", *lineage_sources)
+    if semantic_task_id:
+        if (
+            current_task_id
+            and current_task_id != semantic_task_id
+            and current_task_id.startswith("task_visual_")
+        ):
+            record.setdefault("visual_task_id", current_task_id)
+        elif not current_task_id:
+            record["task_id"] = semantic_task_id
+        record["semantic_plan_task_id"] = semantic_task_id
+        angle_id = _string(record.get("angle_id")) or _first_lineage_value(
+            "angle_id",
+            *lineage_sources,
+        )
+        route = _string(record.get("route")) or _first_lineage_value(
+            "route",
+            *lineage_sources,
+        )
+        if angle_id and route and not _string(record.get("plan_id")):
+            record["plan_id"] = _plan_id_for_visual_task(
+                task_id=_string(record.get("task_id")) or semantic_task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+    visual_task_id = _first_lineage_value("visual_task_id", *lineage_sources)
+    if visual_task_id and visual_task_id != record.get("task_id"):
+        record.setdefault("visual_task_id", visual_task_id)
+    for field in ("semantic_plan_hash", "approved_delta_id"):
+        value = _first_lineage_value(field, *lineage_sources, record)
+        if value:
+            record[field] = value
+    if record.get("semantic_plan_hash") and not _string(record.get("approved_delta_id")):
+        record["approved_delta_id"] = "base_plan"
+
+
+def _first_lineage_value(field: str, *records: Mapping[str, Any]) -> str:
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        value = _string(record.get(field))
+        if value:
+            return value
+    return ""
 
 
 def _dedupe(values: Sequence[str]) -> list[str]:

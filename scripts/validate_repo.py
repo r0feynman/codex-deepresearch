@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV = "CODEX_DEEPRESEARCH_DISABLE_DEFAULT_SEMANTIC_ADAPTER"
 
 
 REQUIRED_FILES = [
@@ -43,6 +44,9 @@ REQUIRED_FILES = [
     "plugins/codex-deepresearch/src/deepresearch/verification_matrix.py",
     "plugins/codex-deepresearch/src/deepresearch/vision_adapter.py",
     "plugins/codex-deepresearch/skills/deep-research/SKILL.md",
+    "plugins/codex-deepresearch/validation/semantic_adapter_schemas/planner.json",
+    "plugins/codex-deepresearch/validation/semantic_adapter_schemas/oracle.json",
+    "plugins/codex-deepresearch/validation/semantic_adapter_schemas/reviewer.json",
     "plugins/codex-deepresearch/validation/public_beta_prompts.json",
     "scripts/bootstrap_github.py",
     "scripts/bootstrap_project_board.py",
@@ -521,6 +525,8 @@ def run_public_beta_validation(runner: Path) -> None:
 
 
 def main() -> None:
+    os.environ.setdefault(DISABLE_DEFAULT_SEMANTIC_ADAPTER_ENV, "1")
+
     for relative_path in REQUIRED_FILES:
         if not (ROOT / relative_path).exists():
             fail(f"missing required file: {relative_path}")

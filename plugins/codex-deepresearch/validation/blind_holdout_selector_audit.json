@@ -1,0 +1,39 @@
+{
+  "audit_type": "independent_selector_audit",
+  "auditor": "codex_main_coordinator",
+  "created_at": "2026-07-07T23:49:17Z",
+  "implementation_freeze": {
+    "commit": "2bef9dc",
+    "record_type": "commit",
+    "release_eligible": true,
+    "timestamp": "2026-07-08T08:48:05+09:00"
+  },
+  "manifest_path": "blind_holdout_semantic_prompts.json",
+  "prompt_count": 12,
+  "prompt_ids": [
+    "holdout-independent-001",
+    "holdout-independent-002",
+    "holdout-independent-003",
+    "holdout-independent-004",
+    "holdout-independent-005",
+    "holdout-independent-006",
+    "holdout-independent-007",
+    "holdout-independent-008",
+    "holdout-independent-009",
+    "holdout-independent-010",
+    "holdout-independent-011",
+    "holdout-independent-012"
+  ],
+  "raw_selector_transcript_hash": "82403a9d0a5b4bf42b299047dcd758f9aa8417a1ec9e89440a81d537aea6593b",
+  "raw_selector_transcript_path": "blind_holdout_selector_transcript.json",
+  "release_eligible": true,
+  "schema_version": "codex-deepresearch.semantic-blind-holdout-selector-audit.v0",
+  "selection_checks": {
+    "distinctive_keyword_scan_found_matches": false,
+    "exact_prompt_string_scan_found_matches": false,
+    "known_manifest_overlap_detected": false,
+    "oracle_hashes_verified": true,
+    "selected_after_implementation_freeze": true
+  },
+  "selector_independent": true
+}

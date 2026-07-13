@@ -200,6 +200,36 @@ class EvidenceSchemaValidatorTests(unittest.TestCase):
             {error.path for error in result.errors},
         )
 
+    def test_search_result_semantic_task_route_can_differ_from_parent_angle_route(self) -> None:
+        evidence = self.load_valid_evidence()
+        search_result = self.load_search_result()
+        search_result["route"] = "text_only"
+        search_result["semantic_task_route"] = "text_only"
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            search_results_path=self.write_jsonl([search_result]),
+        )
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+
+    def test_search_result_route_mismatch_still_fails_without_matching_semantic_task_route(self) -> None:
+        evidence = self.load_valid_evidence()
+        search_result = self.load_search_result()
+        search_result["route"] = "text_only"
+        search_result["semantic_task_route"] = "visual_required"
+
+        result = validate_artifacts(
+            evidence_path=self.write_evidence(evidence),
+            search_results_path=self.write_jsonl([search_result]),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "$.search_results[0].route",
+            {error.path for error in result.errors if error.code == "route_mismatch"},
+        )
+
     def test_top_level_verifier_vote_string_record_fails(self) -> None:
         votes_path = self.write_jsonl(["vote_text_001"])
 
