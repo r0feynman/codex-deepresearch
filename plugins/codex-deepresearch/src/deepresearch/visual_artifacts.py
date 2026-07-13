@@ -130,6 +130,8 @@ class _VisualContext:
         self.search_result_ids: set[str] = set()
         self.observation_links_by_image_claim: set[tuple[str, str, str]] = set()
         self.report_used_image_ids: set[str] = set()
+        self.report_included_claims_available = False
+        self.report_included_image_claim_pairs: set[tuple[str, str]] = set()
 
 
 def automatic_visual_status_envelope(
@@ -1566,6 +1568,7 @@ def _validate_report_status(
             "included_claims must be a list",
         )
         return
+    context.report_included_claims_available = True
     for index, claim_record in enumerate(included_claims):
         claim_path = f"$.report_status.included_claims[{index}]"
         if not _require_object(claim_record, claim_path, collector):
@@ -1593,6 +1596,8 @@ def _validate_report_status(
                     "dangling_reference",
                     f"report status references unknown image '{image_id}'",
                 )
+            if claim_id:
+                context.report_included_image_claim_pairs.add((image_id, claim_id))
             if claim is not None:
                 supporting_images = claim.get("supporting_images", [])
                 if isinstance(supporting_images, list) and image_id not in supporting_images:
@@ -1815,6 +1820,18 @@ def _sum_provider_counter(
 
 def _has_report_cited_supported_visual_claim(context: _VisualContext) -> bool:
     if not context.claim_by_id or not context.report_used_image_ids:
+        return False
+    if context.report_included_claims_available:
+        for image_id, claim_id in context.report_included_image_claim_pairs:
+            if image_id not in context.report_used_image_ids:
+                continue
+            claim = context.claim_by_id.get(claim_id)
+            if not isinstance(claim, Mapping):
+                continue
+            if claim.get("verification_status") == "supported" and claim.get(
+                "claim_type"
+            ) in {"visual", "mixed"}:
+                return True
         return False
     for claim in context.claim_by_id.values():
         if claim.get("verification_status") != "supported":
@@ -2296,7 +2313,11 @@ def _validate_claim_observation_report_lineage(
                     "missing_verifier_link",
                     f"supported visual claim '{claim_id}' lacks verifier link for image '{image_id}'",
                 )
-            if (image_id, claim_id) not in report_pairs:
+            report_link_required = (
+                not context.report_included_claims_available
+                or (image_id, claim_id) in context.report_included_image_claim_pairs
+            )
+            if report_link_required and (image_id, claim_id) not in report_pairs:
                 collector.add(
                     f"$.evidence.claims.{claim_id}.visual_supports",
                     "missing_report_link",

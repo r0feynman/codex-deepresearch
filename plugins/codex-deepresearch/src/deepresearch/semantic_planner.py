@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -61,6 +62,12 @@ CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV = (
 )
 CODEX_SEMANTIC_ADAPTER_WORKDIR_ENV = "CODEX_DEEPRESEARCH_SEMANTIC_ADAPTER_WORKDIR"
 CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND = "codex_exec_json"
+CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_ATTEMPTS_ENV = (
+    "CODEX_DEEPRESEARCH_SEMANTIC_ADAPTER_CAPACITY_RETRY_ATTEMPTS"
+)
+CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS_ENV = (
+    "CODEX_DEEPRESEARCH_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS"
+)
 CODEX_SEMANTIC_ADAPTER_SCHEMA_DIRNAME = "semantic_adapter_schemas"
 CODEX_SEMANTIC_PLANNER_SCHEMA_FILENAME = "planner.json"
 CODEX_SEMANTIC_ORACLE_SCHEMA_FILENAME = "oracle.json"
@@ -790,6 +797,9 @@ def codex_semantic_candidate_plan(
                     budget_cap=raw_request.get("budget_cap"),
                 )
             )
+            candidate, expected_evidence_materializations = (
+                _materialize_candidate_expected_evidence(candidate)
+            )
             candidate, angle_title_materializations = (
                 _materialize_candidate_angle_title_prompt_anchors(
                     candidate,
@@ -813,6 +823,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_budget_cap_materializations"] = (
                     budget_cap_materializations
+                )
+            if expected_evidence_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_expected_evidence_materializations"] = (
+                    expected_evidence_materializations
                 )
             if angle_title_materializations:
                 raw_response["candidate_plan"] = candidate
@@ -1037,13 +1052,11 @@ def invoke_codex_semantic_planner_adapter(
         return None
     command_boundary = validate_codex_semantic_adapter_command(command)
     timeout_seconds = float(os.environ.get(CODEX_SEMANTIC_PLANNER_TIMEOUT_ENV, "300"))
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        input=json.dumps(dict(request), ensure_ascii=False, sort_keys=True),
-        text=True,
-        timeout=timeout_seconds,
+    completed, retry_metadata = _run_codex_semantic_adapter_command_with_capacity_retry(
+        command=command,
+        request=request,
+        timeout_seconds=timeout_seconds,
+        role_label="semantic planner",
     )
     if completed.returncode != 0:
         raise SemanticPlannerAdapterUnavailable(
@@ -1064,7 +1077,11 @@ def invoke_codex_semantic_planner_adapter(
     )
     for key, value in codex_event_provenance.items():
         provenance.setdefault(key, value)
+    if retry_metadata:
+        provenance["adapter_retry_metadata"] = retry_metadata
     payload = dict(payload)
+    if retry_metadata:
+        payload["adapter_retry_metadata"] = retry_metadata
     payload["provenance"] = provenance
     return payload
 
@@ -1485,6 +1502,188 @@ def _candidate_constraints_mention_search_result_cap(
         rf"\b검색 결과\b[^0-9]{{0,80}}\b{max_results}\b",
     )
     return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _materialize_candidate_expected_evidence(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized, []
+
+    raw_angles = normalized.get("angles")
+    angle_records = raw_angles if isinstance(raw_angles, list) else []
+    angles_by_id = {
+        str(angle.get("angle_id") or ""): angle
+        for angle in angle_records
+        if isinstance(angle, Mapping)
+    }
+    normalized_tasks: list[Any] = []
+    materializations: list[dict[str, Any]] = []
+    for index, task in enumerate(raw_tasks, start=1):
+        if not isinstance(task, Mapping):
+            normalized_tasks.append(task)
+            continue
+        normalized_task = dict(task)
+        current = _string_list(normalized_task.get("expected_evidence"))
+        if current:
+            normalized_tasks.append(normalized_task)
+            continue
+        angle = angles_by_id.get(str(normalized_task.get("angle_id") or ""))
+        inferred = _candidate_task_expected_evidence_from_context(
+            normalized_task,
+            angle=angle if isinstance(angle, Mapping) else {},
+        )
+        if not inferred:
+            normalized_tasks.append(normalized_task)
+            continue
+        normalized_task["expected_evidence"] = inferred
+        normalized_tasks.append(normalized_task)
+        materializations.append(
+            {
+                "task_id": normalized_task.get("task_id"),
+                "task_index": index,
+                "angle_id": normalized_task.get("angle_id"),
+                "field": "bounded_tasks.expected_evidence",
+                "materialized_expected_evidence": inferred,
+                "materialization": "inferred_expected_evidence_from_visual_context",
+            }
+        )
+    normalized["bounded_tasks"] = normalized_tasks
+    return normalized, materializations
+
+
+def _candidate_task_expected_evidence_from_context(
+    task: Mapping[str, Any],
+    *,
+    angle: Mapping[str, Any],
+) -> list[str]:
+    evidence: list[str] = []
+    task_route = str(task.get("route") or "")
+    if task_route == "text_only":
+        return evidence
+    task_need = str(task.get("evidence_need") or "")
+    angle_need = str(angle.get("evidence_need") or "")
+    route = str(task_route or angle.get("route") or "text_only")
+    task_targets = _string_list(task.get("expected_visual_targets"))
+    angle_targets = _string_list(angle.get("expected_visual_targets"))
+    targets = [*task_targets, *angle_targets]
+    text = json.dumps(
+        {
+            "task_evidence_need": task_need,
+            "angle_evidence_need": angle_need,
+            "route": route,
+            "expected_visual_targets": targets,
+            "expected_artifacts": [
+                *_string_list(task.get("expected_artifacts")),
+                *_string_list(angle.get("expected_artifacts")),
+            ],
+            "query": task.get("query"),
+            "success_criteria": task.get("success_criteria"),
+            "done_condition": task.get("done_condition"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+
+    for need in (task_need, angle_need):
+        if need in VISUAL_EXPECTED_EVIDENCE:
+            evidence.append(need)
+
+    visual_obligation = (
+        route != "text_only"
+        or bool(targets)
+        or _semantic_task_expected_visual_artifacts(task)
+        or _semantic_task_expected_visual_artifacts(angle)
+    )
+    if not visual_obligation:
+        return _ordered_unique(evidence)
+
+    if _candidate_visual_context_needs_examples(text, targets) or not evidence:
+        evidence.append("visual_example")
+    if _candidate_visual_context_needs_observation(text, targets) or not evidence:
+        evidence.append("visual_observation")
+    if _candidate_visual_context_needs_vlm_analysis(text):
+        evidence.append("vlm_analysis")
+    return _ordered_unique(evidence)
+
+
+def _candidate_visual_context_needs_examples(
+    text: str,
+    targets: Sequence[str],
+) -> bool:
+    target_text = " ".join(str(target) for target in targets).lower()
+    return _contains_any(
+        f"{text} {target_text}",
+        (
+            "example",
+            "examples",
+            "representative",
+            "candidate",
+            "candidates",
+            "gallery",
+            "image set",
+            "source images",
+            "poster",
+            "public examples",
+            "\uc608\uc2dc",
+            "\uc0ac\ub840",
+            "\ud3ec\uc2a4\ud130",
+            "\uc774\ubbf8\uc9c0",
+            "\uc0ac\uc9c4",
+        ),
+    )
+
+
+def _candidate_visual_context_needs_observation(
+    text: str,
+    targets: Sequence[str],
+) -> bool:
+    target_text = " ".join(str(target) for target in targets).lower()
+    return _contains_any(
+        f"{text} {target_text}",
+        (
+            "observation",
+            "observe",
+            "visible",
+            "inspect",
+            "inspection",
+            "analysis",
+            "analyze",
+            "interpret",
+            "feature",
+            "structure",
+            "chart",
+            "diagram",
+            "figure",
+            "comparison",
+            "compare",
+            "\ud310\ub3c5",
+            "\ubd84\uc11d",
+            "\uad6c\uc870",
+            "\ud2b9\uc9d5",
+            "\ucc28\ud2b8",
+            "\uadf8\ub9bc",
+            "\ube44\uad50",
+        ),
+    )
+
+
+def _candidate_visual_context_needs_vlm_analysis(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "vlm",
+            "vision model",
+            "image interpretation",
+            "visual interpretation",
+            "chart reading",
+            "figure reading",
+            "\ud310\ub3c5",
+            "\uc2dc\uac01 \ubd84\uc11d",
+        ),
+    )
 
 
 def _materialize_candidate_angle_title_prompt_anchors(
@@ -2583,6 +2782,112 @@ def semantic_plan_with_review_result(
     )
 
 
+def _run_codex_semantic_adapter_command_with_capacity_retry(
+    *,
+    command: Sequence[str],
+    request: Mapping[str, Any],
+    timeout_seconds: float,
+    role_label: str,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+    request_json = json.dumps(dict(request), ensure_ascii=False, sort_keys=True)
+    max_attempts = _codex_semantic_adapter_capacity_retry_attempts()
+    backoff_base_seconds = _codex_semantic_adapter_capacity_retry_backoff_seconds()
+    failed_attempts: list[dict[str, Any]] = []
+    for attempt in range(1, max_attempts + 1):
+        completed = subprocess.run(
+            list(command),
+            check=False,
+            capture_output=True,
+            input=request_json,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        if completed.returncode == 0:
+            if not failed_attempts:
+                return completed, None
+            return completed, {
+                "retry_policy": "codex_semantic_adapter_capacity_backoff",
+                "transient_failure_type": "model_capacity",
+                "attempt_count": attempt,
+                "failed_attempt_count": len(failed_attempts),
+                "successful_attempt": attempt,
+                "role_label": role_label,
+                "failed_attempts": list(failed_attempts),
+            }
+        if not _codex_semantic_adapter_completed_process_is_capacity_failure(completed):
+            return completed, None
+        will_retry = attempt < max_attempts
+        backoff_seconds = (
+            min(30.0, backoff_base_seconds * (2 ** (attempt - 1)))
+            if will_retry
+            else 0.0
+        )
+        failed_attempts.append(
+            {
+                "attempt": attempt,
+                "failure_category": "model_capacity",
+                "returncode": completed.returncode,
+                "stderr_preview": _preview_text(completed.stderr),
+                "stdout_preview": _preview_text(completed.stdout),
+                "will_retry": will_retry,
+                "backoff_seconds": backoff_seconds,
+            }
+        )
+        if not will_retry:
+            raise SemanticPlannerAdapterUnavailable(
+                f"Codex {role_label} command exited {completed.returncode} after "
+                f"{max_attempts} transient model-capacity attempts; "
+                f"stderr={_preview_text(completed.stderr)}; stdout={_preview_text(completed.stdout)}"
+            )
+        if backoff_seconds > 0:
+            time.sleep(backoff_seconds)
+    raise SemanticPlannerAdapterUnavailable(
+        f"Codex {role_label} command did not return after capacity retry handling"
+    )
+
+
+def _codex_semantic_adapter_capacity_retry_attempts() -> int:
+    raw_value = os.environ.get(
+        CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_ATTEMPTS_ENV,
+        "3",
+    )
+    try:
+        value = int(str(raw_value).strip())
+    except ValueError:
+        return 3
+    return max(1, min(value, 5))
+
+
+def _codex_semantic_adapter_capacity_retry_backoff_seconds() -> float:
+    raw_value = os.environ.get(
+        CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS_ENV,
+        "1.0",
+    )
+    try:
+        value = float(str(raw_value).strip())
+    except ValueError:
+        return 1.0
+    if not math.isfinite(value):
+        return 1.0
+    return max(0.0, min(value, 30.0))
+
+
+def _codex_semantic_adapter_completed_process_is_capacity_failure(
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    text = " ".join(
+        (
+            str(completed.stderr or ""),
+            str(completed.stdout or ""),
+        )
+    ).lower()
+    return (
+        "selected model is at capacity" in text
+        or "model is at capacity" in text
+        or "at capacity. please try a different model" in text
+    )
+
+
 def _invoke_codex_semantic_json_adapter(
     *,
     request: Mapping[str, Any],
@@ -2595,13 +2900,11 @@ def _invoke_codex_semantic_json_adapter(
         return None
     command_boundary = validate_codex_semantic_adapter_command(command)
     timeout_seconds = float(os.environ.get(timeout_env, "300"))
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        input=json.dumps(dict(request), ensure_ascii=False, sort_keys=True),
-        text=True,
-        timeout=timeout_seconds,
+    completed, retry_metadata = _run_codex_semantic_adapter_command_with_capacity_retry(
+        command=command,
+        request=request,
+        timeout_seconds=timeout_seconds,
+        role_label=role_label,
     )
     if completed.returncode != 0:
         raise SemanticPlannerAdapterUnavailable(
@@ -2621,7 +2924,11 @@ def _invoke_codex_semantic_json_adapter(
     )
     for key, value in _codex_event_provenance(codex_events).items():
         provenance.setdefault(key, value)
+    if retry_metadata:
+        provenance["adapter_retry_metadata"] = retry_metadata
     payload = dict(payload)
+    if retry_metadata:
+        payload["adapter_retry_metadata"] = retry_metadata
     payload["provenance"] = provenance
     return payload
 
@@ -4563,6 +4870,20 @@ def validate_semantic_candidate_plan(
             )
         route = str(task.get("route") or "text_only")
         visual_targets = _string_list(task.get("expected_visual_targets"))
+        task_expected_evidence = set(_string_list(task.get("expected_evidence")))
+        if (
+            route == "text_only"
+            and task_expected_evidence & VISUAL_EXPECTED_EVIDENCE
+        ):
+            failures.append(
+                {
+                    "code": "text_only_task_visual_expected_evidence",
+                    "task_id": task.get("task_id"),
+                    "expected_evidence": sorted(
+                        task_expected_evidence & VISUAL_EXPECTED_EVIDENCE
+                    ),
+                }
+            )
         if route != "text_only" or visual_targets:
             try:
                 max_images = int(task.get("max_images") or 0)

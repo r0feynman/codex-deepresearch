@@ -1687,19 +1687,39 @@ def _expected_evidence_for_bounded_task(
     route: str,
     expected_visual_targets: Any,
     max_images: int,
+    task_expected_evidence: Any = None,
 ) -> list[str]:
     visual_obligation = (
         route != "text_only"
         or _has_string_items(expected_visual_targets)
         or max_images > 0
     )
+    explicit_expected = [
+        item
+        for item in _string_items(task_expected_evidence)
+        if visual_obligation
+        or item not in {"visual_example", "visual_observation", "vlm_analysis"}
+    ]
     if not visual_obligation and evidence_need in {
         "visual_example",
         "visual_observation",
         "vlm_analysis",
     }:
-        return ["primary_source"]
-    return _expected_evidence_for_angle(evidence_need, route)
+        evidence_need = "primary_source"
+    return list(
+        dict.fromkeys(
+            [
+                *explicit_expected,
+                *_expected_evidence_for_angle(evidence_need, route),
+            ]
+        )
+    )
+
+
+def _string_items(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
 def _has_string_items(value: Any) -> bool:
@@ -1845,6 +1865,7 @@ def _search_task_from_bounded_task(
             route=route,
             expected_visual_targets=bounded_task.get("expected_visual_targets"),
             max_images=max_images,
+            task_expected_evidence=bounded_task.get("expected_evidence"),
         ),
         "success_criteria": list(bounded_task.get("success_criteria") or []),
         "done_condition": str(bounded_task.get("done_condition") or ""),

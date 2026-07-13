@@ -24,6 +24,7 @@ from deepresearch.report_generation import synthesize_report  # noqa: E402
 from deepresearch.search_handoff import prepare_run  # noqa: E402
 from deepresearch.semantic_planner import (  # noqa: E402
     ALLOWED_EVIDENCE_NEEDS,
+    CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS_ENV,
     CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
     CODEX_SEMANTIC_ADAPTER_WORKDIR_ENV,
     CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV,
@@ -1469,9 +1470,19 @@ class SemanticPlannerTests(unittest.TestCase):
         command_env_configured: bool = True,
         default_codex_available: bool = False,
         route: str | None = None,
+        capacity_failures_by_artifact: dict[str, int] | None = None,
+        non_capacity_failures_by_artifact: dict[str, int] | None = None,
         **adapter_kwargs: object,
     ) -> tuple[dict, dict]:
-        captured = {"commands": []}
+        captured = {"commands": [], "artifact_types": []}
+        capacity_failures = {
+            str(key): int(value)
+            for key, value in dict(capacity_failures_by_artifact or {}).items()
+        }
+        non_capacity_failures = {
+            str(key): int(value)
+            for key, value in dict(non_capacity_failures_by_artifact or {}).items()
+        }
 
         def fake_run(
             command: list[str],
@@ -1490,12 +1501,37 @@ class SemanticPlannerTests(unittest.TestCase):
             self.assertGreater(timeout, 0)
             request = json.loads(input)
             artifact_type = request.get("artifact_type")
+            artifact_key = str(artifact_type or "semantic_planner_raw_request")
+            captured["artifact_types"].append(artifact_key)
+            if artifact_type not in {
+                "semantic_oracle_raw_request",
+                "semantic_reviewer_raw_request",
+            }:
+                captured["request"] = dict(request)
+            if capacity_failures.get(artifact_key, 0) > 0:
+                capacity_failures[artifact_key] -= 1
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr="Selected model is at capacity. Please try a different model.",
+                )
+            if non_capacity_failures.get(artifact_key, 0) > 0:
+                non_capacity_failures[artifact_key] -= 1
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr=(
+                        "adapter command failed for a non-transient reason; "
+                        "try a different model configuration"
+                    ),
+                )
             if artifact_type == "semantic_oracle_raw_request":
                 response = self.oracle_adapter_response(request, **adapter_kwargs)
             elif artifact_type == "semantic_reviewer_raw_request":
                 response = self.reviewer_adapter_response(request)
             else:
-                captured["request"] = dict(request)
                 response = self.codex_adapter_response(request, **adapter_kwargs)
             if artifact_type == "semantic_planner_raw_request" and callable(response_mutator):
                 response = response_mutator(response)
@@ -1566,6 +1602,7 @@ class SemanticPlannerTests(unittest.TestCase):
         env = {}
         if command_env_configured:
             env[CODEX_SEMANTIC_PLANNER_COMMAND_ENV] = "codex exec --json"
+            env[CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS_ENV] = "0"
         if command_env_configured and oracle_configured:
             env[CODEX_SEMANTIC_ORACLE_COMMAND_ENV] = "codex exec --json"
         if command_env_configured and reviewer_configured:
@@ -1590,6 +1627,7 @@ class SemanticPlannerTests(unittest.TestCase):
             )
         request = dict(captured["request"])
         request["_commands"] = list(captured["commands"])
+        request["_artifact_types"] = list(captured["artifact_types"])
         return result, request
 
     def text_only_oauth_candidate(self, *, question: str) -> dict:
@@ -4424,6 +4462,322 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(raw_response["failure_category"], "adapter_unavailable")
         self.assertIn("planner service unavailable", raw_response["blocked_reason"])
 
+    def test_codex_semantic_capacity_retry_preserves_release_eligible_adapters(self) -> None:
+        question = "Research official public health poster image guidance in Korea"
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+            capacity_failures_by_artifact={
+                "semantic_oracle_raw_request": 1,
+                "semantic_planner_raw_request": 1,
+                "semantic_reviewer_raw_request": 1,
+            },
+        )
+        run_dir = Path(result["run_dir"])
+        evidence = self.load_json(run_dir / "evidence.json")
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        raw_responses = (
+            self.load_json(run_dir / "semantic_oracle_raw" / "oracle_response.json"),
+            self.load_json(run_dir / "semantic_planner_raw" / "planner_response.json"),
+            self.load_json(run_dir / "semantic_reviewer_raw" / "reviewer_response.json"),
+        )
+
+        self.assertEqual(
+            adapter_request["_artifact_types"].count("semantic_oracle_raw_request"),
+            2,
+        )
+        self.assertEqual(
+            adapter_request["_artifact_types"].count("semantic_planner_raw_request"),
+            2,
+        )
+        self.assertEqual(
+            adapter_request["_artifact_types"].count("semantic_reviewer_raw_request"),
+            2,
+        )
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(evidence["semantic_planner"]["semantic_release_eligible"])
+        self.assertEqual(evidence["semantic_planner"]["status"], "semantic_review_passed")
+
+        for raw_response in raw_responses:
+            provenance = raw_response["provenance"]
+            self.assertFalse(provenance.get("non_release_fixture"), raw_response)
+            retry = provenance["adapter_retry_metadata"]
+            self.assertEqual(retry["transient_failure_type"], "model_capacity")
+            self.assertEqual(retry["attempt_count"], 2)
+            self.assertEqual(retry["failed_attempt_count"], 1)
+            self.assertEqual(retry["successful_attempt"], 2)
+            self.assertEqual(retry["failed_attempts"][0]["failure_category"], "model_capacity")
+            self.assertIn(
+                "Selected model is at capacity",
+                retry["failed_attempts"][0]["stderr_preview"],
+            )
+            self.assertEqual(raw_response["adapter_retry_metadata"], retry)
+
+        user_visible_constraints = json.dumps(
+            semantic_plan["constraints"],
+            ensure_ascii=False,
+        ).lower()
+        self.assertNotIn("capacity", user_visible_constraints)
+        self.assertNotIn("retry", user_visible_constraints)
+
+    def test_codex_semantic_non_capacity_oracle_failure_still_uses_non_release_fixture(self) -> None:
+        result, adapter_request = self.prepare_with_codex_adapter(
+            "Research official public health guidance in Korea",
+            requirement_types=("subject", "source_quality"),
+            non_capacity_failures_by_artifact={"semantic_oracle_raw_request": 1},
+        )
+        run_dir = Path(result["run_dir"])
+        oracle_raw_response = self.load_json(
+            run_dir / "semantic_oracle_raw" / "oracle_response.json"
+        )
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+
+        self.assertEqual(
+            adapter_request["_artifact_types"].count("semantic_oracle_raw_request"),
+            1,
+        )
+        self.assertEqual(result["status"], "blocked_semantic_review_failed")
+        self.assertEqual(
+            oracle_raw_response["oracle_adapter"],
+            "deterministic_semantic_oracle_fixture_non_release",
+        )
+        self.assertTrue(oracle_raw_response["provenance"]["non_release_fixture"])
+        self.assertNotIn(
+            "adapter_retry_metadata",
+            oracle_raw_response["provenance"],
+        )
+        blocker_codes = {blocker["code"] for blocker in review["blockers"]}
+        self.assertIn("non_release_oracle_fixture", blocker_codes)
+
+    def test_codex_semantic_sem_reg_004_oracle_capacity_retry_avoids_fixture(self) -> None:
+        question = "건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘."
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            requirement_types=("subject", "source_quality", "visual_modality", "deliverable_shape"),
+            visual_angle_indexes=(2, 3, 5),
+            capacity_failures_by_artifact={"semantic_oracle_raw_request": 1},
+        )
+        run_dir = Path(result["run_dir"])
+        oracle_raw_response = self.load_json(
+            run_dir / "semantic_oracle_raw" / "oracle_response.json"
+        )
+        review = self.load_json(run_dir / "semantic_plan_review.json")
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(result["semantic_planning_status"], "semantic_review_passed")
+        self.assertTrue(result["semantic_release_eligible"], result)
+        self.assertEqual(
+            adapter_request["_artifact_types"].count("semantic_oracle_raw_request"),
+            2,
+        )
+        self.assertEqual(
+            oracle_raw_response["oracle_adapter"],
+            "codex_native_semantic_expectation_oracle",
+        )
+        self.assertFalse(oracle_raw_response["provenance"].get("non_release_fixture"))
+        self.assertIn("adapter_retry_metadata", oracle_raw_response["provenance"])
+        self.assertTrue(review["semantic_release_eligible"], review)
+        self.assertEqual(review["reviewer_independence"]["status"], "passed")
+        self.assertNotIn(
+            "non_release_oracle_fixture",
+            {blocker["code"] for blocker in review["blockers"]},
+        )
+        self.assertTrue(
+            any(task.get("route") != "text_only" for task in semantic_plan["bounded_tasks"])
+        )
+
+    def test_codex_semantic_materializes_sem_reg_004_visual_expected_evidence(self) -> None:
+        question = "한국 공공보건 포스터 이미지의 손씻기 지침 차이를 공식 출처와 함께 분석해줘."
+        mixed_text_only_task: dict[str, str] = {}
+
+        def sem_reg_004_style_missing_expected_evidence(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            for angle in response["candidate_plan"]["angles"]:
+                if angle["route"] != "text_only":
+                    angle["route"] = "visual_optional"
+                    angle["expected_visual_targets"] = [
+                        "한국 공공보건 포스터 이미지의 손씻기 지침과 시각적 안내 요소"
+                    ]
+            for task in response["candidate_plan"]["bounded_tasks"]:
+                task.pop("expected_evidence", None)
+                if task["route"] != "text_only":
+                    if not mixed_text_only_task:
+                        mixed_text_only_task["task_id"] = task["task_id"]
+                        task["route"] = "text_only"
+                        task["max_images"] = 0
+                        task["expected_visual_targets"] = []
+                        task["expected_artifacts"] = ["official text source notes"]
+                        task["success_criteria"] = [
+                            "Collect official text source support only.",
+                        ]
+                        continue
+                    task["route"] = "visual_optional"
+                    task["expected_visual_targets"] = [
+                        "한국 공공보건 포스터 이미지의 손씻기 지침과 시각적 안내 요소"
+                    ]
+                    task["expected_artifacts"] = [
+                        *task["expected_artifacts"],
+                        "representative poster image examples",
+                        "visual observation notes",
+                    ]
+                    task["success_criteria"] = [
+                        *task["success_criteria"],
+                        "Analyze visible poster structure and handwashing guidance.",
+                    ]
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+            response_mutator=sem_reg_004_style_missing_expected_evidence,
+        )
+        run_dir = Path(result["run_dir"])
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        search_tasks = self.load_json(run_dir / "search_tasks.json")["tasks"]
+        planned_research_tasks = plan_research_tasks(run=run_dir, min_tasks=1)["tasks"]
+        visual_tasks = [
+            task for task in semantic_plan["bounded_tasks"]
+            if task["route"] != "text_only"
+        ]
+        text_only_tasks = [
+            task for task in semantic_plan["bounded_tasks"]
+            if task["route"] == "text_only"
+        ]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertTrue(result["semantic_release_eligible"], result)
+        self.assertTrue(validation["semantic_release_eligible"], validation)
+        self.assertTrue(validation["ok"], validation)
+        self.assertGreaterEqual(
+            validation["visual_expected_evidence_hits"].get("visual_example", 0),
+            1,
+        )
+        self.assertGreaterEqual(
+            validation["visual_expected_evidence_hits"].get(
+                "visual_observation",
+                0,
+            ),
+            1,
+        )
+        self.assertTrue(visual_tasks)
+        self.assertTrue(
+            all(task.get("expected_evidence") for task in visual_tasks),
+            visual_tasks,
+        )
+        visual_expected = {
+            item
+            for task in visual_tasks
+            for item in task.get("expected_evidence", [])
+        }
+        self.assertIn("visual_example", visual_expected)
+        self.assertIn("visual_observation", visual_expected)
+        self.assertFalse(
+            [
+                task
+                for task in text_only_tasks
+                if task.get("expected_evidence")
+            ],
+            text_only_tasks,
+        )
+        self.assertTrue(mixed_text_only_task, "mixed text-only task was not created")
+        self.assertFalse(
+            [
+                task
+                for task in text_only_tasks
+                if task["task_id"] == mixed_text_only_task["task_id"]
+                and task.get("expected_evidence")
+            ],
+            text_only_tasks,
+        )
+        self.assertIn(
+            "candidate_plan_expected_evidence_materializations",
+            raw_response,
+        )
+        inferred_ids = {
+            record["task_id"]
+            for record in raw_response[
+                "candidate_plan_expected_evidence_materializations"
+            ]
+            if record["materialization"]
+            == "inferred_expected_evidence_from_visual_context"
+        }
+        self.assertNotIn(mixed_text_only_task["task_id"], inferred_ids)
+        self.assertTrue(
+            {task["task_id"] for task in visual_tasks}.issubset(inferred_ids)
+        )
+        expected_by_task_id = {
+            task["task_id"]: task["expected_evidence"]
+            for task in visual_tasks
+        }
+        for task_collection in (search_tasks, planned_research_tasks):
+            for task in task_collection:
+                if task["task_id"] in expected_by_task_id:
+                    self.assertTrue(
+                        set(expected_by_task_id[task["task_id"]]).issubset(
+                            set(task["expected_evidence"])
+                        ),
+                        task,
+                    )
+
+    def test_codex_semantic_rejects_text_only_visual_expected_evidence(self) -> None:
+        def inject_text_only_visual_expected_evidence(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            text_task = next(
+                task
+                for task in response["candidate_plan"]["bounded_tasks"]
+                if task["route"] == "text_only"
+            )
+            text_task["expected_evidence"] = ["visual_example", "vlm_analysis"]
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            "Research official public health guidance in Korea",
+            requirement_types=("subject", "source_quality"),
+            response_mutator=inject_text_only_visual_expected_evidence,
+        )
+        self.assert_invalid_adapter_response_blocked(
+            result,
+            expected_failure_codes={"text_only_task_visual_expected_evidence"},
+        )
+
+    def test_validate_semantic_candidate_plan_rejects_falsy_route_visual_expected_evidence(self) -> None:
+        question = "Research official public health poster image guidance in Korea"
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+        run_dir = Path(result["run_dir"])
+        plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        text_task = next(
+            task for task in plan["bounded_tasks"] if task["route"] == "text_only"
+        )
+        text_task["route"] = ""
+        text_task["expected_evidence"] = ["visual_example"]
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=plan,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "text_only_task_visual_expected_evidence",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
     def test_default_codex_semantic_adapter_command_uses_plugin_schema(self) -> None:
         with mock.patch(
             "deepresearch.semantic_planner.shutil.which",
@@ -5080,6 +5434,41 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertFalse(validation["ok"])
         self.assertIn(
             "visual_expected_evidence_without_image_budget",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+        text_only_visual_expected = json.loads(json.dumps(plan))
+        text_task = next(
+            task
+            for task in text_only_visual_expected["bounded_tasks"]
+            if task["route"] == "text_only"
+        )
+        text_task["expected_evidence"] = ["visual_example", "vlm_analysis"]
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=text_only_visual_expected,
+        )
+        self.assertFalse(validation["ok"])
+        self.assertIn(
+            "text_only_task_visual_expected_evidence",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+        falsy_route_visual_expected = json.loads(json.dumps(plan))
+        text_task = next(
+            task
+            for task in falsy_route_visual_expected["bounded_tasks"]
+            if task["route"] == "text_only"
+        )
+        text_task["route"] = ""
+        text_task["expected_evidence"] = ["visual_example"]
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=falsy_route_visual_expected,
+        )
+        self.assertFalse(validation["ok"])
+        self.assertIn(
+            "text_only_task_visual_expected_evidence",
             {failure["code"] for failure in validation["failures"]},
         )
 

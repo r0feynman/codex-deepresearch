@@ -32,6 +32,7 @@ from .search_handoff import (
 from .semantic_planner import semantic_materialization_plan_hash_for_file
 from .trace import record_stage_trace
 from .visual_artifacts import (
+    DEFAULT_REQUIRED_VISUAL_VLM_IMAGES,
     IMAGE_FETCH_STATUS_FILENAME,
     REAL_ACQUISITION_PROVIDER_KINDS,
     VISUAL_PROVIDER_STATUS_FILENAME,
@@ -1386,8 +1387,6 @@ def _codex_interactive_supplemental_vision_tasks(
 ) -> list[dict[str, Any]]:
     minimums = visual_minimums_for_run(run_dir)
     required = _int_or_zero(minimums.get("required_vlm_images"))
-    if required <= 0:
-        return []
     existing_artifact_backed_image_ids = _release_eligible_codex_observation_image_ids(
         records,
         run_dir=run_dir,
@@ -1396,9 +1395,18 @@ def _codex_interactive_supplemental_vision_tasks(
         _visual_obligation_task_ids(run_dir)
         - _release_eligible_codex_observation_task_ids(records, run_dir=run_dir)
     )
+    fetched_artifacts = _int_or_zero(minimums.get("fetched_artifacts"))
+    if required <= 0:
+        if not missing_obligation_task_ids and fetched_artifacts <= 0:
+            return []
+        required = DEFAULT_REQUIRED_VISUAL_VLM_IMAGES
+    missing_release_images = max(0, required - len(existing_artifact_backed_image_ids))
+    supplemental_count = max(missing_release_images, len(missing_obligation_task_ids))
+    if supplemental_count <= 0:
+        return []
     if len(existing_artifact_backed_image_ids) >= required and not missing_obligation_task_ids:
         return []
-    if _int_or_zero(minimums.get("fetched_artifacts")) < required:
+    if fetched_artifacts < required:
         return []
 
     config = _codex_interactive_vision_config(
@@ -1436,8 +1444,8 @@ def _codex_interactive_supplemental_vision_tasks(
             *_fair_visual_obligation_task_order(other_tasks),
         ]
     if config.max_images is not None and config.max_images > 0:
-        return pending[: config.max_images]
-    return pending
+        supplemental_count = min(supplemental_count, config.max_images)
+    return pending[:supplemental_count]
 
 
 def _release_eligible_codex_observation_identity_keys(

@@ -4101,6 +4101,124 @@ class VisionAdapterTests(unittest.TestCase):
             {"img_checkout_001", "img_checkout_002"},
         )
 
+    def test_codex_interactive_supplements_visual_optional_to_release_minimum(self) -> None:
+        run_dir = self.prepared_visual_run(provider="codex-interactive")
+        self.write_codex_vlm_handoff(run_dir)
+        self.append_codex_vlm_handoff_artifact(run_dir, 2)
+        self.append_codex_vlm_handoff_artifact(run_dir, 3)
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence["routing"] = [{"id": "angle_001", "modality": "visual_optional"}]
+        for task in evidence.get("search_tasks", []):
+            if isinstance(task, dict):
+                task["route"] = "visual_optional"
+                task["modality"] = "visual_optional"
+        self.write_json(run_dir / "evidence.json", evidence)
+        plan = self.load_json(run_dir / "visual_search_plan.json")
+        for task in plan["tasks"]:
+            task["route"] = "visual_optional"
+        self.write_json(run_dir / "visual_search_plan.json", plan)
+        for task_filename in ("visual_tasks.json", "research_tasks.json"):
+            task_path = run_dir / task_filename
+            if not task_path.exists():
+                continue
+            task_payload = self.load_json(task_path)
+            for task in task_payload.get("tasks", []):
+                if isinstance(task, dict):
+                    task["route"] = "visual_optional"
+                    task["modality"] = "visual_optional"
+            self.write_json(task_path, task_payload)
+        raw_candidates = [
+            json.loads(line)
+            for line in (run_dir / "visual_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        raw_fetches = [
+            json.loads(line)
+            for line in (run_dir / "image_fetch_status.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        candidates = [
+            {**candidate, "route": "visual_optional"}
+            for candidate in raw_candidates
+        ]
+        fetches = [
+            {**fetch, "route": "visual_optional"}
+            for fetch in raw_fetches
+        ]
+        self.write_jsonl(run_dir / "visual_candidates.jsonl", candidates)
+        self.write_jsonl(run_dir / "image_fetch_status.jsonl", fetches)
+        records = []
+        for index, local_artifact_path in (
+            (1, "images/checkout.png"),
+            (2, "images/checkout_2.png"),
+        ):
+            records.append(
+                {
+                    "id": f"img_checkout_{index:03d}",
+                    "image_id": f"img_checkout_{index:03d}",
+                    "evidence_image_id": f"img_checkout_{index:03d}",
+                    "source_id": "src_checkout",
+                    "origin": "screenshot",
+                    "local_artifact_path": local_artifact_path,
+                    "mime_type": "image/png",
+                    "candidate_id": f"cand_checkout_{index:03d}",
+                    "fetch_id": f"fetch_checkout_{index:03d}",
+                    "plan_id": "plan_task_visual_001",
+                    "task_id": "task_visual_001",
+                    "angle_id": "angle_001",
+                    "route": "visual_optional",
+                    "provider": "codex-interactive",
+                    "provider_kind": "vlm",
+                    "provider_mode": "real",
+                    "observation_status": "analyzed",
+                    "observations": ["Release-eligible analyzed image."],
+                    "inferences": [],
+                    "policy_decision": "allowed",
+                    "policy_flags": [],
+                }
+            )
+        records.append(
+            {
+                "id": "img_checkout_003",
+                "image_id": "img_checkout_003",
+                "evidence_image_id": "img_checkout_003",
+                "source_id": "src_checkout",
+                "origin": "screenshot",
+                "local_artifact_path": "metadata/unsupported_mime_img_checkout_003.json",
+                "mime_type": "application/json",
+                "candidate_id": "cand_checkout_003",
+                "fetch_id": "fetch_checkout_003",
+                "plan_id": "plan_task_visual_001",
+                "task_id": "task_visual_001",
+                "angle_id": "angle_001",
+                "route": "visual_optional",
+                "provider": "codex-interactive",
+                "provider_kind": "vlm",
+                "provider_mode": "real",
+                "observation_status": "analyzed",
+                "observations": ["Metadata-only analyzed observation."],
+                "inferences": [],
+                "caveats": ["metadata-only visual record; no local image artifact was provided"],
+                "policy_decision": "allowed",
+                "policy_flags": [],
+            }
+        )
+
+        minimums = visual_minimums_for_run(run_dir)
+        tasks = _codex_interactive_supplemental_vision_tasks(
+            run_dir=run_dir,
+            evidence=evidence,
+            records=records,
+            codex_config={"max_images": 2},
+            provider_mode="real",
+        )
+
+        self.assertEqual(minimums["required_vlm_images"], 0)
+        self.assertEqual(minimums["fetched_artifacts"], 3)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["evidence_image_id"], "img_checkout_003")
+        self.assertEqual(tasks[0]["local_artifact_path"], "images/checkout_3.png")
+
     def test_codex_interactive_drops_invalid_child_observations_when_supplemented(self) -> None:
         run_dir = self.prepared_visual_run(provider="codex-interactive")
         self.write_codex_vlm_handoff(run_dir)

@@ -440,6 +440,64 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertIn("missing_verifier_link", error_codes)
         self.assertIn("missing_report_link", error_codes)
 
+    def test_excluded_visual_claim_does_not_require_report_link_for_shared_image(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+        evidence = self.read_json(run_dir / "evidence.json")
+        included_claim = evidence["claims"][0]
+        support = dict(included_claim["visual_supports"][0])
+        excluded_claim_id = "claim_excluded_shared_visual"
+        evidence["claims"].append(
+            {
+                "id": excluded_claim_id,
+                "text": "Excluded claim shares an image with an included visual claim.",
+                "claim_type": "mixed",
+                "supporting_sources": [],
+                "supporting_images": [support["image_id"]],
+                "visual_supports": [support],
+                "quote_spans": [],
+                "votes": [{"id": "vote_excluded_shared_visual"}],
+                "verification_status": "supported",
+                "review_status": "auto_reviewed",
+                "promotion_status": "eligible",
+                "confidence": "medium",
+                "caveats": [],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        verifier_link = dict(observations[0]["verifier_links"][0])
+        verifier_link["claim_id"] = excluded_claim_id
+        verifier_link["verifier_vote_id"] = "vote_excluded_shared_visual"
+        observations[0]["verifier_links"].append(verifier_link)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        report_status = self.read_json(run_dir / "report_status.json")
+        report_status["excluded_claims"] = [
+            {
+                "claim_id": excluded_claim_id,
+                "claim_type": "mixed",
+                "verification_status": "supported",
+                "image_ids": [support["image_id"]],
+                "visual_supports": [support],
+                "exclusion_reasons": ["missing_quote_source"],
+            }
+        ]
+        self.write_json(run_dir / "report_status.json", report_status)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+
+    def test_included_visual_claim_still_requires_report_link(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["report_links"] = []
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        self.assertIn("missing_report_link", {error.code for error in result.errors})
+
     def test_completed_auto_visual_rejects_zero_provider_counters(self) -> None:
         run_dir = self.write_phase3_fixture()
         provider_status = self.read_json(run_dir / VISUAL_PROVIDER_STATUS_FILENAME)
