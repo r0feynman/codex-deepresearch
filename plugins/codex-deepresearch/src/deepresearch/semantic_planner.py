@@ -1427,7 +1427,7 @@ def _materialize_candidate_budget_caps(
         ):
             normalized["constraints"] = [
                 *raw_constraints,
-                f"Budget cap: search results per task must not exceed max_results={max_results}.",
+                f"Search result cap: each bounded task must not exceed max_results={max_results}.",
             ]
             materializations.append(
                 {

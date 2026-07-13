@@ -4955,6 +4955,7 @@ class SemanticPlannerTests(unittest.TestCase):
             ensure_ascii=False,
         )
         self.assertIn("max_results=8", constraint_text)
+        self.assertNotIn("Budget cap", constraint_text)
         self.assertIn("candidate_plan_budget_cap_materializations", raw_response)
         self.assertTrue(semantic_plan["bounded_tasks"])
         self.assertTrue(search_tasks)
