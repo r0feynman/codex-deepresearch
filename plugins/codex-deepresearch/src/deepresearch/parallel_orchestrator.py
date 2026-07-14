@@ -2336,18 +2336,19 @@ def _release_validation_search_result(
         identity,
         task=task,
     )
+    semantic_plan_task_id = str(
+        task.get("semantic_plan_task_id")
+        or task.get("task_id")
+        or task_id
+    )
+    semantic_plan_hash = str(task.get("semantic_plan_hash") or "")
+    approved_delta_id = str(task.get("approved_delta_id") or "base_plan")
     result = {
         "id": _string_value(record, "id"),
         "task_id": task_id,
-        "semantic_plan_task_id": _string_value(record, "semantic_plan_task_id")
-        if _release_child_field_present(record, "semantic_plan_task_id")
-        else task_id,
-        "semantic_plan_hash": _string_value(record, "semantic_plan_hash")
-        if _release_child_field_present(record, "semantic_plan_hash")
-        else str(task.get("semantic_plan_hash") or ""),
-        "approved_delta_id": _string_value(record, "approved_delta_id")
-        if _release_child_field_present(record, "approved_delta_id")
-        else str(task.get("approved_delta_id") or "base_plan"),
+        "semantic_plan_task_id": semantic_plan_task_id,
+        "semantic_plan_hash": semantic_plan_hash,
+        "approved_delta_id": approved_delta_id,
         "angle_id": angle_id,
         "route": route,
         "provider": provider,

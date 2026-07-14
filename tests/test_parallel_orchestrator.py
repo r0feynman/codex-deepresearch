@@ -738,6 +738,46 @@ class ParallelOrchestratorTests(unittest.TestCase):
         )
         self.assertTrue(validation.valid, validation.to_dict())
 
+    def test_release_validation_merge_canonicalizes_child_search_lineage(self) -> None:
+        prepared = prepare_run(
+            question="Public release search lineage canonicalization fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-lineage",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, self.shard(run_dir, task))
+        record = self.release_search_result(
+            task,
+            semantic_plan_task_id="stale-child-task-id",
+            semantic_plan_hash="0" * 64,
+            approved_delta_id="stale-child-delta",
+            semantic_task_query="stale child query",
+        )
+        self.write_jsonl(shard_path.parent / "search_results.jsonl", [record])
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        records = self.load_jsonl(run_dir / "search_results.jsonl")
+        self.assertEqual(len(records), 1)
+        merged_record = records[0]
+        self.assertEqual(merged_record["semantic_plan_task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(merged_record["semantic_plan_hash"], task["semantic_plan_hash"])
+        self.assertEqual(merged_record["approved_delta_id"], task["approved_delta_id"])
+        self.assertEqual(merged_record["angle_id"], task["angle_id"])
+        self.assertEqual(merged_record["route"], task["route"])
+        self.assertEqual(merged_record["semantic_task_query"], task["query"])
+
     def test_release_visual_merge_preserves_child_lineage_and_materializes_handoffs(self) -> None:
         prepared = prepare_run(
             question="Release validation visual handoff fixture.",
