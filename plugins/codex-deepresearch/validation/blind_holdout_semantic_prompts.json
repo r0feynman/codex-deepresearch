@@ -1,27 +1,133 @@
 {
   "created_for_issue": 133,
-  "implementation_freeze": {
-    "record_type": "fixture_safe_timestamp",
-    "release_eligible": false,
-    "timestamp": "2026-07-07T00:00:00Z"
+  "denominator_rules": {
+    "blocked_and_failed_runs_count_as_failures": true,
+    "fixture_manual_heuristic_release_ineligible_count_as_failures": true,
+    "release_counted_prompt_count": 12
   },
-  "name": "Fixture-Safe Blind Holdout Flow",
+  "implementation_freeze": {
+    "commit": "2bef9dc",
+    "record_type": "commit",
+    "release_eligible": true,
+    "timestamp": "2026-07-08T08:48:05+09:00"
+  },
+  "name": "Independent Blind Holdout Release Manifest",
   "prompts": [
     {
       "categories": [
         "korean",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-001",
+      "oracle_hash": "59dc3eb3424066d7f5a817f75b08a3eba328247b531c2d54a9e71b88e34c6b02",
+      "oracle_path": "semantic_oracles.json#holdout-independent-001",
+      "prompt": "질병관리청과 WHO/UNICEF 등 공개 공식 자료만 사용해 2023~2025년 한국 홍역 발생 증가를 '국내 전파', '해외유입', '예방접종률', '감시체계 변화'로 나누어 설명하고, 각 주장에 어떤 표나 자료가 필요한지 구분해 달라.",
+      "prompt_hash": "678af11f56d5d75083766ce8842f598f8735310e059735e3f1556877e7c1933b",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
         "visual",
         "official_regulatory_source_quality",
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-001",
-      "oracle_hash": "5ca18802211d274fe8255dfeea9f9eeb6b2ace4bf01d6adb2daf2b142e84efdd",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-001",
-      "prompt": "한국 해양 안전 표지판 이미지와 공식 항로 안전 지침을 비교해줘.",
+      "id": "holdout-independent-002",
+      "oracle_hash": "63cd09e9423f8712025e98b3268f9127f54bfcd2b653e83b4f245df5b49cfaf8",
+      "oracle_path": "semantic_oracles.json#holdout-independent-002",
+      "prompt": "서울시, 행정안전부, 기상청의 공개 자료와 지도 또는 안전표지 이미지를 근거로, 반지하와 지하차도 침수 위험 안내에서 색상, 아이콘, 경보 단계가 각각 무엇을 의미하는지 분석하고, 실제 대피 판단에 필요한 정보와 지도에서 추론하면 안 되는 정보를 분리해 달라.",
+      "prompt_hash": "f4b145614d7904415876dd4b41ba7ed013defb0ee492b9af095f39c1f9503d5c",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required"
+    },
+    {
+      "categories": [
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-003",
+      "oracle_hash": "da213bb31d19a9746e9e46829fd9828c63ef3f070b4c2ad611578ac907463327",
+      "oracle_path": "semantic_oracles.json#holdout-independent-003",
+      "prompt": "For a U.S.-listed company with significant California revenue but no EU listing, compare what SEC climate disclosure rules, California SB 253 and SB 261, and ISSB-based reporting could require or not require. Use official or regulatory sources only, separating legal status, effective dates, entity scope, assurance requirements, and uncertainty from litigation or rulemaking.",
+      "prompt_hash": "4c0676425ead5bb3da42391e48907bd8817461e6b9cf35aa340f3828b0e409be",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-004",
+      "oracle_hash": "ed380ece89790bd4918ac1c3d550d14fa9c40e44989a2491a168e96ebbd87bd9",
+      "oracle_path": "semantic_oracles.json#holdout-independent-004",
+      "prompt": "Using public official sources and publicly viewable match footage stills or diagrams where available, analyze a disputed soccer offside explanation: separate what can be resolved from the Laws of the Game text, what depends on camera frame or line-drawing evidence, and what remains uncertain without authenticated footage.",
+      "prompt_hash": "08c3495f8e765d96c9fc6d3fa57924c8885fa85367778e21bd17db3d0652e718",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_optional"
+    },
+    {
+      "categories": [
+        "visual",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-005",
+      "oracle_hash": "98b26ad0e2232ee280e7657559627a46c8840e78b6bf2eaf0628d5af311d8504",
+      "oracle_path": "semantic_oracles.json#holdout-independent-005",
+      "prompt": "Use NASA OSIRIS-REx official pages and released Bennu sample images to explain which visible sample features are observational facts versus scientific interpretations about composition. Distinguish image-based observations, lab-analysis claims, and claims that require peer-reviewed or mission-team evidence.",
+      "prompt_hash": "485e9541a502c0a1ccc179f2dea78e20e167047b6bfa5d75aafeca5b596a3cf4",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "visual_required"
+    },
+    {
+      "categories": [
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain",
+        "policy_regulatory_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-006",
+      "oracle_hash": "ccb6a77fbb20e8280a334cb835f7705b9a7162c7710c92367a1039e3e58d2b12",
+      "oracle_path": "semantic_oracles.json#holdout-independent-006",
+      "prompt": "Compare U.S. FTC negative-option or click-to-cancel requirements with EU consumer-rights or Digital Services Act expectations for a streaming subscription signup and cancellation flow. Decompose jurisdiction, business model, covered practices, enforcement status, and what cannot be concluded from press summaries alone.",
+      "prompt_hash": "b6b3c7a18e21fc3a6d90a9f0102cf677a2484ae0c2ff7e3a42d79f1ae5e5ab5e",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
+    },
+    {
+      "categories": [
+        "korean",
+        "official_regulatory_source_quality",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-007",
+      "oracle_hash": "12e1efa51cecbe49c681e6f8ff77f69055da2f0fbea54bbec36e90cf3282686f",
+      "oracle_path": "semantic_oracles.json#holdout-independent-007",
+      "prompt": "OECD PISA와 교육부 공개 자료를 사용해 한국 학생의 최근 수학과 읽기 성취 변화가 '순위 변화', '점수 변화', '표본 또는 응답률', '코로나19 영향' 중 무엇을 말해 주는지 분리해서 설명해 달라. 단순 국가순위 비교로 과장하면 안 되는 부분도 밝혀 달라.",
+      "prompt_hash": "93c3ed35e971c7dd3a20f7aa21d98fd0e2d9beae44b4c730113106c9908a5381",
+      "public_safe": true,
+      "release_counted": true,
+      "route": "text_only"
     },
     {
       "categories": [
@@ -31,44 +137,63 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-002",
-      "oracle_hash": "92954853b405ba82c5618b73d427d6cbba38684e8b900fc180971fab2a9a0135",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-002",
-      "prompt": "한국 어린이 통학버스 안전 규정과 공식 안내 이미지의 차이를 조사해줘.",
+      "id": "holdout-independent-008",
+      "oracle_hash": "216db12fa068b414ae5501603ec5d30a39ef12d691bafe8ae6a74d780585ae3a",
+      "oracle_path": "semantic_oracles.json#holdout-independent-008",
+      "prompt": "한국영상자료원, 영화진흥위원회, 영화제 공식 자료와 공개 포스터 또는 스틸 이미지를 바탕으로 한 편의 복원 한국 고전영화가 왜 '복원', '재개봉', '재평가'로 불리는지 구분해 달라. 포스터나 스틸에서 확인 가능한 시대·장르 단서와 텍스트 자료로만 확인 가능한 사실을 분리해야 한다.",
+      "prompt_hash": "8a9aea64749b9755b750231d06e1ce56145c94020e9e3a4d680339471afd284d",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "visual_required"
     },
     {
       "categories": [
-        "korean",
+        "visual",
         "official_regulatory_source_quality",
         "ambiguous_domain",
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-003",
-      "oracle_hash": "2ff185cfd9bf1561d0284ff5b99ba4c84feba2ebce58faf753cb1bba8b46c8a6",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-003",
-      "prompt": "테스트라는 말이 농산물 잔류농약 검사에서 의미하는 기준과 공식 발표 자료를 비교해줘.",
+      "id": "holdout-independent-009",
+      "oracle_hash": "f8a8f3c323b2ab3cd7daed16eaa932f31ed5e07f2c62c1de05246e4c7d43ec61",
+      "oracle_path": "semantic_oracles.json#holdout-independent-009",
+      "prompt": "For a trip planned on the research date from Jackson Heights-Roosevelt Avenue to World Trade Center, use MTA official maps, station pages, and elevator outage feeds to determine whether the route can be described as step-free. Separate permanent station accessibility, temporary outages, transfer geometry, map-symbol interpretation, and timestamped service advisories.",
+      "prompt_hash": "991db26251fb35111889dbbd882da2a75faf30670099d390f3733619ebd93e1c",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
+      "route": "visual_optional"
+    },
+    {
+      "categories": [
+        "official_regulatory_source_quality",
+        "ambiguous_domain",
+        "non_software_domain"
+      ],
+      "denominator_rule": "release_counted_failure_unless_passed",
+      "id": "holdout-independent-010",
+      "oracle_hash": "d8a5eed76f2916835121241d70c615ac81e7e2c55db65d2e515bb93d0d021f4b",
+      "oracle_path": "semantic_oracles.json#holdout-independent-010",
+      "prompt": "Using CDC National Wastewater Surveillance System and state health department public dashboards, evaluate whether a rise in wastewater viral activity but flat reported cases should be described as an outbreak signal. Decompose surveillance modality, geographic coverage, reporting lag, clinical testing behavior, and confidence level; do not infer individual risk.",
+      "prompt_hash": "c7de0b24a95d395585766e6f664dd2b7bd54529c6efdc19645264cd23ff3630e",
+      "public_safe": true,
+      "release_counted": true,
       "route": "text_only"
     },
     {
       "categories": [
-        "korean",
         "official_regulatory_source_quality",
         "ambiguous_domain",
-        "non_software_domain"
+        "non_software_domain",
+        "policy_regulatory_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-004",
-      "oracle_hash": "f298c6a13fc3234bdff62b7afffaf782c5ddf1671b1bd71206174eada182597b",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-004",
-      "prompt": "구현이라는 표현이 공원 녹지계획 실행 문서에서 쓰일 때 책임기관과 예산 지표를 조사해줘.",
+      "id": "holdout-independent-011",
+      "oracle_hash": "ea2d522bf2e2ca750a14be7fa66ba561bdc292f6cda0ec247de8a55a17476389",
+      "oracle_path": "semantic_oracles.json#holdout-independent-011",
+      "prompt": "For caffeine, pseudoephedrine, and cannabis in Olympic-context sport, use WADA and relevant federation or USADA official materials to explain which are prohibited, monitored, threshold-based, or context-dependent. Distinguish health advice, legal status, in-competition rules, and sanction evidence.",
+      "prompt_hash": "20e2e0b60bc70cccee7f42df5738264e8bd59c5183ad07fef57673b72a1d8812",
       "public_safe": true,
-      "release_counted": false,
+      "release_counted": true,
       "route": "text_only"
     },
     {
@@ -78,125 +203,35 @@
         "non_software_domain"
       ],
       "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-005",
-      "oracle_hash": "50a56ef9a5486d28746d06ac9ff105a73a86ea299887c3af424e570fe2b45321",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-005",
-      "prompt": "Compare public dam safety inspection diagrams and official regulator guidance, separating visual observations from text claims.",
+      "id": "holdout-independent-012",
+      "oracle_hash": "0727d8dc56044d8eb6c2eca2b41d6d5a0b94452e83dd3704c61a7b94dc8bdf0a",
+      "oracle_path": "semantic_oracles.json#holdout-independent-012",
+      "prompt": "Using NOAA, USGS, and local emergency-management public sources plus any official map imagery, explain whether a coastal nuisance-flooding forecast for Norfolk, Virginia should be framed as tide-driven, storm-driven, sea-level-trend-related, or infrastructure-related. Separate map observations, gauge data, forecast language, and unsupported causal claims.",
+      "prompt_hash": "17445dff22f33ca3734f3d81215326f0727fe8aa1b1562c97b527256c981d3e5",
       "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required"
-    },
-    {
-      "categories": [
-        "ambiguous_domain",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-006",
-      "oracle_hash": "9bb6c7a4350566bba7dfadbd358aa442125c57976110f6932dffe7a6598cfdec",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-006",
-      "prompt": "Research model governance in insurance actuarial filings without treating model as a software deployment term.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only"
-    },
-    {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-007",
-      "oracle_hash": "deb70b57b221bf48d854cb8dd83c9be8a535d9250f027efd465cb31b6d269b3d",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-007",
-      "prompt": "Compare public storm-surge evacuation map images and emergency-management guidance.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required"
-    },
-    {
-      "categories": [
-        "ambiguous_domain",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-008",
-      "oracle_hash": "5ce52626f611ee5f34ab4564a4ae2d27b4bd996da41b6890078a31d1300c76c0",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-008",
-      "prompt": "Research architecture review requirements in public library renovation grants, not software architecture.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only"
-    },
-    {
-      "categories": [
-        "software_implementation",
-        "official_regulatory_source_quality"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-009",
-      "oracle_hash": "93ddb194dc1eb009027936814fd7f452035592b9dd32ac72248791024fe6e13d",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-009",
-      "prompt": "Research official guidance for secure webhook implementation and replay protection across public developer docs.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only"
-    },
-    {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-010",
-      "oracle_hash": "3181db06acd929b559f37d6dc304b3eb6961c05093779ca1b10aa7e2ff1d99df",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-010",
-      "prompt": "Compare public emergency-exit signage images and official workplace safety guidance.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required"
-    },
-    {
-      "categories": [
-        "software_implementation",
-        "official_regulatory_source_quality"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-011",
-      "oracle_hash": "c217291888dd581b9936348440ce324c5ce26203fb1070c1511261e114817767",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-011",
-      "prompt": "Research official implementation guidance for SAML single logout and failure modes across identity providers.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "text_only"
-    },
-    {
-      "categories": [
-        "visual",
-        "official_regulatory_source_quality",
-        "non_software_domain"
-      ],
-      "denominator_rule": "release_counted_failure_unless_passed",
-      "id": "holdout-fixture-012",
-      "oracle_hash": "4bea62175cd0a590f51d27244031b6d891b35383128c92c3b4b4407ae4f2cc17",
-      "oracle_path": "semantic_oracles.json#holdout-fixture-012",
-      "prompt": "Compare public pedestrian-safety dashboard screenshots and official city traffic-safety metrics.",
-      "public_safe": true,
-      "release_counted": false,
-      "route": "visual_required"
+      "release_counted": true,
+      "route": "visual_optional"
     }
   ],
   "public_safe": true,
-  "release_gate_ready": false,
+  "release_gate_ready": true,
   "schema_version": "codex-deepresearch.semantic-blind-holdout-manifest.v0",
+  "selection_checks": {
+    "distinctive_keyword_scan_found_matches": false,
+    "exact_prompt_string_scan_found_matches": false,
+    "known_manifest_overlap_detected": false,
+    "selected_after_implementation_freeze": true
+  },
   "selector_provenance": {
-    "independent": false,
-    "reason": "Live independent reviewer selection is not available in public tests; this manifest exercises the flow but cannot satisfy release readiness.",
-    "release_eligible": false,
-    "selector": "fixture_safe_non_release_selector"
+    "audit_artifact_hash": "514ab5388e5fdef02b2d9bf54e5176289faca9a1d6ceeebb7d4fe2e6b8c9179f",
+    "audit_artifact_path": "blind_holdout_selector_audit.json",
+    "independence_evidence": "Selected by a fresh subagent session after freeze commit 2bef9dc. The selector was instructed not to inspect existing repository manifests, planner code, tests, fixtures, or golden files; the raw request and response are recorded in blind_holdout_selector_transcript.json.",
+    "independent": true,
+    "raw_selector_transcript_hash": "82403a9d0a5b4bf42b299047dcd758f9aa8417a1ec9e89440a81d537aea6593b",
+    "raw_selector_transcript_path": "blind_holdout_selector_transcript.json",
+    "release_eligible": true,
+    "selected_at_utc": "2026-07-07T23:49:17Z",
+    "selector": "Hegel independent blind-holdout selector subagent",
+    "selector_agent_id": "019f3efc-4bf6-7001-8977-896dcd7e7a1e"
   }
 }

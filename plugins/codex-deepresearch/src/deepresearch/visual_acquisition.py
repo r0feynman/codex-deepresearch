@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import mimetypes
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, MutableMapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -40,10 +41,12 @@ from .page_image_extraction import (
     _max_fetches as _page_image_max_fetches,
 )
 from .search_handoff import (
+    HANDOFF_SCHEMA_VERSION,
     apply_release_validation_identity,
     release_validation_identity_from_payload,
     resolve_run_dir,
 )
+from .semantic_planner import semantic_materialization_plan_hash_for_file
 from .visual_artifacts import (
     IMAGE_FETCH_STATUS_FILENAME,
     VISUAL_ARTIFACT_SCHEMA_VERSION,
@@ -200,8 +203,13 @@ def acquire_visual_candidates(
         raise VisualAcquisitionError(f"missing evidence.json in run directory: {run_dir}")
 
     evidence = _read_json(evidence_path)
-    visual_task_by_angle = _visual_task_by_angle(run_dir)
-    routes = _visual_routes(evidence, visual_task_by_angle=visual_task_by_angle)
+    visual_tasks = _visual_task_records(run_dir)
+    visual_task_by_angle = _visual_task_by_angle_from_records(visual_tasks)
+    routes = _visual_routes(
+        evidence,
+        visual_tasks=visual_tasks,
+        visual_task_by_angle=visual_task_by_angle,
+    )
     now = _utc_now()
     explicit_provider_request = bool(providers)
     provider_names = _normalize_provider_names(providers)
@@ -354,7 +362,14 @@ def acquire_visual_candidates(
     image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
     visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
+    observations = _merge_visual_observation_records(
+        _read_jsonl(visual_observations_path),
+        selected,
+    )
     image_fetch_records = _image_fetch_records_from_candidates(candidate_records)
+    candidate_records = _release_visible_visual_records_if_needed(run_dir, evidence, candidate_records)
+    image_fetch_records = _release_visible_visual_records_if_needed(run_dir, evidence, image_fetch_records)
+    observations = _release_visible_visual_records_if_needed(run_dir, evidence, observations)
     provider_statuses = _provider_statuses_after_selection(
         provider_statuses=provider_statuses,
         candidate_records=candidate_records,
@@ -369,14 +384,21 @@ def acquire_visual_candidates(
         provider_statuses=provider_statuses,
         image_fetch_records=image_fetch_records,
     )
-    visual_search_plan = _visual_search_plan(
+    visual_search_plan = _combined_visual_search_plan(
         run_dir=run_dir,
         evidence=evidence,
         routes=routes,
         provider_names=active_provider_names,
+        candidate_records=candidate_records,
         created_at=now,
-        selected_observations=len(selected),
+        selected_observations=len(observations),
         state="completed",
+    )
+    _ensure_visual_search_plan_tasks_registered(
+        run_dir=run_dir,
+        evidence=evidence,
+        visual_search_plan=visual_search_plan,
+        created_at=now,
     )
     visual_status = (
         "real_image_search_candidates_collected"
@@ -414,14 +436,14 @@ def acquire_visual_candidates(
         provider_statuses=provider_statuses,
         candidate_records=candidate_records,
         image_fetch_records=image_fetch_records,
-        observations=selected,
+        observations=observations,
         created_at=now,
         actionable_cause=actionable_cause,
     )
     _write_json(visual_search_plan_path, visual_search_plan)
     _write_jsonl(visual_candidates_path, candidate_records)
     _write_jsonl(image_fetch_status_path, image_fetch_records)
-    _write_jsonl(visual_observations_path, selected)
+    _write_jsonl(visual_observations_path, observations)
     _write_json(visual_provider_status_path, visual_provider_status)
 
     candidate_counts = _candidate_counts(candidate_records)
@@ -571,6 +593,7 @@ def _acquire_with_page_image_extractor(
     core_candidates: list[Mapping[str, Any]] = []
     core_fetches: list[Mapping[str, Any]] = []
     core_observations: list[Mapping[str, Any]] = []
+    preexisting_observations = _read_jsonl(run_dir / "visual_observations.jsonl")
     core_provider_records: list[Mapping[str, Any]] = []
     core_status: Mapping[str, Any] | None = None
 
@@ -617,7 +640,10 @@ def _acquire_with_page_image_extractor(
 
     candidate_records = [*core_candidates, *page_candidates]
     image_fetch_records = [*core_fetches, *page_fetches]
-    observations = [item for item in core_observations if isinstance(item, Mapping)]
+    observations = _merge_visual_observation_records(
+        preexisting_observations,
+        [item for item in core_observations if isinstance(item, Mapping)],
+    )
     provider_statuses = _dedupe_provider_statuses(
         [*core_provider_records, *page_provider_records],
         provider_names=provider_names,
@@ -652,6 +678,9 @@ def _acquire_with_page_image_extractor(
     image_fetch_status_path = run_dir / IMAGE_FETCH_STATUS_FILENAME
     visual_provider_status_path = run_dir / VISUAL_PROVIDER_STATUS_FILENAME
     visual_observations_path = run_dir / "visual_observations.jsonl"
+    candidate_records = _release_visible_visual_records_if_needed(run_dir, evidence, candidate_records)
+    image_fetch_records = _release_visible_visual_records_if_needed(run_dir, evidence, image_fetch_records)
+    observations = _release_visible_visual_records_if_needed(run_dir, evidence, observations)
     visual_search_plan = _combined_visual_search_plan(
         run_dir=run_dir,
         evidence=evidence,
@@ -661,6 +690,12 @@ def _acquire_with_page_image_extractor(
         created_at=created_at,
         selected_observations=len(observations),
         state="completed" if real_provider_succeeded else "blocked",
+    )
+    _ensure_visual_search_plan_tasks_registered(
+        run_dir=run_dir,
+        evidence=evidence,
+        visual_search_plan=visual_search_plan,
+        created_at=created_at,
     )
     visual_provider_status = _visual_provider_status(
         run_dir=run_dir,
@@ -1268,80 +1303,96 @@ def _child_discovered_image_candidates(
             or _string(route.get("modality"))
             or "visual_required"
         )
-        task_id = _visual_task_id_for_angle(
-            angle_id=angle_id,
-            routes=context.routes,
-            route=effective_route,
+        task_id = (
+            _string(image.get("semantic_plan_task_id"))
+            or _string(image.get("task_id"))
+            or _visual_task_id_for_angle(
+                angle_id=angle_id,
+                routes=context.routes,
+                route=effective_route,
+            )
         )
         route_visual_tasks = (
             list(effective_route.get("visual_tasks", []))
             if isinstance(effective_route.get("visual_tasks"), list)
             else []
         )
-        candidates.append(
-            {
-                "id": candidate_id,
-                "candidate_id": candidate_id,
-                "plan_id": _plan_id_for_visual_task(
-                    task_id=task_id,
-                    angle_id=angle_id,
-                    route=route_name,
-                ),
-                "task_id": task_id,
-                "angle_id": angle_id,
-                "source_search_result_id": image.get("source_search_result_id")
-                or source.get("search_result_id"),
-                "source_id": image.get("source_id"),
-                "source_url": source.get("url") or image.get("source_url"),
-                "provider": provider,
-                "provider_kind": "web_image_search",
-                "provider_mode": "real",
-                "provider_run_id": provider_run_id,
-                "provider_provenance": provider_provenance,
-                "route": route_name,
-                "candidate_class": "child_discovered_image_url",
-                "origin": _string(image.get("origin")) or "image_search",
-                "candidate_origin": _string(image.get("origin")) or "image_search",
-                "image_url": fetch_image_url,
-                "page_url": _string(image.get("page_url")) or source.get("url"),
-                "rank": ordinal,
-                "score": _score_from_rank(ordinal),
-                "width": _int_or_zero(image.get("width")),
-                "height": _int_or_zero(image.get("height")),
-                "alt_text": _string(image.get("alt_text")) or _string(image.get("title")),
-                "caption_text": _string(image.get("caption_text")),
-                "surrounding_text": _string(image.get("surrounding_text")),
-                "phash_hint": _string(image.get("phash")),
-                "visual_tasks": _dedupe(
-                    _string_list(image.get("visual_tasks")) + route_visual_tasks
-                ),
-                "analysis_status": "skipped",
-                "observations": [],
-                "inferences": [],
-                "policy_flags": source_policy_flags,
-                "policy_decision": source_policy_decision,
-                "candidate_status": "discovered",
-                "rejection_reason": None,
-                "removal_reasons": [],
-                "caveats": _dedupe(
-                    _string_list(image.get("caveats"))
-                    + ["discovered_by_real_codex_child_execution"]
-                ),
-                "requires_vlm_observation": True,
-                "supportable_evidence": False,
-                "estimated_cost_usd": 0.0,
-                "actual_cost_usd": 0.0,
-                "raw_provider_metadata": {
-                    "source_image_id": image.get("id"),
-                    "source_image_origin": image.get("origin"),
-                    "source_image_provider": image.get("provider"),
-                    "source_image_provider_mode": image.get("provider_mode"),
-                    "original_child_image_url": image_url,
-                    **url_resolution,
-                },
-                "created_at": context.created_at,
-            }
+        record = {
+            "id": candidate_id,
+            "candidate_id": candidate_id,
+            "evidence_image_id": _string(image.get("evidence_image_id"))
+            or _string(image.get("id")),
+            "plan_id": _plan_id_for_visual_task(
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route_name,
+            ),
+            "task_id": task_id,
+            "angle_id": angle_id,
+            "source_search_result_id": image.get("source_search_result_id")
+            or source.get("search_result_id"),
+            "source_id": image.get("source_id"),
+            "source_url": source.get("url") or image.get("source_url"),
+            "provider": provider,
+            "provider_kind": "web_image_search",
+            "provider_mode": "real",
+            "provider_run_id": provider_run_id,
+            "provider_provenance": provider_provenance,
+            "route": route_name,
+            "candidate_class": "child_discovered_image_url",
+            "origin": _string(image.get("origin")) or "image_search",
+            "candidate_origin": _string(image.get("origin")) or "image_search",
+            "image_url": fetch_image_url,
+            "page_url": _string(image.get("page_url")) or source.get("url"),
+            "rank": ordinal,
+            "score": _score_from_rank(ordinal),
+            "width": _int_or_zero(image.get("width")),
+            "height": _int_or_zero(image.get("height")),
+            "alt_text": _string(image.get("alt_text")) or _string(image.get("title")),
+            "caption_text": _string(image.get("caption_text")),
+            "surrounding_text": _string(image.get("surrounding_text")),
+            "phash_hint": _string(image.get("phash")),
+            "visual_tasks": _dedupe(
+                _string_list(image.get("visual_tasks")) + route_visual_tasks
+            ),
+            "analysis_status": "skipped",
+            "observations": [],
+            "inferences": [],
+            "policy_flags": source_policy_flags,
+            "policy_decision": source_policy_decision,
+            "candidate_status": "discovered",
+            "rejection_reason": None,
+            "removal_reasons": [],
+            "caveats": _dedupe(
+                _string_list(image.get("caveats"))
+                + ["discovered_by_real_codex_child_execution"]
+            ),
+            "requires_vlm_observation": True,
+            "supportable_evidence": False,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "raw_provider_metadata": {
+                "source_image_id": image.get("id"),
+                "source_image_origin": image.get("origin"),
+                "source_image_provider": image.get("provider"),
+                "source_image_provider_mode": image.get("provider_mode"),
+                "original_child_image_url": image_url,
+                **url_resolution,
+            },
+            "created_at": context.created_at,
+        }
+        route_lineage_sources = [
+            candidate_route
+            for candidate_route in (effective_route, route)
+            if _string(candidate_route.get("id")) == angle_id
+        ]
+        _apply_visual_record_semantic_lineage(
+            record,
+            image,
+            source,
+            *route_lineage_sources,
         )
+        candidates.append(record)
     return candidates
 
 
@@ -1965,6 +2016,7 @@ class _BraveImageSearchProvider:
                     result,
                     secrets=_provider_secret_values(self.config),
                 )
+            _apply_visual_record_semantic_lineage(record, route)
             records.append(record)
         return records
 
@@ -2153,6 +2205,7 @@ def _candidate(
         record["screenshot"] = dict(screenshot)
     if raw_provider_metadata is not None:
         record["raw_provider_metadata"] = dict(raw_provider_metadata)
+    _apply_visual_record_semantic_lineage(record, source, route)
     return record
 
 
@@ -2172,7 +2225,18 @@ def _validate_and_select_candidates(
     seen_phashes: dict[str, str] = {}
     near_duplicate_groups: dict[str, dict[str, Any]] = {}
 
-    for index, raw_candidate in enumerate(candidates, start=1):
+    pending_candidates = [
+        (index, raw_candidate)
+        for index, raw_candidate in enumerate(candidates, start=1)
+    ]
+    covered_task_ids: set[str] = set()
+    attempt_counts_by_task_id: dict[str, int] = {}
+    while pending_candidates:
+        index, raw_candidate = _pop_next_visual_candidate_for_attempt(
+            pending_candidates,
+            covered_task_ids=covered_task_ids,
+            attempt_counts_by_task_id=attempt_counts_by_task_id,
+        )
         record = dict(raw_candidate)
         record["rank"] = index
         record["acquired_at"] = created_at
@@ -2388,6 +2452,7 @@ def _validate_and_select_candidates(
             else:
                 record["candidate_status"] = "analyzed"
                 selected.append(_observation_from_candidate(record))
+            _mark_visual_candidate_covered(covered_task_ids, record)
         record["rejection_reason"] = (
             record["removal_reasons"][0] if record.get("removal_reasons") else None
         )
@@ -2395,6 +2460,54 @@ def _validate_and_select_candidates(
         records.append(_persistable_candidate(record))
 
     return selected, records, list(near_duplicate_groups.values())
+
+
+def _pop_next_visual_candidate_for_attempt(
+    pending_candidates: list[tuple[int, Mapping[str, Any]]],
+    *,
+    covered_task_ids: set[str],
+    attempt_counts_by_task_id: dict[str, int],
+) -> tuple[int, Mapping[str, Any]]:
+    selected_index = 0
+    selected_priority: tuple[int, int, int] | None = None
+    for index, (_rank, candidate) in enumerate(pending_candidates):
+        task_id = _visual_obligation_task_id(candidate)
+        attempts = attempt_counts_by_task_id.get(task_id, 0) if task_id else 0
+        already_covered = bool(task_id and task_id in covered_task_ids)
+        priority = (attempts, 1 if already_covered else 0, index)
+        if selected_priority is None or priority < selected_priority:
+            selected_priority = priority
+            selected_index = index
+    selected = pending_candidates.pop(selected_index)
+    _mark_visual_candidate_attempted(attempt_counts_by_task_id, selected[1])
+    return selected
+
+
+def _mark_visual_candidate_attempted(
+    attempt_counts_by_task_id: dict[str, int],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        attempt_counts_by_task_id[task_id] = attempt_counts_by_task_id.get(task_id, 0) + 1
+
+
+def _mark_visual_candidate_covered(
+    covered_task_ids: set[str],
+    candidate: Mapping[str, Any],
+) -> None:
+    task_id = _visual_obligation_task_id(candidate)
+    if task_id:
+        covered_task_ids.add(task_id)
+
+
+def _visual_obligation_task_id(record: Mapping[str, Any]) -> str:
+    return (
+        _string(record.get("semantic_plan_task_id"))
+        or _string(record.get("task_id"))
+        or _string(record.get("angle_id"))
+        or ""
+    )
 
 
 def _mark_pdf_budget_pruned(record: dict[str, Any]) -> None:
@@ -2578,7 +2691,9 @@ def _sync_nested_screenshot_validation_metadata(record: dict[str, Any]) -> None:
 
 
 def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    image_id = _image_id_for_candidate_id(str(candidate["candidate_id"]))
+    image_id = _string(candidate.get("evidence_image_id")) or _image_id_for_candidate_id(
+        str(candidate["candidate_id"])
+    )
     fetch_id = _fetch_id_for_candidate_id(str(candidate["candidate_id"]))
     observation = {
         "id": image_id,
@@ -2623,6 +2738,10 @@ def _observation_from_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "fetch_id": fetch_id,
         "plan_id": candidate.get("plan_id"),
         "task_id": candidate.get("task_id"),
+        "semantic_plan_task_id": candidate.get("semantic_plan_task_id"),
+        "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+        "approved_delta_id": candidate.get("approved_delta_id"),
+        "visual_task_id": candidate.get("visual_task_id"),
         "candidate_class": candidate["candidate_class"],
         "angle_id": candidate.get("angle_id"),
         "route": candidate.get("route"),
@@ -2688,6 +2807,7 @@ def _apply_phase3_candidate_defaults(
         "plan_id",
         _plan_id_for_visual_task(task_id=task_id, angle_id=angle_id, route=route_name),
     )
+    _apply_visual_record_semantic_lineage(record)
     provider = _string(record.get("provider")) or "local-fixture"
     provider_kind = _string(record.get("provider_kind")) or _provider_kind(provider)
     provider_mode = _string(record.get("provider_mode")) or "fixture"
@@ -2793,11 +2913,16 @@ def _image_fetch_records_from_candidates(
         status = _fetch_status_for_candidate(candidate)
         fetched = status == "fetched"
         requires_vlm_observation = candidate.get("requires_vlm_observation") is True
+        evidence_image_id = _string(candidate.get("evidence_image_id"))
         record = {
             "fetch_id": _fetch_id_for_candidate_id(candidate_id),
             "candidate_id": candidate_id,
             "plan_id": candidate.get("plan_id"),
             "task_id": candidate.get("task_id"),
+            "semantic_plan_task_id": candidate.get("semantic_plan_task_id"),
+            "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+            "approved_delta_id": candidate.get("approved_delta_id"),
+            "visual_task_id": candidate.get("visual_task_id"),
             "angle_id": candidate.get("angle_id"),
             "route": candidate.get("route"),
             "source_search_result_id": candidate.get("source_search_result_id"),
@@ -2817,7 +2942,9 @@ def _image_fetch_records_from_candidates(
             "hash": candidate.get("hash") if fetched else None,
             "phash": candidate.get("phash") if fetched else None,
             "local_artifact_path": candidate.get("local_artifact_path") if fetched else None,
-            "evidence_image_id": _image_id_for_candidate_id(candidate_id)
+            "evidence_image_id": evidence_image_id
+            if fetched and evidence_image_id
+            else _image_id_for_candidate_id(candidate_id)
             if fetched and not requires_vlm_observation
             else None,
             "policy_decision": candidate.get("policy_decision", "allowed"),
@@ -2937,35 +3064,35 @@ def _visual_search_plan(
         route_name = _string(route.get("modality")) or "visual_required"
         task_id = _string(route.get("task_id")) or _task_id_for_angle(angle_id)
         max_images = int(route.get("max_images") or selected_observations or 0)
-        tasks.append(
-            {
-                "plan_id": _plan_id_for_visual_task(
-                    task_id=task_id,
-                    angle_id=angle_id,
-                    route=route_name,
-                ),
-                "task_id": task_id,
-                "angle_id": angle_id,
-                "route": route_name,
-                "target_evidence_type": _target_evidence_type(provider_names),
-                "query": str(evidence.get("question") or ""),
-                "providers": list(provider_names),
-                "source_search_result_ids": [],
-                "caps": {
-                    "max_candidates": max(max_images, selected_observations),
-                    "max_fetches": max_images,
-                    "max_vlm_images": max_images,
-                    "max_cost_usd": _budget_cost_cap(evidence),
-                },
-                "policy_constraints": {
-                    "license_policy": "allowed",
-                    "robots_policy": "allowed",
-                    "policy_decision": "allowed",
-                },
-                "estimated_cost_usd": 0.0,
-                "state": state,
-            }
-        )
+        task_record = {
+            "plan_id": _plan_id_for_visual_task(
+                task_id=task_id,
+                angle_id=angle_id,
+                route=route_name,
+            ),
+            "task_id": task_id,
+            "angle_id": angle_id,
+            "route": route_name,
+            "target_evidence_type": _target_evidence_type(provider_names),
+            "query": str(route.get("query") or evidence.get("question") or ""),
+            "providers": list(provider_names),
+            "source_search_result_ids": [],
+            "caps": {
+                "max_candidates": max(max_images, selected_observations),
+                "max_fetches": max_images,
+                "max_vlm_images": max_images,
+                "max_cost_usd": _budget_cost_cap(evidence),
+            },
+            "policy_constraints": {
+                "license_policy": "allowed",
+                "robots_policy": "allowed",
+                "policy_decision": "allowed",
+            },
+            "estimated_cost_usd": 0.0,
+            "state": state,
+        }
+        _apply_visual_record_semantic_lineage(task_record, route)
+        tasks.append(task_record)
     payload = {
         "schema_version": VISUAL_ARTIFACT_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
@@ -2974,7 +3101,7 @@ def _visual_search_plan(
     }
     return apply_release_validation_identity(
         payload,
-        release_validation_identity_from_payload(evidence),
+        _release_validation_identity_for_visual_run(run_dir, evidence),
     )
 
 
@@ -2999,19 +3126,61 @@ def _combined_visual_search_plan(
             selected_observations=selected_observations,
             state=state,
         )
+    base_plan = _visual_search_plan(
+        run_dir=run_dir,
+        evidence=evidence,
+        routes=routes,
+        provider_names=provider_names,
+        created_at=created_at,
+        selected_observations=selected_observations,
+        state=state,
+    )
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for task in base_plan.get("tasks", []):
+        if not isinstance(task, Mapping):
+            continue
+        plan_id = _string(task.get("plan_id"))
+        task_id = _string(task.get("task_id"))
+        semantic_task_id = _string(task.get("semantic_plan_task_id")) or task_id
+        angle_id = _string(task.get("angle_id"))
+        key = _visual_search_plan_task_key(
+            plan_id=plan_id,
+            task_id=task_id,
+            semantic_task_id=semantic_task_id,
+            angle_id=angle_id,
+        )
+        if key is not None:
+            grouped[key] = dict(task)
     for candidate in candidate_records:
         plan_id = _string(candidate.get("plan_id"))
         task_id = _string(candidate.get("task_id"))
+        semantic_task_id = _string(candidate.get("semantic_plan_task_id")) or task_id
         angle_id = _string(candidate.get("angle_id"))
-        if not plan_id or not task_id or not angle_id:
+        route_name = _string(candidate.get("route")) or "visual_required"
+        if (
+            not plan_id
+            or not task_id
+            or not angle_id
+            or route_name == "text_only"
+        ):
             continue
-        key = (plan_id, task_id, angle_id)
+        key = _visual_search_plan_task_key(
+            plan_id=plan_id,
+            task_id=task_id,
+            semantic_task_id=semantic_task_id,
+            angle_id=angle_id,
+        )
+        if key is None:
+            continue
         task = grouped.setdefault(
             key,
             {
                 "plan_id": plan_id,
                 "task_id": task_id,
+                "semantic_plan_task_id": semantic_task_id,
+                "semantic_plan_hash": candidate.get("semantic_plan_hash"),
+                "approved_delta_id": candidate.get("approved_delta_id"),
+                "visual_task_id": candidate.get("visual_task_id"),
                 "angle_id": angle_id,
                 "route": _string(candidate.get("route")) or "visual_required",
                 "target_evidence_type": _target_evidence_type(
@@ -3035,6 +3204,7 @@ def _combined_visual_search_plan(
                 "state": state,
             },
         )
+        _apply_visual_record_semantic_lineage(task, candidate)
         provider = _string(candidate.get("provider"))
         if provider and provider not in task["providers"]:
             task["providers"].append(provider)
@@ -3064,8 +3234,410 @@ def _combined_visual_search_plan(
     }
     return apply_release_validation_identity(
         payload,
-        release_validation_identity_from_payload(evidence),
+        _release_validation_identity_for_visual_run(run_dir, evidence),
     )
+
+
+def _visual_search_plan_task_key(
+    *,
+    plan_id: str,
+    task_id: str,
+    semantic_task_id: str,
+    angle_id: str,
+) -> tuple[str, str, str] | None:
+    if semantic_task_id:
+        return ("semantic", semantic_task_id, "")
+    if task_id:
+        return ("task", task_id, angle_id)
+    if plan_id:
+        return ("plan", plan_id, angle_id)
+    return None
+
+
+def _release_visible_visual_records_if_needed(
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    materialization_context = _release_visual_materialization_context(run_dir, evidence)
+    release_bound = bool(materialization_context.get("release_bound"))
+    task_by_id = materialization_context.get("task_by_id", {})
+    visual_obligation_task_ids = set(
+        materialization_context.get("visual_obligation_task_ids", set())
+    )
+    visible: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        record_copy = dict(record)
+        if not release_bound:
+            visible.append(record_copy)
+            continue
+        task_id = _apply_semantic_task_lineage_to_visual_record(
+            record_copy,
+            task_by_id=task_by_id if isinstance(task_by_id, Mapping) else {},
+        )
+        if not _release_visual_artifact_policy_visible(record_copy):
+            continue
+        if not task_id or task_id not in visual_obligation_task_ids:
+            continue
+        visible.append(record_copy)
+    return visible
+
+
+def _release_visual_artifact_policy_visible(record: Mapping[str, Any]) -> bool:
+    policy_decision = (_string(record.get("policy_decision")) or "").strip().lower()
+    if policy_decision in {"blocked", "manual_review", "disallowed", "restricted"}:
+        return False
+    status_values = {
+        (_string(record.get("candidate_status")) or "").strip().lower(),
+        (_string(record.get("fetch_status")) or "").strip().lower(),
+        (_string(record.get("analysis_status")) or "").strip().lower(),
+        (_string(record.get("observation_status")) or "").strip().lower(),
+    }
+    if "policy_blocked" in status_values:
+        return False
+    policy_flags = {
+        (_string(flag) or "").strip().lower()
+        for flag in record.get("policy_flags", [])
+        if (_string(flag) or "").strip()
+    } if isinstance(record.get("policy_flags"), list) else set()
+    if policy_flags & {
+        "policy_blocked",
+        "policy_decision_blocked",
+        "license_policy_blocked",
+        "robots_disallowed",
+    } and policy_decision not in {"allowed", "budget_pruned"}:
+        return False
+    return True
+
+
+def _release_validation_identity_for_visual_run(
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+) -> dict[str, str]:
+    identity_payload: dict[str, Any] = {}
+    run_status_path = run_dir / "run_status.json"
+    if run_status_path.exists():
+        try:
+            run_status = json.loads(run_status_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            run_status = {}
+        if isinstance(run_status, Mapping):
+            identity_payload.update(run_status)
+    if isinstance(evidence, Mapping):
+        identity_payload.update(evidence)
+    return release_validation_identity_from_payload(identity_payload)
+
+
+def _release_visual_materialization_context(
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    release_identity = _release_validation_identity_for_visual_run(run_dir, evidence)
+    if not release_identity:
+        return {
+            "release_bound": False,
+            "task_by_id": {},
+            "visual_obligation_task_ids": set(),
+        }
+    task_by_id = _semantic_task_lineage_by_id(run_dir, evidence)
+    visual_obligation_task_ids = {
+        task_id
+        for task in task_by_id.values()
+        for task_id in [_semantic_task_id_for_lineage(task)]
+        if task_id and _semantic_task_has_visual_obligation(task)
+    }
+    return {
+        "release_bound": True,
+        "task_by_id": task_by_id,
+        "visual_obligation_task_ids": visual_obligation_task_ids,
+    }
+
+
+def _semantic_task_lineage_by_id(
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    plan_path = run_dir / "semantic_plan.json"
+    plan_payload = _read_optional_json_object(plan_path) if plan_path.exists() else {}
+    plan_hash = _semantic_plan_hash(plan_path)
+    approved_delta_id = _approved_delta_id_for_visual_materialization(run_dir)
+    task_by_id: dict[str, dict[str, Any]] = {}
+    for task in _semantic_plan_bounded_tasks(plan_payload):
+        _merge_semantic_task_lineage_record(
+            task_by_id,
+            task,
+            plan_hash=plan_hash,
+            approved_delta_id=approved_delta_id,
+        )
+    for filename in ("research_tasks.json", "visual_tasks.json"):
+        path = run_dir / filename
+        if not path.exists():
+            continue
+        payload = _read_json_object(path)
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            if isinstance(task, Mapping):
+                _merge_semantic_task_lineage_record(
+                    task_by_id,
+                    task,
+                    plan_hash=plan_hash,
+                    approved_delta_id=approved_delta_id,
+                )
+    search_tasks = evidence.get("search_tasks")
+    if isinstance(search_tasks, list):
+        for task in search_tasks:
+            if isinstance(task, Mapping):
+                _merge_semantic_task_lineage_record(
+                    task_by_id,
+                    task,
+                    plan_hash=plan_hash,
+                    approved_delta_id=approved_delta_id,
+                )
+    return task_by_id
+
+
+def _merge_semantic_task_lineage_record(
+    task_by_id: dict[str, dict[str, Any]],
+    task: Mapping[str, Any],
+    *,
+    plan_hash: str | None,
+    approved_delta_id: str,
+) -> None:
+    semantic_task_id = _semantic_task_id_for_lineage(task)
+    if not semantic_task_id:
+        return
+    target = task_by_id.get(semantic_task_id)
+    if target is None:
+        target = {
+            "task_id": semantic_task_id,
+            "semantic_plan_task_id": semantic_task_id,
+        }
+        task_by_id[semantic_task_id] = target
+    task_record_id = _string(task.get("id")) or ""
+    if task_record_id.startswith("task_visual_"):
+        target.setdefault("visual_task_id", task_record_id)
+    for field in (
+        "id",
+        "task_id",
+        "semantic_plan_task_id",
+        "search_task_id",
+        "visual_task_id",
+        "angle_id",
+        "query",
+        "freshness_requirement",
+        "source_policy",
+        "expected_source_types",
+        "expected_visual_targets",
+        "expected_artifacts",
+        "success_criteria",
+        "done_condition",
+        "max_sources",
+        "max_images",
+    ):
+        value = task.get(field)
+        if value not in (None, "", []):
+            target.setdefault(field, copy.deepcopy(value))
+    route = task.get("route") or task.get("modality")
+    if route not in (None, "", []):
+        target.setdefault("route", copy.deepcopy(route))
+    semantic_plan_hash = _string(task.get("semantic_plan_hash")) or plan_hash
+    if semantic_plan_hash:
+        target.setdefault("semantic_plan_hash", semantic_plan_hash)
+    delta_id = _string(task.get("approved_delta_id")) or approved_delta_id
+    if delta_id:
+        target.setdefault("approved_delta_id", delta_id)
+    target["task_id"] = semantic_task_id
+    target["semantic_plan_task_id"] = semantic_task_id
+    for alias in _semantic_task_aliases(task, target):
+        task_by_id.setdefault(alias, target)
+
+
+def _semantic_task_aliases(
+    task: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> set[str]:
+    aliases: set[str] = set()
+    for record in (task, target):
+        for field in (
+            "semantic_plan_task_id",
+            "task_id",
+            "search_task_id",
+            "visual_task_id",
+            "id",
+        ):
+            value = _string(record.get(field))
+            if value:
+                aliases.add(value)
+    return aliases
+
+
+def _semantic_task_id_for_lineage(task: Mapping[str, Any]) -> str:
+    return (
+        _string(task.get("semantic_plan_task_id"))
+        or _string(task.get("task_id"))
+        or _string(task.get("search_task_id"))
+        or _string(task.get("id"))
+        or ""
+    )
+
+
+def _semantic_plan_bounded_tasks(plan_payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    semantic_plan = plan_payload.get("semantic_plan")
+    candidates = (
+        semantic_plan.get("bounded_tasks")
+        if isinstance(semantic_plan, Mapping)
+        else plan_payload.get("bounded_tasks")
+    )
+    if not isinstance(candidates, list):
+        return []
+    return [task for task in candidates if isinstance(task, Mapping)]
+
+
+def _semantic_plan_hash(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return semantic_materialization_plan_hash_for_file(path) or hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+
+
+def _approved_delta_id_for_visual_materialization(run_dir: Path) -> str:
+    path = run_dir / "semantic_plan_delta.json"
+    if not path.exists():
+        return "base_plan"
+    delta = _read_json_object(path)
+    if delta.get("delta_applied") is not True:
+        return "base_plan"
+    return (
+        _string(delta.get("approved_delta_id"))
+        or _string(delta.get("delta_id"))
+        or _string(delta.get("new_semantic_plan_version_id"))
+        or "unapproved_delta"
+    )
+
+
+def _apply_semantic_task_lineage_to_visual_record(
+    record: MutableMapping[str, Any],
+    *,
+    task_by_id: Mapping[str, Mapping[str, Any]],
+) -> str:
+    task = _semantic_task_for_visual_record(record, task_by_id=task_by_id)
+    if not isinstance(task, Mapping):
+        return _visual_record_semantic_task_id(record)
+    semantic_task_id = _semantic_task_id_for_lineage(task)
+    if not semantic_task_id:
+        return _visual_record_semantic_task_id(record)
+    current_task_id = _string(record.get("task_id"))
+    if current_task_id and current_task_id != semantic_task_id:
+        record.setdefault("visual_task_id", current_task_id)
+    record["task_id"] = semantic_task_id
+    record["semantic_plan_task_id"] = semantic_task_id
+    visual_task_id = _string(task.get("visual_task_id"))
+    if visual_task_id and visual_task_id != semantic_task_id:
+        record.setdefault("visual_task_id", visual_task_id)
+    for field in ("angle_id", "route", "semantic_plan_hash", "approved_delta_id"):
+        value = _string(task.get(field))
+        if value:
+            record[field] = value
+    for field in ("max_images",):
+        value = task.get(field)
+        if value not in (None, "", []) and record.get(field) in (None, "", []):
+            record[field] = copy.deepcopy(value)
+    if record.get("semantic_plan_hash") and not _string(record.get("approved_delta_id")):
+        record["approved_delta_id"] = "base_plan"
+    angle_id = _string(record.get("angle_id"))
+    route = _string(record.get("route"))
+    if semantic_task_id and angle_id and route:
+        record["plan_id"] = _plan_id_for_visual_task(
+            task_id=semantic_task_id,
+            angle_id=angle_id,
+            route=route,
+        )
+    return semantic_task_id
+
+
+def _semantic_task_for_visual_record(
+    record: Mapping[str, Any],
+    *,
+    task_by_id: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    for field in (
+        "semantic_plan_task_id",
+        "task_id",
+        "search_task_id",
+        "visual_task_id",
+    ):
+        task_id = _string(record.get(field))
+        if task_id and isinstance(task_by_id.get(task_id), Mapping):
+            return task_by_id[task_id]
+    return None
+
+
+def _visual_record_semantic_task_id(record: Mapping[str, Any]) -> str:
+    return (
+        _string(record.get("semantic_plan_task_id"))
+        or _string(record.get("task_id"))
+        or _string(record.get("search_task_id"))
+        or ""
+    )
+
+
+def _semantic_task_has_visual_obligation(task: Mapping[str, Any]) -> bool:
+    route = _string(task.get("route")) or _string(task.get("modality")) or ""
+    max_images_value = task.get("max_images")
+    max_images_present = max_images_value is not None
+    max_images = _int_or_zero(max_images_value)
+    if route == "text_only":
+        return False
+    if _string_list(task.get("expected_visual_targets")):
+        return True
+    if _semantic_task_expected_visual_artifacts(task):
+        return True
+    if max_images > 0:
+        return True
+    if max_images_present and max_images <= 0:
+        return False
+    if route in {"visual_required", "visual_optional"}:
+        return True
+    return False
+
+
+def _semantic_task_expected_visual_artifacts(task: Mapping[str, Any]) -> bool:
+    for field in ("expected_artifacts", "expected_source_types", "expected_evidence"):
+        for value in _string_list(task.get(field)):
+            normalized = re.sub(r"\s+", " ", str(value).strip().lower()).replace("-", "_")
+            if normalized in {
+                "image",
+                "images",
+                "visual",
+                "visual_search_plan",
+                "visual_candidates",
+                "image_fetch_status",
+                "visual_observations",
+                "vlm_analysis",
+                "screenshot",
+                "screenshots",
+                "chart",
+                "charts",
+                "diagram",
+                "diagrams",
+                "figure",
+                "figures",
+                "photo",
+                "photos",
+            }:
+                return True
+            if any(token in normalized for token in ("image", "visual", "screenshot", "vlm")):
+                return True
+    return (_string(task.get("evidence_need")) or "") in {
+        "visual_example",
+        "visual_observation",
+        "vlm_analysis",
+    }
 
 
 def _visual_provider_status(
@@ -3273,6 +3845,78 @@ def _plan_id_for_visual_task(*, task_id: str, angle_id: str, route: str) -> str:
     return "plan_" + _safe_id(f"{task_id}_{angle_id}_{route}")
 
 
+def _apply_visual_record_semantic_lineage(
+    record: MutableMapping[str, Any],
+    *lineage_sources: Mapping[str, Any],
+) -> None:
+    current_task_id = _string(record.get("task_id"))
+    lineage_records = (*lineage_sources, record)
+    semantic_task_id = _first_visual_lineage_value(
+        "semantic_plan_task_id",
+        *lineage_records,
+    )
+    if not semantic_task_id and _has_visual_semantic_lineage_marker(*lineage_records):
+        semantic_task_id = _first_visual_lineage_value("task_id", *lineage_sources)
+    if semantic_task_id:
+        if (
+            current_task_id
+            and current_task_id != semantic_task_id
+            and current_task_id.startswith("task_visual_")
+        ):
+            record.setdefault("visual_task_id", current_task_id)
+        record["task_id"] = semantic_task_id
+        record["semantic_plan_task_id"] = semantic_task_id
+        angle_id = _string(record.get("angle_id")) or _first_visual_lineage_value(
+            "angle_id",
+            *lineage_sources,
+        )
+        route = _string(record.get("route")) or _first_visual_lineage_value(
+            "route",
+            *lineage_sources,
+        )
+        if angle_id and route and not _string(record.get("plan_id")):
+            record["plan_id"] = _plan_id_for_visual_task(
+                task_id=_string(record.get("task_id")) or semantic_task_id,
+                angle_id=angle_id,
+                route=route,
+            )
+    visual_task_id = _first_visual_lineage_value("visual_task_id", *lineage_sources)
+    if visual_task_id and visual_task_id != record.get("task_id"):
+        record.setdefault("visual_task_id", visual_task_id)
+    for field in ("semantic_plan_hash", "approved_delta_id"):
+        value = _first_visual_lineage_value(field, *lineage_sources, record)
+        if value:
+            record[field] = value
+    if record.get("semantic_plan_hash") and not _string(record.get("approved_delta_id")):
+        record["approved_delta_id"] = "base_plan"
+
+
+def _has_visual_semantic_lineage_marker(*records: Mapping[str, Any]) -> bool:
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if (
+            _string(record.get("semantic_plan_task_id"))
+            or _string(record.get("semantic_plan_hash"))
+            or _string(record.get("approved_delta_id"))
+        ):
+            return True
+    return False
+
+
+def _first_visual_lineage_value(
+    field: str,
+    *records: Mapping[str, Any],
+) -> str:
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        value = _string(record.get(field))
+        if value:
+            return value
+    return ""
+
+
 def _fetch_id_for_candidate_id(candidate_id: str) -> str:
     return "fetch_" + _safe_id(candidate_id.removeprefix("cand_"))
 
@@ -3461,6 +4105,10 @@ def _write_text_only_skip(
         "created_at": created_at,
         "tasks": [],
     }
+    visual_search_plan = apply_release_validation_identity(
+        visual_search_plan,
+        _release_validation_identity_for_visual_run(run_dir, evidence),
+    )
     image_fetch_records: list[dict[str, Any]] = []
     visual_provider_status = _visual_provider_status(
         run_dir=run_dir,
@@ -3593,6 +4241,12 @@ def _write_blocked_missing_visual_provider(
         selected_observations=0,
         state="blocked",
     )
+    _ensure_visual_search_plan_tasks_registered(
+        run_dir=run_dir,
+        evidence=evidence,
+        visual_search_plan=visual_search_plan,
+        created_at=created_at,
+    )
     actionable_cause = _blocked_actionable_cause(provider_statuses)
     visual_provider_status = _visual_provider_status(
         run_dir=run_dir,
@@ -3707,37 +4361,213 @@ def _write_blocked_missing_visual_provider(
     return status
 
 
-def _visual_task_by_angle(run_dir: Path) -> dict[str, Mapping[str, Any]]:
+def _visual_task_records(run_dir: Path) -> list[Mapping[str, Any]]:
     path = run_dir / "visual_tasks.json"
     if not path.exists():
-        return {}
+        return []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise VisualAcquisitionError(f"invalid JSON in {path}: {exc}") from exc
     if not isinstance(payload, Mapping):
-        return {}
+        return []
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
+        return []
+    return [task for task in tasks if isinstance(task, Mapping)]
+
+
+def _visual_task_by_angle(run_dir: Path) -> dict[str, Mapping[str, Any]]:
+    return _visual_task_by_angle_from_records(_visual_task_records(run_dir))
+
+
+def _visual_task_by_angle_from_records(
+    tasks: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    if not tasks:
         return {}
     result: dict[str, Mapping[str, Any]] = {}
     for task in tasks:
-        if not isinstance(task, Mapping):
-            continue
         angle_id = task.get("angle_id")
         if isinstance(angle_id, str) and angle_id:
             result[angle_id] = task
     return result
 
 
+def _ensure_visual_search_plan_tasks_registered(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    visual_search_plan: Mapping[str, Any],
+    created_at: str,
+) -> int:
+    """Register generated visual plan tasks so release lineage validation can trace them."""
+
+    plan_tasks = visual_search_plan.get("tasks")
+    if not isinstance(plan_tasks, list) or not plan_tasks:
+        return 0
+
+    research_task_ids = _task_ids_from_artifact(run_dir / "research_tasks.json")
+    search_task_ids = {
+        str(task.get("id"))
+        for task in evidence.get("search_tasks", [])
+        if isinstance(task, Mapping) and isinstance(task.get("id"), str) and task.get("id")
+    }
+
+    visual_tasks_path = run_dir / "visual_tasks.json"
+    if visual_tasks_path.exists():
+        visual_tasks_payload = _read_json_object(visual_tasks_path)
+    else:
+        visual_tasks_payload = {
+            "schema_version": HANDOFF_SCHEMA_VERSION,
+            "run_id": str(evidence.get("run_id") or run_dir.name),
+            "created_at": created_at,
+            "tasks": [],
+        }
+        apply_release_validation_identity(
+            visual_tasks_payload,
+            _release_validation_identity_for_visual_run(run_dir, evidence),
+        )
+    tasks = visual_tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        tasks = []
+        visual_tasks_payload["tasks"] = tasks
+
+    known_ids = {
+        *research_task_ids,
+        *search_task_ids,
+        *{
+            str(task.get("id"))
+            for task in tasks
+            if isinstance(task, Mapping) and isinstance(task.get("id"), str) and task.get("id")
+        },
+    }
+    added = 0
+    for plan_task in plan_tasks:
+        if not isinstance(plan_task, Mapping):
+            continue
+        task_id = _string(plan_task.get("task_id"))
+        if not task_id or task_id in known_ids:
+            continue
+        tasks.append(_generated_visual_task_from_plan(plan_task, evidence=evidence))
+        known_ids.add(task_id)
+        added += 1
+
+    if added:
+        visual_tasks_payload.setdefault("schema_version", HANDOFF_SCHEMA_VERSION)
+        visual_tasks_payload.setdefault("run_id", str(evidence.get("run_id") or run_dir.name))
+        visual_tasks_payload.setdefault("created_at", created_at)
+        apply_release_validation_identity(
+            visual_tasks_payload,
+            _release_validation_identity_for_visual_run(run_dir, evidence),
+        )
+        _write_json(visual_tasks_path, visual_tasks_payload)
+    return added
+
+
+def _task_ids_from_artifact(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    payload = _read_json_object(path)
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return set()
+    return {
+        str(task.get("id"))
+        for task in tasks
+        if isinstance(task, Mapping) and isinstance(task.get("id"), str) and task.get("id")
+    }
+
+
+def _generated_visual_task_from_plan(
+    plan_task: Mapping[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    task_id = _string(plan_task.get("task_id")) or _task_id_for_angle(plan_task.get("angle_id"))
+    angle_id = _string(plan_task.get("angle_id")) or "angle_001"
+    route = _string(plan_task.get("route")) or "visual_required"
+    caps = plan_task.get("caps") if isinstance(plan_task.get("caps"), Mapping) else {}
+    target = _string(plan_task.get("target_evidence_type")) or "web_image"
+    query = _string(plan_task.get("query")) or str(evidence.get("question") or "")
+    max_images = max(
+        _int_or_zero(caps.get("max_vlm_images") if isinstance(caps, Mapping) else None),
+        _int_or_zero(caps.get("max_fetches") if isinstance(caps, Mapping) else None),
+    )
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "semantic_plan_task_id": _string(plan_task.get("semantic_plan_task_id")) or task_id,
+        "angle_id": angle_id,
+        "angle": angle_id,
+        "query": query,
+        "route": route,
+        "expected_visual_targets": [target],
+        "expected_artifacts": ["visual_search_plan", "visual_candidates", "image_fetch_status"],
+        "expected_source_types": [target],
+        "success_criteria": [
+            "visual acquisition artifacts preserve plan/task/angle/route lineage",
+        ],
+        "done_condition": "visual plan task is represented in visual_tasks.json",
+        "freshness_requirement": "any",
+        "source_policy": {"decision": "allowed", "flags": []},
+        "visual_tasks": [target],
+        "max_sources": _int_or_zero(caps.get("max_candidates") if isinstance(caps, Mapping) else None),
+        "max_images": max_images,
+        "status": "generated_visual_acquisition_task",
+        "generated_by": "visual_acquisition",
+        "origin": "visual_search_plan",
+        "plan_id": _string(plan_task.get("plan_id")),
+        "provider_names": [
+            str(provider)
+            for provider in plan_task.get("providers", [])
+            if isinstance(provider, str) and provider
+        ]
+        if isinstance(plan_task.get("providers"), list)
+        else [],
+    }
+
+
 def _visual_routes(
     evidence: Mapping[str, Any],
     *,
+    visual_tasks: Sequence[Mapping[str, Any]] = (),
     visual_task_by_angle: Mapping[str, Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
     routes = evidence.get("routing", [])
     if not isinstance(routes, list):
         return []
+    route_by_angle = {
+        str(route.get("id")): route
+        for route in routes
+        if isinstance(route, Mapping) and isinstance(route.get("id"), str)
+    }
+    if visual_tasks:
+        task_routes: list[Mapping[str, Any]] = []
+        for visual_task in visual_tasks:
+            angle_id = _string(visual_task.get("angle_id")) or "angle_001"
+            base_route = route_by_angle.get(angle_id, {})
+            route_name = (
+                _string(visual_task.get("route"))
+                or _string(visual_task.get("modality"))
+                or _string(base_route.get("modality"))
+                or "visual_required"
+            )
+            max_images = _int_or_zero(
+                visual_task.get("max_images")
+                if visual_task.get("max_images") is not None
+                else base_route.get("max_images")
+            )
+            if route_name not in SEARCH_ROUTES or route_name == "text_only" or max_images <= 0:
+                continue
+            enriched = dict(base_route)
+            enriched["id"] = angle_id
+            enriched["modality"] = route_name
+            enriched["max_images"] = max_images
+            _apply_visual_task_route_lineage(enriched, visual_task)
+            task_routes.append(enriched)
+        if task_routes:
+            return task_routes
     result = []
     for route in routes:
         if not isinstance(route, Mapping):
@@ -3747,9 +4577,38 @@ def _visual_routes(
             enriched = dict(route)
             visual_task = visual_task_by_angle.get(str(enriched.get("id") or ""))
             if visual_task is not None:
-                enriched["task_id"] = visual_task.get("id")
+                _apply_visual_task_route_lineage(enriched, visual_task)
             result.append(enriched)
     return result
+
+
+def _apply_visual_task_route_lineage(
+    route: MutableMapping[str, Any],
+    visual_task: Mapping[str, Any],
+) -> None:
+    visual_task_id = _string(visual_task.get("id"))
+    task_id = _string(visual_task.get("task_id")) or visual_task_id
+    semantic_task_id = _string(visual_task.get("semantic_plan_task_id"))
+    if not semantic_task_id and _has_visual_semantic_lineage_marker(visual_task):
+        semantic_task_id = task_id
+    if semantic_task_id:
+        route["task_id"] = semantic_task_id
+        route["semantic_plan_task_id"] = semantic_task_id
+    elif task_id:
+        route["task_id"] = task_id
+    if visual_task_id and visual_task_id != route.get("task_id"):
+        route["visual_task_id"] = visual_task_id
+    for field in (
+        "semantic_plan_hash",
+        "approved_delta_id",
+        "query",
+        "expected_visual_targets",
+        "visual_tasks",
+        "source_policy",
+    ):
+        value = visual_task.get(field)
+        if value not in (None, "", []):
+            route[field] = copy.deepcopy(value)
 
 
 def _ensure_fixture_sources(
@@ -4476,7 +5335,18 @@ def _source_route(
 ) -> Mapping[str, Any]:
     angle_id = source.get("angle_id")
     route = source.get("route")
+    source_task_id = (
+        _string(source.get("semantic_plan_task_id"))
+        or _string(source.get("task_id"))
+        or _string(source.get("search_task_id"))
+    )
     for candidate in routes:
+        candidate_task_id = (
+            _string(candidate.get("semantic_plan_task_id"))
+            or _string(candidate.get("task_id"))
+        )
+        if source_task_id and candidate_task_id == source_task_id:
+            return candidate
         if angle_id and candidate.get("id") == angle_id:
             return candidate
         if route and candidate.get("modality") == route:
@@ -4714,6 +5584,114 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
             records.append(payload)
     return records
+
+
+def _merge_visual_observation_records(
+    existing: Sequence[Mapping[str, Any]],
+    additions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    index_by_key: dict[str, int] = {}
+    for record in [*existing, *additions]:
+        if not isinstance(record, Mapping):
+            continue
+        record_copy = dict(record)
+        key = _visual_observation_key(record_copy)
+        if not key or key not in index_by_key:
+            if key:
+                index_by_key[key] = len(merged)
+            merged.append(record_copy)
+            continue
+        current = dict(merged[index_by_key[key]])
+        for link_field in ("verifier_links", "report_links"):
+            current[link_field] = _merge_visual_observation_links(
+                current.get(link_field),
+                record_copy.get(link_field),
+            )
+        for field, value in record_copy.items():
+            if field in {"verifier_links", "report_links"}:
+                continue
+            if value not in (None, "", []):
+                current[field] = value
+        merged[index_by_key[key]] = current
+    return _normalize_visual_observation_ids(merged)
+
+
+def _normalize_visual_observation_ids(
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    id_counts: dict[str, int] = {}
+    for record in records:
+        observation_id = _string(record.get("observation_id"))
+        if observation_id:
+            id_counts[observation_id] = id_counts.get(observation_id, 0) + 1
+
+    normalized: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    unavailable_ids = {
+        observation_id
+        for observation_id, count in id_counts.items()
+        if count == 1
+    }
+    for index, record in enumerate(records, start=1):
+        record_copy = dict(record)
+        observation_id = _string(record_copy.get("observation_id"))
+        if not observation_id or id_counts.get(observation_id, 0) > 1 or observation_id in used_ids:
+            if observation_id and "raw_child_observation_id" not in record_copy:
+                record_copy["raw_child_observation_id"] = observation_id
+            observation_id = _unique_visual_observation_id(record_copy, index, unavailable_ids)
+            record_copy["observation_id"] = observation_id
+        used_ids.add(observation_id)
+        unavailable_ids.add(observation_id)
+        normalized.append(record_copy)
+    return normalized
+
+
+def _unique_visual_observation_id(
+    record: Mapping[str, Any],
+    index: int,
+    used_ids: set[str],
+) -> str:
+    parts = [
+        _safe_id(value)
+        for field in ("task_id", "evidence_image_id", "candidate_id", "fetch_id")
+        for value in [_string(record.get(field))]
+        if value
+    ]
+    if parts:
+        base = "obs_" + "_".join(parts)
+    else:
+        base = f"obs_record_{index:03d}"
+    candidate = base
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _visual_observation_key(record: Mapping[str, Any]) -> str:
+    for field in ("evidence_image_id", "image_id", "id"):
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _merge_visual_observation_links(existing: Any, additions: Any) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in [
+        *([item for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []),
+        *([item for item in additions if isinstance(item, Mapping)] if isinstance(additions, list) else []),
+    ]:
+        record_copy = dict(record)
+        key = json.dumps(record_copy, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(record_copy)
+    return output
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

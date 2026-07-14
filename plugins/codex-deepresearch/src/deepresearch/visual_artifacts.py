@@ -130,6 +130,8 @@ class _VisualContext:
         self.search_result_ids: set[str] = set()
         self.observation_links_by_image_claim: set[tuple[str, str, str]] = set()
         self.report_used_image_ids: set[str] = set()
+        self.report_included_claims_available = False
+        self.report_included_image_claim_pairs: set[tuple[str, str]] = set()
 
 
 def automatic_visual_status_envelope(
@@ -277,7 +279,7 @@ def visual_minimums_for_run(
     required = (
         required_vlm_images
         if required_vlm_images is not None
-        else required_vlm_images_for_evidence(evidence)
+        else _required_vlm_images_for_run_artifacts(base, evidence)
     )
     return visual_release_minimums(
         candidates=_read_optional_artifact_jsonl(base / VISUAL_CANDIDATES_FILENAME),
@@ -288,6 +290,69 @@ def visual_minimums_for_run(
         report_text=_read_optional_artifact_text(base / "report.md"),
         required_vlm_images=required,
     )
+
+
+def _required_vlm_images_for_run_artifacts(
+    run_dir: Path,
+    evidence: Mapping[str, Any] | None,
+) -> int:
+    evidence_required = required_vlm_images_for_evidence(evidence)
+    if evidence_required > 0:
+        return evidence_required
+    if _run_artifacts_have_visual_required_task(run_dir, evidence):
+        return DEFAULT_REQUIRED_VISUAL_VLM_IMAGES
+    return evidence_required
+
+
+def _run_artifacts_have_visual_required_task(
+    run_dir: Path,
+    evidence: Mapping[str, Any] | None,
+) -> bool:
+    for records in (
+        _artifact_tasks(run_dir / VISUAL_SEARCH_PLAN_FILENAME),
+        _artifact_tasks(run_dir / "visual_tasks.json"),
+        _artifact_tasks(run_dir / "research_tasks.json"),
+        _evidence_tasks(evidence),
+    ):
+        if any(_record_route(record) == "visual_required" for record in records):
+            return True
+    return any(
+        _record_route(record) == "visual_required"
+        for record in _read_optional_artifact_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME)
+    )
+
+
+def _artifact_tasks(path: Path) -> list[Mapping[str, Any]]:
+    payload = _read_optional_artifact_json(path)
+    if not isinstance(payload, Mapping):
+        return []
+    tasks = payload.get("tasks")
+    if isinstance(tasks, list):
+        return [task for task in tasks if isinstance(task, Mapping)]
+    semantic_plan = payload.get("semantic_plan")
+    bounded_tasks = (
+        semantic_plan.get("bounded_tasks")
+        if isinstance(semantic_plan, Mapping)
+        else payload.get("bounded_tasks")
+    )
+    if isinstance(bounded_tasks, list):
+        return [task for task in bounded_tasks if isinstance(task, Mapping)]
+    return []
+
+
+def _evidence_tasks(evidence: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    if not isinstance(evidence, Mapping):
+        return []
+    records: list[Mapping[str, Any]] = []
+    for field in ("search_tasks", "routing"):
+        values = evidence.get(field)
+        if isinstance(values, list):
+            records.extend(item for item in values if isinstance(item, Mapping))
+    return records
+
+
+def _record_route(record: Mapping[str, Any]) -> str:
+    return str(record.get("route") or record.get("modality") or "").strip()
 
 
 def visual_release_minimums(
@@ -416,6 +481,8 @@ def visual_failure_code_for_shortfall_reason(reason: str | None) -> str | None:
         return None
     if reason == "report_linkage_missing":
         return "visual_report_linkage_missing"
+    if reason == "semantic_materialization_missing":
+        return "semantic_materialization_diff_invalid"
     return "visual_minimum_shortfall"
 
 
@@ -1501,6 +1568,7 @@ def _validate_report_status(
             "included_claims must be a list",
         )
         return
+    context.report_included_claims_available = True
     for index, claim_record in enumerate(included_claims):
         claim_path = f"$.report_status.included_claims[{index}]"
         if not _require_object(claim_record, claim_path, collector):
@@ -1528,6 +1596,8 @@ def _validate_report_status(
                     "dangling_reference",
                     f"report status references unknown image '{image_id}'",
                 )
+            if claim_id:
+                context.report_included_image_claim_pairs.add((image_id, claim_id))
             if claim is not None:
                 supporting_images = claim.get("supporting_images", [])
                 if isinstance(supporting_images, list) and image_id not in supporting_images:
@@ -1750,6 +1820,18 @@ def _sum_provider_counter(
 
 def _has_report_cited_supported_visual_claim(context: _VisualContext) -> bool:
     if not context.claim_by_id or not context.report_used_image_ids:
+        return False
+    if context.report_included_claims_available:
+        for image_id, claim_id in context.report_included_image_claim_pairs:
+            if image_id not in context.report_used_image_ids:
+                continue
+            claim = context.claim_by_id.get(claim_id)
+            if not isinstance(claim, Mapping):
+                continue
+            if claim.get("verification_status") == "supported" and claim.get(
+                "claim_type"
+            ) in {"visual", "mixed"}:
+                return True
         return False
     for claim in context.claim_by_id.values():
         if claim.get("verification_status") != "supported":
@@ -2231,7 +2313,11 @@ def _validate_claim_observation_report_lineage(
                     "missing_verifier_link",
                     f"supported visual claim '{claim_id}' lacks verifier link for image '{image_id}'",
                 )
-            if (image_id, claim_id) not in report_pairs:
+            report_link_required = (
+                not context.report_included_claims_available
+                or (image_id, claim_id) in context.report_included_image_claim_pairs
+            )
+            if report_link_required and (image_id, claim_id) not in report_pairs:
                 collector.add(
                     f"$.evidence.claims.{claim_id}.visual_supports",
                     "missing_report_link",

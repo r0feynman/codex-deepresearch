@@ -27,6 +27,7 @@ from deepresearch.visual_artifacts import (  # noqa: E402
     validate_visual_artifacts,
     visual_failure_code_for_minimums,
     visual_minimum_diagnostics,
+    visual_minimums_for_run,
     visual_release_minimums,
 )
 
@@ -207,6 +208,60 @@ class VisualArtifactTests(unittest.TestCase):
         image = image_by_id[support["image_id"]]
         self.assert_lineage(support, image)
 
+    def test_visual_minimums_detect_visual_required_from_plan_artifact(self) -> None:
+        run_dir = self.temp_dir()
+        self.write_json(
+            run_dir / "evidence.json",
+            {
+                "schema_version": "0.1.0",
+                "run_id": run_dir.name,
+                "question": "Inspect plan-bound visual work",
+                "routing": [{"id": "angle_001", "modality": "text_only"}],
+                "sources": [],
+                "images": [],
+                "claims": [],
+            },
+        )
+        self.write_json(
+            run_dir / VISUAL_SEARCH_PLAN_FILENAME,
+            {
+                "schema_version": "codex-deepresearch.visual-artifacts.v0",
+                "run_id": run_dir.name,
+                "created_at": "2026-07-12T00:00:00Z",
+                "tasks": [
+                    {
+                        "plan_id": "plan_task_016_angle_004_visual_required",
+                        "task_id": "task_016",
+                        "semantic_plan_task_id": "task_016",
+                        "angle_id": "angle_004",
+                        "route": "visual_required",
+                        "target_evidence_type": "web_image",
+                        "query": "visual consistency",
+                        "providers": ["child-discovered-image-url"],
+                        "source_search_result_ids": [],
+                        "caps": {
+                            "max_candidates": 10,
+                            "max_fetches": 3,
+                            "max_vlm_images": 3,
+                            "max_cost_usd": 0.0,
+                        },
+                        "policy_constraints": {"policy_decision": "allowed"},
+                        "estimated_cost_usd": 0.0,
+                        "state": "completed",
+                    }
+                ],
+            },
+        )
+        self.write_jsonl(run_dir / VISUAL_CANDIDATES_FILENAME, [])
+        self.write_jsonl(run_dir / IMAGE_FETCH_STATUS_FILENAME, [])
+        self.write_jsonl(run_dir / "visual_observations.jsonl", [])
+
+        minimums = visual_minimums_for_run(run_dir)
+
+        self.assertEqual(minimums["required_vlm_images"], 3)
+        self.assertFalse(minimums["satisfied"])
+        self.assertEqual(minimums["shortfall_reason"], "insufficient_candidates")
+
     def test_multi_angle_visual_lineage_reports_specific_error_classes(self) -> None:
         cases = {
             "duplicate_id": self.break_duplicate_plan_id,
@@ -384,6 +439,64 @@ class VisualArtifactTests(unittest.TestCase):
         error_codes = {error.code for error in result.errors}
         self.assertIn("missing_verifier_link", error_codes)
         self.assertIn("missing_report_link", error_codes)
+
+    def test_excluded_visual_claim_does_not_require_report_link_for_shared_image(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+        evidence = self.read_json(run_dir / "evidence.json")
+        included_claim = evidence["claims"][0]
+        support = dict(included_claim["visual_supports"][0])
+        excluded_claim_id = "claim_excluded_shared_visual"
+        evidence["claims"].append(
+            {
+                "id": excluded_claim_id,
+                "text": "Excluded claim shares an image with an included visual claim.",
+                "claim_type": "mixed",
+                "supporting_sources": [],
+                "supporting_images": [support["image_id"]],
+                "visual_supports": [support],
+                "quote_spans": [],
+                "votes": [{"id": "vote_excluded_shared_visual"}],
+                "verification_status": "supported",
+                "review_status": "auto_reviewed",
+                "promotion_status": "eligible",
+                "confidence": "medium",
+                "caveats": [],
+            }
+        )
+        self.write_json(run_dir / "evidence.json", evidence)
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        verifier_link = dict(observations[0]["verifier_links"][0])
+        verifier_link["claim_id"] = excluded_claim_id
+        verifier_link["verifier_vote_id"] = "vote_excluded_shared_visual"
+        observations[0]["verifier_links"].append(verifier_link)
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+        report_status = self.read_json(run_dir / "report_status.json")
+        report_status["excluded_claims"] = [
+            {
+                "claim_id": excluded_claim_id,
+                "claim_type": "mixed",
+                "verification_status": "supported",
+                "image_ids": [support["image_id"]],
+                "visual_supports": [support],
+                "exclusion_reasons": ["missing_quote_source"],
+            }
+        ]
+        self.write_json(run_dir / "report_status.json", report_status)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertTrue(result.valid, [error.to_dict() for error in result.errors])
+
+    def test_included_visual_claim_still_requires_report_link(self) -> None:
+        run_dir = self.write_multi_angle_lineage_fixture()
+        observations = self.read_jsonl(run_dir / "visual_observations.jsonl")
+        observations[0]["report_links"] = []
+        self.write_jsonl(run_dir / "visual_observations.jsonl", observations)
+
+        result = validate_visual_artifacts(run_dir=run_dir)
+
+        self.assertFalse(result.valid)
+        self.assertIn("missing_report_link", {error.code for error in result.errors})
 
     def test_completed_auto_visual_rejects_zero_provider_counters(self) -> None:
         run_dir = self.write_phase3_fixture()

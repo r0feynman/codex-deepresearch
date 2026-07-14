@@ -108,7 +108,12 @@ def verify_claims(
     existing_top_level_votes = _read_existing_verifier_votes(run_dir / "verifier_votes.jsonl")
     sources_by_id = _records_by_id(evidence.get("sources", []))
     images_by_id = _records_by_id(evidence.get("images", []))
+    valid_evidence_refs = set(sources_by_id) | set(images_by_id)
     routing_by_angle = _routing_by_angle(evidence.get("routing", []))
+    visual_image_ref_reconciliation = _reconcile_visual_claim_supporting_images(
+        claims,
+        images_by_id=images_by_id,
+    )
     route_counts = {route: 0 for route in SEARCH_ROUTES}
     all_votes: list[dict[str, Any]] = []
     claim_statuses: list[dict[str, Any]] = []
@@ -130,28 +135,47 @@ def verify_claims(
             images_by_id=images_by_id,
             verification_route=route,
         )
-        preserved_votes = _preserved_votes(claim, existing_top_level_votes)
-        reusable_matrix_votes = _existing_matrix_votes(claim, existing_top_level_votes)
+        current_policy_blocks = _current_policy_blocks(
+            claim,
+            sources_by_id=sources_by_id,
+            images_by_id=images_by_id,
+        )
+        usable_visual_evidence_refs = set(_usable_image_refs(claim, images_by_id=images_by_id))
+        if current_policy_blocks:
+            usable_visual_evidence_refs.update(
+                _valid_visual_support_image_refs(claim, images_by_id=images_by_id)
+            )
+        preserved_votes, dropped_preserved_visual_vote = _preserved_votes(
+            claim,
+            existing_top_level_votes,
+            valid_evidence_refs=valid_evidence_refs,
+            usable_visual_evidence_refs=usable_visual_evidence_refs,
+        )
+        reusable_matrix_votes, dropped_matrix_visual_vote = _existing_matrix_votes(
+            claim,
+            existing_top_level_votes,
+            valid_evidence_refs=valid_evidence_refs,
+            usable_visual_evidence_refs=usable_visual_evidence_refs,
+        )
+        claim_votes_for_reuse = preserved_votes + reusable_matrix_votes
         if _can_reuse_claim_verification(
             claim,
             current_claim_cache_key,
             reusable_matrix_votes,
+            route=route,
+            claim_votes=claim_votes_for_reuse,
+            visual_vote_filtered=dropped_preserved_visual_vote or dropped_matrix_visual_vote,
         ):
             claim["cache_key"] = current_claim_cache_key
             claim["verification_cache_key"] = current_claim_cache_key
-            claim_votes = preserved_votes + reusable_matrix_votes
-            claim["votes"] = claim_votes
+            claim["votes"] = claim_votes_for_reuse
             claim["verification_route"] = route
-            _update_vote_reference_fields(claim, claim_votes)
-            if _current_policy_blocks(
-                claim,
-                sources_by_id=sources_by_id,
-                images_by_id=images_by_id,
-            ):
+            _update_vote_reference_fields(claim, claim_votes_for_reuse)
+            if current_policy_blocks:
                 _apply_current_policy_block(claim)
             else:
                 _update_report_eligibility(claim)
-            all_votes.extend(claim_votes)
+            all_votes.extend(claim_votes_for_reuse)
             claim_statuses.append(_claim_status_record(claim, route, 0, cache_hit=True))
             reused_count += 1
             continue
@@ -207,6 +231,12 @@ def verify_claims(
         "claims_processed": len([claim for claim in claims if isinstance(claim, Mapping)]),
         "claims_reused": reused_count,
         "claims_budget_pruned": pruned_count,
+        "dangling_visual_supporting_images_pruned": visual_image_ref_reconciliation[
+            "supporting_images_pruned"
+        ],
+        "visual_supporting_images_added": visual_image_ref_reconciliation[
+            "supporting_images_added"
+        ],
     }
 
     verifier_votes_path = run_dir / "verifier_votes.jsonl"
@@ -286,14 +316,13 @@ def _matrix_votes(
         route == "visual_optional"
         and _visual_budget_allows(claim, images_by_id=images_by_id)
     ):
-        votes.append(
-            _visual_vote(
-                claim,
-                route=route,
-                images_by_id=images_by_id,
-                created_at=created_at,
-            )
+        visual_vote = _visual_vote(
+            claim,
+            images_by_id=images_by_id,
+            created_at=created_at,
         )
+        if visual_vote is not None:
+            votes.append(visual_vote)
     return votes
 
 
@@ -371,30 +400,21 @@ def _policy_vote(
 def _visual_vote(
     claim: Mapping[str, Any],
     *,
-    route: str,
     images_by_id: Mapping[str, Mapping[str, Any]],
     created_at: str,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     usable_refs = _usable_image_refs(claim, images_by_id=images_by_id)
-    if usable_refs:
-        vote = "support"
-        confidence = 0.74
-        rationale = "Usable visual evidence is linked to the claim."
-        evidence_refs = usable_refs
-    else:
-        vote = "uncertain"
-        confidence = 0.3
-        rationale = f"No usable VisualEvidence is linked for the {route} route."
-        evidence_refs = []
+    if not usable_refs:
+        return None
     return _vote(
         claim,
         verifier_type="visual",
         agent_name="matrix_visual_1",
         ordinal=1,
-        vote=vote,
-        confidence=confidence,
-        evidence_refs=evidence_refs,
-        rationale=rationale,
+        vote="support",
+        confidence=0.74,
+        evidence_refs=usable_refs,
+        rationale="Usable visual evidence is linked to the claim.",
         created_at=created_at,
     )
 
@@ -701,6 +721,7 @@ def _persist_visual_observation_verifier_links(
     if observations is None:
         return
 
+    current_visual_vote_ids: set[str] = set()
     links_by_image_id: dict[str, list[dict[str, Any]]] = {}
     for claim in claims:
         if not isinstance(claim, Mapping):
@@ -711,6 +732,7 @@ def _persist_visual_observation_verifier_links(
         vote_ids = _string_list(claim.get("visual_verifier_vote_refs"))
         if not vote_ids:
             continue
+        current_visual_vote_ids.update(vote_ids)
         supports = claim.get("visual_supports", [])
         if not isinstance(supports, list):
             continue
@@ -742,15 +764,27 @@ def _persist_visual_observation_verifier_links(
                     link
                 )
 
-    if not links_by_image_id:
-        return
-
     changed = False
     updated: list[dict[str, Any]] = []
     for observation in observations:
         if not isinstance(observation, Mapping):
             continue
         record = dict(observation)
+        existing_links = record.get("verifier_links")
+        if isinstance(existing_links, list):
+            pruned_links = [
+                link
+                for link in existing_links
+                if isinstance(link, Mapping)
+                and isinstance(link.get("verifier_vote_id"), str)
+                and link["verifier_vote_id"] in current_visual_vote_ids
+            ]
+            if pruned_links != existing_links:
+                changed = True
+                if pruned_links:
+                    record["verifier_links"] = [dict(link) for link in pruned_links]
+                else:
+                    record.pop("verifier_links", None)
         image_id = record.get("evidence_image_id") or record.get("id")
         links = links_by_image_id.get(image_id) if isinstance(image_id, str) else None
         if links:
@@ -792,47 +826,167 @@ def _merge_link_records(
 def _preserved_votes(
     claim: Mapping[str, Any],
     top_level_votes: Mapping[str, Mapping[str, Any]],
-) -> list[dict[str, Any]]:
+    *,
+    valid_evidence_refs: set[str],
+    usable_visual_evidence_refs: set[str],
+) -> tuple[list[dict[str, Any]], bool]:
     preserved: list[dict[str, Any]] = []
+    dropped_visual_vote = False
     votes = claim.get("votes", [])
     if not isinstance(votes, list):
-        return preserved
+        return preserved, dropped_visual_vote
     for vote in votes:
         record = top_level_votes.get(vote) if isinstance(vote, str) else vote
         if not isinstance(record, Mapping) or _is_matrix_vote(record):
             continue
+        if not _vote_belongs_to_claim(record, claim):
+            if record.get("verifier_type") == "visual":
+                dropped_visual_vote = True
+            continue
+        if not _visual_vote_has_joinable_evidence_refs(
+            record,
+            valid_evidence_refs=valid_evidence_refs,
+            usable_visual_evidence_refs=usable_visual_evidence_refs,
+        ):
+            dropped_visual_vote = True
+            continue
         preserved.append(dict(record))
-    return preserved
+    return preserved, dropped_visual_vote
 
 
 def _existing_matrix_votes(
     claim: Mapping[str, Any],
     top_level_votes: Mapping[str, Mapping[str, Any]],
-) -> list[dict[str, Any]]:
+    *,
+    valid_evidence_refs: set[str],
+    usable_visual_evidence_refs: set[str],
+) -> tuple[list[dict[str, Any]], bool]:
     matrix_votes: dict[str, dict[str, Any]] = {}
+    dropped_visual_vote = False
+    expected_visual_vote_refs = _expected_matrix_visual_vote_refs(claim)
+    retained_visual_vote_refs: set[str] = set()
     votes = claim.get("votes", [])
     if not isinstance(votes, list):
-        return []
+        return [], bool(expected_visual_vote_refs)
     for vote in votes:
         record = top_level_votes.get(vote) if isinstance(vote, str) else vote
-        if not isinstance(record, Mapping) or not _is_matrix_vote(record):
+        if not isinstance(record, Mapping):
+            if isinstance(vote, str) and vote in expected_visual_vote_refs:
+                dropped_visual_vote = True
+            continue
+        if not _is_matrix_vote(record):
+            continue
+        if not _vote_belongs_to_claim(record, claim):
+            if record.get("verifier_type") == "visual":
+                dropped_visual_vote = True
+            continue
+        if not _visual_vote_has_joinable_evidence_refs(
+            record,
+            valid_evidence_refs=valid_evidence_refs,
+            usable_visual_evidence_refs=usable_visual_evidence_refs,
+        ):
+            dropped_visual_vote = True
             continue
         vote_id = record.get("id")
         if isinstance(vote_id, str) and vote_id:
             matrix_votes[vote_id] = dict(record)
-    return [matrix_votes[vote_id] for vote_id in sorted(matrix_votes)]
+            if record.get("verifier_type") == "visual":
+                retained_visual_vote_refs.add(vote_id)
+    if expected_visual_vote_refs - retained_visual_vote_refs:
+        dropped_visual_vote = True
+    return [matrix_votes[vote_id] for vote_id in sorted(matrix_votes)], dropped_visual_vote
+
+
+def _vote_belongs_to_claim(
+    vote: Mapping[str, Any],
+    claim: Mapping[str, Any],
+) -> bool:
+    claim_id = claim.get("id")
+    vote_claim_id = vote.get("claim_id")
+    return isinstance(claim_id, str) and vote_claim_id == claim_id
+
+
+def _expected_matrix_visual_vote_refs(claim: Mapping[str, Any]) -> set[str]:
+    expected = {
+        vote_id
+        for vote_id in _string_list(claim.get("visual_verifier_vote_refs"))
+        if _is_matrix_visual_vote_id(vote_id)
+    }
+    votes = claim.get("votes", [])
+    if not isinstance(votes, list):
+        return expected
+    for vote in votes:
+        if isinstance(vote, str) and _is_matrix_visual_vote_id(vote):
+            expected.add(vote)
+    return expected
+
+
+def _is_matrix_visual_vote_id(vote_id: str) -> bool:
+    if not vote_id.startswith(MATRIX_VOTE_PREFIX):
+        return False
+    parts = vote_id.rsplit("_", 2)
+    return len(parts) == 3 and parts[1] == "visual" and parts[2].isdigit()
+
+
+def _visual_vote_has_joinable_evidence_refs(
+    vote: Mapping[str, Any],
+    *,
+    valid_evidence_refs: set[str],
+    usable_visual_evidence_refs: set[str],
+) -> bool:
+    if vote.get("verifier_type") != "visual":
+        return True
+    evidence_refs = vote.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        return False
+    return all(
+        isinstance(reference, str)
+        and bool(reference)
+        and reference in valid_evidence_refs
+        for reference in evidence_refs
+    ) and any(
+        isinstance(reference, str) and reference in usable_visual_evidence_refs
+        for reference in evidence_refs
+    )
 
 
 def _can_reuse_claim_verification(
     claim: Mapping[str, Any],
     current_cache_key: str,
     matrix_votes: Sequence[Mapping[str, Any]],
+    *,
+    route: str,
+    claim_votes: Sequence[Mapping[str, Any]],
+    visual_vote_filtered: bool = False,
 ) -> bool:
+    if visual_vote_filtered:
+        return False
+    if _visual_support_required_for_reuse(claim, route=route) and not (
+        _reusable_visual_support_available(claim_votes)
+    ):
+        return False
     if claim.get("verification_cache_key") != current_cache_key:
         return False
     if claim.get("verification_status") in {None, "unverified"}:
         return False
     return bool(matrix_votes) or _is_budget_pruned(claim)
+
+
+def _visual_support_required_for_reuse(
+    claim: Mapping[str, Any],
+    *,
+    route: str,
+) -> bool:
+    return route == "visual_required" or claim.get("claim_type") in {"visual", "mixed"}
+
+
+def _reusable_visual_support_available(votes: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        vote.get("verifier_type") == "visual"
+        and vote.get("vote") == "support"
+        and bool(_string_list(vote.get("evidence_refs")))
+        for vote in votes
+    )
 
 
 def _is_matrix_vote(vote: Mapping[str, Any]) -> bool:
@@ -986,6 +1140,87 @@ def _usable_visual_support_refs(
         if _image_policy_blocks(image, claim=claim):
             continue
         if not _has_image_source_or_capture(claim, image):
+            continue
+        observations = image.get("observations", [])
+        if not isinstance(observations, list):
+            continue
+        if observation_index < 0 or observation_index >= len(observations):
+            continue
+        if support.get("observation_text") != observations[observation_index]:
+            continue
+        usable.append(image_id)
+    return list(dict.fromkeys(usable))
+
+
+def _reconcile_visual_claim_supporting_images(
+    claims: Sequence[Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    pruned = 0
+    added = 0
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        if claim.get("claim_type") not in {"visual", "mixed"}:
+            continue
+
+        original_images = list(dict.fromkeys(_string_list(claim.get("supporting_images"))))
+        supported_images = _valid_visual_support_image_refs(
+            claim,
+            images_by_id=images_by_id,
+        )
+        if not supported_images:
+            continue
+        supported_image_set = set(supported_images)
+        reconciled_images = [
+            image_id for image_id in original_images if image_id in supported_image_set
+        ]
+        reconciled_image_set = set(reconciled_images)
+        for image_id in supported_images:
+            if image_id not in reconciled_image_set:
+                reconciled_images.append(image_id)
+                reconciled_image_set.add(image_id)
+
+        if reconciled_images == original_images:
+            continue
+        pruned += len(
+            [
+                image_id
+                for image_id in original_images
+                if image_id not in supported_image_set
+            ]
+        )
+        original_image_set = set(original_images)
+        added += len(
+            [image_id for image_id in supported_images if image_id not in original_image_set]
+        )
+        claim["supporting_images"] = reconciled_images
+
+    return {
+        "supporting_images_pruned": pruned,
+        "supporting_images_added": added,
+    }
+
+
+def _valid_visual_support_image_refs(
+    claim: Mapping[str, Any],
+    *,
+    images_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    supports = claim.get("visual_supports", [])
+    if not isinstance(supports, list):
+        return []
+    usable: list[str] = []
+    for support in supports:
+        if not isinstance(support, Mapping):
+            continue
+        image_id = support.get("image_id")
+        observation_index = support.get("observation_index")
+        if not isinstance(image_id, str) or not isinstance(observation_index, int):
+            continue
+        image = images_by_id.get(image_id)
+        if not isinstance(image, Mapping):
             continue
         observations = image.get("observations", [])
         if not isinstance(observations, list):

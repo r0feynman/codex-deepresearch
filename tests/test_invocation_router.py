@@ -72,6 +72,41 @@ class InvocationRouterTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_create_status_run_dir_retries_when_mkdir_collides(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        fixed_timestamp = "2026-07-09T10:23:34Z"
+        base_name = "dr_preflight_20260709T102334"
+        original_mkdir = Path.mkdir
+        collided = {"done": False}
+        attempted_names: list[str] = []
+
+        def mkdir_with_collision(path: Path, *args, **kwargs):
+            attempted_names.append(path.name)
+            if path.name == base_name and not collided["done"]:
+                collided["done"] = True
+                raise FileExistsError(
+                    "simulated concurrent status run directory allocation"
+                )
+            return original_mkdir(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(invocation_router, "_utc_now", return_value=fixed_timestamp),
+            mock.patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
+                side_effect=mkdir_with_collision,
+            ),
+        ):
+            run_dir = invocation_router._create_status_run_dir(runs_dir)
+
+        self.assertEqual(run_dir.name, f"{base_name}_2")
+        self.assertTrue(run_dir.is_dir())
+        self.assertEqual(
+            [name for name in attempted_names if name.startswith(base_name)],
+            [base_name, f"{base_name}_2"],
+        )
+
     def write_visual_lineage_fixture(
         self,
         run_dir: Path,
@@ -718,6 +753,121 @@ class InvocationRouterTests(unittest.TestCase):
         self.assertEqual(trace[-1]["event_type"], "semantic_planner_blocked")
         self.assertEqual(trace[-1]["status"], "blocked_semantic_planner_unavailable")
 
+    def test_blocked_semantic_validation_failure_is_terminal_before_parallel(self) -> None:
+        runs_dir = self.temp_runs_dir()
+        blocked_status = "blocked_semantic_planner_validation_failed"
+        semantic_diagnostic = "Semantic planner validation failed fixture."
+
+        def fake_prepare_run(*, question, runs_dir, **_kwargs):
+            run_dir = Path(runs_dir) / "blocked-semantic-validation"
+            run_dir.mkdir()
+            evidence_path = run_dir / "evidence.json"
+            status_path = run_dir / "status.json"
+            validation_path = run_dir / "semantic_planner_validation.json"
+            self.write_json(
+                evidence_path,
+                {
+                    "run_id": run_dir.name,
+                    "question": question,
+                    "semantic_planner": {
+                        "status": blocked_status,
+                        "planner_mode": "codex_semantic",
+                        "semantic_release_eligible": False,
+                        "diagnostics": {
+                            "user_visible_diagnostic": semantic_diagnostic,
+                        },
+                    },
+                },
+            )
+            self.write_json(
+                status_path,
+                {
+                    "run_id": run_dir.name,
+                    "status": blocked_status,
+                    "semantic_planning_status": blocked_status,
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": False,
+                },
+            )
+            self.write_json(
+                validation_path,
+                {
+                    "ok": False,
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": False,
+                },
+            )
+            return {
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "status": blocked_status,
+                "artifacts": {
+                    "evidence": str(evidence_path),
+                    "status": str(status_path),
+                    "semantic_planner_validation": str(validation_path),
+                },
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": False,
+                "semantic_planning_status": blocked_status,
+                "semantic_planning": {
+                    "status": blocked_status,
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": False,
+                    "validation_ok": False,
+                    "user_visible_diagnostic": semantic_diagnostic,
+                },
+                "diagnostics": {
+                    "semantic_planning": semantic_diagnostic,
+                    "failure_codes": ["semantic_release_ineligible"],
+                },
+            }
+
+        with (
+            mock.patch.object(
+                invocation_router,
+                "prepare_run",
+                side_effect=fake_prepare_run,
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.run_parallel_orchestration"
+            ) as parallel_mock,
+        ):
+            result = run_skill_invocation(
+                "$deep-research: investigate semantic validation failure routing",
+                runs_dir=runs_dir,
+                adapter_name="codex-exec",
+                route="text_only",
+                angles=["primary source discovery"],
+                budget_preset="quick",
+                min_tasks=1,
+                max_tasks=1,
+            )
+
+        parallel_mock.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["terminal_status"], blocked_status)
+        self.assertEqual(result["selected_mode"], "blocked")
+        self.assertEqual(result["status"], blocked_status)
+        self.assertEqual(result["provenance"]["type"], blocked_status)
+        self.assertEqual(
+            result["diagnostics"]["actionable_cause"],
+            semantic_diagnostic,
+        )
+        self.assertEqual(
+            result["diagnostics"]["failure_codes"],
+            ["semantic_release_ineligible"],
+        )
+        self.assertNotIn("parallel_orchestration_status", result["artifacts"])
+
+        run_status = self.read_json(Path(result["artifacts"]["run_status"]))
+        self.assertFalse(run_status["ok"])
+        self.assertTrue(run_status["terminal"])
+        self.assertEqual(run_status["status"], blocked_status)
+        self.assertEqual(run_status["terminal_status"], blocked_status)
+        self.assertEqual(run_status["provenance"]["type"], blocked_status)
+        self.assertNotIn("parallel_orchestration_status", run_status["artifacts"])
+
     def test_visual_required_with_codex_worker_available_reaches_parallel_handoff(self) -> None:
         runs_dir = self.temp_runs_dir()
         parallel_called = False
@@ -1332,6 +1482,116 @@ class InvocationRouterTests(unittest.TestCase):
         )
         provider_status = self.read_json(run_dir / "visual_provider_status.json")
         self.assertEqual(provider_status["status"], "partial_auto_visual")
+
+    def test_completed_auto_visual_finalization_rejects_invalid_semantic_materialization(self) -> None:
+        class PassingVisualValidation:
+            valid = True
+
+            def to_dict(self) -> dict:
+                return {"valid": True, "errors": []}
+
+        run_dir = self.temp_runs_dir() / "run_semantic_materialization_gate"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "visual_provider_status.json",
+            {
+                "status": "codex_interactive_visual_worker_analyzed",
+                "providers": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_materialization_diff.json",
+            {
+                "valid": False,
+                "require_downstream": True,
+                "full_materialization_validation_implemented": True,
+            },
+        )
+        minimums = {
+            "candidate_count": 10,
+            "selected_candidates": 10,
+            "fetched_artifacts": 3,
+            "vlm_images_analyzed": 3,
+            "report_cited_images": 1,
+            "required_vlm_images": 3,
+            "satisfied": True,
+            "shortfall_reason": "none",
+        }
+        computed_diff = {
+            "valid": False,
+            "require_downstream": True,
+            "missing_task_ids": ["task_006", "task_016"],
+            "dropped_visual_obligations": [],
+            "visual_obligation_task_ids": ["task_006", "task_016"],
+            "failures": [
+                {
+                    "code": "semantic_materialization_difference",
+                    "missing_task_ids": ["task_006", "task_016"],
+                }
+            ],
+            "artifact_checks": [
+                {"artifact": "visual_candidates", "valid": False},
+                {"artifact": "image_fetch_status", "valid": False},
+                {"artifact": "visual_observations", "valid": False},
+                {"artifact": "evidence.images", "valid": False},
+            ],
+        }
+
+        with (
+            mock.patch(
+                "deepresearch.invocation_router.validate_visual_artifacts",
+                return_value=PassingVisualValidation(),
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.visual_minimums_for_run",
+                return_value=minimums,
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.real_automatic_visual_release_counts",
+                return_value={"real_candidates": 10},
+            ),
+            mock.patch(
+                "deepresearch.invocation_router.build_semantic_materialization_diff",
+                return_value=computed_diff,
+            ),
+        ):
+            result = invocation_router._finalize_automatic_visual_completion(
+                run_dir=run_dir,
+                visual_stage_status={},
+            )
+
+        self.assertEqual(result["status"], "partial_auto_visual")
+        self.assertFalse(result["visual_release_gate"]["valid"])
+        self.assertIn(
+            "semantic_materialization_diff_valid",
+            result["visual_release_gate"]["failures"],
+        )
+        self.assertEqual(
+            result["visual_release_gate"]["semantic_materialization"]["missing_task_ids"],
+            ["task_006", "task_016"],
+        )
+        self.assertEqual(
+            result["diagnostics"]["missing_semantic_materialization_task_ids"],
+            ["task_006", "task_016"],
+        )
+        self.assertEqual(
+            result["diagnostics"]["failure_code"],
+            "semantic_materialization_diff_invalid",
+        )
+        self.assertNotEqual(
+            result["diagnostics"].get("failure_code"),
+            "visual_minimum_shortfall",
+        )
+        provider_status = self.read_json(run_dir / "visual_provider_status.json")
+        self.assertEqual(provider_status["status"], "partial_auto_visual")
+        self.assertEqual(
+            provider_status["diagnostics"]["missing_semantic_materialization_task_ids"],
+            ["task_006", "task_016"],
+        )
+        self.assertEqual(
+            provider_status["diagnostics"]["failure_code"],
+            "semantic_materialization_diff_invalid",
+        )
 
     def test_visual_lineage_failure_wins_over_satisfied_minimums(self) -> None:
         runs_dir = self.temp_runs_dir()
