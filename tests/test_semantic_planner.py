@@ -3117,6 +3117,118 @@ class SemanticPlannerTests(unittest.TestCase):
             convergence["terminal_failure"]["reason_codes"],
         )
 
+    def test_adapter_invalid_candidate_validation_retries_in_outer_convergence(self) -> None:
+        def over_cap_until_convergence_retry(response: dict, request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            if request.get("semantic_convergence_attempt"):
+                return response
+            task = response["candidate_plan"]["bounded_tasks"][0]
+            task["query"] = "Compare eight vendors using official source records."
+            task["max_sources"] = 1
+            task["max_images"] = 1
+            task["route"] = "visual_required"
+            task["expected_visual_targets"] = ["official poster images"]
+            task["done_condition"] = (
+                "Done when at least four images and eight vendors have official "
+                "source records with caveats."
+            )
+            return response
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "2"},
+        ):
+            result, adapter_request = self.prepare_with_codex_adapter(
+                "Compare official public poster image guidance across agencies.",
+                requirement_types=("subject", "source_quality", "visual_modality"),
+                visual_angle_indexes=(2, 3),
+                planner_response_mutator=over_cap_until_convergence_retry,
+            )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+
+        self.assertEqual(result["status"], "awaiting_search_results")
+        self.assertEqual(convergence["status"], "converged")
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 3)
+        first_attempt = convergence["attempts"][0]
+        self.assertEqual(
+            first_attempt["planner_status"],
+            "blocked_semantic_planner_unavailable",
+        )
+        self.assertFalse(first_attempt["terminal_failure"])
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            first_attempt["deterministic_failure_codes"],
+        )
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_images",
+            first_attempt["deterministic_failure_codes"],
+        )
+        self.assertEqual(
+            first_attempt["repair_inputs"]["retry_source"],
+            "adapter_invalid_response_candidate_validation",
+        )
+        retry_request = adapter_request["_planner_requests"][-1]
+        self.assertEqual(retry_request["semantic_convergence_attempt"], 2)
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            retry_request["semantic_convergence_repair_inputs"][
+                "deterministic_failure_codes"
+            ],
+        )
+        self.assertTrue(convergence["attempts"][1]["final_selection"])
+
+    def test_adapter_invalid_candidate_validation_blocks_after_outer_max_attempts(self) -> None:
+        def always_over_cap(response: dict, _request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            task = response["candidate_plan"]["bounded_tasks"][0]
+            task["query"] = "Compare eight vendors using official source records."
+            task["max_sources"] = 1
+            task["max_images"] = 1
+            task["route"] = "visual_required"
+            task["expected_visual_targets"] = ["official poster images"]
+            task["done_condition"] = (
+                "Done when at least four images and eight vendors have official "
+                "source records with caveats."
+            )
+            return response
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "2"},
+        ):
+            result, adapter_request = self.prepare_with_codex_adapter(
+                "Compare official public poster image guidance across agencies.",
+                requirement_types=("subject", "source_quality", "visual_modality"),
+                visual_angle_indexes=(2, 3),
+                planner_response_mutator=always_over_cap,
+            )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+
+        self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(convergence["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 4)
+        self.assertTrue(convergence["attempts"][-1]["terminal_failure"])
+        self.assertEqual(
+            convergence["attempts"][-1]["repair_inputs"]["terminal_reason"],
+            "max_attempts_exhausted",
+        )
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            convergence["terminal_failure"]["reason_codes"],
+        )
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_images",
+            convergence["terminal_failure"]["reason_codes"],
+        )
+        self.assertEqual(raw_response["failure_category"], "adapter_invalid_response")
+
     def test_visual_cap_repair_raises_image_budget_within_schema_limit(self) -> None:
         def planner_mutator(response: dict, _request: dict) -> dict:
             for task in response["candidate_plan"]["bounded_tasks"]:

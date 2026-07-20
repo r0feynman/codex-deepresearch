@@ -3660,6 +3660,29 @@ def semantic_plan_candidate_hash(plan: SemanticPlan | Mapping[str, Any]) -> str:
     return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
 
 
+def semantic_plan_candidate_validation(plan: SemanticPlan | Mapping[str, Any]) -> dict[str, Any]:
+    """Extract deterministic candidate validation from normal or blocked payloads."""
+
+    if isinstance(plan, SemanticPlan):
+        raw_response = plan.raw_response_payload
+        diagnostics = plan.diagnostics
+    else:
+        raw_response = dict(plan).get("raw_response_payload")
+        diagnostics = dict(plan).get("diagnostics")
+    for payload in (
+        raw_response,
+        raw_response.get("adapter_response") if isinstance(raw_response, Mapping) else None,
+        raw_response.get("diagnostics") if isinstance(raw_response, Mapping) else None,
+        diagnostics,
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        candidate_validation = payload.get("candidate_validation")
+        if isinstance(candidate_validation, Mapping):
+            return dict(candidate_validation)
+    return {}
+
+
 def semantic_review_failure_codes(review: Mapping[str, Any]) -> list[str]:
     codes: list[str] = []
     for blocker in _list(review.get("blockers")):
@@ -3768,7 +3791,14 @@ def semantic_convergence_artifact(
     review = dict(final_review or {})
     terminal_codes = []
     if status != "converged":
-        terminal_codes = semantic_review_failure_codes(review)
+        terminal_codes = (
+            semantic_review_failure_codes(review)
+            if isinstance(final_review, Mapping)
+            else []
+        )
+        if not terminal_codes:
+            candidate_validation = semantic_plan_candidate_validation(final_plan)
+            terminal_codes = _candidate_validation_failure_codes(candidate_validation)
         if not terminal_codes:
             diagnostics = final_plan.diagnostics if isinstance(final_plan.diagnostics, Mapping) else {}
             blocked_reason = diagnostics.get("blocked_reason") or diagnostics.get(
@@ -3870,6 +3900,47 @@ def codex_semantic_review_retry_raw_request(
         "For ambiguous architecture, model, or testing prompts, use software/Codex "
         "implementation templates only when the original question explicitly asks "
         "about software, Codex, APIs, code, runners, or repositories."
+    )
+    retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
+    return retry_request
+
+
+def codex_semantic_candidate_validation_retry_raw_request(
+    *,
+    raw_request: Mapping[str, Any],
+    attempt: int,
+    deterministic_validation: Mapping[str, Any],
+    candidate_hash: str,
+    max_attempts: int,
+) -> dict[str, Any]:
+    retry_request = _codex_semantic_retry_raw_request(
+        raw_request=raw_request,
+        attempt=attempt,
+        validation=deterministic_validation,
+    )
+    repair_inputs = {
+        "previous_candidate_hash": candidate_hash,
+        "deterministic_failure_codes": _candidate_validation_failure_codes(
+            deterministic_validation
+        ),
+        "deterministic_failures": [
+            dict(failure)
+            for failure in _list(deterministic_validation.get("failures"))[:8]
+            if isinstance(failure, Mapping)
+        ],
+        "retry_source": "adapter_invalid_response_candidate_validation",
+    }
+    retry_request["semantic_convergence_attempt"] = attempt
+    retry_request["semantic_convergence_max_attempts"] = max_attempts
+    retry_request["semantic_convergence_repair_inputs"] = repair_inputs
+    retry_request["planner_retry_instructions"] = (
+        str(retry_request.get("planner_retry_instructions") or "")
+        + " The previous semantic planner adapter response was structurally "
+        "consumable but failed deterministic candidate validation. Treat these "
+        "failures as repairable convergence inputs; preserve user obligations, "
+        "split over-broad source or visual work when caps make a single bounded "
+        "task infeasible, and only raise max_sources/max_images within schema and "
+        "runner budget limits."
     )
     retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
     return retry_request

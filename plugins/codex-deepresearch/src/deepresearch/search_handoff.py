@@ -45,12 +45,14 @@ from .semantic_planner import (
     SEMANTIC_PLANNER_SCHEMA_VERSION,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
     build_codex_semantic_raw_request,
+    codex_semantic_candidate_validation_retry_raw_request,
     codex_semantic_review_retry_raw_request,
     semantic_convergence_artifact,
     semantic_convergence_attempt_record,
     plan_semantic_angles,
     semantic_materialization_plan_hash_for_file,
     semantic_plan_candidate_hash,
+    semantic_plan_candidate_validation,
     semantic_plan_with_review_result,
     semantic_review_failure_retryable,
     semantic_review_release_eligible,
@@ -760,13 +762,60 @@ def _prepare_semantic_plan_with_convergence(
             semantic_plan
         )
         if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+            retryable_invalid_response = (
+                _blocked_semantic_candidate_validation_retryable(
+                    semantic_plan=semantic_plan,
+                    deterministic_validation=deterministic_validation,
+                )
+            )
+            last_attempt = attempt >= max_attempts
+            if (
+                retryable_invalid_response
+                and not last_attempt
+                and not allow_release_ineligible_materialization_for_tests
+                and explicit_angles is None
+            ):
+                candidate_hash = semantic_plan_candidate_hash(semantic_plan)
+                retry_request = codex_semantic_candidate_validation_retry_raw_request(
+                    raw_request=semantic_plan.raw_request_payload or next_raw_request,
+                    attempt=attempt + 1,
+                    deterministic_validation=deterministic_validation,
+                    candidate_hash=candidate_hash,
+                    max_attempts=max_attempts,
+                )
+                repair_inputs = dict(
+                    retry_request.get("semantic_convergence_repair_inputs") or {}
+                )
+                repair_inputs["next_attempt"] = attempt + 1
+                repair_inputs["retry_request_hash"] = retry_request.get(
+                    "adapter_request_hash"
+                )
+                attempts.append(
+                    semantic_convergence_attempt_record(
+                        attempt=attempt,
+                        plan=semantic_plan,
+                        deterministic_validation=deterministic_validation,
+                        semantic_review=None,
+                        repair_inputs=repair_inputs,
+                    )
+                )
+                next_raw_request = retry_request
+                continue
+            terminal_reason = semantic_plan.status
+            if retryable_invalid_response and last_attempt:
+                terminal_reason = "max_attempts_exhausted"
+            elif not retryable_invalid_response:
+                terminal_reason = "non_retryable_adapter_block"
             attempts.append(
                 semantic_convergence_attempt_record(
                     attempt=attempt,
                     plan=semantic_plan,
                     deterministic_validation=deterministic_validation,
                     semantic_review=None,
-                    repair_inputs={"terminal_reason": semantic_plan.status},
+                    repair_inputs={
+                        "terminal_reason": terminal_reason,
+                        "attempt": attempt,
+                    },
                     terminal_failure=True,
                 )
             )
@@ -932,12 +981,26 @@ def _semantic_candidate_validation_from_review_or_plan(
 
 
 def _semantic_candidate_validation_from_plan(semantic_plan: Any) -> Mapping[str, Any]:
-    raw_response = getattr(semantic_plan, "raw_response_payload", None)
-    if isinstance(raw_response, Mapping):
-        candidate_validation = raw_response.get("candidate_validation")
-        if isinstance(candidate_validation, Mapping):
-            return candidate_validation
-    return {}
+    return semantic_plan_candidate_validation(semantic_plan)
+
+
+def _blocked_semantic_candidate_validation_retryable(
+    *,
+    semantic_plan: Any,
+    deterministic_validation: Mapping[str, Any],
+) -> bool:
+    diagnostics = getattr(semantic_plan, "diagnostics", None)
+    if not isinstance(diagnostics, Mapping):
+        return False
+    if diagnostics.get("failure_category") != "adapter_invalid_response":
+        return False
+    if deterministic_validation.get("ok") is True:
+        return False
+    failures = deterministic_validation.get("failures")
+    return isinstance(failures, list) and any(
+        isinstance(failure, Mapping) and failure.get("code")
+        for failure in failures
+    )
 
 
 def _write_semantic_convergence_artifact(
