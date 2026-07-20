@@ -3300,6 +3300,9 @@ def _semantic_release_report(
         for run in evaluated_runs
         if isinstance(run, Mapping)
     ]
+    prepare_ready_count = sum(
+        1 for run in report_runs if run.get("semantic_prepare_ready") is True
+    )
     missing_entries = [
         str(run.get("id"))
         for run in evaluated_runs
@@ -3329,6 +3332,15 @@ def _semantic_release_report(
             "manual_trace_audits_required_when_claiming_semantic_readiness": True,
         },
         "manual_trace_audit_gate": manual_trace_audit_gate,
+        "semantic_prepare_summary": {
+            "ready_run_count": prepare_ready_count,
+            "failed_run_count": len(report_runs) - prepare_ready_count,
+            "release_counted_run_count": len(report_runs),
+            "all_prepare_runs_ready": bool(report_runs)
+            and prepare_ready_count == len(report_runs),
+            "full_release_readiness_is_separate": True,
+            "full_release_required_artifacts_still_enforced": True,
+        },
         "release_counted_run_count": len(report_runs),
         "ready_run_count": sum(
             1 for run in report_runs if run.get("semantic_release_ready") is True
@@ -3344,6 +3356,7 @@ def _semantic_release_report(
 def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
     status_artifacts = run.get("status_artifacts")
     artifact_paths = status_artifacts if isinstance(status_artifacts, Mapping) else {}
+    semantic_prepare = _semantic_prepare_readiness_from_artifacts(artifact_paths)
     artifact_hashes = {
         name: _artifact_file_hash(path)
         for name, path in sorted(artifact_paths.items())
@@ -3432,6 +3445,10 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
         "release_counted_status": (
             "passed" if semantic_ready else "denominator_failure"
         ),
+        "semantic_prepare_ready": semantic_prepare["ready"],
+        "semantic_prepare_status": semantic_prepare["status"],
+        "semantic_prepare_failure_reason": semantic_prepare["failure_reason"],
+        "semantic_prepare_checks": semantic_prepare,
         "semantic_release_ready": semantic_ready,
         "semantic_release_check_valid": (
             semantic_checks.get("valid") if isinstance(semantic_checks, Mapping) else None
@@ -3444,6 +3461,79 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
         "failure_category": run.get("failure_category"),
         "failure_reason": failure_reason,
         "semantic_failures": semantic_failures,
+    }
+
+
+def _semantic_prepare_readiness_from_artifacts(
+    artifact_paths: Mapping[str, Any],
+) -> dict[str, Any]:
+    validation = _read_optional_json(artifact_paths.get("semantic_planner_validation", ""))
+    review = _read_optional_json(artifact_paths.get("semantic_plan_review", ""))
+    plan_payload = _read_optional_json(artifact_paths.get("semantic_plan", ""))
+    plan = (
+        plan_payload.get("semantic_plan")
+        if isinstance(plan_payload, Mapping)
+        and isinstance(plan_payload.get("semantic_plan"), Mapping)
+        else plan_payload
+    )
+    validation_ok = isinstance(validation, Mapping) and validation.get("ok") is True
+    review_score = (
+        _numeric_or_none(review.get("semantic_fit_score"))
+        if isinstance(review, Mapping)
+        else None
+    )
+    review_pass = (
+        isinstance(review, Mapping)
+        and review.get("verdict") == "pass"
+        and review.get("semantic_release_eligible") is True
+        and review_score is not None
+        and review_score >= 9.0
+    )
+    planner_mode = (
+        plan.get("planner_mode")
+        if isinstance(plan, Mapping)
+        else (
+            validation.get("planner_mode")
+            if isinstance(validation, Mapping)
+            else None
+        )
+    )
+    plan_eligible = isinstance(plan, Mapping) and plan.get("semantic_release_eligible") is True
+    failures: list[str] = []
+    if not validation_ok:
+        failures.append("semantic_planner_validation_not_ok")
+    if not review_pass:
+        failures.append("semantic_plan_review_not_release_eligible")
+    if planner_mode != "codex_semantic":
+        failures.append("planner_mode_not_codex_semantic")
+    if not plan_eligible:
+        failures.append("semantic_plan_not_release_eligible")
+    ready = not failures
+    return {
+        "schema_version": "codex-deepresearch.semantic-prepare-readiness.v0",
+        "ready": ready,
+        "status": "passed" if ready else "failed",
+        "failure_reason": " | ".join(failures) if failures else None,
+        "validation_ok": validation_ok,
+        "planner_mode": planner_mode,
+        "semantic_fit_score": review_score,
+        "review_verdict": review.get("verdict") if isinstance(review, Mapping) else None,
+        "review_release_eligible": (
+            review.get("semantic_release_eligible")
+            if isinstance(review, Mapping)
+            else None
+        ),
+        "plan_release_eligible": plan_eligible,
+        "validation_failure_codes": [
+            str(failure.get("code"))
+            for failure in (
+                validation.get("failures")
+                if isinstance(validation, Mapping)
+                and isinstance(validation.get("failures"), list)
+                else []
+            )
+            if isinstance(failure, Mapping) and failure.get("code")
+        ],
     }
 
 

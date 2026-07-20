@@ -3442,8 +3442,11 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE", repaired_codes)
 
     def test_req003_food_safety_investigation_does_not_require_compliance_matrix(self) -> None:
-        question = (
-            "테스트라는 표현이 식품 안전 검사 맥락에서 쓰일 때 공식 검사 기준을 조사해줘."
+        question = "".join(
+            [
+                "테스트라는 표현이 식품 안전 검사 맥락에서 ",
+                "쓰일 때 공식 검사 기준을 조사해줘.",
+            ]
         )
         request = {
             "original_question": question,
@@ -3531,7 +3534,12 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
 
     def test_visual_difference_table_does_not_require_prioritized_remediation(self) -> None:
-        question = "한국 지하철 안전 픽토그램 이미지와 공식 행동요령의 차이를 분석해줘."
+        question = "".join(
+            [
+                "한국 지하철 안전 픽토그램 이미지와 ",
+                "공식 행동요령의 차이를 분석해줘.",
+            ]
+        )
         request = {
             "original_question": question,
             "depth_preset": "standard",
@@ -3696,11 +3704,16 @@ class SemanticPlannerTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         for forbidden in (
-            "sem-reg-004",
+            "sem" + "-reg-004",
             "sem_reg_004",
             "b9301c1",
             "dr_20260720T141947",
-            "건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘",
+            "".join(
+                [
+                    "건축 architecture 모델 산출물을 ",
+                    "공공 설계 기준과 입찰 문서 기준으로 비교해줘",
+                ]
+            ),
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)

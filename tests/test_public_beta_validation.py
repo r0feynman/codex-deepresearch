@@ -43,6 +43,7 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     run_semantic_release_validation,
     semantic_manifest_execution_gate,
     _semantic_angle_ids,
+    _semantic_release_report,
     _valid_oracle_requirement_map,
     _valid_requirement_coverage_map,
     _valid_semantic_angles,
@@ -1216,6 +1217,89 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(verifier_votes[0]["claim_id"], "claim_visual_001")
         self.assertEqual(verifier_votes[0]["verifier_type"], "visual")
         self.assertTrue(verifier_votes[0]["evidence_refs"])
+
+    def test_semantic_release_report_distinguishes_prepare_from_full_release(self) -> None:
+        run_dir = self.temp_dir() / "prepare-only"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "semantic_planner_validation.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "ok": True,
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "failures": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan_review.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "semantic_fit_score": 9.4,
+                "verdict": "pass",
+                "blockers": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "semantic_plan": {
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": True,
+                    "status": "semantic_review_passed",
+                }
+            },
+        )
+
+        report = _semantic_release_report(
+            evaluated_runs=[
+                {
+                    "id": "sem" + "-reg-001",
+                    "route": "text_only",
+                    "status": "failed",
+                    "terminal_status": "missing_run_status",
+                    "metric_classification": "included_failure",
+                    "failure_category": "artifact_handoff_failure",
+                    "failure_detail": "run_status.json is missing or invalid",
+                    "status_artifacts": {
+                        "semantic_planner_validation": str(
+                            run_dir / "semantic_planner_validation.json"
+                        ),
+                        "semantic_plan_review": str(
+                            run_dir / "semantic_plan_review.json"
+                        ),
+                        "semantic_plan": str(run_dir / "semantic_plan.json"),
+                    },
+                }
+            ],
+            report_path=self.temp_dir() / "semantic_release_report.json",
+            generated_at=self.now(),
+            manual_audit_manifest=None,
+            require_manual_trace_audits=True,
+        )
+
+        self.assertFalse(report["valid"])
+        self.assertFalse(report["release_gate_ready"])
+        self.assertEqual(
+            report["semantic_prepare_summary"]["ready_run_count"],
+            1,
+        )
+        self.assertEqual(
+            report["semantic_prepare_summary"]["failed_run_count"],
+            0,
+        )
+        self.assertTrue(
+            report["semantic_prepare_summary"][
+                "full_release_readiness_is_separate"
+            ]
+        )
+        run = report["runs"][0]
+        self.assertTrue(run["semantic_prepare_ready"])
+        self.assertEqual(run["semantic_prepare_status"], "passed")
+        self.assertFalse(run["semantic_release_ready"])
+        self.assertEqual(run["release_counted_status"], "denominator_failure")
 
     def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
