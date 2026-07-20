@@ -59,7 +59,9 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
     _materialize_candidate_budget_caps,
+    _materialize_candidate_broad_cardinality,
     _materialize_candidate_placeholder_selection_workflow,
+    _materialize_candidate_source_cap_splits,
     _materialize_candidate_source_cap_constraints,
     _materialize_candidate_visual_image_cap_feasibility,
     _normalize_candidate_executable_source_caps,
@@ -4179,6 +4181,270 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertTrue(validation["ok"], validation)
 
+    def test_source_cap_repair_splits_requirement_exceeding_schema_max(self) -> None:
+        question = (
+            "Compare OAuth device-flow provider behavior across official "
+            "implementation documentation."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        original_task_id = candidate["bounded_tasks"][0]["task_id"]
+        candidate["bounded_tasks"][0]["max_sources"] = 5
+        candidate["bounded_tasks"][0]["query"] = (
+            "Compare OAuth device-flow provider behavior using at least 12 "
+            "official sources."
+        )
+        candidate["bounded_tasks"][0]["done_condition"] = (
+            "Complete when 12 official sources are checked with caveats."
+        )
+
+        original_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            {failure["code"] for failure in original_validation["failures"]},
+        )
+
+        normalized, _cap_repairs = _normalize_candidate_executable_source_caps(
+            candidate
+        )
+        repaired, materializations = _materialize_candidate_source_cap_splits(
+            normalized
+        )
+
+        self.assertTrue(materializations)
+        self.assertEqual(
+            materializations[0]["materialization"],
+            "split_overbroad_source_requirement",
+        )
+        split_task_ids = materializations[0]["split_task_ids"]
+        repaired_task_ids = {
+            task["task_id"] for task in repaired["bounded_tasks"]
+        }
+        self.assertNotIn(original_task_id, repaired_task_ids)
+        self.assertTrue(set(split_task_ids).issubset(repaired_task_ids))
+        for task in repaired["bounded_tasks"]:
+            self.assertLessEqual(task["max_sources"], 5)
+        for requirement in repaired["requirement_coverage_map"]:
+            covered = set(requirement["covered_by_task_ids"])
+            self.assertNotIn(original_task_id, covered)
+            self.assertTrue(set(split_task_ids).issubset(covered))
+
+        repaired_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(repaired_validation["ok"], repaired_validation)
+
+    def test_sem_reg_012_like_retry_materializes_broad_cardinality_and_source_split(self) -> None:
+        question = (
+            "Research cache invalidation implementation hazards for a Next.js "
+            "migration using current official docs."
+        )
+        repair_marker = "nextjs cache invalidation comparison matrix repaired"
+
+        def sanitize_text_only_nextjs(candidate: dict) -> None:
+            angle_specs = [
+                (
+                    "primary_source",
+                    "Current Next.js Cache Invalidation Source Baseline",
+                    "Which current official Next.js docs define cache invalidation behavior for migration planning?",
+                ),
+                (
+                    "implementation_detail",
+                    "Next.js Cache Invalidation API Implementation Hazards",
+                    "Which documented API constraints create implementation hazards during a Next.js migration?",
+                ),
+                (
+                    "recent_change",
+                    "Current Next.js Migration Freshness And Version Caveats",
+                    "Which current official docs separate stable migration behavior from stale cache guidance?",
+                ),
+                (
+                    "failure_pattern",
+                    "Next.js Migration Failure Patterns And Remediation",
+                    "Which cache invalidation failure patterns need source-backed remediation during migration?",
+                ),
+                (
+                    "risk_or_guardrail",
+                    "Next.js Cache Invalidation Risk Guardrails",
+                    "Which official constraints become rollout guardrails for cache invalidation migration?",
+                ),
+            ]
+            for index, angle in enumerate(candidate["angles"], start=1):
+                need, title, research_question = angle_specs[(index - 1) % len(angle_specs)]
+                angle["route"] = "text_only"
+                angle["evidence_need"] = need
+                angle["title"] = title
+                angle["research_question"] = research_question
+                angle["why_this_angle_matters"] = (
+                    "This angle preserves a distinct Next.js cache migration evidence need."
+                )
+                angle["included_scope"] = [question]
+                angle["excluded_scope"] = ["Do not use unrelated framework migration advice."]
+                angle["expected_source_types"] = [
+                    "current official Next.js documentation",
+                    "official Vercel documentation",
+                ]
+                angle["expected_visual_targets"] = []
+                angle["expected_artifacts"] = [
+                    f"{title} source notes",
+                    "migration hazard caveats",
+                ]
+                angle["search_queries"] = [f"{question} {need} official docs"]
+                angle["success_criteria"] = [
+                    "Use current official documentation as primary evidence.",
+                    "Record caveats, deprecated behavior, and unknowns.",
+                ]
+                angle["report_section"] = f"Next.js Cache Migration Angle {index}"
+                angle["risk_or_contradiction_checks"] = [
+                    "Check stale, deprecated, experimental, or contradictory guidance."
+                ]
+            for index, task in enumerate(candidate["bounded_tasks"], start=1):
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task.pop("expected_evidence", None)
+                task["freshness_requirement"] = "recent"
+                task["source_policy"] = {
+                    "decision": "allowed",
+                    "requires_official_or_primary": True,
+                    "quality_requirements": [
+                        "current official Next.js documentation",
+                        "official Vercel documentation",
+                    ],
+                    "flags": [],
+                }
+                task["expected_source_types"] = [
+                    "current official Next.js documentation",
+                    "official Vercel documentation",
+                ]
+                task["expected_artifacts"] = [
+                    "Next.js cache invalidation source notes",
+                    "migration hazard caveats",
+                ]
+                task["success_criteria"] = [
+                    "Use official, regulatory, or primary sources for support.",
+                    "Tie each finding to the Next.js migration cache invalidation hazard.",
+                ]
+                task["query"] = (
+                    f"{question} official documentation bounded task {index}"
+                )
+                task["done_condition"] = (
+                    "Stop when source-backed Next.js cache migration findings, "
+                    "caveats, and unknowns are recorded."
+                )
+
+        def planner_mutator(response: dict, request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            sanitize_text_only_nextjs(candidate)
+            if not request.get("semantic_convergence_attempt"):
+                return response
+
+            kept_angles = candidate["angles"][:4]
+            kept_angle_ids = [angle["angle_id"] for angle in kept_angles]
+            kept_tasks = []
+            for angle_id in kept_angle_ids:
+                kept_tasks.extend(
+                    [
+                        task
+                        for task in candidate["bounded_tasks"]
+                        if task["angle_id"] == angle_id
+                    ][:2]
+                )
+            candidate["question_scope"] = "narrow"
+            candidate["angles"] = kept_angles
+            candidate["bounded_tasks"] = kept_tasks
+            candidate["constraints"].append(repair_marker)
+            task_ids = [task["task_id"] for task in kept_tasks]
+            for requirement in candidate["requirement_coverage_map"]:
+                requirement["covered_by_angle_ids"] = kept_angle_ids
+                requirement["covered_by_task_ids"] = task_ids
+                requirement["coverage_status"] = "covered"
+            overbroad_task = candidate["bounded_tasks"][-1]
+            overbroad_task["max_sources"] = 5
+            overbroad_task["query"] = (
+                "Build a side-by-side Next.js cache invalidation migration "
+                "hazard matrix from 20 official sources."
+            )
+            overbroad_task["expected_artifacts"] = [
+                "side-by-side Next.js cache invalidation hazard matrix",
+                "remediation next-action table",
+            ]
+            overbroad_task["success_criteria"] = [
+                (
+                    "Include match, partial, mismatch, unverifiable status, "
+                    "evidence, caveat, and remediation fields."
+                ),
+                "Use official source-backed evidence for every row.",
+            ]
+            overbroad_task["done_condition"] = (
+                "Complete when 20 official sources are checked for status, "
+                "evidence, caveats, and remediation next actions."
+            )
+            return response
+
+        def reviewer_mutator(response: dict, request: dict) -> dict:
+            plan_text = json.dumps(request["semantic_plan"], ensure_ascii=False)
+            if repair_marker not in plan_text:
+                review = response["semantic_plan_review"]
+                review["semantic_fit_score"] = 8.4
+                review["blockers"] = [
+                    {"code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE"}
+                ]
+                review["verdict"] = "release_ineligible"
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="text_only",
+            requirement_types=("subject", "source_quality", "time_range"),
+            planner_response_mutator=planner_mutator,
+            reviewer_response_mutator=reviewer_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(convergence["status"], "converged", convergence)
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertIn(
+            "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+            convergence["attempts"][0]["reviewer_blocker_codes"],
+        )
+        self.assertIn(
+            "candidate_plan_source_cap_split_materializations",
+            raw_response,
+        )
+        self.assertIn(
+            "candidate_plan_broad_cardinality_materializations",
+            raw_response,
+        )
+        self.assertEqual(len(semantic_plan["angles"]), 5)
+        self.assertEqual(len(semantic_plan["bounded_tasks"]), 20)
+        self.assertEqual(semantic_plan["question_scope"], "broad")
+        self.assertEqual(
+            semantic_plan["question_class"],
+            "implementation_architecture",
+        )
+        self.assertTrue(
+            all(task["max_sources"] <= 5 for task in semantic_plan["bounded_tasks"])
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=semantic_plan,
+            visual_preference="text_only",
+        )
+        self.assertTrue(validation["ok"], validation)
+
     def test_source_cap_validation_ignores_task_id_range_reuse_references(self) -> None:
         question = "Compare OAuth device-flow provider behavior across official implementation documentation."
         candidate = self.text_only_oauth_candidate(question=question)
@@ -4893,7 +5159,7 @@ class SemanticPlannerTests(unittest.TestCase):
         ):
             self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 3)
 
-    def test_codex_semantic_rejects_effective_broad_narrow_self_label_before_reviewer(self) -> None:
+    def test_codex_semantic_repairs_effective_broad_narrow_self_label_before_reviewer(self) -> None:
         question = "Compare official product screenshots and chart images for onboarding workflows"
 
         result, adapter_request = self.prepare_with_codex_adapter(
@@ -4906,27 +5172,32 @@ class SemanticPlannerTests(unittest.TestCase):
             visual_angle_indexes=(2, 3),
         )
 
-        self.assert_invalid_adapter_response_blocked(
-            result,
-            expected_failure_codes={
-                "broad_question_angle_count_out_of_range",
-                "broad_question_task_count_out_of_range",
-            },
-        )
+        self.assertEqual(result["status"], "awaiting_search_results", result)
         run_dir = Path(result["run_dir"])
-        self.assertEqual(adapter_request["retry_attempt"], 3)
-        self.assertFalse(
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        self.assertEqual(convergence["status"], "converged", convergence)
+        self.assertGreaterEqual(convergence["attempt_count"], 2)
+        self.assertTrue(
             (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
         )
         raw_response = self.load_json(
             run_dir / "semantic_planner_raw" / "planner_response.json"
         )
-        candidate_validation = raw_response["adapter_response"]["candidate_validation"]
-        self.assertTrue(candidate_validation["effective_broad_question"])
-        self.assertEqual(candidate_validation["declared_question_scope"], "narrow")
+        self.assertIn(
+            "candidate_plan_broad_cardinality_materializations",
+            raw_response,
+        )
+        first_attempt = convergence["attempts"][0]
+        self.assertIn(
+            "broad_question_angle_count_out_of_range",
+            first_attempt["deterministic_failure_codes"],
+        )
+        candidate_validation = raw_response["candidate_validation"]
+        self.assertTrue(candidate_validation["ok"], candidate_validation)
+        self.assertEqual(candidate_validation["declared_question_scope"], "broad")
         self.assertEqual(candidate_validation["question_class"], "visual_style")
-        self.assertEqual(candidate_validation["angle_count"], 4)
-        self.assertEqual(candidate_validation["task_count"], 8)
+        self.assertEqual(candidate_validation["angle_count"], 5)
+        self.assertEqual(candidate_validation["task_count"], 20)
         self.assertEqual(
             set(candidate_validation["expected_evidence_needs"]),
             {
@@ -4934,6 +5205,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 "visual_example",
                 "visual_observation",
                 "official_source",
+                "comparative_analysis",
             },
         )
 

@@ -792,12 +792,32 @@ def codex_semantic_candidate_plan(
             candidate, source_cap_normalizations = (
                 _normalize_candidate_executable_source_caps(candidate)
             )
+            source_cap_split_materializations: list[dict[str, Any]] = []
+            broad_cardinality_materializations: list[dict[str, Any]] = []
+            task_source_cap_materializations: list[dict[str, Any]] = []
+            repair_materialization_allowed = _semantic_repair_materialization_allowed(
+                raw_request
+            )
+            if repair_materialization_allowed:
+                candidate, source_cap_split_materializations = (
+                    _materialize_candidate_source_cap_splits(candidate)
+                )
+                candidate, broad_cardinality_materializations = (
+                    _materialize_candidate_broad_cardinality(
+                        candidate,
+                        original_question=original_question,
+                    )
+                )
             candidate, source_cap_constraint_materializations = (
                 _materialize_candidate_source_cap_constraints(
                     candidate,
                     source_cap_normalizations=source_cap_normalizations,
                 )
             )
+            if repair_materialization_allowed:
+                candidate, task_source_cap_materializations = (
+                    _materialize_candidate_task_source_cap_feasibility(candidate)
+                )
             candidate, budget_cap_materializations = (
                 _materialize_candidate_budget_caps(
                     candidate,
@@ -830,11 +850,26 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan_source_cap_normalizations"] = (
                     source_cap_normalizations
                 )
+            if source_cap_split_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_source_cap_split_materializations"] = (
+                    source_cap_split_materializations
+                )
+            if broad_cardinality_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_broad_cardinality_materializations"] = (
+                    broad_cardinality_materializations
+                )
             if source_cap_constraint_materializations:
                 raw_response["candidate_plan"] = candidate
                 raw_response[
                     "candidate_plan_source_cap_constraint_materializations"
                 ] = source_cap_constraint_materializations
+            if task_source_cap_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_task_source_cap_materializations"] = (
+                    task_source_cap_materializations
+                )
             if budget_cap_materializations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_request_budget_materializations"] = (
@@ -1362,6 +1397,805 @@ def _normalize_candidate_executable_source_caps(
     return normalized, normalizations
 
 
+def _semantic_repair_materialization_allowed(raw_request: Mapping[str, Any]) -> bool:
+    """Allow heavier plan repair only after convergence has reviewer/validator input."""
+
+    return _semantic_task_source_cap_int(
+        raw_request.get("semantic_convergence_attempt")
+    ) is not None
+
+
+def _materialize_candidate_source_cap_splits(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized, []
+
+    existing_task_ids = {
+        str(task.get("task_id") or "")
+        for task in raw_tasks
+        if isinstance(task, Mapping) and str(task.get("task_id") or "")
+    }
+    split_replacements: dict[str, list[str]] = {}
+    materializations: list[dict[str, Any]] = []
+    normalized_tasks: list[Any] = []
+    mapping_task_count = sum(1 for task in raw_tasks if isinstance(task, Mapping))
+    for index, task in enumerate(raw_tasks, start=1):
+        if not isinstance(task, Mapping):
+            normalized_tasks.append(task)
+            continue
+
+        required_sources, source_reasons, source_counts = (
+            _candidate_task_required_source_count(task)
+        )
+        max_images = _semantic_task_source_cap_int(task.get("max_images"))
+        required_images, _image_counts = _candidate_task_required_image_count(task)
+        if max_images is not None and required_images > max_images:
+            normalized_tasks.append(dict(task))
+            continue
+        if required_sources <= SEMANTIC_TASK_MAX_SOURCES:
+            normalized_tasks.append(dict(task))
+            continue
+
+        split_count = math.ceil(required_sources / SEMANTIC_TASK_MAX_SOURCES)
+        if split_count <= 1:
+            normalized_tasks.append(dict(task))
+            continue
+        if mapping_task_count + split_count - 1 > 40:
+            normalized_tasks.append(dict(task))
+            continue
+
+        original_task_id = str(task.get("task_id") or f"task_{index:03d}")
+        split_tasks: list[dict[str, Any]] = []
+        for split_index in range(1, split_count + 1):
+            split_task = _candidate_source_cap_split_task(
+                task,
+                original_task_id=original_task_id,
+                split_index=split_index,
+                split_count=split_count,
+                required_sources=required_sources,
+                existing_task_ids=existing_task_ids,
+            )
+            existing_task_ids.add(str(split_task["task_id"]))
+            split_tasks.append(split_task)
+        normalized_tasks.extend(split_tasks)
+        split_task_ids = [str(split_task["task_id"]) for split_task in split_tasks]
+        split_replacements[original_task_id] = split_task_ids
+        materializations.append(
+            {
+                "field": "bounded_tasks",
+                "materialization": "split_overbroad_source_requirement",
+                "original_task_id": original_task_id,
+                "original_task_index": index,
+                "split_task_ids": split_task_ids,
+                "split_task_count": split_count,
+                "required_count": required_sources,
+                "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
+                "original_max_sources": _semantic_task_source_cap_int(
+                    task.get("max_sources")
+                ),
+                "requirement_kind": _dominant_cap_requirement_kind(
+                    source_counts,
+                    fallback="source",
+                    source_reasons=source_reasons,
+                ),
+                "explicit_requirement_counts": source_counts,
+                "source_cap_reasons": source_reasons,
+            }
+        )
+
+    if not split_replacements:
+        normalized["bounded_tasks"] = normalized_tasks
+        return normalized, []
+
+    normalized["bounded_tasks"] = normalized_tasks
+    normalized["requirement_coverage_map"] = _candidate_rewrite_split_task_coverage(
+        normalized.get("requirement_coverage_map"),
+        split_replacements=split_replacements,
+    )
+    normalized["constraints"] = _candidate_append_source_split_constraint(
+        normalized.get("constraints"),
+        materializations=materializations,
+    )
+    return normalized, materializations
+
+
+def _candidate_source_cap_split_task(
+    task: Mapping[str, Any],
+    *,
+    original_task_id: str,
+    split_index: int,
+    split_count: int,
+    required_sources: int,
+    existing_task_ids: set[str],
+) -> dict[str, Any]:
+    split_task = dict(task)
+    split_task["task_id"] = _candidate_split_task_id(
+        original_task_id,
+        split_index=split_index,
+        existing_task_ids=existing_task_ids,
+    )
+    subject = _candidate_source_split_subject(task)
+    focus = _candidate_source_split_focus(task)
+    split_task["query"] = (
+        f"{subject} {focus} source group {split_index} of {split_count}"
+    )
+    split_task["max_sources"] = SEMANTIC_TASK_MAX_SOURCES
+    if str(split_task.get("route") or "text_only") == "text_only":
+        split_task["max_images"] = 0
+        split_task["expected_visual_targets"] = []
+    source_policy = split_task.get("source_policy")
+    if isinstance(source_policy, Mapping):
+        split_policy = dict(source_policy)
+    else:
+        split_policy = {"decision": "allowed", "flags": []}
+    split_policy["source_group"] = {
+        "index": split_index,
+        "count": split_count,
+        "original_task_id": original_task_id,
+        "original_required_sources": required_sources,
+    }
+    split_task["source_policy"] = split_policy
+    split_task["expected_artifacts"] = _ordered_unique(
+        [
+            *_candidate_source_split_scrub_list(
+                _string_list(task.get("expected_artifacts"))
+            ),
+            f"source group {split_index} evidence notes",
+        ]
+    )
+    split_task["success_criteria"] = _ordered_unique(
+        [
+            *_candidate_source_split_scrub_list(
+                _string_list(task.get("success_criteria"))
+            ),
+            (
+                f"Collect no more than {SEMANTIC_TASK_MAX_SOURCES} official or "
+                "primary source records for this source group."
+            ),
+            (
+                "Record source metadata, caveats, and unresolved contradictions "
+                "without requiring cross-group synthesis inside this bounded task."
+            ),
+        ]
+    )
+    split_task["done_condition"] = (
+        f"Stop when source group {split_index} has no more than "
+        f"{SEMANTIC_TASK_MAX_SOURCES} source-backed findings, source metadata, "
+        "and caveats; defer cross-group synthesis to the comparison deliverable."
+    )
+    return split_task
+
+
+def _candidate_split_task_id(
+    original_task_id: str,
+    *,
+    split_index: int,
+    existing_task_ids: set[str],
+) -> str:
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", original_task_id).strip("_")
+    if not base:
+        base = "task"
+    candidate = f"{base}_srcgrp_{split_index:02d}"
+    if candidate not in existing_task_ids:
+        return candidate
+    suffix = 2
+    while f"{candidate}_{suffix}" in existing_task_ids:
+        suffix += 1
+    return f"{candidate}_{suffix}"
+
+
+def _candidate_source_split_subject(task: Mapping[str, Any]) -> str:
+    for value in (
+        task.get("query"),
+        task.get("done_condition"),
+        task.get("expected_artifacts"),
+    ):
+        text = _candidate_source_split_scrub_text(
+            json.dumps(value, ensure_ascii=False)
+            if isinstance(value, (Mapping, list, tuple, set))
+            else str(value or "")
+        )
+        words = [word for word in re.findall(r"[A-Za-z0-9.+#-]+", text) if len(word) > 2]
+        if len(words) >= 3:
+            return " ".join(words[:12])
+    return "requested evidence"
+
+
+def _candidate_source_split_focus(task: Mapping[str, Any]) -> str:
+    text = _candidate_task_source_cap_text(task)
+    if "migration" in text or "implementation" in text:
+        return "implementation evidence"
+    if "comparison" in text or "compare" in text:
+        return "comparison evidence"
+    if "official" in text or "regulatory" in text:
+        return "official evidence"
+    if "current" in text or "recent" in text or "latest" in text:
+        return "freshness evidence"
+    return "bounded evidence"
+
+
+def _candidate_source_split_scrub_list(values: Sequence[str]) -> list[str]:
+    return [
+        scrubbed
+        for value in values
+        for scrubbed in [_candidate_source_split_scrub_text(value)]
+        if scrubbed
+    ]
+
+
+def _candidate_source_split_scrub_text(value: str) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    count_pattern = (
+        r"(?:[1-9]\d*|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|twenty)"
+    )
+    counted_nouns = (
+        "source",
+        "sources",
+        "official source",
+        "official sources",
+        "primary source",
+        "primary sources",
+        "regulatory source",
+        "regulatory sources",
+        "source record",
+        "source records",
+        "vendor",
+        "vendors",
+        "provider",
+        "providers",
+        "jurisdiction",
+        "jurisdictions",
+        "source-backed artifact",
+        "source-backed artifacts",
+    )
+    noun_pattern = "|".join(
+        re.escape(noun) for noun in sorted(counted_nouns, key=len, reverse=True)
+    )
+    text = re.sub(
+        rf"\b(?:at least|minimum of|no fewer than|compare|across|from|cover|collect|inspect|analyze|review|use|include)?\s*"
+        rf"{count_pattern}\s+(?:distinct\s+|different\s+|representative\s+|official\s+|primary\s+|regulatory\s+)?(?:{noun_pattern})\b",
+        "source group evidence",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(text.split())
+
+
+def _candidate_rewrite_split_task_coverage(
+    raw_coverage: Any,
+    *,
+    split_replacements: Mapping[str, Sequence[str]],
+) -> Any:
+    if not isinstance(raw_coverage, list):
+        return raw_coverage
+    rewritten: list[Any] = []
+    for requirement in raw_coverage:
+        if not isinstance(requirement, Mapping):
+            rewritten.append(requirement)
+            continue
+        repaired = dict(requirement)
+        covered_task_ids: list[str] = []
+        for task_id in _string_list(requirement.get("covered_by_task_ids")):
+            replacements = split_replacements.get(task_id)
+            if replacements:
+                covered_task_ids.extend(str(item) for item in replacements)
+            else:
+                covered_task_ids.append(task_id)
+        if covered_task_ids:
+            repaired["covered_by_task_ids"] = _ordered_unique(covered_task_ids)
+        rewritten.append(repaired)
+    return rewritten
+
+
+def _candidate_append_source_split_constraint(
+    raw_constraints: Any,
+    *,
+    materializations: Sequence[Mapping[str, Any]],
+) -> Any:
+    if not isinstance(raw_constraints, list):
+        return raw_constraints
+    split_count = sum(
+        int(materialization.get("split_task_count") or 0)
+        for materialization in materializations
+    )
+    original_ids = [
+        str(materialization.get("original_task_id"))
+        for materialization in materializations
+        if materialization.get("original_task_id")
+    ]
+    return [
+        *raw_constraints,
+        (
+            "Over-broad source obligations were split before fan-out: "
+            f"{', '.join(original_ids)} now materialize as {split_count} "
+            f"bounded source-group tasks, each with max_sources<={SEMANTIC_TASK_MAX_SOURCES}. "
+            "Synthesis must combine the source groups without raising any per-task cap."
+        ),
+    ]
+
+
+def _materialize_candidate_broad_cardinality(
+    candidate: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_angles = normalized.get("angles")
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_angles, list) or not isinstance(raw_tasks, list):
+        return normalized, []
+
+    angles = [dict(angle) for angle in raw_angles if isinstance(angle, Mapping)]
+    tasks = [dict(task) for task in raw_tasks if isinstance(task, Mapping)]
+    if not angles or not tasks or len(angles) > 8 or len(tasks) > 40:
+        return normalized, []
+
+    requirements = [
+        requirement
+        for requirement in _list(normalized.get("requirement_coverage_map"))
+        if isinstance(requirement, Mapping)
+    ]
+    question_class = _candidate_validation_question_class(
+        plan=normalized,
+        angles=angles,
+        requirements=requirements,
+    )
+    classified_question = classify_question(original_question)
+    if question_class == _CLASS_GENERAL and classified_question != _CLASS_GENERAL:
+        question_class = classified_question
+    elif (
+        question_class == _CLASS_POLICY
+        and classified_question in {_CLASS_IMPLEMENTATION, _CLASS_TECHNICAL}
+    ):
+        question_class = classified_question
+    expected_needs = _candidate_validation_expected_needs(
+        plan=normalized,
+        angles=angles,
+    )
+    effective_broad = _effective_broad_question(
+        question_class=question_class,
+        expected_needs=expected_needs,
+        declared_broad=str(normalized.get("question_scope") or "") == "broad",
+    )
+    if not effective_broad and classified_question != _CLASS_IMPLEMENTATION:
+        return normalized, []
+    if len(angles) >= 5 and len(tasks) >= 20:
+        if str(normalized.get("question_scope") or "") != "broad":
+            normalized["question_scope"] = "broad"
+            normalized.setdefault("question_class", question_class)
+            return normalized, [
+                {
+                    "field": "question_scope",
+                    "materialization": "promoted_effective_broad_question_scope",
+                    "previous_question_scope": candidate.get("question_scope"),
+                    "question_class": question_class,
+                }
+            ]
+        return normalized, []
+
+    materializations: list[dict[str, Any]] = []
+    previous_scope = normalized.get("question_scope")
+    if previous_scope != "broad":
+        normalized["question_scope"] = "broad"
+        materializations.append(
+            {
+                "field": "question_scope",
+                "materialization": "promoted_effective_broad_question_scope",
+                "previous_question_scope": previous_scope,
+                "question_class": question_class,
+            }
+        )
+    normalized["question_class"] = question_class
+
+    existing_angle_ids = {
+        str(angle.get("angle_id") or "")
+        for angle in angles
+        if str(angle.get("angle_id") or "")
+    }
+    added_angle_ids: list[str] = []
+    while len(angles) < 5:
+        angle = _candidate_broad_cardinality_angle(
+            original_question=original_question,
+            question_class=question_class,
+            existing_angles=angles,
+            existing_angle_ids=existing_angle_ids,
+        )
+        existing_angle_ids.add(str(angle["angle_id"]))
+        added_angle_ids.append(str(angle["angle_id"]))
+        angles.append(angle)
+
+    existing_task_ids = {
+        str(task.get("task_id") or "")
+        for task in tasks
+        if str(task.get("task_id") or "")
+    }
+    tasks_by_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
+    added_task_ids: list[str] = []
+    task_sequence = 1
+    while len(tasks) < 20 or any(
+        tasks_by_angle[str(angle.get("angle_id") or "")] < 2 for angle in angles
+    ):
+        if len(tasks) >= 40:
+            break
+        angle = _candidate_broad_cardinality_next_angle(
+            angles=angles,
+            tasks_by_angle=tasks_by_angle,
+            sequence=task_sequence,
+        )
+        task = _candidate_broad_cardinality_task(
+            original_question=original_question,
+            angle=angle,
+            existing_tasks=tasks,
+            existing_task_ids=existing_task_ids,
+            sequence=task_sequence,
+        )
+        existing_task_ids.add(str(task["task_id"]))
+        added_task_ids.append(str(task["task_id"]))
+        tasks.append(task)
+        tasks_by_angle[str(task["angle_id"])] += 1
+        task_sequence += 1
+
+    normalized["angles"] = [
+        _candidate_record if isinstance(_candidate_record, Mapping) else _candidate_record
+        for _candidate_record in raw_angles
+        if not isinstance(_candidate_record, Mapping)
+    ] + angles
+    normalized["bounded_tasks"] = [
+        _candidate_record if isinstance(_candidate_record, Mapping) else _candidate_record
+        for _candidate_record in raw_tasks
+        if not isinstance(_candidate_record, Mapping)
+    ] + tasks
+    if added_angle_ids:
+        normalized["requirement_coverage_map"] = _candidate_add_angle_coverage(
+            normalized.get("requirement_coverage_map"),
+            added_angle_ids=added_angle_ids,
+        )
+    if added_task_ids:
+        normalized["requirement_coverage_map"] = _candidate_add_task_coverage(
+            normalized.get("requirement_coverage_map"),
+            added_task_ids=added_task_ids,
+        )
+    if added_angle_ids or added_task_ids:
+        normalized["decomposition_strategy"] = (
+            str(normalized.get("decomposition_strategy") or "").rstrip()
+            + " Broad-question cardinality was materialized before validation so "
+            "the candidate preserves 5-8 semantic angles and 20-40 bounded tasks."
+        ).strip()
+        materializations.append(
+            {
+                "field": "angles,bounded_tasks",
+                "materialization": "expanded_effective_broad_question_cardinality",
+                "previous_angle_count": len(angles) - len(added_angle_ids),
+                "previous_task_count": len(tasks) - len(added_task_ids),
+                "materialized_angle_count": len(angles),
+                "materialized_task_count": len(tasks),
+                "added_angle_ids": added_angle_ids,
+                "added_task_ids": added_task_ids,
+                "question_class": question_class,
+            }
+        )
+    return normalized, materializations
+
+
+def _candidate_broad_cardinality_angle(
+    *,
+    original_question: str,
+    question_class: str,
+    existing_angles: Sequence[Mapping[str, Any]],
+    existing_angle_ids: set[str],
+) -> dict[str, Any]:
+    angle_id = _candidate_next_angle_id(existing_angle_ids)
+    evidence_need = _candidate_broad_missing_evidence_need(
+        existing_angles,
+        question_class=question_class,
+    )
+    anchor = _candidate_prompt_anchor_phrase(original_question)
+    source_types = _candidate_preferred_source_types(existing_angles)
+    route = "text_only"
+    expected_visual_targets: list[str] = []
+    return {
+        "angle_id": angle_id,
+        "title": f"{anchor.title()} {_candidate_evidence_need_label(evidence_need)}",
+        "research_question": (
+            f"Which source-backed evidence changes the assessment of {anchor}?"
+        ),
+        "why_this_angle_matters": (
+            f"This angle preserves a distinct broad-question evidence need for {original_question}."
+        ),
+        "included_scope": [original_question],
+        "excluded_scope": ["Do not substitute generic or unrelated implementation material."],
+        "route": route,
+        "evidence_need": evidence_need,
+        "expected_source_types": source_types,
+        "expected_visual_targets": expected_visual_targets,
+        "expected_artifacts": [
+            f"{anchor} {_candidate_evidence_need_label(evidence_need).lower()} notes",
+            f"{anchor} evidence caveats",
+        ],
+        "search_queries": [
+            f"{original_question} {_candidate_evidence_need_label(evidence_need).lower()} source evidence"
+        ],
+        "success_criteria": [
+            f"Findings must directly address {original_question}.",
+            "Claims must cite source metadata and record caveats or unknowns.",
+        ],
+        "report_section": f"{anchor.title()} {_candidate_evidence_need_label(evidence_need)}",
+        "risk_or_contradiction_checks": [
+            "Check stale, contradictory, deprecated, or version-specific evidence.",
+        ],
+    }
+
+
+def _candidate_next_angle_id(existing_angle_ids: set[str]) -> str:
+    index = 1
+    while f"angle_{index:03d}" in existing_angle_ids:
+        index += 1
+    return f"angle_{index:03d}"
+
+
+def _candidate_broad_missing_evidence_need(
+    existing_angles: Sequence[Mapping[str, Any]],
+    *,
+    question_class: str,
+) -> str:
+    existing = {
+        str(angle.get("evidence_need") or "")
+        for angle in existing_angles
+        if str(angle.get("evidence_need") or "")
+    }
+    needs_by_class = {
+        _CLASS_IMPLEMENTATION: (
+            "primary_source",
+            "implementation_detail",
+            "recent_change",
+            "failure_pattern",
+            "comparative_analysis",
+            "risk_or_guardrail",
+            "counter_evidence",
+        ),
+        _CLASS_TECHNICAL: (
+            "official_source",
+            "recent_change",
+            "implementation_detail",
+            "failure_pattern",
+            "risk_or_guardrail",
+            "counter_evidence",
+        ),
+        _CLASS_POLICY: (
+            "official_source",
+            "policy_or_legal",
+            "risk_or_guardrail",
+            "comparative_analysis",
+            "counter_evidence",
+        ),
+    }
+    for need in needs_by_class.get(
+        question_class,
+        (
+            "primary_source",
+            "comparative_analysis",
+            "recent_change",
+            "failure_pattern",
+            "risk_or_guardrail",
+            "counter_evidence",
+        ),
+    ):
+        if need not in existing:
+            return need
+    return "counter_evidence"
+
+
+def _candidate_prompt_anchor_phrase(original_question: str) -> str:
+    records = _semantic_release_ordered_meaningful_token_records(original_question)
+    display_tokens = [
+        str(record.get("display") or record.get("token"))
+        for record in records
+        if str(record.get("display") or record.get("token") or "")
+    ]
+    if len(display_tokens) >= 4:
+        return " ".join(display_tokens[:4])
+    if display_tokens:
+        return " ".join(display_tokens)
+    fallback = " ".join(str(original_question or "requested subject").split()[:4])
+    return fallback or "requested subject"
+
+
+def _candidate_preferred_source_types(
+    angles: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    for angle in angles:
+        values = _string_list(angle.get("expected_source_types"))
+        if values:
+            return values
+    return ["official documentation", "primary sources"]
+
+
+def _candidate_evidence_need_label(evidence_need: str) -> str:
+    labels = {
+        "primary_source": "Primary Evidence",
+        "official_source": "Official Evidence",
+        "implementation_detail": "Implementation Detail",
+        "recent_change": "Recent Change Evidence",
+        "failure_pattern": "Failure Pattern Evidence",
+        "comparative_analysis": "Comparison Evidence",
+        "risk_or_guardrail": "Risk Guardrail Evidence",
+        "counter_evidence": "Counter Evidence",
+        "policy_or_legal": "Policy Evidence",
+        "user_workflow": "Workflow Evidence",
+    }
+    return labels.get(evidence_need, "Source Evidence")
+
+
+def _candidate_broad_cardinality_next_angle(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks_by_angle: Mapping[str, int],
+    sequence: int,
+) -> Mapping[str, Any]:
+    missing_minimum = [
+        angle
+        for angle in angles
+        if tasks_by_angle[str(angle.get("angle_id") or "")] < 2
+    ]
+    if missing_minimum:
+        return sorted(
+            missing_minimum,
+            key=lambda angle: str(angle.get("angle_id") or ""),
+        )[0]
+    return angles[(sequence - 1) % len(angles)]
+
+
+def _candidate_broad_cardinality_task(
+    *,
+    original_question: str,
+    angle: Mapping[str, Any],
+    existing_tasks: Sequence[Mapping[str, Any]],
+    existing_task_ids: set[str],
+    sequence: int,
+) -> dict[str, Any]:
+    task_id = _candidate_next_task_id(existing_task_ids)
+    angle_id = str(angle.get("angle_id") or "")
+    base_task = next(
+        (
+            task
+            for task in existing_tasks
+            if str(task.get("angle_id") or "") == angle_id
+        ),
+        {},
+    )
+    route = str(angle.get("route") or base_task.get("route") or "text_only")
+    max_sources = _semantic_task_source_cap_int(base_task.get("max_sources"))
+    if max_sources is None:
+        max_sources = 3
+    max_sources = max(
+        SEMANTIC_TASK_MIN_SOURCES,
+        min(SEMANTIC_TASK_MAX_SOURCES, max_sources),
+    )
+    max_images = _semantic_task_source_cap_int(base_task.get("max_images")) or 0
+    if route == "text_only":
+        max_images = 0
+    focus = _candidate_broad_task_focus(sequence)
+    angle_title = str(angle.get("title") or angle_id)
+    source_policy = (
+        dict(base_task.get("source_policy"))
+        if isinstance(base_task.get("source_policy"), Mapping)
+        else {"decision": "allowed", "flags": []}
+    )
+    freshness = str(
+        base_task.get("freshness_requirement")
+        or ("recent" if "current" in original_question.lower() else "any")
+    )
+    return {
+        "task_id": task_id,
+        "angle_id": angle_id,
+        "query": f"{original_question} {angle_title} {focus}",
+        "route": route,
+        "freshness_requirement": freshness,
+        "source_policy": source_policy,
+        "expected_source_types": _string_list(angle.get("expected_source_types"))
+        or _string_list(base_task.get("expected_source_types"))
+        or ["official documentation", "primary sources"],
+        "expected_visual_targets": (
+            _string_list(angle.get("expected_visual_targets"))
+            if route != "text_only"
+            else []
+        ),
+        "expected_artifacts": _ordered_unique(
+            [
+                *_string_list(angle.get("expected_artifacts")),
+                f"{angle_title} {focus} notes",
+            ]
+        ),
+        "success_criteria": _ordered_unique(
+            [
+                *_string_list(angle.get("success_criteria")),
+                f"Task findings must directly address {original_question}.",
+                "Use source-backed evidence and record caveats, conflicts, or unknowns.",
+            ]
+        ),
+        "max_results": base_task.get("max_results", 8),
+        "max_sources": max_sources,
+        "max_images": max_images,
+        "done_condition": (
+            "Stop when this bounded task has source-backed findings, evidence "
+            "metadata, caveats, and unresolved items marked unknown."
+        ),
+    }
+
+
+def _candidate_next_task_id(existing_task_ids: set[str]) -> str:
+    index = 1
+    while f"task_semantic_{index:03d}" in existing_task_ids:
+        index += 1
+    return f"task_semantic_{index:03d}"
+
+
+def _candidate_broad_task_focus(sequence: int) -> str:
+    focuses = (
+        "official documentation baseline",
+        "current behavior constraints",
+        "migration hazard evidence",
+        "version caveat cross-check",
+        "remediation evidence",
+        "counter-evidence review",
+        "implementation boundary check",
+        "synthesis readiness check",
+    )
+    return focuses[(sequence - 1) % len(focuses)]
+
+
+def _candidate_add_angle_coverage(
+    raw_coverage: Any,
+    *,
+    added_angle_ids: Sequence[str],
+) -> Any:
+    if not isinstance(raw_coverage, list):
+        return raw_coverage
+    updated: list[Any] = []
+    for requirement in raw_coverage:
+        if not isinstance(requirement, Mapping):
+            updated.append(requirement)
+            continue
+        repaired = dict(requirement)
+        repaired["covered_by_angle_ids"] = _ordered_unique(
+            [
+                *_string_list(requirement.get("covered_by_angle_ids")),
+                *[str(angle_id) for angle_id in added_angle_ids],
+            ]
+        )
+        updated.append(repaired)
+    return updated
+
+
+def _candidate_add_task_coverage(
+    raw_coverage: Any,
+    *,
+    added_task_ids: Sequence[str],
+) -> Any:
+    if not isinstance(raw_coverage, list):
+        return raw_coverage
+    updated: list[Any] = []
+    for requirement in raw_coverage:
+        if not isinstance(requirement, Mapping):
+            updated.append(requirement)
+            continue
+        repaired = dict(requirement)
+        repaired["covered_by_task_ids"] = _ordered_unique(
+            [
+                *_string_list(requirement.get("covered_by_task_ids")),
+                *[str(task_id) for task_id in added_task_ids],
+            ]
+        )
+        updated.append(repaired)
+    return updated
+
+
 def _materialize_candidate_source_cap_constraints(
     candidate: Mapping[str, Any],
     *,
@@ -1611,6 +2445,120 @@ def _candidate_source_cap_constraint_conflicts_with_normalization(
         re.search(pattern, lowered if pattern.isascii() else text)
         for pattern in single_source_patterns
     )
+
+
+def _materialize_candidate_task_source_cap_feasibility(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized, []
+
+    angles_by_id = {
+        str(angle.get("angle_id") or ""): angle
+        for angle in _list(normalized.get("angles"))
+        if isinstance(angle, Mapping)
+    }
+    normalized_tasks: list[Any] = []
+    materializations: list[dict[str, Any]] = []
+    for index, task in enumerate(raw_tasks, start=1):
+        if not isinstance(task, Mapping):
+            normalized_tasks.append(task)
+            continue
+        normalized_task = dict(task)
+        max_sources = _semantic_task_source_cap_int(normalized_task.get("max_sources"))
+        if max_sources is None or max_sources < SEMANTIC_TASK_MIN_SOURCES:
+            normalized_tasks.append(normalized_task)
+            continue
+        max_images = _semantic_task_source_cap_int(normalized_task.get("max_images"))
+        required_images, _image_counts = _candidate_task_required_image_count(
+            normalized_task
+        )
+        if max_images is not None and required_images > max_images:
+            normalized_tasks.append(normalized_task)
+            continue
+        required_sources, source_reasons, source_counts = (
+            _candidate_task_required_source_count(normalized_task)
+        )
+        if required_sources <= max_sources:
+            normalized_tasks.append(normalized_task)
+            continue
+
+        angle = angles_by_id.get(str(normalized_task.get("angle_id") or ""))
+        angle_title = (
+            str(angle.get("title") or "").strip()
+            if isinstance(angle, Mapping)
+            else ""
+        )
+        subject = _candidate_task_subject_anchor(normalized_task, fallback=angle_title)
+        if not subject:
+            subject = "the requested investigation"
+        normalized_task["query"] = (
+            f"{subject} shared-source-pool synthesis for "
+            f"{angle_title or 'the semantic angle'}"
+        )
+        normalized_task["success_criteria"] = [
+            (
+                f"Use no more than {max_sources} new source records in this bounded "
+                "task; reuse upstream evidence from the shared source pool for wider "
+                "synthesis."
+            ),
+            (
+                "Preserve every requested comparison, caveat, status, and remediation "
+                "field without requiring this task to fetch more sources than its cap."
+            ),
+        ]
+        normalized_task["done_condition"] = (
+            "Complete when capped new evidence plus upstream shared-source-pool "
+            "findings are mapped into the requested synthesis, with unresolved gaps "
+            "marked as caveats instead of expanding this task's source cap."
+        )
+        normalized_task["source_pool_reuse_required"] = True
+        normalized_task["source_pool_reuse_note"] = (
+            "The task previously required more distinct source records than "
+            "bounded_tasks.max_sources permits. It now reuses upstream run-level "
+            "evidence and keeps its own new-source work within the declared cap."
+        )
+        normalized_tasks.append(normalized_task)
+        materializations.append(
+            {
+                "task_id": normalized_task.get("task_id"),
+                "task_index": index,
+                "field": "bounded_tasks",
+                "materialization": "source_cap_feasibility_reuse_upstream_pool",
+                "previous_required_sources": required_sources,
+                "max_sources": max_sources,
+                "source_cap_reasons": list(source_reasons),
+                "explicit_requirement_counts": dict(source_counts),
+            }
+        )
+    normalized["bounded_tasks"] = normalized_tasks
+    return normalized, materializations
+
+
+def _candidate_task_subject_anchor(
+    task: Mapping[str, Any],
+    *,
+    fallback: str,
+) -> str:
+    for value in (
+        task.get("query"),
+        task.get("done_condition"),
+        fallback,
+    ):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        tokens = _semantic_release_ordered_meaningful_token_records(text)
+        selected = [
+            record["display"]
+            for record in tokens[:6]
+            if str(record.get("display") or "").strip()
+        ]
+        if selected:
+            return " ".join(selected)
+    return ""
 
 
 def _candidate_declared_global_source_budget(constraint: Any) -> int | None:
@@ -3466,6 +4414,26 @@ def _semantic_repair_guidance_for_codes(
             "structured properties, compare them against public design and tender "
             "criteria, and avoid making VLM or image inspection mandatory unless the "
             "user supplied an actual image/model file."
+        )
+    if "bounded_task_requirement_exceeds_max_sources" in code_set:
+        guidance.append(
+            " If `bounded_task_requirement_exceeds_max_sources` appears, do not "
+            "raise any bounded_task.max_sources above 5 and do not collapse the "
+            "obligation into an impossible single task. Split the over-broad "
+            "source/vendor/jurisdiction/source-artifact obligation into multiple "
+            "bounded source-group tasks, each executable within max_sources 1-5, "
+            "then synthesize across those groups."
+        )
+    if code_set & {
+        "broad_question_angle_count_out_of_range",
+        "broad_question_task_count_out_of_range",
+    }:
+        guidance.append(
+            " If a broad-question count failure appears, repair by preserving the "
+            "question as broad and returning 5-8 prompt-specific semantic angles "
+            "and 20-40 executable bounded tasks. Do not relabel a broad software, "
+            "architecture, migration, testing, comparison, official-source, or "
+            "current-docs investigation as narrow."
         )
     if visual_preference == "visual_optional" and not provided_images:
         guidance.append(
