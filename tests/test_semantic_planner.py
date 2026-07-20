@@ -3439,6 +3439,95 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", repaired_codes)
         self.assertNotIn("STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE", repaired_codes)
 
+    def test_req003_food_safety_investigation_does_not_require_compliance_matrix(self) -> None:
+        question = (
+            "테스트라는 표현이 식품 안전 검사 맥락에서 쓰일 때 공식 검사 기준을 조사해줘."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "f" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "analysis_and_output_shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        req_003 = candidate["requirement_coverage_map"][2]
+        req_003.update(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "analysis_and_output_shape",
+                "requirement_text": (
+                    "‘테스트’라는 포괄적 표현을 공식 용어와 대응시키고, 검사 "
+                    "목적·대상·방법·시료채취·판정기준·후속조치 및 기준의 "
+                    "법적 지위를 구조적으로 분석한다. 관할 또는 검사 유형에 "
+                    "따라 의미가 달라지면 비교해 제시한다."
+                ),
+                "prompt_text": question,
+                "expected_modalities": ["text"],
+                "output_shape_constraints": [
+                    "범위 및 용어 정의",
+                    "공식 기준 체계 요약",
+                    "검사 절차와 판정 요소",
+                    "관할·검사유형별 차이",
+                    "근거 출처",
+                    "한계와 확인 필요사항",
+                ],
+            }
+        )
+        for angle in candidate["angles"]:
+            angle["route"] = "text_only"
+            angle["evidence_need"] = "official_source"
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = [
+                "food safety inspection terminology notes",
+                "official inspection criteria summary",
+            ]
+            angle["success_criteria"] = [
+                "Explain official food-safety inspection terminology and criteria.",
+                "Separate jurisdiction-specific differences from general definitions.",
+            ]
+        for task in candidate["bounded_tasks"]:
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task["query"] = (
+                f"{question} 공식 식품 안전 검사 용어 기준 판정기준 후속조치 "
+                f"source-backed task {task['task_id']}"
+            )
+            task["expected_artifacts"] = [
+                "food safety inspection terminology notes",
+                "official inspection criteria summary",
+            ]
+            task["success_criteria"] = [
+                "Use official, regulatory, or primary sources for support.",
+                "Explain terminology, test method, sampling, decision criteria, and caveats.",
+            ]
+            task["done_condition"] = (
+                "Stop when official food-safety inspection terminology, criteria, "
+                "jurisdiction limits, evidence, and caveats are recorded."
+            )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+        self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
+
     def test_semantic_planner_source_has_no_sem_reg_004_special_case(self) -> None:
         source = (
             ROOT

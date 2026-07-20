@@ -3438,10 +3438,12 @@ def _semantic_repair_guidance_for_codes(
         guidance.append(
             " If `REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE` appears, add a bounded "
             "text/document/structured task and expected artifact for a consolidated "
-            "side-by-side comparison deliverable with fields for requirement or "
-            "criterion, architectural model output or structured artifact, public "
-            "design criteria, tender document criteria, match/partial/mismatch/"
-            "unverifiable status, evidence, caveats, and remediation."
+            "side-by-side comparison deliverable using the entities and comparison "
+            "axes from the user's own question. Include fields for requirement or "
+            "criterion, each compared item/standard/source named by the user, "
+            "match/partial/mismatch/unverifiable status where compliance-style "
+            "judgment is requested, evidence, caveats, and remediation or next action "
+            "only when the oracle asks for it."
         )
     if code_set & {
         "REQ_003_PRIORITIZED_REMEDIATION_MISSING",
@@ -6647,22 +6649,54 @@ def _candidate_requirement_is_req003_comparison(
     requirement_id = str(requirement.get("requirement_id") or "").lower()
     requirement_type = str(requirement.get("requirement_type") or "").lower()
     text = _candidate_requirement_text(requirement).lower()
-    if requirement_id != "req_003" and requirement_type != "analysis_comparison_output_shape":
+    if requirement_id != "req_003" and "comparison" not in requirement_type:
+        return False
+    normalized_modalities = {
+        _normalize_text(item).replace(" ", "_")
+        for item in _string_list(requirement.get("expected_modalities"))
+    }
+    if normalized_modalities & {
+        "structured_comparison",
+        "comparison_matrix",
+        "comparison_table",
+    }:
+        return True
+    if "comparison" in requirement_type:
+        return True
+    output_shape_text = " ".join(
+        _string_list(requirement.get("output_shape_constraints"))
+    ).lower()
+    if _contains_any(
+        output_shape_text,
+        (
+            "side-by-side",
+            "comparison table",
+            "comparison matrix",
+            "matrix",
+            "requirements matrix",
+            "\uc694\uad6c\uc0ac\ud56d\ubcc4 \ube44\uad50",
+            "\ube44\uad50\ud45c",
+            "\ube44\uad50 \ub9e4\ud2b8\ub9ad\uc2a4",
+            "\ub300\uc751\ud45c",
+        ),
+    ):
+        return True
+    if not _contains_any(text, ("compare", "comparison", "\ube44\uad50")):
         return False
     return _contains_any(
         text,
         (
-            "compare",
-            "comparison",
             "side-by-side",
             "matrix",
             "table",
-            "criteria",
-            "\ube44\uad50",
             "\ub300\uc751\ud45c",
             "\ube44\uad50\ud45c",
             "\ucda9\uc871\ub3c4",
-            "\ud310\uc815",
+            "\uc77c\uce58",
+            "\ubd88\uc77c\uce58",
+            "\ud310\ub2e8 \ubd88\uac00",
+            "\uaca9\ucc28",
+            "\ubcf4\uc644 \uc870\uce58",
         ),
     )
 
@@ -6696,11 +6730,24 @@ def _candidate_has_comparison_deliverable_task(
         if not _contains_any(
             text,
             (
+                "requirement",
+                "criterion",
+                "criteria",
+                "standard",
+                "compared item",
+                "policy",
+                "guidance",
                 "model output",
                 "structured artifact",
                 "artifact",
                 "public design",
                 "tender",
+                "\uc694\uad6c\uc0ac\ud56d",
+                "\uc694\uad6c",
+                "\uae30\uc900",
+                "\ud56d\ubaa9",
+                "\uaddc\uc815",
+                "\uc9c0\uce68",
                 "\ubaa8\ub378 \uc0b0\ucd9c\ubb3c",
                 "\uc0b0\ucd9c\ubb3c",
                 "\uacf5\uacf5 \uc124\uacc4",
@@ -6722,23 +6769,37 @@ def _candidate_requirement_needs_prioritized_remediation(
     requirement: Mapping[str, Any],
 ) -> bool:
     text = _candidate_requirement_text(requirement).lower()
-    return _contains_any(
+    action_requested = _contains_any(
         text,
         (
             "remediation",
             "remediate",
             "recommendation",
             "recommendations",
-            "prioritized",
-            "priority",
             "next action",
             "\uac1c\uc120",
             "\ubcf4\uc644",
             "\uc870\uce58",
             "\uad8c\uace0",
-            "\uc6b0\uc120\uc21c\uc704",
         ),
     )
+    priority_requested = _contains_any(
+        text,
+        (
+            "prioritized",
+            "priority",
+            "rank",
+            "severity",
+            "impact",
+            "effort",
+            "\uc6b0\uc120\uc21c\uc704",
+            "\uc6b0\uc120",
+            "\uc21c\uc704",
+            "\uc911\ub300\uc131",
+            "\uc601\ud5a5",
+        ),
+    )
+    return action_requested and priority_requested
 
 
 def _candidate_has_prioritized_remediation_task(
