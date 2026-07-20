@@ -932,6 +932,18 @@ class PublicBetaValidationTests(unittest.TestCase):
         scan = run_semantic_anti_overfit_scan()
 
         self.assertEqual(scan["status"], "passed", scan["findings"])
+        scanned = {Path(path).name for path in scan["scanned_paths"]}
+        excluded = {Path(path).name for path in scan["excluded_paths"]}
+        self.assertIn("semantic_planner.py", scanned)
+        self.assertIn("search_handoff.py", scanned)
+        self.assertIn("plugin.json", scanned)
+        self.assertIn("SKILL.md", scanned)
+        self.assertIn("test_semantic_planner.py", scanned)
+        self.assertIn("test_public_beta_validation.py", scanned)
+        self.assertIn("semantic_regression_prompts.json", excluded)
+        self.assertIn("public_beta_semantic_prompts.json", excluded)
+        self.assertIn("blind_holdout_semantic_prompts.json", excluded)
+        self.assertIn("semantic_oracles.json", excluded)
 
     def test_semantic_anti_overfit_scan_rejects_malicious_planner_file(self) -> None:
         temp = self.temp_dir()
@@ -1015,7 +1027,11 @@ class PublicBetaValidationTests(unittest.TestCase):
                 / "semantic_oracles.json"
             ).read_text(encoding="utf-8")
         )
-        oracle_note = oracle_bundle["oracles"]["sem-reg-001"][
+        regression = load_semantic_regression_manifest(
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST
+        )
+        oracle_fragment_id = regression["prompts"][0]["oracle_path"].split("#", 1)[1]
+        oracle_note = oracle_bundle["oracles"][oracle_fragment_id][
             "expected_source_policy"
         ][-1]
         bad.write_text(f"ORACLE_NOTE = {oracle_note!r}\n", encoding="utf-8")
@@ -1300,7 +1316,10 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
     def test_semantic_artifact_integrity_accepts_korean_particle_overlap(self) -> None:
-        original_question = "한국 공공보건 포스터 이미지의 손씻기 지침 차이를 공식 출처와 함께 분석해줘."
+        regression = load_semantic_regression_manifest(
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST
+        )
+        original_question = regression["prompts"][1]["prompt"]
         angles = [
             {
                 "angle_id": "angle_004",

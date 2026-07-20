@@ -1643,13 +1643,11 @@ def _materialize_candidate_budget_caps(
     normalized = copy.deepcopy(dict(candidate))
     if not isinstance(budget_cap, Mapping):
         return normalized, []
-    max_results = _semantic_task_source_cap_int(budget_cap.get("max_results"))
-    if max_results is None or max_results < 1:
-        return normalized, []
 
     materializations: list[dict[str, Any]] = []
     raw_constraints = normalized.get("constraints")
-    if isinstance(raw_constraints, list):
+    max_results = _semantic_task_source_cap_int(budget_cap.get("max_results"))
+    if max_results is not None and max_results >= 1 and isinstance(raw_constraints, list):
         if not _candidate_constraints_mention_search_result_cap(
             raw_constraints,
             max_results=max_results,
@@ -1667,7 +1665,7 @@ def _materialize_candidate_budget_caps(
             )
 
     raw_tasks = normalized.get("bounded_tasks")
-    if isinstance(raw_tasks, list):
+    if max_results is not None and max_results >= 1 and isinstance(raw_tasks, list):
         normalized_tasks: list[Any] = []
         task_materializations: list[dict[str, Any]] = []
         for index, task in enumerate(raw_tasks, start=1):
@@ -1698,7 +1696,110 @@ def _materialize_candidate_budget_caps(
                 }
             )
 
+    max_sources = _semantic_task_source_cap_int(budget_cap.get("max_sources"))
+    if max_sources is not None and max_sources > 0:
+        normalized, source_budget_materialization = (
+            _materialize_candidate_runner_source_budget_cap(
+                normalized,
+                max_sources=max_sources,
+            )
+        )
+        if source_budget_materialization:
+            materializations.append(source_budget_materialization)
+
     return normalized, materializations
+
+
+def _materialize_candidate_runner_source_budget_cap(
+    candidate: Mapping[str, Any],
+    *,
+    max_sources: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized, None
+    caps = [
+        cap
+        for cap in (
+            _semantic_task_source_cap_int(task.get("max_sources"))
+            for task in raw_tasks
+            if isinstance(task, Mapping)
+        )
+        if cap is not None
+    ]
+    if not caps:
+        return normalized, None
+
+    total_cap = sum(caps)
+    existing_runner_budget = normalized.get("runner_source_budget")
+    existing_cap = _candidate_runner_source_budget_cap(existing_runner_budget)
+    declared_budget = (
+        min(existing_cap, max_sources) if existing_cap is not None else max_sources
+    )
+    runner_source_budget = _candidate_runner_source_budget_record(
+        declared_source_budget=declared_budget,
+        task_max_sources_sum=total_cap,
+        bounded_task_count=len(caps),
+        removed_constraints=[],
+    )
+    runner_source_budget.update(
+        {
+            "materialized_from_budget_cap": declared_budget == max_sources,
+            "budget_cap_max_sources": max_sources,
+        }
+    )
+    if isinstance(existing_runner_budget, Mapping):
+        merged_runner_budget = dict(existing_runner_budget)
+        merged_runner_budget.update(runner_source_budget)
+        runner_source_budget = merged_runner_budget
+    normalized["runner_source_budget"] = runner_source_budget
+
+    constraints = normalized.get("constraints")
+    appended_constraint = None
+    if isinstance(constraints, list) and not _candidate_constraints_preserve_runner_source_budget(
+        constraints,
+        declared_source_budget=declared_budget,
+    ):
+        appended_constraint = (
+            "Runner-level source budget from budget_cap is preserved as a "
+            f"unique-source reuse budget: max_unique_sources={declared_budget}. "
+            f"The combined per-task source ceilings total {total_cap}, so "
+            "execution must reuse sources through a shared source pool and must "
+            "not treat per-task max_sources as additive permission for unique "
+            "source retrievals."
+        )
+        normalized["constraints"] = [*constraints, appended_constraint]
+
+    materialization = {
+        "field": "runner_source_budget",
+        "materialization": "preserved_budget_cap_source_budget",
+        "budget_cap_max_sources": max_sources,
+        "preserved_declared_source_budget": declared_budget,
+        "task_max_sources_sum": total_cap,
+        "bounded_task_count": len(caps),
+        "reuse_required": total_cap > declared_budget,
+        "runner_source_budget": copy.deepcopy(runner_source_budget),
+    }
+    if appended_constraint is not None:
+        materialization["replacement_constraint"] = appended_constraint
+    return normalized, materialization
+
+
+def _candidate_constraints_preserve_runner_source_budget(
+    constraints: Sequence[Any],
+    *,
+    declared_source_budget: int,
+) -> bool:
+    return any(
+        _candidate_declared_global_source_budget(constraint)
+        == declared_source_budget
+        and _candidate_constraint_preserves_executable_source_budget(
+            constraint,
+            declared_source_budget=declared_source_budget,
+        )
+        for constraint in constraints
+    )
 
 
 def _candidate_constraints_mention_search_result_cap(
@@ -1982,34 +2083,6 @@ def _materialize_candidate_visual_image_cap_feasibility(
                     }
                 )
                 max_images = repaired_max_images
-        for field_name in ("query", "done_condition"):
-            current = str(normalized_task.get(field_name) or "")
-            repaired = _cap_visual_image_demand_text(current, max_images=max_images)
-            if repaired != current:
-                normalized_task[field_name] = repaired
-                task_materializations.append(
-                    {
-                        "field": f"bounded_tasks.{field_name}",
-                        "previous": current,
-                        "materialized": repaired,
-                    }
-                )
-        success_criteria = _string_list(normalized_task.get("success_criteria"))
-        if success_criteria:
-            repaired_criteria: list[str] = []
-            for criterion in success_criteria:
-                repaired_criteria.append(
-                    _cap_visual_image_demand_text(criterion, max_images=max_images)
-                )
-            if repaired_criteria != success_criteria:
-                normalized_task["success_criteria"] = repaired_criteria
-                task_materializations.append(
-                    {
-                        "field": "bounded_tasks.success_criteria",
-                        "previous": success_criteria,
-                        "materialized": repaired_criteria,
-                    }
-                )
         if task_materializations:
             materializations.append(
                 {
@@ -2023,45 +2096,6 @@ def _materialize_candidate_visual_image_cap_feasibility(
         normalized_tasks.append(normalized_task)
     normalized["bounded_tasks"] = normalized_tasks
     return normalized, materializations
-
-
-def _cap_visual_image_demand_text(text: str, *, max_images: int) -> str:
-    if not text or max_images <= 0:
-        return text
-
-    def replace_at_least(match: re.Match[str]) -> str:
-        requested = _semantic_count_word_to_int(match.group("count"))
-        if requested is None or requested <= max_images:
-            return match.group(0)
-        target = match.group("target").strip()
-        suffix = match.group("suffix") or ""
-        return (
-            f"Up to {max_images} {target} are acquired in this bounded task; "
-            "additional required visual examples must be covered by adjacent "
-            f"visual tasks or recorded as cap-limited caveats{suffix}"
-        )
-
-    repaired = re.sub(
-        r"\b[Aa]t least\s+(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
-        r"(?P<target>[^.;]{0,100}?(?:poster|posters|image|images|visual example|visual examples)[^.;]{0,100}?)"
-        r"(?P<suffix>[.;]|$)",
-        replace_at_least,
-        text,
-    )
-    if max_images < 4:
-        repaired = re.sub(
-            r"\bacquir(?:e|ing)\s+one representative image per program\b",
-            f"acquiring up to {max_images} representative images within this task's cap",
-            repaired,
-            flags=re.IGNORECASE,
-        )
-        repaired = re.sub(
-            r"\bfor the sampled programs\b",
-            f"for up to {max_images} sampled programs in this bounded task",
-            repaired,
-            flags=re.IGNORECASE,
-        )
-    return repaired
 
 
 def _semantic_count_word_to_int(value: str) -> int | None:
@@ -7775,8 +7809,7 @@ def _candidate_source_cap_constraint_failures(
     constraints: Any,
     tasks: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    if not isinstance(constraints, list):
-        return []
+    constraint_records = constraints if isinstance(constraints, list) else []
     caps = [
         cap
         for cap in (
@@ -7790,7 +7823,7 @@ def _candidate_source_cap_constraint_failures(
         return []
     failures: list[dict[str, Any]] = []
     executable_budgets: list[int] = []
-    for index, constraint in enumerate(constraints, start=1):
+    for index, constraint in enumerate(constraint_records, start=1):
         global_budget = _candidate_declared_global_source_budget(constraint)
         if (
             global_budget is not None

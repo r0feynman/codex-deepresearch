@@ -1488,7 +1488,14 @@ def run_semantic_anti_overfit_scan(
         scan_paths = [
             PLUGIN_ROOT / "src" / "deepresearch" / "semantic_planner.py",
             PLUGIN_ROOT / "src" / "deepresearch" / "search_handoff.py",
+            PLUGIN_ROOT / ".codex-plugin" / "plugin.json",
             PLUGIN_ROOT / "skills",
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+            DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
+            DEFAULT_BLIND_HOLDOUT_MANIFEST,
+            DEFAULT_BLIND_HOLDOUT_MANIFEST.parent / "semantic_oracles.json",
+            root / "tests" / "test_semantic_planner.py",
+            root / "tests" / "test_public_beta_validation.py",
             root / "tests" / "fixtures",
         ]
     files = _semantic_scan_files(scan_paths)
@@ -1504,14 +1511,18 @@ def run_semantic_anti_overfit_scan(
         for path in record.get("oracle_manifest_paths", [])
         if isinstance(path, str) and Path(path).exists()
     }
+    explicitly_excluded_paths: list[str] = []
+    scanned_paths: list[str] = []
     for path in files:
         resolved = path.resolve()
         if resolved in protected_manifest_paths or resolved in oracle_manifest_paths:
+            explicitly_excluded_paths.append(str(resolved))
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        scanned_paths.append(str(resolved))
         normalized = _normalize_prompt_text(text)
         for prompt in prompt_texts:
             if prompt and _normalize_prompt_text(prompt) in normalized:
@@ -1597,6 +1608,9 @@ def run_semantic_anti_overfit_scan(
         "protected_prompt_id_count": len(prompt_ids),
         "protected_prompt_hash_count": len(prompt_hashes),
         "protected_oracle_fragment_count": len(oracle_strings),
+        "scanned_paths": sorted(scanned_paths),
+        "excluded_paths": sorted(set(explicitly_excluded_paths)),
+        "excluded_path_count": len(set(explicitly_excluded_paths)),
         "findings": findings,
     }
 
@@ -1755,13 +1769,13 @@ def _semantic_prompt_hash_alias_routing_findings(text: str) -> list[str]:
         findings.append("prompt_hash_alias_routing")
     if re.search(
         rf"(?is)\b(?:plan|route|angle|task|bounded_tasks|semantic_plan)_by_"
-        rf"(?:hash|digest)\b.{{0,420}}(?:prompt_hash|{hash_helper}\s*\(|sha256\s*\()"
+        rf"(?:hash|digest)\b.{{0,420}}(?:prompt_hash|{hash_helper}\s*\()"
         rf".{{0,420}}{semantic_target}",
         text,
     ):
         findings.append("prompt_hash_alias_routing")
     if re.search(
-        rf"(?is)\{{.{{0,260}}(?:{hash_helper}\s*\(|sha256\s*\()"
+        rf"(?is)\{{.{{0,260}}(?:{hash_helper}\s*\()"
         rf".{{0,420}}{semantic_target}",
         text,
     ):

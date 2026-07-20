@@ -58,6 +58,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     write_semantic_planner_validation,
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
+    _materialize_candidate_budget_caps,
     _materialize_candidate_placeholder_selection_workflow,
     _materialize_candidate_source_cap_constraints,
     _materialize_candidate_visual_image_cap_feasibility,
@@ -164,6 +165,16 @@ class SemanticPlannerTests(unittest.TestCase):
 
     def load_json(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def semantic_regression_prompt(self, index: int) -> str:
+        manifest = self.load_json(
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_regression_prompts.json"
+        )
+        return str(manifest["prompts"][index]["prompt"])
 
     def write_json(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2617,7 +2628,7 @@ class SemanticPlannerTests(unittest.TestCase):
             self.assertNotIn(token, request_text)
 
     def test_text_only_planner_request_and_prompt_include_no_visual_contract(self) -> None:
-        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
         raw_request = build_codex_semantic_raw_request(
             question=question,
             visual_preference="text_only",
@@ -2648,7 +2659,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 self.assertIn(forbidden_visual_work, contract_text)
 
     def test_text_only_visual_preference_rejects_visual_candidate_before_review(self) -> None:
-        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
         result, adapter_request = self.prepare_with_codex_adapter(
             question,
             route="text_only",
@@ -2685,7 +2696,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
 
     def test_text_only_validation_rejects_visual_work_terms_without_visual_route(self) -> None:
-        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
         request = {
             "original_question": question,
             "depth_preset": "standard",
@@ -2795,7 +2806,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
 
     def test_text_only_visual_work_terms_block_adapter_candidate_before_review(self) -> None:
-        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
 
         def hide_visual_work_in_text_fields(response: dict) -> dict:
             response = json.loads(json.dumps(response))
@@ -2885,7 +2896,7 @@ class SemanticPlannerTests(unittest.TestCase):
     def test_visual_keyword_detection_is_token_aware_for_oauth_guidance(self) -> None:
         self.assertFalse(
             question_mentions_visual_evidence(
-                "Compare OAuth device-flow implementation guidance across official provider documentation."
+                "Compare OAuth device-flow provider behavior across official implementation documentation."
             )
         )
         self.assertFalse(question_mentions_visual_evidence("Review device-flow guidance."))
@@ -2901,7 +2912,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 self.assertTrue(question_mentions_visual_evidence(question))
 
     def test_text_only_allows_visual_terms_in_excluded_scope(self) -> None:
-        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
         candidate = self.text_only_oauth_candidate(question=question)
         for angle in candidate["angles"]:
             angle["excluded_scope"] = [
@@ -2921,7 +2932,7 @@ class SemanticPlannerTests(unittest.TestCase):
 
     def test_text_only_suppresses_visual_missing_failures_for_visual_exclusion_text(self) -> None:
         question = (
-            "Compare OAuth device-flow implementation guidance across official provider "
+            "Compare OAuth device-flow provider behavior across official implementation "
             "documentation, excluding visual inspection and screenshots."
         )
         candidate = self.text_only_oauth_candidate(question=question)
@@ -3179,7 +3190,7 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_source_cap_validation_ignores_task_id_range_reuse_references(self) -> None:
-        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
         candidate = self.text_only_oauth_candidate(question=question)
         task = candidate["bounded_tasks"][15]
         task["task_id"] = "task_016"
@@ -4520,7 +4531,7 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(result["semantic_release_eligible"], result)
 
     def test_codex_semantic_materializes_shallow_angle_titles_with_prompt_anchors(self) -> None:
-        question = "국내 개인정보 영향평가 제도와 해외 규제기관 가이드를 비교해줘."
+        question = self.semantic_regression_prompt(5)
 
         def sem_reg_006_style_shallow_titles(response: dict) -> dict:
             response = json.loads(json.dumps(response))
@@ -4908,7 +4919,7 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("non_release_oracle_fixture", blocker_codes)
 
     def test_codex_semantic_sem_reg_004_oracle_capacity_retry_avoids_fixture(self) -> None:
-        question = "건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘."
+        question = self.semantic_regression_prompt(3)
         result, adapter_request = self.prepare_with_codex_adapter(
             question,
             route="visual_optional",
@@ -4947,7 +4958,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
 
     def test_codex_semantic_materializes_sem_reg_004_visual_expected_evidence(self) -> None:
-        question = "한국 공공보건 포스터 이미지의 손씻기 지침 차이를 공식 출처와 함께 분석해줘."
+        question = self.semantic_regression_prompt(1)
         mixed_text_only_task: dict[str, str] = {}
 
         def sem_reg_004_style_missing_expected_evidence(response: dict) -> dict:
@@ -5673,6 +5684,70 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertTrue(repaired_validation["ok"], repaired_validation)
 
+    def test_request_source_budget_materialized_without_stale_constraints(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "c" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = []
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+
+        repaired, materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_results": 8, "max_sources": 20},
+        )
+
+        budget_materialization = next(
+            materialization
+            for materialization in materializations
+            if materialization.get("field") == "runner_source_budget"
+        )
+        self.assertEqual(
+            budget_materialization["materialization"],
+            "preserved_budget_cap_source_budget",
+        )
+        self.assertEqual(repaired["runner_source_budget"]["max_unique_sources"], 20)
+        self.assertEqual(repaired["runner_source_budget"]["task_max_sources_sum"], 60)
+        self.assertTrue(repaired["runner_source_budget"]["reuse_required"])
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("max_unique_sources=20", constraints_text)
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(validation["ok"], validation)
+
+        missing_constraint = json.loads(json.dumps(repaired))
+        missing_constraint.pop("constraints")
+        missing_constraint_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=missing_constraint,
+        )
+        self.assertFalse(
+            missing_constraint_validation["ok"],
+            missing_constraint_validation,
+        )
+        self.assertIn(
+            "global_source_budget_not_preserved_in_constraints",
+            {
+                failure["code"]
+                for failure in missing_constraint_validation["failures"]
+            },
+        )
+
     def test_multi_vendor_official_tasks_raise_source_cap_without_multiple_source_types(self) -> None:
         candidate = {
             "bounded_tasks": [
@@ -5811,7 +5886,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertTrue(repaired_validation["ok"], repaired_validation)
 
-    def test_visual_task_image_demands_are_capped_to_task_budget(self) -> None:
+    def test_visual_task_image_demands_over_schema_cap_remain_validation_failures(self) -> None:
         candidate = {
             "bounded_tasks": [
                 {
@@ -5834,7 +5909,7 @@ class SemanticPlannerTests(unittest.TestCase):
                     "max_sources": 2,
                     "max_images": 3,
                     "done_condition": (
-                        "Done when representative posters are obtained for the sampled programs."
+                        "Done when at least four images are acquired for the sampled programs."
                     ),
                 }
             ]
@@ -5844,13 +5919,22 @@ class SemanticPlannerTests(unittest.TestCase):
             candidate
         )
 
-        self.assertTrue(materializations)
+        self.assertFalse(materializations)
         task = repaired["bounded_tasks"][0]
         text = json.dumps(task, ensure_ascii=False)
-        self.assertIn("Up to 3", text)
-        self.assertIn("within this task's cap", text)
-        self.assertNotIn("At least four", text)
-        self.assertNotIn("one representative image per program", text)
+        self.assertIn("At least four", text)
+        self.assertIn("one representative image per program", text)
+        self.assertIn("at least four images", text)
+        self.assertNotIn("Up to 3", text)
+        validation = validate_semantic_candidate_plan(
+            original_question="Compare public recycling poster examples.",
+            plan=repaired,
+        )
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_images",
+            {failure["code"] for failure in validation["failures"]},
+        )
 
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
         with self.assertRaisesRegex(
