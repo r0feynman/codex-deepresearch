@@ -61,6 +61,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _materialize_candidate_budget_caps,
     _materialize_candidate_broad_cardinality,
     _materialize_candidate_placeholder_selection_workflow,
+    _materialize_candidate_req003_comparison_deliverable,
     _materialize_candidate_source_cap_splits,
     _materialize_candidate_source_cap_constraints,
     _materialize_candidate_task_source_cap_feasibility,
@@ -3609,6 +3610,168 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
         self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
 
+    def test_req003_reviewer_retry_materializes_text_only_comparison_schema(self) -> None:
+        question = (
+            "Compare OAuth device-flow provider documentation against official "
+            "implementation requirements."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        task_ids = [task["task_id"] for task in candidate["bounded_tasks"]]
+        angle_ids = [angle["angle_id"] for angle in candidate["angles"]]
+        candidate["requirement_coverage_map"].append(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "analysis_comparison_output_shape",
+                "requirement_text": (
+                    "Produce a side-by-side comparison table of provider "
+                    "documentation against official implementation requirements."
+                ),
+                "prompt_text": "side-by-side comparison table",
+                "prompt_span": {"start": None, "end": None},
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": angle_ids,
+                "covered_by_task_ids": task_ids,
+                "coverage_status": "covered",
+            }
+        )
+        candidate["angles"][4]["evidence_need"] = "comparative_analysis"
+        candidate["angles"][4]["title"] = "OAuth Provider Requirement Comparison Synthesis"
+        candidate["angles"][4]["research_question"] = (
+            "How should OAuth provider documentation rows be compared against "
+            "official implementation requirements?"
+        )
+        for task in candidate["bounded_tasks"][:4]:
+            task["query"] = (
+                "Collect official OAuth device-flow source evidence for the "
+                f"source-baseline angle: {task['task_id']}"
+            )
+            task["expected_artifacts"] = ["official source evidence notes"]
+            task["success_criteria"] = [
+                "Stay scoped to official-source collection for angle_001."
+            ]
+            task["done_condition"] = (
+                "Stop when official source evidence for angle_001 is recorded."
+            )
+        comparison_task = candidate["bounded_tasks"][18]
+        comparison_task["angle_id"] = candidate["angles"][4]["angle_id"]
+        comparison_task["query"] = (
+            "Build OAuth provider documentation rows against official "
+            "implementation requirements."
+        )
+        comparison_task["expected_artifacts"] = [
+            "side-by-side provider requirement comparison table"
+        ]
+        comparison_task["success_criteria"] = [
+            "Compare provider documentation against official requirements with evidence."
+        ]
+        comparison_task["done_condition"] = (
+            "Stop when source-backed comparison rows are ready."
+        )
+
+        repaired, materializations = _materialize_candidate_req003_comparison_deliverable(
+            candidate,
+            raw_request={
+                "visual_preference": "text_only",
+                "semantic_convergence_attempt": 2,
+                "previous_semantic_review_failure_codes": [
+                    "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE"
+                ],
+            },
+            original_question=question,
+        )
+
+        self.assertTrue(materializations, materializations)
+        self.assertEqual(
+            materializations[0]["task_id"],
+            comparison_task["task_id"],
+        )
+        self.assertEqual(
+            materializations[0]["materialization"],
+            "materialized_req003_comparison_deliverable",
+        )
+        self.assertNotIn(
+            "comparison row schema",
+            json.dumps(repaired["bounded_tasks"][0]).lower(),
+        )
+        repaired_task = repaired["bounded_tasks"][18]
+        self.assertEqual(repaired_task["route"], "text_only")
+        self.assertEqual(repaired_task["expected_visual_targets"], [])
+        self.assertEqual(repaired_task["max_images"], 0)
+        self.assertIn("Build OAuth provider documentation rows", repaired_task["query"])
+        self.assertNotIn(question, repaired_task["query"])
+        repaired_task_text = json.dumps(repaired_task, ensure_ascii=False).lower()
+        for expected in ("status", "evidence", "caveat", "remediation"):
+            self.assertIn(expected, repaired_task_text)
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+            visual_preference="text_only",
+        )
+        self.assertTrue(validation["ok"], validation)
+
+    def test_req003_reviewer_retry_appends_to_comparison_angle_when_no_task_matches(self) -> None:
+        question = (
+            "Compare OAuth provider notices against official implementation requirements."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        candidate["bounded_tasks"] = candidate["bounded_tasks"][:19]
+        candidate["angles"][4]["evidence_need"] = "comparative_analysis"
+        candidate["angles"][4]["title"] = "OAuth Notice Requirement Comparison"
+        candidate["angles"][4]["research_question"] = (
+            "Which final comparison rows reconcile OAuth notices with official requirements?"
+        )
+        for task in candidate["bounded_tasks"]:
+            task["query"] = (
+                "Collect bounded official OAuth source evidence for "
+                f"{task['angle_id']} {task['task_id']}."
+            )
+            task["expected_artifacts"] = ["official source notes"]
+            task["success_criteria"] = ["Keep this task scoped to source collection."]
+            task["done_condition"] = "Stop when source evidence notes are recorded."
+        candidate["requirement_coverage_map"].append(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "analysis_comparison_output_shape",
+                "requirement_text": (
+                    "Produce a side-by-side comparison deliverable with status, "
+                    "evidence, caveat, and remediation fields."
+                ),
+                "prompt_text": "comparison deliverable",
+                "prompt_span": {"start": None, "end": None},
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": [candidate["angles"][4]["angle_id"]],
+                "covered_by_task_ids": [],
+                "coverage_status": "covered",
+            }
+        )
+
+        repaired, materializations = _materialize_candidate_req003_comparison_deliverable(
+            candidate,
+            raw_request={
+                "visual_preference": "text_only",
+                "semantic_convergence_attempt": 2,
+                "previous_semantic_review_failure_codes": [
+                    "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE"
+                ],
+            },
+            original_question=question,
+        )
+
+        self.assertEqual(len(repaired["bounded_tasks"]), 20)
+        self.assertEqual(materializations[0]["task_action"], "appended")
+        appended_task = repaired["bounded_tasks"][-1]
+        self.assertEqual(appended_task["angle_id"], candidate["angles"][4]["angle_id"])
+        self.assertEqual(appended_task["route"], "text_only")
+        self.assertEqual(appended_task["expected_visual_targets"], [])
+        self.assertEqual(appended_task["max_images"], 0)
+        self.assertNotIn(question, appended_task["query"])
+        appended_text = json.dumps(appended_task, ensure_ascii=False).lower()
+        for expected in ("status", "evidence", "caveat", "remediation"):
+            self.assertIn(expected, appended_text)
+
     def test_generic_analysis_comparison_type_does_not_force_comparison_table(self) -> None:
         question = (
             "Research testing requirements for drinking-water lead sampling, "
@@ -3982,6 +4145,196 @@ class SemanticPlannerTests(unittest.TestCase):
             "STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE",
             retry_request["planner_retry_instructions"],
         )
+
+    def test_korean_cross_modal_req003_reviewer_retry_materializes_schema(self) -> None:
+        question = "한국 학교 급식 알레르기 라벨 이미지와 공식 표시 규정을 비교해줘."
+
+        def planner_mutator(response: dict, _request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            req_003 = candidate["requirement_coverage_map"][2]
+            req_003.update(
+                {
+                    "requirement_id": "req_003",
+                    "requirement_type": "analysis_comparison_output_shape",
+                    "requirement_text": (
+                        "Compare school meal allergy label examples against "
+                        "official display regulations in a side-by-side table."
+                    ),
+                    "prompt_text": "비교",
+                    "expected_modalities": [
+                        "visual interpretation",
+                        "textual comparison",
+                    ],
+                    "output_shape_constraints": [
+                        "side-by-side comparison table",
+                        "source-backed evidence",
+                    ],
+                    "non_negotiable": True,
+                    "coverage_status": "covered",
+                }
+            )
+            candidate["angles"][0]["evidence_need"] = "official_primary_documents"
+            candidate["angles"][0]["title"] = "한국 학교 급식 알레르기 공식 표시 규정의 법적 기준"
+            candidate["angles"][4]["route"] = "text_only"
+            candidate["angles"][4]["evidence_need"] = "structured_compliance_comparison"
+            candidate["angles"][4]["expected_visual_targets"] = []
+            candidate["angles"][4]["title"] = (
+                "한국 학교 급식 알레르기 라벨과 공식 표시 규정 대조"
+            )
+            for task in candidate["bounded_tasks"][:4]:
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task["query"] = (
+                    "한국 학교 급식 알레르기 공식 표시 규정 법적 기준 "
+                    f"출처 수집 {task['task_id']}"
+                )
+                task["expected_artifacts"] = ["공식 표시 규정 출처 노트"]
+                task["success_criteria"] = [
+                    "angle_001 공식 규정 출처 수집 범위를 유지한다."
+                ]
+                task["done_condition"] = "공식 규정 출처 근거가 기록되면 중지한다."
+            comparison_task = candidate["bounded_tasks"][18]
+            comparison_task["angle_id"] = candidate["angles"][4]["angle_id"]
+            comparison_task["route"] = "text_only"
+            comparison_task["expected_visual_targets"] = []
+            comparison_task["max_images"] = 0
+            comparison_task["query"] = (
+                "요구사항별 공식 기준과 각 이미지 관찰값을 좌우로 배치한 "
+                "준수 대조표를 작성하라."
+            )
+            comparison_task["expected_artifacts"] = [
+                "학교 급식 알레르기 표시 준수 대조표"
+            ]
+            comparison_task["success_criteria"] = [
+                "공식 규정 기준과 이미지 관찰값의 차이를 근거와 함께 비교한다."
+            ]
+            comparison_task["done_condition"] = (
+                "요구사항별 대조표 행이 근거와 함께 준비되면 중지한다."
+            )
+            return response
+
+        def reviewer_mutator(response: dict, request: dict) -> dict:
+            plan_text = json.dumps(request["semantic_plan"], ensure_ascii=False).lower()
+            required_terms = ("status", "evidence", "caveat", "remediation")
+            if not all(term in plan_text for term in required_terms):
+                review = response["semantic_plan_review"]
+                review["semantic_fit_score"] = 8.9
+                review["blockers"] = [
+                    {
+                        "code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+                        "message": (
+                            "Req_003 comparison/output-shape oracle requirements "
+                            "need a bounded side-by-side comparison deliverable "
+                            "with status, evidence, caveat, and remediation fields."
+                        ),
+                    }
+                ]
+                review["verdict"] = "release_ineligible"
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "analysis_comparison_output_shape",
+            ),
+            visual_angle_indexes=(2, 3),
+            planner_response_mutator=planner_mutator,
+            reviewer_response_mutator=reviewer_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(convergence["status"], "converged", convergence)
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertIn(
+            "candidate_plan_req003_comparison_deliverable_materializations",
+            raw_response,
+        )
+        materializations = raw_response[
+            "candidate_plan_req003_comparison_deliverable_materializations"
+        ]
+        self.assertTrue(materializations, raw_response)
+        materialization = materializations[0]
+        self.assertEqual(materialization["task_action"], "strengthened")
+        selected_task_id = materialization["task_id"]
+        self.assertNotEqual(selected_task_id, "task_semantic_001")
+        self.assertTrue(
+            any(task["route"] != "text_only" for task in semantic_plan["bounded_tasks"])
+        )
+        self.assertNotIn(
+            "comparison row schema",
+            json.dumps(semantic_plan["bounded_tasks"][0]).lower(),
+        )
+        official_angle_id = semantic_plan["angles"][0]["angle_id"]
+        official_source_task_ids = {
+            task["task_id"]
+            for task in semantic_plan["bounded_tasks"]
+            if task.get("angle_id") == official_angle_id
+        }
+        self.assertNotIn(selected_task_id, official_source_task_ids)
+        comparison_tasks = [
+            task
+            for task in semantic_plan["bounded_tasks"]
+            if "comparison row schema" in json.dumps(task).lower()
+        ]
+        self.assertTrue(comparison_tasks, semantic_plan)
+        comparison_task = next(
+            (
+                task
+                for task in comparison_tasks
+                if task.get("task_id") == selected_task_id
+            ),
+            None,
+        )
+        self.assertIsNotNone(comparison_task, comparison_tasks)
+        assert comparison_task is not None
+        self.assertEqual(materialization["angle_id"], comparison_task["angle_id"])
+        selected_angle = next(
+            (
+                angle
+                for angle in semantic_plan["angles"]
+                if angle.get("angle_id") == comparison_task["angle_id"]
+            ),
+            {},
+        )
+        self.assertIn(
+            selected_angle.get("evidence_need"),
+            {"structured_compliance_comparison", "comparative_analysis", "synthesis"},
+        )
+        self.assertEqual(comparison_task["route"], "text_only")
+        self.assertEqual(comparison_task["expected_visual_targets"], [])
+        self.assertEqual(comparison_task["max_images"], 0)
+        self.assertNotIn(question, comparison_task["query"])
+        query_prefix = comparison_task["query"].split("행별 판정 상태", 1)[0]
+        self.assertTrue(
+            any(
+                term in query_prefix
+                for term in (
+                    "공식 기준",
+                    "이미지 관찰값",
+                    "대조표",
+                    "준수",
+                    "상충 판정",
+                    "법적 단정",
+                    "누락된 근거",
+                )
+            ),
+            comparison_task["query"],
+        )
+        comparison_text = json.dumps(comparison_task, ensure_ascii=False).lower()
+        for expected in ("status", "evidence", "caveat", "remediation"):
+            self.assertIn(expected, comparison_text)
 
     def test_semantic_reviewer_failure_terminal_after_bounded_convergence(self) -> None:
         def reviewer_mutator(response: dict, _request: dict) -> dict:

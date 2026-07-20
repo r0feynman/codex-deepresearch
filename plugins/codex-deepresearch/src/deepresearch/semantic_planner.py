@@ -808,6 +808,15 @@ def codex_semantic_candidate_plan(
                         original_question=original_question,
                     )
                 )
+                candidate, comparison_deliverable_materializations = (
+                    _materialize_candidate_req003_comparison_deliverable(
+                        candidate,
+                        raw_request=raw_request,
+                        original_question=original_question,
+                    )
+                )
+            else:
+                comparison_deliverable_materializations = []
             candidate, source_cap_constraint_materializations = (
                 _materialize_candidate_source_cap_constraints(
                     candidate,
@@ -860,6 +869,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan_broad_cardinality_materializations"] = (
                     broad_cardinality_materializations
                 )
+            if comparison_deliverable_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response[
+                    "candidate_plan_req003_comparison_deliverable_materializations"
+                ] = comparison_deliverable_materializations
             if source_cap_constraint_materializations:
                 raw_response["candidate_plan"] = candidate
                 raw_response[
@@ -2227,6 +2241,723 @@ def _candidate_add_task_coverage(
         )
         updated.append(repaired)
     return updated
+
+
+REQ003_COMPARISON_DELIVERABLE_REPAIR_CODES = {
+    "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+    "comparison_deliverable_missing_required_fields",
+}
+REQ003_PRIORITIZED_REMEDIATION_REPAIR_CODES = {
+    "REQ_003_PRIORITIZED_REMEDIATION_MISSING",
+    "prioritized_remediation_missing",
+}
+
+
+def _materialize_candidate_req003_comparison_deliverable(
+    candidate: Mapping[str, Any],
+    *,
+    raw_request: Mapping[str, Any],
+    original_question: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        return normalized, []
+
+    repair_codes = _semantic_repair_failure_codes_from_request(raw_request)
+    reviewer_requested_schema = bool(
+        repair_codes & REQ003_COMPARISON_DELIVERABLE_REPAIR_CODES
+    )
+    prioritized_requested_by_reviewer = bool(
+        repair_codes & REQ003_PRIORITIZED_REMEDIATION_REPAIR_CODES
+    )
+    requirements = [
+        requirement
+        for requirement in _list(normalized.get("requirement_coverage_map"))
+        if isinstance(requirement, Mapping)
+    ]
+    comparison_requirements = [
+        requirement
+        for requirement in requirements
+        if requirement.get("non_negotiable") is True
+        and _candidate_requirement_is_req003_comparison(requirement)
+    ]
+    if not comparison_requirements and not reviewer_requested_schema:
+        return normalized, []
+
+    task_records = [
+        task for task in raw_tasks if isinstance(task, Mapping)
+    ]
+    if not task_records:
+        return normalized, []
+
+    remediation_required = prioritized_requested_by_reviewer or any(
+        _candidate_requirement_needs_prioritized_remediation(requirement)
+        for requirement in comparison_requirements
+    )
+    if reviewer_requested_schema:
+        if any(
+            _candidate_has_req003_comparison_field_schema_task(task)
+            for task in task_records
+        ) and (
+            not remediation_required
+            or _candidate_has_prioritized_remediation_task(tasks=task_records)
+        ):
+            return normalized, []
+    elif comparison_requirements and all(
+        _candidate_has_comparison_deliverable_task(
+            tasks=task_records,
+            requirement=requirement,
+        )
+        for requirement in comparison_requirements
+    ):
+        return normalized, []
+
+    text_only_contract = (
+        _normalized_visual_preference(raw_request.get("visual_preference"))
+        == "text_only"
+    )
+    angles_by_id = {
+        str(angle.get("angle_id") or ""): angle
+        for angle in _list(normalized.get("angles"))
+        if isinstance(angle, Mapping)
+    }
+    selected_index = _candidate_req003_comparison_task_index(
+        tasks=raw_tasks,
+        requirements=comparison_requirements,
+        angles_by_id=angles_by_id,
+        original_question=original_question,
+    )
+    appended = False
+    if selected_index is None and len(task_records) < _candidate_task_count_ceiling(normalized):
+        appended_task = _candidate_req003_append_comparison_task(
+            candidate=normalized,
+            requirements=comparison_requirements,
+            angles_by_id=angles_by_id,
+            text_only_contract=text_only_contract,
+            prioritized_remediation=remediation_required,
+        )
+        if appended_task:
+            raw_tasks = [*raw_tasks, appended_task]
+            selected_index = len(raw_tasks) - 1
+            appended = True
+    if selected_index is None or not isinstance(raw_tasks[selected_index], Mapping):
+        return normalized, []
+
+    original_task = dict(raw_tasks[selected_index])
+    task_angle = angles_by_id.get(str(original_task.get("angle_id") or ""), {})
+    repaired_task = _candidate_req003_repaired_comparison_task(
+        task=original_task,
+        angle=task_angle,
+        requirements=comparison_requirements,
+        original_question=original_question,
+        text_only_contract=text_only_contract,
+        prioritized_remediation=remediation_required,
+    )
+    updated_tasks = list(raw_tasks)
+    updated_tasks[selected_index] = repaired_task
+    normalized["bounded_tasks"] = updated_tasks
+    task_id = str(repaired_task.get("task_id") or "")
+    if task_id and comparison_requirements:
+        normalized["requirement_coverage_map"] = (
+            _candidate_add_task_coverage_for_requirement_ids(
+                normalized.get("requirement_coverage_map"),
+                requirement_ids=[
+                    str(requirement.get("requirement_id") or "")
+                    for requirement in comparison_requirements
+                ],
+                added_task_ids=[task_id],
+            )
+        )
+    normalized["constraints"] = _candidate_append_req003_comparison_constraint(
+        normalized.get("constraints"),
+        task_id=task_id,
+        reviewer_requested_schema=reviewer_requested_schema,
+        prioritized_remediation=remediation_required,
+    )
+    normalized["decomposition_strategy"] = (
+        str(normalized.get("decomposition_strategy") or "").rstrip()
+        + " Req_003 comparison/output-shape repair materialized an explicit "
+        "bounded side-by-side comparison deliverable with status, evidence, "
+        "caveat, and remediation fields."
+    ).strip()
+    return normalized, [
+        {
+            "field": "bounded_tasks",
+            "materialization": "materialized_req003_comparison_deliverable",
+            "repair_source": (
+                "semantic_reviewer_blocker"
+                if reviewer_requested_schema
+                else "candidate_requirement_validation"
+            ),
+            "task_id": task_id,
+            "task_action": "appended" if appended else "strengthened",
+            "angle_id": repaired_task.get("angle_id"),
+            "requirement_ids": [
+                str(requirement.get("requirement_id") or "")
+                for requirement in comparison_requirements
+            ],
+            "reviewer_failure_codes": sorted(
+                repair_codes & REQ003_COMPARISON_DELIVERABLE_REPAIR_CODES
+            ),
+            "prioritized_remediation": remediation_required,
+            "route": repaired_task.get("route"),
+            "max_images": repaired_task.get("max_images"),
+        }
+    ]
+
+
+def _semantic_repair_failure_codes_from_request(
+    raw_request: Mapping[str, Any],
+) -> set[str]:
+    codes: list[str] = []
+    for field_name in (
+        "previous_semantic_review_failure_codes",
+        "previous_candidate_validation_failure_codes",
+    ):
+        codes.extend(_string_list(raw_request.get(field_name)))
+    repair_inputs = raw_request.get("semantic_convergence_repair_inputs")
+    if isinstance(repair_inputs, Mapping):
+        codes.extend(_string_list(repair_inputs.get("reviewer_failure_codes")))
+        codes.extend(_string_list(repair_inputs.get("deterministic_failure_codes")))
+        for blocker in _list(repair_inputs.get("reviewer_blockers")):
+            if isinstance(blocker, Mapping) and blocker.get("code"):
+                codes.append(str(blocker["code"]))
+    return {code for code in codes if code}
+
+
+def _candidate_req003_comparison_task_index(
+    *,
+    tasks: Sequence[Any],
+    requirements: Sequence[Mapping[str, Any]],
+    angles_by_id: Mapping[str, Mapping[str, Any]],
+    original_question: str,
+) -> int | None:
+    covered_task_ids = {
+        task_id
+        for requirement in requirements
+        for task_id in _string_list(requirement.get("covered_by_task_ids"))
+    }
+
+    def task_score(index: int, task: Mapping[str, Any]) -> tuple[int, int, int, int]:
+        text = _candidate_task_deliverable_text(task)
+        task_id = str(task.get("task_id") or "")
+        if _candidate_query_is_original_plus_schema(
+            str(task.get("query") or ""),
+            original_question=original_question,
+        ):
+            return 0, 0, 0, -index
+        angle = angles_by_id.get(str(task.get("angle_id") or ""), {})
+        angle_score = _candidate_req003_comparison_angle_score(angle)
+        task_comparison_score = _candidate_req003_comparison_task_score(text)
+        score = 0
+        if task_comparison_score <= 0:
+            return 0, 0, 0, -index
+        if str(task.get("route") or "text_only") != "text_only":
+            return 0, 0, 0, -index
+        score += angle_score * 100
+        score += task_comparison_score * 10
+        if task_id in covered_task_ids:
+            score += 25
+        if _contains_any(text, ("official", "regulation", "standard", "guidance")):
+            score += 10
+        if _contains_any(text, ("write", "build", "작성", "작성하라", "통합")):
+            score += 25
+        if _contains_any(text, ("review", "검토")):
+            score -= 25
+        if str(task.get("evidence_need") or "") in {"comparative_analysis", "synthesis"}:
+            score += 5
+        return score, angle_score, task_comparison_score, index
+
+    scored = [
+        (task_score(index, task), index)
+        for index, task in enumerate(tasks)
+        if isinstance(task, Mapping)
+        and str(task.get("route") or "text_only") == "text_only"
+    ]
+    if not scored:
+        return None
+    best_score, best_index = max(scored, key=lambda item: item[0])
+    return best_index if best_score[0] > 0 else None
+
+
+REQ003_COMPARISON_ANGLE_TERMS = (
+    "comparison",
+    "compare",
+    "compliance",
+    "synthesis",
+    "matrix",
+    "table",
+    "side-by-side",
+    "side by side",
+    "deliverable",
+    "대조",
+    "비교",
+    "준수",
+    "통합",
+    "종합",
+    "표",
+)
+REQ003_SOURCE_ONLY_ANGLE_TERMS = (
+    "official_primary_documents",
+    "official source",
+    "official-source",
+    "primary source",
+    "source baseline",
+    "source collection",
+    "regulation source",
+    "공식 표시 규정의 법적 기준",
+    "공식 자료",
+    "법적 기준",
+    "1차 자료",
+)
+REQ003_COMPARISON_TASK_TERMS = (
+    "side-by-side",
+    "side by side",
+    "comparison table",
+    "comparison matrix",
+    "comparison deliverable",
+    "comparison row",
+    "matrix",
+    "table",
+    "compare",
+    "comparison",
+    "cross-check",
+    "synthesis",
+    "compliance",
+    "대조표",
+    "대조",
+    "비교표",
+    "비교",
+    "좌우",
+    "준수",
+    "통합",
+    "판정",
+)
+
+
+def _candidate_req003_comparison_angle_score(angle: Mapping[str, Any]) -> int:
+    if not isinstance(angle, Mapping):
+        return 0
+    text = json.dumps(
+        [
+            angle.get("evidence_need"),
+            angle.get("title"),
+            angle.get("research_question"),
+            angle.get("expected_artifacts"),
+            angle.get("success_criteria"),
+            angle.get("report_section"),
+        ],
+        ensure_ascii=False,
+    ).lower()
+    score = 0
+    if _contains_any(text, REQ003_COMPARISON_ANGLE_TERMS):
+        score += 3
+    if _contains_any(text, ("structured_compliance_comparison", "comparative_analysis")):
+        score += 3
+    if _contains_any(text, ("synthesis", "final", "최종", "종합", "통합")):
+        score += 2
+    if _contains_any(text, REQ003_SOURCE_ONLY_ANGLE_TERMS) and not _contains_any(
+        text,
+        ("comparison", "compare", "대조", "비교", "준수", "통합"),
+    ):
+        score -= 4
+    return max(0, score)
+
+
+def _candidate_req003_comparison_task_score(text: str) -> int:
+    if not _contains_any(text, REQ003_COMPARISON_TASK_TERMS):
+        return 0
+    score = 0
+    score += 3
+    if _contains_any(text, ("requirement", "criterion", "standard", "official", "regulation", "요구사항", "기준", "규정")):
+        score += 1
+    if _contains_any(text, ("observed", "observation", "image observation", "관찰값", "이미지 판독", "각 이미지")):
+        score += 1
+    if _contains_any(text, ("caveat", "unknown", "remediation", "개선", "주의사항", "확인불가")):
+        score += 1
+    return score
+
+
+def _candidate_task_count_ceiling(candidate: Mapping[str, Any]) -> int:
+    return 40 if str(candidate.get("question_scope") or "") == "broad" else 12
+
+
+def _candidate_req003_append_comparison_task(
+    *,
+    candidate: Mapping[str, Any],
+    requirements: Sequence[Mapping[str, Any]],
+    angles_by_id: Mapping[str, Mapping[str, Any]],
+    text_only_contract: bool,
+    prioritized_remediation: bool,
+) -> dict[str, Any] | None:
+    angle = _candidate_req003_append_target_angle(angles_by_id)
+    if not angle:
+        return None
+    angle_id = str(angle.get("angle_id") or "")
+    existing_task_ids = {
+        str(task.get("task_id") or "")
+        for task in _list(candidate.get("bounded_tasks"))
+        if isinstance(task, Mapping) and str(task.get("task_id") or "")
+    }
+    base_task = next(
+        (
+            task
+            for task in _list(candidate.get("bounded_tasks"))
+            if isinstance(task, Mapping)
+            and str(task.get("angle_id") or "") == angle_id
+            and str(task.get("route") or "text_only") == "text_only"
+        ),
+        {},
+    )
+    source_policy = (
+        dict(base_task.get("source_policy"))
+        if isinstance(base_task, Mapping)
+        and isinstance(base_task.get("source_policy"), Mapping)
+        else {"decision": "allowed", "flags": []}
+    )
+    task = {
+        "task_id": _candidate_next_task_id(existing_task_ids),
+        "angle_id": angle_id,
+        "query": str(angle.get("research_question") or angle.get("title") or "").strip(),
+        "route": "text_only",
+        "freshness_requirement": (
+            str(base_task.get("freshness_requirement") or "any")
+            if isinstance(base_task, Mapping)
+            else "any"
+        ),
+        "source_policy": source_policy,
+        "expected_source_types": _string_list(base_task.get("expected_source_types"))
+        if isinstance(base_task, Mapping)
+        else _string_list(angle.get("expected_source_types")),
+        "expected_visual_targets": [],
+        "expected_artifacts": _string_list(angle.get("expected_artifacts")),
+        "success_criteria": _string_list(angle.get("success_criteria")),
+        "max_results": base_task.get("max_results", 8)
+        if isinstance(base_task, Mapping)
+        else 8,
+        "max_sources": _semantic_task_source_cap_int(
+            base_task.get("max_sources") if isinstance(base_task, Mapping) else None
+        )
+        or 3,
+        "max_images": 0,
+        "done_condition": "",
+    }
+    return _candidate_req003_repaired_comparison_task(
+        task=task,
+        angle=angle,
+        requirements=requirements,
+        original_question="",
+        text_only_contract=text_only_contract,
+        prioritized_remediation=prioritized_remediation,
+    )
+
+
+def _candidate_req003_append_target_angle(
+    angles_by_id: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    scored = [
+        (_candidate_req003_comparison_angle_score(angle), str(angle_id), angle)
+        for angle_id, angle in angles_by_id.items()
+        if isinstance(angle, Mapping)
+        and str(angle.get("route") or "text_only") == "text_only"
+    ]
+    if not scored:
+        return {}
+    score, _angle_id, angle = max(scored, key=lambda item: (item[0], item[1]))
+    return angle if score > 0 else {}
+
+
+def _candidate_req003_repaired_comparison_task(
+    *,
+    task: Mapping[str, Any],
+    angle: Mapping[str, Any],
+    requirements: Sequence[Mapping[str, Any]],
+    original_question: str,
+    text_only_contract: bool,
+    prioritized_remediation: bool,
+) -> dict[str, Any]:
+    repaired = dict(task)
+    repaired["route"] = "text_only"
+    repaired["expected_visual_targets"] = []
+    repaired["max_images"] = 0
+    original_query = str(task.get("query") or "").strip()
+    query_base = _candidate_req003_aligned_query_base(
+        task=task,
+        angle=angle,
+        original_question=original_question,
+        requirements=requirements,
+        text_only_contract=text_only_contract,
+    )
+    expected_evidence = [
+        value
+        for value in _string_list(repaired.get("expected_evidence"))
+        if value not in VISUAL_EXPECTED_EVIDENCE
+    ]
+    if expected_evidence:
+        repaired["expected_evidence"] = expected_evidence
+    elif "expected_evidence" in repaired:
+        repaired.pop("expected_evidence", None)
+    repaired["query"] = _candidate_req003_repaired_query(
+        query_base,
+        korean=bool(re.search(r"[\uac00-\ud7a3]", original_query or query_base)),
+    )
+    source_policy = (
+        dict(repaired.get("source_policy"))
+        if isinstance(repaired.get("source_policy"), Mapping)
+        else {"decision": "allowed", "flags": []}
+    )
+    source_policy.setdefault("decision", "allowed")
+    quality = _ordered_unique(
+        [
+            *_string_list(source_policy.get("quality_requirements")),
+            "official",
+            "primary",
+            "source-backed",
+        ]
+    )
+    source_policy["quality_requirements"] = quality
+    if _contains_any(
+        _candidate_req003_requirement_text(requirements).lower(),
+        ("official", "regulation", "regulatory", "standard", "guidance", "rule"),
+    ):
+        source_policy["requires_official_or_primary"] = True
+    repaired["source_policy"] = source_policy
+    source_types = _ordered_unique(
+        [
+            *_candidate_req003_sanitize_text_only_values(
+                _string_list(repaired.get("expected_source_types")),
+                text_only_contract=text_only_contract,
+            ),
+            "official regulations or standards",
+            "primary source evidence",
+        ]
+    )
+    repaired["expected_source_types"] = source_types
+    repaired["expected_artifacts"] = _ordered_unique(
+        [
+            *_candidate_req003_sanitize_text_only_values(
+                _string_list(repaired.get("expected_artifacts")),
+                text_only_contract=text_only_contract,
+            ),
+            "bounded side-by-side comparison deliverable",
+            "comparison row schema: compared item, official standard, status, evidence, caveat, remediation",
+        ]
+    )
+    remediation_text = (
+        "Rank remediation recommendations by severity, impact, evidence confidence, and next action."
+        if prioritized_remediation
+        else "Include a remediation or next-action field for each mismatch, gap, or unverifiable row."
+    )
+    repaired["success_criteria"] = _ordered_unique(
+        [
+            *_candidate_req003_sanitize_text_only_values(
+                _string_list(repaired.get("success_criteria")),
+                text_only_contract=text_only_contract,
+            ),
+            (
+                "The side-by-side comparison has fields for compared item or "
+                "requirement, source item or label/artifact, official standard "
+                "or regulation, status (match, partial, mismatch, unverifiable), "
+                "evidence citation, caveat or unknown, and remediation or next action."
+            ),
+            "Every status judgment is tied to source-backed evidence and an explicit caveat when evidence is incomplete.",
+            remediation_text,
+        ]
+    )
+    repaired["done_condition"] = (
+        "Stop when the bounded side-by-side comparison deliverable has one row "
+        "per compared requirement or criterion, with status, evidence, caveat, "
+        "and remediation fields completed or marked unverifiable."
+    )
+    current_max_sources = _semantic_task_source_cap_int(repaired.get("max_sources"))
+    required_sources, _source_reasons, _source_counts = (
+        _candidate_task_required_source_count(repaired)
+    )
+    repaired["max_sources"] = max(
+        SEMANTIC_TASK_MIN_SOURCES,
+        min(
+            SEMANTIC_TASK_MAX_SOURCES,
+            max(current_max_sources or 0, required_sources),
+        ),
+    )
+    return repaired
+
+
+def _candidate_req003_subject_phrase(
+    *,
+    original_question: str,
+    requirements: Sequence[Mapping[str, Any]],
+    text_only_contract: bool,
+) -> str:
+    if not text_only_contract or not question_mentions_visual_evidence(original_question):
+        return " ".join(original_question.split()) or "requested comparison"
+    for requirement in requirements:
+        for field_name in ("prompt_text", "requirement_text"):
+            value = str(requirement.get(field_name) or "")
+            if value and not question_mentions_visual_evidence(value):
+                return " ".join(value.split())
+    return "requested text and document comparison"
+
+
+def _candidate_req003_aligned_query_base(
+    *,
+    task: Mapping[str, Any],
+    angle: Mapping[str, Any],
+    original_question: str,
+    requirements: Sequence[Mapping[str, Any]],
+    text_only_contract: bool,
+) -> str:
+    original_query = " ".join(str(task.get("query") or "").split())
+    if original_query and not _candidate_query_is_original_plus_schema(
+        original_query,
+        original_question=original_question,
+    ):
+        return original_query
+    angle_query = " ".join(
+        str(angle.get("research_question") or angle.get("title") or "").split()
+    )
+    if angle_query:
+        return angle_query
+    return _candidate_req003_subject_phrase(
+        original_question=original_question,
+        requirements=requirements,
+        text_only_contract=text_only_contract,
+    )
+
+
+def _candidate_query_is_original_plus_schema(
+    query: str,
+    *,
+    original_question: str,
+) -> bool:
+    normalized_query = _normalize_text(query)
+    normalized_question = _normalize_text(original_question)
+    if not normalized_query or not normalized_question:
+        return False
+    if not normalized_query.startswith(normalized_question):
+        return False
+    suffix = normalized_query[len(normalized_question):].strip(" .,:;/-")
+    return bool(suffix) and _contains_any(
+        suffix,
+        (
+            "bounded",
+            "deliverable",
+            "schema",
+            "status",
+            "evidence",
+            "caveat",
+            "remediation",
+            "side-by-side",
+            "comparison",
+        ),
+    )
+
+
+def _candidate_req003_repaired_query(query_base: str, *, korean: bool) -> str:
+    base = " ".join(str(query_base or "").split()).rstrip(".")
+    if not base:
+        base = "Prepare the comparison angle rows"
+    if korean:
+        suffix = (
+            "행별 판정 상태, 근거, 주의사항, 개선 조치 열을 포함하라"
+        )
+    else:
+        suffix = (
+            "include row-level status, evidence, caveat, and remediation fields"
+        )
+    if _contains_any(base.lower(), ("status", "판정 상태")) and _contains_any(
+        base.lower(),
+        ("remediation", "개선 조치"),
+    ):
+        return base
+    separator = "하고 " if korean else " and "
+    return f"{base}{separator}{suffix}."
+
+
+def _candidate_req003_requirement_text(
+    requirements: Sequence[Mapping[str, Any]],
+) -> str:
+    return " ".join(
+        _candidate_requirement_text(requirement)
+        for requirement in requirements
+    )
+
+
+def _candidate_req003_sanitize_text_only_values(
+    values: Sequence[str],
+    *,
+    text_only_contract: bool,
+) -> list[str]:
+    if not text_only_contract:
+        return [str(value) for value in values if str(value).strip()]
+    sanitized: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if _text_only_visual_work_matches(text):
+            continue
+        if text.strip():
+            sanitized.append(text)
+    return sanitized
+
+
+def _candidate_add_task_coverage_for_requirement_ids(
+    raw_coverage: Any,
+    *,
+    requirement_ids: Sequence[str],
+    added_task_ids: Sequence[str],
+) -> Any:
+    if not isinstance(raw_coverage, list):
+        return raw_coverage
+    requirement_id_set = {str(item) for item in requirement_ids if str(item)}
+    updated: list[Any] = []
+    for requirement in raw_coverage:
+        if not isinstance(requirement, Mapping):
+            updated.append(requirement)
+            continue
+        if str(requirement.get("requirement_id") or "") not in requirement_id_set:
+            updated.append(requirement)
+            continue
+        repaired = dict(requirement)
+        repaired["covered_by_task_ids"] = _ordered_unique(
+            [
+                *_string_list(requirement.get("covered_by_task_ids")),
+                *[str(task_id) for task_id in added_task_ids],
+            ]
+        )
+        repaired["coverage_status"] = "covered"
+        updated.append(repaired)
+    return updated
+
+
+def _candidate_append_req003_comparison_constraint(
+    raw_constraints: Any,
+    *,
+    task_id: str,
+    reviewer_requested_schema: bool,
+    prioritized_remediation: bool,
+) -> Any:
+    if not isinstance(raw_constraints, list):
+        return raw_constraints
+    reason = (
+        "reviewer-blocker repair"
+        if reviewer_requested_schema
+        else "candidate-validation repair"
+    )
+    remediation = (
+        "prioritized remediation recommendations are required"
+        if prioritized_remediation
+        else "row-level remediation or next action is required"
+    )
+    return [
+        *raw_constraints,
+        (
+            f"Req_003 comparison/output-shape {reason}: bounded task {task_id} "
+            "is authoritative for the side-by-side comparison deliverable schema. "
+            "Rows must include compared item, official standard, status, evidence, "
+            f"caveat, and remediation fields; {remediation}."
+        ),
+    ]
 
 
 def _materialize_candidate_source_cap_constraints(
@@ -7720,8 +8451,6 @@ def _candidate_requirement_is_req003_comparison(
         "comparison_table",
     }:
         return True
-    if requirement_type == "analysis_comparison_output_shape":
-        return True
     output_shape_text = " ".join(
         _string_list(requirement.get("output_shape_constraints"))
     ).lower()
@@ -7729,15 +8458,46 @@ def _candidate_requirement_is_req003_comparison(
         output_shape_text,
         (
             "side-by-side",
+            "side by side",
             "comparison table",
             "comparison matrix",
+            "comparison deliverable",
             "matrix",
             "requirements matrix",
             "\uc694\uad6c\uc0ac\ud56d\ubcc4 \ube44\uad50",
             "\ube44\uad50\ud45c",
             "\ube44\uad50 \ub9e4\ud2b8\ub9ad\uc2a4",
             "\ub300\uc751\ud45c",
+            "\uc88c\uc6b0 \ub300\uc870",
+            "\uc88c\uc6b0 \ub300\uc870\ud45c",
+            "\ub300\uc870\ud45c",
         ),
+    ):
+        return True
+    if requirement_id == "req_003" and _contains_any(
+        text,
+        (
+            "status",
+            "match",
+            "partial",
+            "mismatch",
+            "unverifiable",
+            "compliance",
+            "evidence",
+            "caveat",
+            "remediation",
+            "next action",
+            "\uc0c1\ud0dc",
+            "\uc77c\uce58",
+            "\ubd80\ubd84",
+            "\ubd88\uc77c\uce58",
+            "\ud310\ub2e8 \ubd88\uac00",
+            "\uc900\uc218",
+            "\ucda9\uc871\ub3c4",
+        ),
+    ) and _contains_any(
+        text,
+        ("compare", "comparison", "\ube44\uad50", "\ub300\uc870", "\uc88c\uc6b0"),
     ):
         return True
     if not _contains_any(text, ("compare", "comparison", "\ube44\uad50")):
@@ -7746,15 +8506,23 @@ def _candidate_requirement_is_req003_comparison(
         text,
         (
             "side-by-side",
+            "side by side",
             "matrix",
             "table",
             "\ub300\uc751\ud45c",
             "\ube44\uad50\ud45c",
+            "\uc88c\uc6b0",
+            "\ub300\uc870\ud45c",
+            "\ub300\uc870",
             "\ucda9\uc871\ub3c4",
+            "\uc0c1\ud0dc",
             "\uc77c\uce58",
             "\ubd88\uc77c\uce58",
             "\ud310\ub2e8 \ubd88\uac00",
             "\uaca9\ucc28",
+            "\uc99d\uac70",
+            "\uc8fc\uc758\uc0ac\ud56d",
+            "\uac1c\uc120",
             "\ubcf4\uc644 \uc870\uce58",
         ),
     )
@@ -7780,8 +8548,11 @@ def _candidate_has_comparison_deliverable_task(
             text,
             (
                 "side-by-side",
+                "side by side",
                 "comparison table",
                 "comparison matrix",
+                "comparison deliverable",
+                "comparison row schema",
                 "matrix",
                 "table",
                 "\ub300\uc751\ud45c",
@@ -7800,6 +8571,16 @@ def _candidate_has_comparison_deliverable_task(
                 "compared item",
                 "policy",
                 "guidance",
+                "regulation",
+                "rule",
+                "display",
+                "disclosure",
+                "label",
+                "labeling",
+                "allergen",
+                "marking",
+                "notice",
+                "signage",
                 "pictogram",
                 "visual message",
                 "behavior guidance",
@@ -7813,6 +8594,12 @@ def _candidate_has_comparison_deliverable_task(
                 "\uae30\uc900",
                 "\ud56d\ubaa9",
                 "\uaddc\uc815",
+                "\uaddc\uce59",
+                "\ud45c\uc2dc",
+                "\ub77c\ubca8",
+                "\uc54c\ub808\ub974\uae30",
+                "\uace0\uc9c0",
+                "\uacf5\uc9c0",
                 "\uc9c0\uce68",
                 "\ud53d\ud1a0\uadf8\ub7a8",
                 "\uc2dc\uac01 \uba54\uc2dc\uc9c0",
@@ -7825,8 +8612,9 @@ def _candidate_has_comparison_deliverable_task(
             ),
         ):
             continue
+        has_reviewer_schema = _candidate_has_req003_comparison_field_schema_task(task)
         if strict_status_fields:
-            if not all(_contains_any(text, group) for group in status_groups):
+            if not all(_contains_any(text, group) for group in status_groups) and not has_reviewer_schema:
                 continue
         elif not _contains_any(
             text,
@@ -7846,12 +8634,88 @@ def _candidate_has_comparison_deliverable_task(
                 "\ub204\ub77d",
                 "\ubaa8\ud638",
             ),
-        ):
+        ) and not has_reviewer_schema:
             continue
         if not _contains_any(text, ("evidence", "citation", "source", "\uadfc\uac70", "\uc778\uc6a9")):
             continue
         return True
     return False
+
+
+def _candidate_has_req003_comparison_field_schema_task(
+    task: Mapping[str, Any],
+) -> bool:
+    text = _candidate_task_deliverable_text(task)
+    if not _contains_any(
+        text,
+        (
+            "side-by-side",
+            "side by side",
+            "comparison table",
+            "comparison matrix",
+            "comparison deliverable",
+            "comparison row schema",
+            "matrix",
+            "table",
+            "\ub300\uc751\ud45c",
+            "\ube44\uad50\ud45c",
+            "\ub9e4\ud2b8\ub9ad\uc2a4",
+        ),
+    ):
+        return False
+    required_field_groups = (
+        (
+            "status",
+            "match",
+            "partial",
+            "mismatch",
+            "unverifiable",
+            "judgment",
+            "compliance",
+            "\uc0c1\ud0dc",
+            "\ud310\uc815",
+            "\uc77c\uce58",
+            "\ubd80\ubd84",
+            "\ubd88\uc77c\uce58",
+            "\ud655\uc778 \ubd88\uac00",
+        ),
+        (
+            "evidence",
+            "citation",
+            "source",
+            "source-backed",
+            "\uadfc\uac70",
+            "\uc778\uc6a9",
+            "\ucd9c\ucc98",
+        ),
+        (
+            "caveat",
+            "unknown",
+            "limitation",
+            "uncertainty",
+            "exception",
+            "condition",
+            "\ud55c\uacc4",
+            "\ubbf8\ud655\uc778",
+            "\uc608\uc678",
+            "\uc870\uac74",
+        ),
+        (
+            "remediation",
+            "next action",
+            "recommendation",
+            "fix",
+            "correction",
+            "follow-up",
+            "improvement",
+            "\ubcf4\uc644",
+            "\uac1c\uc120",
+            "\uc870\uce58",
+            "\uad8c\uace0",
+            "\uc2dc\uc815",
+        ),
+    )
+    return all(_contains_any(text, group) for group in required_field_groups)
 
 
 def _candidate_requirement_needs_compliance_status_fields(
