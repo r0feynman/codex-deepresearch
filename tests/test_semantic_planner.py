@@ -2962,6 +2962,50 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertNotIn("text_only_visual_preference_violation", failure_codes)
 
+    def test_visual_preferences_reject_all_text_candidate_before_review(self) -> None:
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
+
+        for preference in ("visual_required", "visual_optional"):
+            with self.subTest(preference=preference):
+                candidate = self.text_only_oauth_candidate(question=question)
+                validation = validate_semantic_candidate_plan(
+                    original_question=question,
+                    plan=candidate,
+                    visual_preference=preference,
+                )
+
+                self.assertFalse(validation["ok"], validation)
+                failure_codes = {failure["code"] for failure in validation["failures"]}
+                self.assertIn("visual_requirement_missing_visual_route", failure_codes)
+                self.assertIn("visual_question_all_text_only", failure_codes)
+
+    def test_prepare_visual_optional_blocks_adapter_that_drops_visual_routes(self) -> None:
+        question = "Compare OAuth device-flow provider behavior across official implementation documentation."
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "1"},
+        ):
+            result, adapter_request = self.prepare_with_codex_adapter(
+                question,
+                route="visual_optional",
+                requirement_types=("subject", "source_quality"),
+                visual_angle_indexes=(),
+            )
+
+        self.assert_invalid_adapter_response_blocked(
+            result,
+            expected_failure_codes={
+                "visual_requirement_missing_visual_route",
+                "visual_question_all_text_only",
+            },
+        )
+        self.assertEqual(adapter_request["visual_preference"], "visual_optional")
+        run_dir = Path(result["run_dir"])
+        self.assertFalse(
+            (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
+        )
+
     def test_default_codex_semantic_adapter_commands_use_schemas_when_env_absent(self) -> None:
         question = "Research lunar habitat material tests using official images and source records"
         result, adapter_request = self.prepare_with_codex_adapter(
@@ -4870,6 +4914,89 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertEqual(adapter_request["retry_attempt"], 3)
 
+    def test_convergence_records_inner_candidate_validation_retry_attempts(self) -> None:
+        question = "Compare official public health poster images for handwashing guidance"
+        attempts = {"count": 0}
+
+        def first_two_responses_underallocate_one_broad_angle(response: dict) -> dict:
+            attempts["count"] += 1
+            response = json.loads(json.dumps(response))
+            if attempts["count"] > 2:
+                return response
+            candidate = response["candidate_plan"]
+            underallocated_angle_id = "angle_006"
+            seen_underallocated_angle_task = False
+            kept_tasks = []
+            for task in candidate["bounded_tasks"]:
+                if task.get("angle_id") != underallocated_angle_id:
+                    kept_tasks.append(task)
+                    continue
+                if not seen_underallocated_angle_task:
+                    kept_tasks.append(task)
+                    seen_underallocated_angle_task = True
+            kept_task_ids = {task["task_id"] for task in kept_tasks}
+            candidate["bounded_tasks"] = kept_tasks
+            for requirement in candidate["requirement_coverage_map"]:
+                requirement["covered_by_task_ids"] = [
+                    task_id
+                    for task_id in requirement["covered_by_task_ids"]
+                    if task_id in kept_task_ids
+                ]
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=first_two_responses_underallocate_one_broad_angle,
+            angle_count=6,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+
+        self.assertEqual(result["status"], "awaiting_search_results")
+        self.assertEqual(len(adapter_request["_planner_requests"]), 3)
+        self.assertEqual(convergence["attempt_count"], 1)
+        outer_attempt = convergence["attempts"][0]
+        self.assertEqual(outer_attempt["adapter_candidate_attempt_count"], 3)
+        inner_attempts = outer_attempt["adapter_candidate_attempts"]
+        self.assertEqual([attempt["attempt"] for attempt in inner_attempts], [1, 2, 3])
+        required_fields = {
+            "attempt",
+            "candidate_id",
+            "candidate_hash",
+            "raw_response_hash",
+            "deterministic_ok",
+            "deterministic_failure_codes",
+            "deterministic_failures",
+            "repair_inputs",
+            "final_selection",
+            "terminal_failure",
+        }
+        for inner_attempt in inner_attempts:
+            self.assertTrue(required_fields.issubset(inner_attempt), inner_attempt)
+            self.assertEqual(len(inner_attempt["candidate_hash"]), 64)
+            self.assertEqual(
+                inner_attempt["candidate_id"],
+                inner_attempt["candidate_hash"][:16],
+            )
+        self.assertFalse(inner_attempts[0]["deterministic_ok"])
+        self.assertIn(
+            "broad_angle_has_too_few_tasks",
+            inner_attempts[0]["deterministic_failure_codes"],
+        )
+        self.assertEqual(
+            inner_attempts[0]["repair_inputs"]["retry_source"],
+            "adapter_candidate_validation",
+        )
+        self.assertEqual(inner_attempts[0]["repair_inputs"]["next_attempt"], 2)
+        self.assertFalse(inner_attempts[1]["deterministic_ok"])
+        self.assertEqual(inner_attempts[1]["repair_inputs"]["next_attempt"], 3)
+        self.assertTrue(inner_attempts[2]["deterministic_ok"])
+        self.assertTrue(inner_attempts[2]["final_selection"])
+        self.assertEqual(inner_attempts[2]["repair_inputs"], {})
+
     def test_codex_semantic_independence_qualifies_reused_item_ids_by_session(self) -> None:
         question = "Research coastal microgrid outage recovery using official source records"
         result, _adapter_request = self.prepare_with_codex_adapter(
@@ -6046,6 +6173,62 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn(
             "bounded_task_requirement_exceeds_max_images",
             {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_per_entity_visual_image_demands_count_against_max_images(self) -> None:
+        candidate = {
+            "bounded_tasks": [
+                {
+                    "task_id": "task_program_posters",
+                    "angle_id": "angle_visual",
+                    "query": (
+                        "Compare four public recycling programs and collect one "
+                        "representative poster image per program where available."
+                    ),
+                    "route": "visual_required",
+                    "freshness_requirement": "any",
+                    "source_policy": {"decision": "allowed", "flags": []},
+                    "expected_source_types": ["official municipal program page"],
+                    "expected_visual_targets": [
+                        "one representative poster image per program"
+                    ],
+                    "expected_artifacts": ["program poster evidence table"],
+                    "success_criteria": [
+                        "Cover four programs with provenance for each poster example.",
+                        "Every acquired image is linked to its program source.",
+                    ],
+                    "max_sources": 3,
+                    "max_images": 3,
+                    "done_condition": (
+                        "Done when one representative poster image per program is "
+                        "verified across four programs with source notes."
+                    ),
+                }
+            ]
+        }
+
+        repaired, materializations = _materialize_candidate_visual_image_cap_feasibility(
+            candidate
+        )
+        task_text = json.dumps(repaired["bounded_tasks"][0], ensure_ascii=False).lower()
+
+        self.assertFalse(materializations)
+        self.assertNotIn("four images", task_text)
+        validation = validate_semantic_candidate_plan(
+            original_question="Compare public recycling program poster examples.",
+            plan=repaired,
+        )
+        self.assertFalse(validation["ok"], validation)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "bounded_task_requirement_exceeds_max_images"
+        )
+        self.assertEqual(failure["required_count"], 4)
+        self.assertEqual(failure["max_images"], 3)
+        self.assertEqual(
+            failure["explicit_requirement_counts"]["image_per_program"],
+            4,
         )
 
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:

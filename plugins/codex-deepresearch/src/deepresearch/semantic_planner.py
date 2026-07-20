@@ -867,21 +867,47 @@ def codex_semantic_candidate_plan(
             )
             raw_response["candidate_validation"] = candidate_validation
             if candidate_validation.get("ok") is True:
+                raw_response["adapter_candidate_attempts"] = list(previous_attempts) + [
+                    _candidate_validation_attempt_record(
+                        attempt=attempt,
+                        validation=candidate_validation,
+                        raw_response=raw_response,
+                        candidate=candidate,
+                        final_selection=True,
+                    )
+                ]
                 break
             if attempt < max_attempts:
+                retry_request = _codex_semantic_retry_raw_request(
+                    raw_request=raw_request,
+                    attempt=attempt + 1,
+                    validation=candidate_validation,
+                )
                 previous_attempts.append(
                     _candidate_validation_retry_record(
                         attempt=attempt,
                         validation=candidate_validation,
                         raw_response=raw_response,
+                        candidate=candidate,
+                        retry_request=retry_request,
                     )
                 )
-                raw_request = _codex_semantic_retry_raw_request(
-                    raw_request=raw_request,
-                    attempt=attempt + 1,
-                    validation=candidate_validation,
-                )
+                raw_response["adapter_candidate_attempts"] = list(previous_attempts)
+                raw_request = retry_request
                 continue
+            raw_response["adapter_candidate_attempts"] = list(previous_attempts) + [
+                _candidate_validation_attempt_record(
+                    attempt=attempt,
+                    validation=candidate_validation,
+                    raw_response=raw_response,
+                    candidate=candidate,
+                    repair_inputs={
+                        "terminal_reason": "max_attempts_exhausted",
+                        "retry_source": "adapter_candidate_validation",
+                    },
+                    terminal_failure=True,
+                )
+            ]
             raise SemanticPlannerAdapterUnavailable(
                 _candidate_validation_blocked_reason(candidate_validation)
             )
@@ -2650,7 +2676,11 @@ def _candidate_task_required_source_count(
 
 def _candidate_task_required_image_count(task: Mapping[str, Any]) -> tuple[int, dict[str, int]]:
     counts = _candidate_task_explicit_requirement_counts(task)
-    required = int(counts.get("image") or 0)
+    per_entity_count, per_entity_details = _candidate_task_per_entity_image_requirement_count(
+        task
+    )
+    counts.update(per_entity_details)
+    required = max(int(counts.get("image") or 0), per_entity_count)
     return required, counts
 
 
@@ -2741,6 +2771,112 @@ def _candidate_task_explicit_requirement_counts(task: Mapping[str, Any]) -> dict
         kind: _max_explicit_requirement_count(text, kind=kind)
         for kind, text in text_by_kind.items()
     }
+
+
+def _candidate_task_per_entity_image_requirement_count(
+    task: Mapping[str, Any],
+) -> tuple[int, dict[str, int]]:
+    text = _candidate_task_requirement_count_text(task, "image")
+    lowered = str(text or "").lower()
+    if not lowered:
+        return 0, {}
+
+    image_nouns = (
+        "image",
+        "photo",
+        "screenshot",
+        "figure",
+        "diagram",
+        "chart",
+        "poster",
+        "visual example",
+    )
+    entity_nouns = (
+        ("program", "programs"),
+        ("vendor", "vendors"),
+        ("provider", "providers"),
+        ("product", "products"),
+        ("service", "services"),
+        ("jurisdiction", "jurisdictions"),
+        ("municipality", "municipalities"),
+        ("city", "cities"),
+        ("county", "counties"),
+        ("region", "regions"),
+        ("country", "countries"),
+        ("agency", "agencies"),
+        ("source", "sources"),
+        ("model", "models"),
+        ("case", "cases"),
+        ("location", "locations"),
+        ("site", "sites"),
+    )
+    count_pattern = (
+        r"(?P<count>(?:[1-9]\d*)|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|twenty)"
+    )
+    image_noun_pattern = "|".join(
+        re.escape(noun) for noun in sorted(image_nouns, key=len, reverse=True)
+    )
+    per_requirements: list[tuple[str, int]] = []
+    for singular, plural in entity_nouns:
+        per_entity_pattern = (
+            rf"(?:{count_pattern}\s+)?"
+            rf"(?:distinct\s+|different\s+|representative\s+|official\s+|primary\s+)?"
+            rf"(?:{image_noun_pattern})\b[\w\s-]{{0,80}}\bper\s+{re.escape(singular)}\b"
+        )
+        if not re.search(per_entity_pattern, lowered):
+            continue
+        per_match = re.search(per_entity_pattern, lowered)
+        per_image_count = 1
+        if per_match and per_match.groupdict().get("count"):
+            parsed = _semantic_count_word_to_int(per_match.group("count"))
+            if parsed is not None:
+                per_image_count = parsed
+        entity_count = _max_entity_count_for_image_per_entity_text(
+            lowered,
+            singular=singular,
+            plural=plural,
+        )
+        if entity_count <= 0:
+            continue
+        per_requirements.append((singular, per_image_count * entity_count))
+
+    if not per_requirements:
+        return 0, {}
+    dominant_entity, required_count = max(per_requirements, key=lambda item: item[1])
+    return required_count, {
+        "image_per_entity": required_count,
+        "image_per_entity_count": required_count,
+        f"image_per_{dominant_entity}": required_count,
+    }
+
+
+def _max_entity_count_for_image_per_entity_text(
+    text: str,
+    *,
+    singular: str,
+    plural: str,
+) -> int:
+    count_pattern = (
+        r"(?P<count>(?:[1-9]\d*)|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|twenty)"
+    )
+    patterns = (
+        rf"\b(?:across|from|cover(?:ing)?|include|including|for|among|between|sampled from)\s+"
+        rf"{count_pattern}\s+(?:distinct\s+|different\s+|sampled\s+)?{re.escape(plural)}\b",
+        rf"\b{count_pattern}\s+(?:distinct\s+|different\s+|sampled\s+)?{re.escape(plural)}\b",
+        rf"\b(?:each|every)\s+of\s+{count_pattern}\s+"
+        rf"(?:distinct\s+|different\s+|sampled\s+)?{re.escape(plural)}\b",
+    )
+    counts: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            parsed = _semantic_count_word_to_int(match.group("count"))
+            if parsed is not None:
+                counts.append(parsed)
+    if counts:
+        return max(counts)
+    return 0
 
 
 def _candidate_task_requirement_count_text(
@@ -3028,24 +3164,68 @@ def _candidate_validation_failure_codes(validation: Mapping[str, Any]) -> list[s
     ]
 
 
+def _candidate_validation_attempt_record(
+    *,
+    attempt: int,
+    validation: Mapping[str, Any],
+    raw_response: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    repair_inputs: Mapping[str, Any] | None = None,
+    final_selection: bool = False,
+    terminal_failure: bool = False,
+) -> dict[str, Any]:
+    failure_codes = _candidate_validation_failure_codes(validation)
+    candidate_hash = _sha256_payload(candidate)
+    return {
+        "attempt": attempt,
+        "candidate_id": candidate_hash[:16],
+        "candidate_hash": candidate_hash,
+        "raw_response_hash": _sha256_payload(raw_response),
+        "deterministic_ok": validation.get("ok"),
+        "deterministic_failure_codes": failure_codes,
+        "deterministic_failures": [
+            dict(failure)
+            for failure in _list(validation.get("failures"))[:8]
+            if isinstance(failure, Mapping)
+        ],
+        "repair_inputs": dict(repair_inputs or {}),
+        "final_selection": final_selection,
+        "terminal_failure": terminal_failure,
+        "candidate_validation_failure_codes": failure_codes,
+        "candidate_validation_failure_count": int(
+            validation.get("failure_count")
+            or len(failure_codes)
+        ),
+        "candidate_validation": dict(validation),
+    }
+
+
 def _candidate_validation_retry_record(
     *,
     attempt: int,
     validation: Mapping[str, Any],
     raw_response: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    retry_request: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "attempt": attempt,
-        "candidate_validation_failure_codes": _candidate_validation_failure_codes(
-            validation
-        ),
-        "candidate_validation_failure_count": int(
-            validation.get("failure_count")
-            or len(_candidate_validation_failure_codes(validation))
-        ),
-        "candidate_validation": dict(validation),
-        "raw_response_hash": _sha256_payload(raw_response),
+    repair_inputs = {
+        "retry_source": "adapter_candidate_validation",
+        "next_attempt": retry_request.get("retry_attempt"),
+        "retry_request_hash": retry_request.get("adapter_request_hash"),
+        "deterministic_failure_codes": _candidate_validation_failure_codes(validation),
+        "deterministic_failures": [
+            dict(failure)
+            for failure in _list(validation.get("failures"))[:8]
+            if isinstance(failure, Mapping)
+        ],
     }
+    return _candidate_validation_attempt_record(
+        attempt=attempt,
+        validation=validation,
+        raw_response=raw_response,
+        candidate=candidate,
+        repair_inputs=repair_inputs,
+    )
 
 
 def _codex_semantic_retry_raw_request(
@@ -3683,6 +3863,75 @@ def semantic_plan_candidate_validation(plan: SemanticPlan | Mapping[str, Any]) -
     return {}
 
 
+def semantic_plan_adapter_candidate_attempts(
+    plan: SemanticPlan | Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Extract structured adapter-level candidate attempts for convergence records."""
+
+    if isinstance(plan, SemanticPlan):
+        raw_response = plan.raw_response_payload
+        diagnostics = plan.diagnostics
+    else:
+        raw_response = dict(plan).get("raw_response_payload")
+        diagnostics = dict(plan).get("diagnostics")
+    payloads = (
+        raw_response,
+        raw_response.get("adapter_response") if isinstance(raw_response, Mapping) else None,
+        raw_response.get("diagnostics") if isinstance(raw_response, Mapping) else None,
+        diagnostics,
+    )
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        attempts = payload.get("adapter_candidate_attempts")
+        if not isinstance(attempts, list):
+            continue
+        normalized = [
+            _normalize_adapter_candidate_attempt_record(attempt)
+            for attempt in attempts
+            if isinstance(attempt, Mapping)
+        ]
+        if normalized:
+            return normalized
+    return []
+
+
+def _normalize_adapter_candidate_attempt_record(
+    attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate_hash = str(attempt.get("candidate_hash") or "")
+    candidate_id = str(attempt.get("candidate_id") or candidate_hash[:16])
+    deterministic_failures = attempt.get("deterministic_failures")
+    if not isinstance(deterministic_failures, list):
+        deterministic_failures = attempt.get("candidate_validation", {}).get(
+            "failures",
+            [],
+        ) if isinstance(attempt.get("candidate_validation"), Mapping) else []
+    failure_codes = attempt.get("deterministic_failure_codes")
+    if not isinstance(failure_codes, list):
+        failure_codes = attempt.get("candidate_validation_failure_codes", [])
+    return {
+        "attempt": attempt.get("attempt"),
+        "candidate_id": candidate_id,
+        "candidate_hash": candidate_hash,
+        "raw_response_hash": attempt.get("raw_response_hash"),
+        "deterministic_ok": attempt.get("deterministic_ok"),
+        "deterministic_failure_codes": [str(code) for code in _list(failure_codes)],
+        "deterministic_failures": [
+            dict(failure)
+            for failure in _list(deterministic_failures)
+            if isinstance(failure, Mapping)
+        ],
+        "repair_inputs": (
+            dict(attempt.get("repair_inputs"))
+            if isinstance(attempt.get("repair_inputs"), Mapping)
+            else {}
+        ),
+        "final_selection": bool(attempt.get("final_selection")),
+        "terminal_failure": bool(attempt.get("terminal_failure")),
+    }
+
+
 def semantic_review_failure_codes(review: Mapping[str, Any]) -> list[str]:
     codes: list[str] = []
     for blocker in _list(review.get("blockers")):
@@ -3741,6 +3990,7 @@ def semantic_convergence_attempt_record(
     candidate_hash = semantic_plan_candidate_hash(plan)
     deterministic = dict(deterministic_validation or {})
     review = dict(semantic_review or {})
+    adapter_candidate_attempts = semantic_plan_adapter_candidate_attempts(plan)
     return {
         "attempt": attempt,
         "candidate_id": candidate_hash[:16],
@@ -3772,6 +4022,8 @@ def semantic_convergence_attempt_record(
             for blocker in _list(review.get("blockers"))
             if isinstance(blocker, Mapping)
         ],
+        "adapter_candidate_attempt_count": len(adapter_candidate_attempts),
+        "adapter_candidate_attempts": adapter_candidate_attempts,
         "repair_inputs": dict(repair_inputs or {}),
         "final_selection": final_selection,
         "terminal_failure": terminal_failure,
@@ -6430,12 +6682,18 @@ def validate_semantic_candidate_plan(
                     "violation_count": len(text_only_violations),
                 }
             )
-    visual_required = request_visual_preference != "text_only" and (
-        any(
-            str(requirement.get("requirement_type") or "") == "visual_modality"
-            for requirement in requirements
+    visual_required = request_visual_preference in {
+        "visual_required",
+        "visual_optional",
+    } or (
+        request_visual_preference != "text_only"
+        and (
+            any(
+                str(requirement.get("requirement_type") or "") == "visual_modality"
+                for requirement in requirements
+            )
+            or question_mentions_visual_evidence(question)
         )
-        or question_mentions_visual_evidence(question)
     )
     if visual_required:
         visual_angles = [
