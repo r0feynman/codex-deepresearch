@@ -3598,6 +3598,91 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
         self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
 
+    def test_generic_analysis_comparison_type_does_not_force_comparison_table(self) -> None:
+        question = (
+            "Research testing requirements for drinking-water lead sampling, "
+            "distinguishing lab testing from school IT systems."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "requested analysis/comparison/output shape",
+            ),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        req_003 = candidate["requirement_coverage_map"][2]
+        req_003.update(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "requested analysis/comparison/output shape",
+                "requirement_text": (
+                    "Explicitly separate requirements for physical sampling and "
+                    "laboratory analysis from requirements or capabilities of school "
+                    "information-technology systems, and explain the boundary between them."
+                ),
+                "prompt_text": "distinguishing lab testing from school IT systems",
+                "expected_modalities": ["comparative textual analysis"],
+                "output_shape_constraints": [
+                    "Separate sections for sampling/laboratory testing and school IT systems",
+                    "Direct comparison of responsibilities, functions, and non-overlap",
+                    "Concise synthesis of where data transfer or recordkeeping connects the two domains",
+                ],
+            }
+        )
+        for index, angle in enumerate(candidate["angles"], start=1):
+            angle["route"] = "text_only"
+            angle["evidence_need"] = "official_source"
+            angle["title"] = f"Drinking-water lead sampling requirement angle {index}"
+            angle["research_question"] = (
+                "Which official lead sampling, laboratory testing, or school IT "
+                "system requirement does this angle establish?"
+            )
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = ["official requirement notes"]
+            angle["success_criteria"] = [
+                "Use official, regulatory, or primary text sources.",
+                "Keep laboratory testing and school IT system obligations separate.",
+            ]
+        for task in candidate["bounded_tasks"]:
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task["query"] = (
+                "drinking-water lead sampling laboratory testing school IT systems "
+                f"official requirements source-backed task {task['task_id']}"
+            )
+            task["expected_artifacts"] = ["official requirement notes"]
+            task["success_criteria"] = [
+                "Use official, regulatory, or primary text sources.",
+                "Distinguish laboratory testing obligations from school IT system obligations.",
+            ]
+            task["done_condition"] = (
+                "Stop when source-backed requirements, boundaries, caveats, and "
+                "unknown jurisdiction limits are recorded."
+            )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+        self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
+
     def test_semantic_planner_source_has_no_sem_reg_004_special_case(self) -> None:
         source = (
             ROOT

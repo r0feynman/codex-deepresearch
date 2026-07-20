@@ -6660,7 +6660,7 @@ def _candidate_requirement_is_req003_comparison(
     requirement_id = str(requirement.get("requirement_id") or "").lower()
     requirement_type = str(requirement.get("requirement_type") or "").lower()
     text = _candidate_requirement_text(requirement).lower()
-    if requirement_id != "req_003" and "comparison" not in requirement_type:
+    if requirement_id != "req_003" and requirement_type != "analysis_comparison_output_shape":
         return False
     normalized_modalities = {
         _normalize_text(item).replace(" ", "_")
@@ -6672,7 +6672,7 @@ def _candidate_requirement_is_req003_comparison(
         "comparison_table",
     }:
         return True
-    if "comparison" in requirement_type:
+    if requirement_type == "analysis_comparison_output_shape":
         return True
     output_shape_text = " ".join(
         _string_list(requirement.get("output_shape_constraints"))
