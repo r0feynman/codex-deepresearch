@@ -1443,8 +1443,36 @@ def _materialize_candidate_source_cap_splits(
         if split_count <= 1:
             normalized_tasks.append(dict(task))
             continue
-        if mapping_task_count + split_count - 1 > 40:
+        projected_task_count = mapping_task_count + split_count - 1
+        if projected_task_count > 40:
             normalized_tasks.append(dict(task))
+            materializations.append(
+                {
+                    "field": "bounded_tasks",
+                    "materialization": "source_cap_split_blocked_task_ceiling",
+                    "repair_status": "blocked",
+                    "blocked_feasibility_code": (
+                        "bounded_task_requirement_exceeds_max_sources"
+                    ),
+                    "original_task_id": str(
+                        task.get("task_id") or f"task_{index:03d}"
+                    ),
+                    "original_task_index": index,
+                    "required_count": required_sources,
+                    "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
+                    "required_split_task_count": split_count,
+                    "current_task_count": mapping_task_count,
+                    "projected_task_count": projected_task_count,
+                    "max_task_count": 40,
+                    "requirement_kind": _dominant_cap_requirement_kind(
+                        source_counts,
+                        fallback="source",
+                        source_reasons=source_reasons,
+                    ),
+                    "explicit_requirement_counts": source_counts,
+                    "source_cap_reasons": source_reasons,
+                }
+            )
             continue
 
         original_task_id = str(task.get("task_id") or f"task_{index:03d}")
@@ -1488,7 +1516,7 @@ def _materialize_candidate_source_cap_splits(
 
     if not split_replacements:
         normalized["bounded_tasks"] = normalized_tasks
-        return normalized, []
+        return normalized, materializations
 
     normalized["bounded_tasks"] = normalized_tasks
     normalized["requirement_coverage_map"] = _candidate_rewrite_split_task_coverage(
@@ -1700,13 +1728,18 @@ def _candidate_append_source_split_constraint(
 ) -> Any:
     if not isinstance(raw_constraints, list):
         return raw_constraints
+    split_materializations = [
+        materialization
+        for materialization in materializations
+        if materialization.get("materialization") == "split_overbroad_source_requirement"
+    ]
     split_count = sum(
         int(materialization.get("split_task_count") or 0)
-        for materialization in materializations
+        for materialization in split_materializations
     )
     original_ids = [
         str(materialization.get("original_task_id"))
-        for materialization in materializations
+        for materialization in split_materializations
         if materialization.get("original_task_id")
     ]
     return [
@@ -2462,6 +2495,7 @@ def _materialize_candidate_task_source_cap_feasibility(
     }
     normalized_tasks: list[Any] = []
     materializations: list[dict[str, Any]] = []
+    mapping_task_count = sum(1 for task in raw_tasks if isinstance(task, Mapping))
     for index, task in enumerate(raw_tasks, start=1):
         if not isinstance(task, Mapping):
             normalized_tasks.append(task)
@@ -2483,6 +2517,38 @@ def _materialize_candidate_task_source_cap_feasibility(
         )
         if required_sources <= max_sources:
             normalized_tasks.append(normalized_task)
+            continue
+        if required_sources > SEMANTIC_TASK_MAX_SOURCES:
+            split_count = math.ceil(required_sources / SEMANTIC_TASK_MAX_SOURCES)
+            projected_task_count = mapping_task_count + split_count - 1
+            blocked_reason = (
+                "source_cap_split_would_exceed_task_ceiling"
+                if projected_task_count > 40
+                else "required_sources_exceed_per_task_schema_max"
+            )
+            normalized_tasks.append(normalized_task)
+            materializations.append(
+                {
+                    "task_id": normalized_task.get("task_id"),
+                    "task_index": index,
+                    "field": "bounded_tasks",
+                    "materialization": "source_cap_feasibility_blocked",
+                    "repair_status": "blocked",
+                    "blocked_reason": blocked_reason,
+                    "blocked_feasibility_code": (
+                        "bounded_task_requirement_exceeds_max_sources"
+                    ),
+                    "previous_required_sources": required_sources,
+                    "max_sources": max_sources,
+                    "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
+                    "required_split_task_count": split_count,
+                    "current_task_count": mapping_task_count,
+                    "projected_task_count": projected_task_count,
+                    "max_task_count": 40,
+                    "source_cap_reasons": list(source_reasons),
+                    "explicit_requirement_counts": dict(source_counts),
+                }
+            )
             continue
 
         angle = angles_by_id.get(str(normalized_task.get("angle_id") or ""))
@@ -5115,15 +5181,25 @@ def semantic_convergence_attempt_record(
     repair_inputs: Mapping[str, Any] | None = None,
     final_selection: bool = False,
     terminal_failure: bool = False,
+    candidate_hash: str | None = None,
+    reviewed_plan_candidate_hash: str | None = None,
 ) -> dict[str, Any]:
-    candidate_hash = semantic_plan_candidate_hash(plan)
+    plan_hash = semantic_plan_candidate_hash(plan)
+    evaluated_candidate_hash = candidate_hash or plan_hash
+    reviewed_candidate_hash = reviewed_plan_candidate_hash
+    if (
+        reviewed_candidate_hash is None
+        and semantic_review is not None
+        and plan_hash != evaluated_candidate_hash
+    ):
+        reviewed_candidate_hash = plan_hash
     deterministic = dict(deterministic_validation or {})
     review = dict(semantic_review or {})
     adapter_candidate_attempts = semantic_plan_adapter_candidate_attempts(plan)
-    return {
+    record = {
         "attempt": attempt,
-        "candidate_id": candidate_hash[:16],
-        "candidate_hash": candidate_hash,
+        "candidate_id": evaluated_candidate_hash[:16],
+        "candidate_hash": evaluated_candidate_hash,
         "planner_status": plan.status,
         "planner_mode": plan.planner_mode,
         "raw_request_hash": plan.planner_provenance.get("raw_request_hash")
@@ -5157,6 +5233,10 @@ def semantic_convergence_attempt_record(
         "final_selection": final_selection,
         "terminal_failure": terminal_failure,
     }
+    if reviewed_candidate_hash and reviewed_candidate_hash != evaluated_candidate_hash:
+        record["reviewed_plan_candidate_id"] = reviewed_candidate_hash[:16]
+        record["reviewed_plan_candidate_hash"] = reviewed_candidate_hash
+    return record
 
 
 def semantic_convergence_artifact(

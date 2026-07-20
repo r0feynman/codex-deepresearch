@@ -63,6 +63,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _materialize_candidate_placeholder_selection_workflow,
     _materialize_candidate_source_cap_splits,
     _materialize_candidate_source_cap_constraints,
+    _materialize_candidate_task_source_cap_feasibility,
     _materialize_candidate_visual_image_cap_feasibility,
     _normalize_candidate_executable_source_caps,
     _repair_candidate_requirement_coverage,
@@ -3818,6 +3819,15 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(len(adapter_request["_planner_requests"]), 2)
         self.assertEqual(len(adapter_request["_reviewer_requests"]), 2)
         first_attempt = convergence["attempts"][0]
+        first_reviewer_hash = adapter_request["_reviewer_requests"][0][
+            "semantic_plan_candidate_hash"
+        ]
+        self.assertEqual(first_attempt["candidate_hash"], first_reviewer_hash)
+        self.assertIn("reviewed_plan_candidate_hash", first_attempt)
+        self.assertNotEqual(
+            first_attempt["reviewed_plan_candidate_hash"],
+            first_reviewer_hash,
+        )
         self.assertIn(
             "NON_EXECUTABLE_TASK_SCOPE_CAP",
             first_attempt["reviewer_blocker_codes"],
@@ -4249,6 +4259,89 @@ class SemanticPlannerTests(unittest.TestCase):
             plan=repaired,
         )
         self.assertTrue(repaired_validation["ok"], repaired_validation)
+
+    def test_source_cap_repair_keeps_unsplittable_over_cap_requirement_blocked(self) -> None:
+        question = (
+            "Compare OAuth device-flow provider behavior across official "
+            "implementation documentation."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        while len(candidate["bounded_tasks"]) < 39:
+            next_index = len(candidate["bounded_tasks"]) + 1
+            template = candidate["bounded_tasks"][
+                (next_index - 1) % len(candidate["bounded_tasks"])
+            ]
+            task = json.loads(json.dumps(template))
+            task["task_id"] = f"task_extra_{next_index:03d}"
+            task["angle_id"] = candidate["angles"][
+                (next_index - 1) % len(candidate["angles"])
+            ]["angle_id"]
+            task["query"] = (
+                "OAuth device-flow provider documentation supplemental official "
+                f"source task {next_index}"
+            )
+            task["done_condition"] = (
+                "Stop when source-backed supplemental guidance notes are ready."
+            )
+            candidate["bounded_tasks"].append(task)
+
+        original_task_id = candidate["bounded_tasks"][0]["task_id"]
+        candidate["bounded_tasks"][0]["max_sources"] = 5
+        candidate["bounded_tasks"][0]["query"] = (
+            "Compare OAuth device-flow provider behavior using at least 12 "
+            "official sources."
+        )
+        candidate["bounded_tasks"][0]["done_condition"] = (
+            "Complete when 12 official sources are checked with caveats."
+        )
+
+        normalized, _cap_repairs = _normalize_candidate_executable_source_caps(
+            candidate
+        )
+        split_repaired, split_materializations = _materialize_candidate_source_cap_splits(
+            normalized
+        )
+        feasibility_repaired, feasibility_materializations = (
+            _materialize_candidate_task_source_cap_feasibility(split_repaired)
+        )
+        repaired_task = next(
+            task
+            for task in feasibility_repaired["bounded_tasks"]
+            if task["task_id"] == original_task_id
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=feasibility_repaired,
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+
+        self.assertEqual(len(feasibility_repaired["bounded_tasks"]), 39)
+        self.assertTrue(
+            any(
+                materialization.get("materialization")
+                == "source_cap_split_blocked_task_ceiling"
+                and materialization.get("blocked_feasibility_code")
+                == "bounded_task_requirement_exceeds_max_sources"
+                for materialization in split_materializations
+            ),
+            split_materializations,
+        )
+        self.assertTrue(
+            any(
+                materialization.get("materialization")
+                == "source_cap_feasibility_blocked"
+                and materialization.get("blocked_reason")
+                == "source_cap_split_would_exceed_task_ceiling"
+                for materialization in feasibility_materializations
+            ),
+            feasibility_materializations,
+        )
+        self.assertNotIn("source_pool_reuse_required", repaired_task)
+        self.assertIn("12 official sources", repaired_task["query"])
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            failure_codes,
+        )
 
     def test_sem_reg_012_like_retry_materializes_broad_cardinality_and_source_split(self) -> None:
         question = (

@@ -850,6 +850,7 @@ def _prepare_semantic_plan_with_convergence(
             locked_oracle=locked_oracle,
         )
         pre_review_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+        pre_review_candidate_hash = semantic_plan_candidate_hash(semantic_plan)
         with _default_semantic_adapter_disabled_for_fixture_runs(
             allow_release_ineligible_materialization_for_tests
         ):
@@ -871,6 +872,7 @@ def _prepare_semantic_plan_with_convergence(
             semantic_plan=semantic_plan,
         )
         reviewed_plan = semantic_plan_with_review_result(semantic_plan, semantic_review)
+        reviewed_plan_candidate_hash = semantic_plan_candidate_hash(reviewed_plan)
         review_passed = semantic_review_release_eligible(semantic_review)
         retryable_review_failure = semantic_review_failure_retryable(semantic_review)
         last_attempt = attempt >= max_attempts
@@ -904,6 +906,8 @@ def _prepare_semantic_plan_with_convergence(
                     final_selection=review_passed,
                     terminal_failure=not review_passed
                     and not allow_release_ineligible_materialization_for_tests,
+                    candidate_hash=pre_review_candidate_hash,
+                    reviewed_plan_candidate_hash=reviewed_plan_candidate_hash,
                 )
             )
             convergence_status = (
@@ -939,13 +943,12 @@ def _prepare_semantic_plan_with_convergence(
             )
             return reviewed_plan, semantic_review, semantic_integrity_artifacts
 
-        candidate_hash = semantic_plan_candidate_hash(semantic_plan)
         retry_request = codex_semantic_review_retry_raw_request(
             raw_request=semantic_plan.raw_request_payload or next_raw_request,
             attempt=attempt + 1,
             deterministic_validation=deterministic_validation,
             semantic_review=semantic_review,
-            candidate_hash=candidate_hash,
+            candidate_hash=pre_review_candidate_hash,
             max_attempts=max_attempts,
         )
         repair_inputs = dict(
@@ -960,6 +963,8 @@ def _prepare_semantic_plan_with_convergence(
                 deterministic_validation=deterministic_validation,
                 semantic_review=semantic_review,
                 repair_inputs=repair_inputs,
+                candidate_hash=pre_review_candidate_hash,
+                reviewed_plan_candidate_hash=reviewed_plan_candidate_hash,
             )
         )
         next_raw_request = retry_request
