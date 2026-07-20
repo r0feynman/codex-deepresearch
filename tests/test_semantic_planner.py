@@ -1332,6 +1332,58 @@ class SemanticPlannerTests(unittest.TestCase):
             },
         }
 
+    def semantic_plan_from_candidate_payload(self, candidate: dict) -> SemanticPlan:
+        def string_items(value: object) -> list[str]:
+            return [str(item) for item in value] if isinstance(value, list) else []
+
+        angles = [
+            SemanticAngle(
+                angle_id=str(angle["angle_id"]),
+                title=str(angle["title"]),
+                research_question=str(angle["research_question"]),
+                question_context=str(
+                    angle.get("question_context")
+                    or (angle.get("included_scope") or [""])[0]
+                ),
+                route=str(angle["route"]),
+                evidence_need=str(angle["evidence_need"]),
+                expected_artifacts=string_items(angle.get("expected_artifacts")),
+                success_criteria=string_items(angle.get("success_criteria")),
+                report_section=str(angle["report_section"]),
+                why_this_angle_matters=str(angle.get("why_this_angle_matters") or ""),
+                included_scope=string_items(angle.get("included_scope")),
+                excluded_scope=string_items(angle.get("excluded_scope")),
+                expected_source_types=string_items(angle.get("expected_source_types")),
+                expected_visual_targets=string_items(angle.get("expected_visual_targets")),
+                search_queries=string_items(angle.get("search_queries")),
+                risk_or_contradiction_checks=string_items(
+                    angle.get("risk_or_contradiction_checks")
+                ),
+            )
+            for angle in candidate["angles"]
+        ]
+        return SemanticPlan(
+            schema_version=str(candidate["schema_version"]),
+            question_class="product_market",
+            broad_question=str(candidate["question_scope"]) == "broad",
+            source=str(candidate.get("source") or "codex_semantic"),
+            expected_evidence_needs=list(
+                dict.fromkeys(angle.evidence_need for angle in angles)
+            ),
+            angles=angles,
+            intent_summary=str(candidate["intent_summary"]),
+            domain_entities=list(candidate.get("domain_entities") or []),
+            constraints=list(candidate.get("constraints") or []),
+            runner_source_budget=dict(candidate.get("runner_source_budget") or {}),
+            question_scope=str(candidate["question_scope"]),
+            decomposition_strategy=str(candidate["decomposition_strategy"]),
+            requirement_coverage_map=list(candidate["requirement_coverage_map"]),
+            negative_scope=list(candidate.get("negative_scope") or []),
+            bounded_tasks=list(candidate["bounded_tasks"]),
+            planner_mode=PLANNER_MODE_CODEX_SEMANTIC,
+            semantic_release_eligible=False,
+        )
+
     def oracle_adapter_response(
         self,
         request: dict,
@@ -1917,6 +1969,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 "schema",
                 "requirement_id",
                 "local deterministic template",
+                "budget_cap",
             ],
         }
 
@@ -2024,6 +2077,11 @@ class SemanticPlannerTests(unittest.TestCase):
                 "oracle subagent implementation",
                 "Describe oracle and subagent implementation work.",
                 {"oracle", "subagent"},
+            ),
+            (
+                "budget_cap leakage",
+                "Document budget_cap propagation through review-visible plan constraints.",
+                {"budget_cap"},
             ),
         )
 
@@ -5941,6 +5999,11 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         candidate = response["candidate_plan"]
         candidate["constraints"] = []
+        candidate["runner_source_budget"] = {
+            "budget_cap_max_sources": 20,
+            "materialized_from_budget_cap": True,
+            "debug_note": "preserved from budget_cap before sanitization",
+        }
         for task in candidate["bounded_tasks"]:
             task["max_sources"] = 3
 
@@ -5956,13 +6019,25 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertEqual(
             budget_materialization["materialization"],
-            "preserved_budget_cap_source_budget",
+            "preserved_request_source_budget",
         )
         self.assertEqual(repaired["runner_source_budget"]["max_unique_sources"], 20)
         self.assertEqual(repaired["runner_source_budget"]["task_max_sources_sum"], 60)
         self.assertTrue(repaired["runner_source_budget"]["reuse_required"])
         constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
         self.assertIn("max_unique_sources=20", constraints_text)
+        self.assertNotIn("budget_cap", constraints_text.lower())
+        runner_budget_text = json.dumps(
+            repaired["runner_source_budget"],
+            ensure_ascii=False,
+            sort_keys=True,
+        ).lower()
+        self.assertNotIn("budget_cap", runner_budget_text)
+        self.assertEqual(repaired["runner_source_budget"]["request_max_sources"], 20)
+        self.assertTrue(
+            repaired["runner_source_budget"]["materialized_from_request_source_limit"]
+        )
+        self.assertNotIn("debug_note", repaired["runner_source_budget"])
         validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=repaired,
@@ -5985,6 +6060,54 @@ class SemanticPlannerTests(unittest.TestCase):
                 failure["code"]
                 for failure in missing_constraint_validation["failures"]
             },
+        )
+
+    def test_request_source_budget_materialization_passes_substitute_check(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "c" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = []
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+
+        repaired, _materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_results": 8, "max_sources": 20},
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(validation["ok"], validation)
+        plan = self.semantic_plan_from_candidate_payload(repaired)
+        plan_text = json.dumps(plan.to_dict(), ensure_ascii=False, sort_keys=True).lower()
+        self.assertIn("max_unique_sources", plan_text)
+        self.assertNotIn("budget_cap", plan_text)
+
+        oracle = self.semantic_internal_leakage_oracle()
+        substitute = _semantic_substitute_implementation_check(
+            plan=plan,
+            oracle=oracle,
+        )
+
+        self.assertFalse(_has_forbidden_internal_leakage(plan=plan, oracle=oracle))
+        self.assertTrue(substitute["passed"], substitute)
+        self.assertEqual(
+            substitute["forbidden_internal_implementation_terms_found"],
+            [],
         )
 
     def test_multi_vendor_official_tasks_raise_source_cap_without_multiple_source_types(self) -> None:
@@ -6321,7 +6444,24 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertIn("max_results=8", constraint_text)
         self.assertNotIn("Budget cap", constraint_text)
-        self.assertIn("candidate_plan_budget_cap_materializations", raw_response)
+        self.assertIn("candidate_plan_request_budget_materializations", raw_response)
+        self.assertNotIn("candidate_plan_budget_cap_materializations", raw_response)
+        semantic_plan_text = json.dumps(
+            semantic_plan,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).lower()
+        self.assertIn("runner_source_budget", semantic_plan_text)
+        self.assertIn("max_unique_sources", semantic_plan_text)
+        self.assertNotIn("budget_cap", semantic_plan_text)
+        reviewer_plan_text = json.dumps(
+            adapter_request["_reviewer_requests"][-1]["semantic_plan"],
+            ensure_ascii=False,
+            sort_keys=True,
+        ).lower()
+        self.assertIn("runner_source_budget", reviewer_plan_text)
+        self.assertIn("max_unique_sources", reviewer_plan_text)
+        self.assertNotIn("budget_cap", reviewer_plan_text)
         self.assertTrue(semantic_plan["bounded_tasks"])
         self.assertTrue(search_tasks)
         for bounded_task, search_task in zip(

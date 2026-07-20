@@ -518,6 +518,9 @@ class SemanticPlan:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["angles"] = [angle.to_dict() for angle in self.angles]
+        data["runner_source_budget"] = _review_visible_runner_source_budget_metadata(
+            self.runner_source_budget
+        )
         data["diagnostics"] = dict(self.diagnostics or {})
         data.pop("raw_request_payload", None)
         data.pop("raw_response_payload", None)
@@ -832,7 +835,7 @@ def codex_semantic_candidate_plan(
                 ] = source_cap_constraint_materializations
             if budget_cap_materializations:
                 raw_response["candidate_plan"] = candidate
-                raw_response["candidate_plan_budget_cap_materializations"] = (
+                raw_response["candidate_plan_request_budget_materializations"] = (
                     budget_cap_materializations
                 )
             if expected_evidence_materializations:
@@ -1418,7 +1421,9 @@ def _materialize_candidate_source_cap_constraints(
         )
         existing_runner_budget = normalized.get("runner_source_budget")
         if isinstance(existing_runner_budget, Mapping):
-            merged_runner_budget = dict(existing_runner_budget)
+            merged_runner_budget = _review_visible_runner_source_budget_metadata(
+                existing_runner_budget
+            )
             merged_runner_budget.update(runner_source_budget)
             runner_source_budget = merged_runner_budget
         normalized["runner_source_budget"] = runner_source_budget
@@ -1526,7 +1531,7 @@ def _candidate_runner_source_budget_record(
         "reuse_required": task_max_sources_sum > declared_source_budget,
         "allocation_strategy": "shared_source_pool",
         "enforcement_scope": "run",
-        "materialized_from_constraints": list(removed_constraints),
+        "materialized_constraint_count": len(removed_constraints),
     }
 
 
@@ -1769,14 +1774,10 @@ def _materialize_candidate_runner_source_budget_cap(
         bounded_task_count=len(caps),
         removed_constraints=[],
     )
-    runner_source_budget.update(
-        {
-            "materialized_from_budget_cap": declared_budget == max_sources,
-            "budget_cap_max_sources": max_sources,
-        }
-    )
     if isinstance(existing_runner_budget, Mapping):
-        merged_runner_budget = dict(existing_runner_budget)
+        merged_runner_budget = _review_visible_runner_source_budget_metadata(
+            existing_runner_budget
+        )
         merged_runner_budget.update(runner_source_budget)
         runner_source_budget = merged_runner_budget
     normalized["runner_source_budget"] = runner_source_budget
@@ -1788,8 +1789,8 @@ def _materialize_candidate_runner_source_budget_cap(
         declared_source_budget=declared_budget,
     ):
         appended_constraint = (
-            "Runner-level source budget from budget_cap is preserved as a "
-            f"unique-source reuse budget: max_unique_sources={declared_budget}. "
+            "Runner-level source budget is preserved as a unique-source reuse "
+            f"budget: max_unique_sources={declared_budget}. "
             f"The combined per-task source ceilings total {total_cap}, so "
             "execution must reuse sources through a shared source pool and must "
             "not treat per-task max_sources as additive permission for unique "
@@ -1799,8 +1800,8 @@ def _materialize_candidate_runner_source_budget_cap(
 
     materialization = {
         "field": "runner_source_budget",
-        "materialization": "preserved_budget_cap_source_budget",
-        "budget_cap_max_sources": max_sources,
+        "materialization": "preserved_request_source_budget",
+        "request_max_sources": max_sources,
         "preserved_declared_source_budget": declared_budget,
         "task_max_sources_sum": total_cap,
         "bounded_task_count": len(caps),
@@ -1826,6 +1827,31 @@ def _candidate_constraints_preserve_runner_source_budget(
         )
         for constraint in constraints
     )
+
+
+def _review_visible_runner_source_budget_metadata(
+    runner_source_budget: Any,
+) -> dict[str, Any]:
+    if not isinstance(runner_source_budget, Mapping):
+        return {}
+    renamed_fields = {
+        "materialized_from_budget_cap": "materialized_from_request_source_limit",
+        "budget_cap_max_sources": "request_max_sources",
+    }
+    visible: dict[str, Any] = {}
+    for raw_key, value in runner_source_budget.items():
+        key = renamed_fields.get(str(raw_key), str(raw_key))
+        if _contains_budget_cap_term(key):
+            continue
+        if _contains_budget_cap_term(value):
+            continue
+        visible[key] = value
+    return visible
+
+
+def _contains_budget_cap_term(value: Any) -> bool:
+    normalized = _normalize_text(json.dumps(value, ensure_ascii=False, default=str))
+    return _contains_normalized_phrase(normalized, "budget cap")
 
 
 def _candidate_constraints_mention_search_result_cap(
@@ -4862,6 +4888,7 @@ def _forbidden_internal_terms() -> list[str]:
         "heuristic_template_planner",
         "local deterministic template",
         "fixture_semantic_candidate_response_for_validation_tests",
+        "budget_cap",
     ]
 
 
@@ -9043,7 +9070,9 @@ def write_semantic_integrity_artifacts(
             "intent_summary": plan.intent_summary,
             "domain_entities": list(plan.domain_entities),
             "constraints": list(plan.constraints),
-            "runner_source_budget": dict(plan.runner_source_budget),
+            "runner_source_budget": _review_visible_runner_source_budget_metadata(
+                plan.runner_source_budget
+            ),
             "candidate_question_scope": plan.question_scope,
             "decomposition_strategy": plan.decomposition_strategy,
             "negative_scope": list(plan.negative_scope),
