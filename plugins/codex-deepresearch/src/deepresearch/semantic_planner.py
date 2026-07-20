@@ -165,6 +165,8 @@ ALLOWED_EVIDENCE_NEEDS = (
 )
 
 VISUAL_EXPECTED_EVIDENCE = {"visual_example", "visual_observation", "vlm_analysis"}
+VISUAL_OPTIONAL_SUPPORT_MAX_TASK_RATIO = 0.25
+VISUAL_OPTIONAL_SUPPORT_MAX_ANGLE_RATIO = 0.25
 TEXT_ONLY_VISUAL_WORK_TEXT_PATTERNS = (
     ("vlm_analysis", r"\bvlm(?:[-_\s]+analysis)?\b"),
     ("visual_example", r"\bvisual[-_\s]+examples?\b"),
@@ -867,6 +869,7 @@ def codex_semantic_candidate_plan(
                 original_question=original_question,
                 candidate=candidate,
                 visual_preference=str(raw_request.get("visual_preference") or "auto"),
+                provided_images=_list(raw_request.get("provided_images")),
             )
             raw_response["candidate_validation"] = candidate_validation
             if candidate_validation.get("ok") is True:
@@ -3130,12 +3133,14 @@ def _codex_semantic_candidate_validation(
     original_question: str,
     candidate: Mapping[str, Any],
     visual_preference: str | None = None,
+    provided_images: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     try:
         validation = validate_semantic_candidate_plan(
             original_question=original_question,
             plan=candidate,
             visual_preference=visual_preference,
+            provided_images=provided_images,
         )
     except Exception as exc:  # pragma: no cover - defensive boundary guard
         validation = {
@@ -3273,13 +3278,17 @@ def _codex_semantic_retry_raw_request(
     visual_preference = _normalized_visual_preference(
         retry_request.get("visual_preference")
     )
-    visual_guidance = (
-        "Because visual_preference is text_only, all angles and bounded_tasks must "
-        "use route=text_only, max_images=0, expected_visual_targets=[], and no image, "
-        "chart, screenshot, diagram, visual-example, visual-observation, or VLM work "
-        "may be introduced."
-        if visual_preference == "text_only"
-        else (
+    if visual_preference == "text_only":
+        visual_guidance = _text_only_visual_contract_instruction()
+    elif visual_preference == "visual_optional":
+        visual_guidance = _visual_optional_contract_instruction(
+            has_provided_images=bool(_list(retry_request.get("provided_images"))),
+            prompt_mentions_visual=question_mentions_visual_evidence(
+                str(retry_request.get("original_question") or "")
+            ),
+        )
+    else:
+        visual_guidance = (
             "If the question requires visual evidence, include at least one visual "
             "angle with evidence_need `visual_example` for collecting representative "
             "source images and at least one visual angle with evidence_need "
@@ -3288,7 +3297,6 @@ def _codex_semantic_retry_raw_request(
             "visual expected evidence task must set max_images between 1 and 3; "
             "text-only tasks should keep max_images=0."
         )
-    )
     semantic_angle_guidance = (
         " If `semantic_angle_release_depth_failed` appears, rewrite the failing "
         "angle titles and research_questions so they are prompt-specific, preserve "
@@ -3307,6 +3315,11 @@ def _codex_semantic_retry_raw_request(
         if "semantic_angle_release_duplicate_failed" in failure_codes
         else ""
     )
+    repair_guidance = _semantic_repair_guidance_for_codes(
+        failure_codes,
+        visual_preference=visual_preference,
+        provided_images=_list(retry_request.get("provided_images")),
+    )
     retry_request["planner_retry_instructions"] = (
         "The previous Codex semantic candidate did not pass release validation. "
         "Generate a fresh semantic decomposition that fixes these failure codes "
@@ -3320,6 +3333,7 @@ def _codex_semantic_retry_raw_request(
         f"geography/time, and deliverable requirements. {visual_guidance}"
         f"{semantic_angle_guidance}"
         f"{semantic_angle_duplicate_guidance}"
+        f"{repair_guidance}"
     )
     retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
     return retry_request
@@ -3339,6 +3353,125 @@ def _text_only_visual_contract_instruction() -> str:
         "chart, screenshot, diagram, visual-example, visual-observation, or VLM work "
         "may be introduced."
     )
+
+
+def _visual_optional_contract_instruction(
+    *,
+    has_provided_images: bool = False,
+    prompt_mentions_visual: bool = False,
+) -> str:
+    if has_provided_images or prompt_mentions_visual:
+        return (
+            "When visual_preference is visual_optional, keep executable visual support "
+            "using route=visual_optional with concrete visual targets and max_images "
+            "1-3, while keeping text/document/table/structured evidence tasks for the "
+            "primary comparison and deliverable obligations."
+        )
+    return (
+        "When visual_preference is visual_optional and the user did not provide an "
+        "image or explicitly ask to inspect images/screenshots/figures, keep visual "
+        "work bounded and supporting: use route=visual_optional, not visual_required; "
+        "include at least one executable visual-support task with concrete visual "
+        "targets and max_images 1-3; keep visual support to no more than one quarter "
+        "of angles/tasks; and preserve text/document/table/structured-artifact tasks "
+        "as the primary comparison and deliverable path."
+    )
+
+
+def _visual_optional_without_primary_visual_evidence(
+    *,
+    question: str,
+    visual_preference: str,
+    provided_images: Sequence[Any] | None = None,
+    expected_modalities: Sequence[str] | None = None,
+) -> bool:
+    if visual_preference != "visual_optional":
+        return False
+    if provided_images:
+        return False
+    normalized_modalities = {
+        _normalize_text(str(item)).replace(" ", "_")
+        for item in expected_modalities or []
+        if str(item).strip()
+    }
+    if normalized_modalities & {
+        "visual",
+        "image",
+        "images",
+        "screenshot",
+        "screenshots",
+        "figure",
+        "figures",
+        "chart",
+        "charts",
+        "diagram",
+        "diagrams",
+    }:
+        return False
+    return not question_mentions_visual_evidence(question)
+
+
+def _semantic_repair_guidance_for_codes(
+    codes: Sequence[str],
+    *,
+    visual_preference: str | None = None,
+    provided_images: Sequence[Any] | None = None,
+) -> str:
+    code_set = {str(code) for code in codes if str(code).strip()}
+    guidance: list[str] = []
+    if code_set & {
+        "MODALITY_OPTIONALITY_REVERSED",
+        "visual_optional_visual_work_dominates_primary_evidence",
+    }:
+        guidance.append(
+            " If `MODALITY_OPTIONALITY_REVERSED` appears, repair visual_optional "
+            "by keeping visual work bounded and supporting: use route=visual_optional "
+            "rather than route=visual_required, keep at least one executable visual "
+            "support task with concrete targets and max_images 1-3, cap visual support "
+            "to one quarter of angles/tasks when no user image was supplied, and make "
+            "text/document/table/structured-artifact comparison the primary path."
+        )
+    if code_set & {
+        "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+        "comparison_deliverable_missing_required_fields",
+    }:
+        guidance.append(
+            " If `REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE` appears, add a bounded "
+            "text/document/structured task and expected artifact for a consolidated "
+            "side-by-side comparison deliverable with fields for requirement or "
+            "criterion, architectural model output or structured artifact, public "
+            "design criteria, tender document criteria, match/partial/mismatch/"
+            "unverifiable status, evidence, caveats, and remediation."
+        )
+    if code_set & {
+        "REQ_003_PRIORITIZED_REMEDIATION_MISSING",
+        "prioritized_remediation_missing",
+    }:
+        guidance.append(
+            " If `REQ_003_PRIORITIZED_REMEDIATION_MISSING` appears, add a bounded "
+            "task and artifact for prioritized remediation recommendations that rank "
+            "mismatches or gaps by severity, impact, evidence confidence, and feasible "
+            "next action."
+        )
+    if code_set & {
+        "STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE",
+        "structured_artifact_assessment_missing",
+    }:
+        guidance.append(
+            " If `STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE` appears, add text/document/"
+            "structured-artifact assessment tasks for model outputs or artifacts: "
+            "inventory the files/fields/attributes/object classes/LOD or equivalent "
+            "structured properties, compare them against public design and tender "
+            "criteria, and avoid making VLM or image inspection mandatory unless the "
+            "user supplied an actual image/model file."
+        )
+    if visual_preference == "visual_optional" and not provided_images:
+        guidance.append(
+            " For this visual_optional retry with no supplied images, do not let "
+            "visual acquisition or VLM analysis displace the primary text/document/"
+            "structured comparison deliverable."
+        )
+    return "".join(guidance)
 
 
 def _append_text_only_visual_work_violations(
@@ -4178,6 +4311,13 @@ def codex_semantic_review_retry_raw_request(
         "For ambiguous architecture, model, or testing prompts, use software/Codex "
         "implementation templates only when the original question explicitly asks "
         "about software, Codex, APIs, code, runners, or repositories."
+        + _semantic_repair_guidance_for_codes(
+            review_codes,
+            visual_preference=_normalized_visual_preference(
+                retry_request.get("visual_preference")
+            ),
+            provided_images=_list(retry_request.get("provided_images")),
+        )
     )
     retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
     return retry_request
@@ -4476,6 +4616,7 @@ def _semantic_adapter_prompt(role_label: str) -> str:
             "max_sources as an integer from 1 to 5. Text-only tasks must have max_images=0. "
             "Visual-required or visual-optional tasks must have max_images from 1 to 3 and "
             "non-empty expected_visual_targets. "
+            f"{_visual_optional_contract_instruction()} "
             "Every angle title plus research_question must be prompt-specific and share at least "
             "2 meaningful non-generic domain/source/comparison tokens with the original question; "
             "avoid generic labels such as comparison, implications, latestness, or limitations "
@@ -5219,6 +5360,16 @@ def _deterministic_semantic_review(
     candidate_validation = validate_semantic_candidate_plan(
         original_question=question,
         plan=plan_payload,
+        visual_preference=_normalized_visual_preference(
+            plan.raw_request_payload.get("visual_preference")
+            if isinstance(plan.raw_request_payload, Mapping)
+            else None
+        ),
+        provided_images=(
+            _list(plan.raw_request_payload.get("provided_images"))
+            if isinstance(plan.raw_request_payload, Mapping)
+            else []
+        ),
     )
     blockers: list[dict[str, Any]] = []
     for failure in _list(candidate_validation.get("failures")):
@@ -5250,6 +5401,13 @@ def _deterministic_semantic_review(
         blockers.append({"code": "oracle_requirement_map_missing_or_incomplete"})
     if not _plan_covers_oracle_requirements(plan=plan, oracle=oracle):
         blockers.append({"code": "oracle_requirement_coverage_incomplete"})
+    blockers.extend(
+        _semantic_review_oracle_semantic_blockers(
+            question=question,
+            plan=plan,
+            oracle=oracle,
+        )
+    )
     if _has_forbidden_internal_leakage(plan=plan, oracle=oracle):
         blockers.append({"code": "forbidden_internal_implementation_leakage"})
     substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
@@ -5396,6 +5554,126 @@ def _modalities_match_oracle(
     return any(angle.route != "text_only" for angle in plan.angles) and any(
         str(task.get("route") or "") != "text_only" for task in plan.bounded_tasks
     )
+
+
+def _semantic_review_oracle_semantic_blockers(
+    *,
+    question: str,
+    plan: SemanticPlan,
+    oracle: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    visual_preference = _normalized_visual_preference(
+        plan.raw_request_payload.get("visual_preference")
+        if isinstance(plan.raw_request_payload, Mapping)
+        else None
+    )
+    provided_images = (
+        _list(plan.raw_request_payload.get("provided_images"))
+        if isinstance(plan.raw_request_payload, Mapping)
+        else []
+    )
+    expected_modalities = _string_list(oracle.get("expected_modalities"))
+    angles = [angle.to_dict() for angle in plan.angles]
+    tasks = [
+        task for task in plan.bounded_tasks if isinstance(task, Mapping)
+    ]
+    if _visual_optional_without_primary_visual_evidence(
+        question=question,
+        visual_preference=visual_preference,
+        provided_images=provided_images,
+        expected_modalities=expected_modalities,
+    ):
+        profile = _candidate_visual_support_profile(angles=angles, tasks=tasks)
+        if profile["visual_required_angle_count"] or profile["visual_required_task_count"]:
+            blockers.append(
+                {
+                    "code": "MODALITY_OPTIONALITY_REVERSED",
+                    "message": (
+                        "Oracle did not make visual evidence mandatory, but the plan "
+                        "made optional visual support required."
+                    ),
+                    "profile": profile,
+                }
+            )
+        if (
+            profile["visual_angle_count"] > profile["max_visual_angles"]
+            or profile["visual_task_count"] > profile["max_visual_tasks"]
+            or (
+                profile["text_task_count"] > 0
+                and profile["visual_task_count"] >= profile["text_task_count"]
+            )
+        ):
+            blockers.append(
+                {
+                    "code": "visual_optional_visual_work_dominates_primary_evidence",
+                    "message": (
+                        "Oracle-primary text/document/table/structured evidence was "
+                        "displaced by optional visual work."
+                    ),
+                    "profile": profile,
+                }
+            )
+
+    requirements = [
+        requirement
+        for requirement in _list(oracle.get("oracle_requirement_map"))
+        if isinstance(requirement, Mapping)
+    ]
+    if any(_candidate_requirement_is_req003_comparison(req) for req in requirements):
+        if not _candidate_has_comparison_deliverable_task(tasks=tasks):
+            blockers.append(
+                {
+                    "code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+                    "message": (
+                        "Req_003 comparison/output-shape oracle requirements need a "
+                        "bounded side-by-side comparison deliverable with status, "
+                        "evidence, caveat, and remediation fields."
+                    ),
+                }
+            )
+        if any(
+            _candidate_requirement_needs_prioritized_remediation(req)
+            for req in requirements
+        ) and not _candidate_has_prioritized_remediation_task(tasks=tasks):
+            blockers.append(
+                {
+                    "code": "REQ_003_PRIORITIZED_REMEDIATION_MISSING",
+                    "message": (
+                        "Req_003 asks for remediation, but no bounded prioritized "
+                        "remediation task/artifact is present."
+                    ),
+                }
+            )
+    normalized_modalities = {
+        _normalize_text(modality).replace(" ", "_")
+        for modality in expected_modalities
+    }
+    structured_expected = bool(
+        normalized_modalities
+        & {
+            "structured_model_or_artifact",
+            "structured_artifact",
+            "structured_model",
+        }
+    ) or any(
+        _candidate_requirement_needs_structured_artifact_assessment(req)
+        for req in requirements
+    )
+    if structured_expected and not _candidate_has_structured_artifact_assessment_task(
+        tasks=tasks
+    ):
+        blockers.append(
+            {
+                "code": "STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE",
+                "message": (
+                    "Oracle expects document/table/structured artifact assessment, "
+                    "but the plan lacks a bounded text/document structured-artifact "
+                    "assessment task."
+                ),
+            }
+        )
+    return _dedupe_blockers(blockers)
 
 
 def _non_negotiable_coverage_complete(
@@ -6264,11 +6542,311 @@ def _preview_text(value: str, limit: int = 240) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def _candidate_visual_support_profile(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    visual_angles = [
+        angle
+        for angle in angles
+        if str(angle.get("route") or "text_only") != "text_only"
+        or bool(_string_list(angle.get("expected_visual_targets")))
+    ]
+    visual_tasks = [
+        task
+        for task in tasks
+        if _candidate_task_has_visual_support(task)
+    ]
+    max_visual_angles = (
+        max(1, math.floor(len(angles) * VISUAL_OPTIONAL_SUPPORT_MAX_ANGLE_RATIO))
+        if angles
+        else 0
+    )
+    max_visual_tasks = (
+        max(1, math.floor(len(tasks) * VISUAL_OPTIONAL_SUPPORT_MAX_TASK_RATIO))
+        if tasks
+        else 0
+    )
+    return {
+        "angle_count": len(angles),
+        "task_count": len(tasks),
+        "visual_angle_count": len(visual_angles),
+        "visual_task_count": len(visual_tasks),
+        "text_task_count": max(0, len(tasks) - len(visual_tasks)),
+        "visual_required_angle_count": sum(
+            1
+            for angle in visual_angles
+            if str(angle.get("route") or "") == "visual_required"
+        ),
+        "visual_required_task_count": sum(
+            1
+            for task in visual_tasks
+            if str(task.get("route") or "") == "visual_required"
+        ),
+        "max_visual_angles": max_visual_angles,
+        "max_visual_tasks": max_visual_tasks,
+        "visual_angle_ids": [
+            str(angle.get("angle_id") or "")
+            for angle in visual_angles
+            if str(angle.get("angle_id") or "")
+        ],
+        "visual_task_ids": [
+            str(task.get("task_id") or "")
+            for task in visual_tasks
+            if str(task.get("task_id") or "")
+        ],
+    }
+
+
+def _candidate_task_has_visual_support(task: Mapping[str, Any]) -> bool:
+    route = str(task.get("route") or "text_only")
+    if route != "text_only":
+        return True
+    if _string_list(task.get("expected_visual_targets")):
+        return True
+    if _task_expected_evidence(task) & VISUAL_EXPECTED_EVIDENCE:
+        return True
+    if _semantic_task_expected_visual_artifacts(task):
+        return True
+    return _nonnegative_int(task.get("max_images")) > 0
+
+
+def _candidate_requirement_text(requirement: Mapping[str, Any]) -> str:
+    return json.dumps(
+        [
+            requirement.get("requirement_id"),
+            requirement.get("requirement_type"),
+            requirement.get("prompt_text"),
+            requirement.get("requirement_text"),
+            requirement.get("output_shape_constraints"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _candidate_task_deliverable_text(task: Mapping[str, Any]) -> str:
+    return json.dumps(
+        [
+            task.get("query"),
+            task.get("route"),
+            task.get("expected_source_types"),
+            task.get("expected_artifacts"),
+            task.get("success_criteria"),
+            task.get("done_condition"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+
+
+def _candidate_requirement_is_req003_comparison(
+    requirement: Mapping[str, Any],
+) -> bool:
+    requirement_id = str(requirement.get("requirement_id") or "").lower()
+    requirement_type = str(requirement.get("requirement_type") or "").lower()
+    text = _candidate_requirement_text(requirement).lower()
+    if requirement_id != "req_003" and requirement_type != "analysis_comparison_output_shape":
+        return False
+    return _contains_any(
+        text,
+        (
+            "compare",
+            "comparison",
+            "side-by-side",
+            "matrix",
+            "table",
+            "criteria",
+            "\ube44\uad50",
+            "\ub300\uc751\ud45c",
+            "\ube44\uad50\ud45c",
+            "\ucda9\uc871\ub3c4",
+            "\ud310\uc815",
+        ),
+    )
+
+
+def _candidate_has_comparison_deliverable_task(
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    status_groups = (
+        ("match", "matched", "meets", "\ub9e4\uce58", "\uc77c\uce58", "\ucda9\uc871"),
+        ("partial", "partially", "\ubd80\ubd84", "\ubd80\ubd84 \ucda9\uc871"),
+        ("mismatch", "gap", "non-compliant", "\ubd88\uc77c\uce58", "\ubbf8\ucda9\uc871", "\uac04\uadf9"),
+        ("unverifiable", "unknown", "not verifiable", "\ubbf8\ud655\uc778", "\ud655\uc778 \ubd88\uac00", "\ubbf8\uc0c1"),
+    )
+    for task in tasks:
+        text = _candidate_task_deliverable_text(task)
+        if not _contains_any(
+            text,
+            (
+                "side-by-side",
+                "comparison table",
+                "comparison matrix",
+                "matrix",
+                "table",
+                "\ub300\uc751\ud45c",
+                "\ube44\uad50\ud45c",
+                "\ub9e4\ud2b8\ub9ad\uc2a4",
+            ),
+        ):
+            continue
+        if not _contains_any(
+            text,
+            (
+                "model output",
+                "structured artifact",
+                "artifact",
+                "public design",
+                "tender",
+                "\ubaa8\ub378 \uc0b0\ucd9c\ubb3c",
+                "\uc0b0\ucd9c\ubb3c",
+                "\uacf5\uacf5 \uc124\uacc4",
+                "\uc785\ucc30",
+            ),
+        ):
+            continue
+        if not all(_contains_any(text, group) for group in status_groups):
+            continue
+        if not _contains_any(text, ("evidence", "citation", "source", "\uadfc\uac70", "\uc778\uc6a9")):
+            continue
+        if not _contains_any(text, ("remediation", "recommendation", "next action", "\uac1c\uc120", "\ubcf4\uc644", "\uc870\uce58", "\uad8c\uace0")):
+            continue
+        return True
+    return False
+
+
+def _candidate_requirement_needs_prioritized_remediation(
+    requirement: Mapping[str, Any],
+) -> bool:
+    text = _candidate_requirement_text(requirement).lower()
+    return _contains_any(
+        text,
+        (
+            "remediation",
+            "remediate",
+            "recommendation",
+            "recommendations",
+            "prioritized",
+            "priority",
+            "next action",
+            "\uac1c\uc120",
+            "\ubcf4\uc644",
+            "\uc870\uce58",
+            "\uad8c\uace0",
+            "\uc6b0\uc120\uc21c\uc704",
+        ),
+    )
+
+
+def _candidate_has_prioritized_remediation_task(
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    for task in tasks:
+        text = _candidate_task_deliverable_text(task)
+        if not _contains_any(
+            text,
+            (
+                "remediation",
+                "recommendation",
+                "next action",
+                "\uac1c\uc120",
+                "\ubcf4\uc644",
+                "\uc870\uce58",
+                "\uad8c\uace0",
+            ),
+        ):
+            continue
+        if not _contains_any(text, ("priority", "prioritized", "rank", "severity", "\uc6b0\uc120\uc21c\uc704", "\uc911\ub300\uc131")):
+            continue
+        if not _contains_any(text, ("impact", "effort", "confidence", "evidence", "\uc601\ud5a5", "\ub178\ub825", "\uc2e0\ub8b0", "\uadfc\uac70")):
+            continue
+        return True
+    return False
+
+
+def _candidate_requirement_needs_structured_artifact_assessment(
+    requirement: Mapping[str, Any],
+) -> bool:
+    requirement_type = str(requirement.get("requirement_type") or "").lower()
+    text = _candidate_requirement_text(requirement).lower()
+    if requirement_type in {
+        "structured_artifact_assessment",
+        "structured_model_or_artifact",
+        "structured_model_or_artifact_assessment",
+    }:
+        return True
+    return _contains_any(
+        text,
+        (
+            "structured artifact",
+            "model output",
+            "model outputs",
+            "artifact assessment",
+            "bim",
+            "\ubaa8\ub378 \uc0b0\ucd9c\ubb3c",
+            "\uc0b0\ucd9c\ubb3c",
+        ),
+    )
+
+
+def _candidate_has_structured_artifact_assessment_task(
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    for task in tasks:
+        if str(task.get("route") or "text_only") != "text_only":
+            continue
+        text = _candidate_task_deliverable_text(task)
+        if not _contains_any(
+            text,
+            (
+                "structured artifact",
+                "model output",
+                "model outputs",
+                "artifact",
+                "bim",
+                "ifc",
+                "\ubaa8\ub378",
+                "\uc0b0\ucd9c\ubb3c",
+            ),
+        ):
+            continue
+        if not _contains_any(
+            text,
+            (
+                "inventory",
+                "field",
+                "attribute",
+                "object",
+                "schema",
+                "criterion",
+                "criteria",
+                "requirement",
+                "assessment",
+                "\uc778\ubca4\ud1a0\ub9ac",
+                "\ud544\ub4dc",
+                "\uc18d\uc131",
+                "\uac1d\uccb4",
+                "\uae30\uc900",
+                "\uc694\uad6c",
+                "\ud3c9\uac00",
+            ),
+        ):
+            continue
+        return True
+    return False
+
+
 def validate_semantic_candidate_plan(
     *,
     original_question: str,
     plan: Mapping[str, Any],
     visual_preference: str | None = None,
+    provided_images: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Validate P3-SP2 candidate semantics before independent review exists."""
 
@@ -6448,6 +7026,49 @@ def validate_semantic_candidate_plan(
                         "requirement_id": requirement.get("requirement_id"),
                     }
                 )
+        if (
+            requirement.get("non_negotiable") is True
+            and _candidate_requirement_is_req003_comparison(requirement)
+        ):
+            if not _candidate_has_comparison_deliverable_task(tasks=tasks):
+                failures.append(
+                    {
+                        "code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+                        "requirement_id": requirement.get("requirement_id"),
+                        "message": (
+                            "Canonical req_003 comparison/output-shape requirements "
+                            "need a bounded side-by-side comparison deliverable with "
+                            "match/partial/mismatch/unverifiable, evidence, caveat, "
+                            "and remediation fields."
+                        ),
+                    }
+                )
+            if (
+                _candidate_requirement_needs_prioritized_remediation(requirement)
+                and not _candidate_has_prioritized_remediation_task(tasks=tasks)
+            ):
+                failures.append(
+                    {
+                        "code": "REQ_003_PRIORITIZED_REMEDIATION_MISSING",
+                        "requirement_id": requirement.get("requirement_id"),
+                    }
+                )
+        if (
+            requirement.get("non_negotiable") is True
+            and _candidate_requirement_needs_structured_artifact_assessment(requirement)
+            and not _candidate_has_structured_artifact_assessment_task(tasks=tasks)
+        ):
+            failures.append(
+                {
+                    "code": "STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE",
+                    "requirement_id": requirement.get("requirement_id"),
+                    "message": (
+                        "Structured model/artifact requirements need at least one "
+                        "text/document structured-artifact assessment task; visual "
+                        "inspection alone is not enough."
+                    ),
+                }
+            )
     tasks_per_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
     if effective_broad_question:
         for angle_id in angle_ids:
@@ -6709,6 +7330,55 @@ def validate_semantic_candidate_plan(
                     "violation_count": len(text_only_violations),
                 }
             )
+    visual_optional_support_profile: dict[str, Any] = {}
+    if _visual_optional_without_primary_visual_evidence(
+        question=question,
+        visual_preference=request_visual_preference,
+        provided_images=provided_images,
+    ):
+        visual_optional_support_profile = _candidate_visual_support_profile(
+            angles=angles,
+            tasks=tasks,
+        )
+        if (
+            visual_optional_support_profile["visual_required_angle_count"]
+            or visual_optional_support_profile["visual_required_task_count"]
+        ):
+            failures.append(
+                {
+                    "code": "MODALITY_OPTIONALITY_REVERSED",
+                    "visual_preference": request_visual_preference,
+                    "message": (
+                        "visual_optional without a supplied image or explicit visual "
+                        "evidence request must use bounded visual_optional support, "
+                        "not visual_required routes."
+                    ),
+                    "profile": dict(visual_optional_support_profile),
+                }
+            )
+        if (
+            visual_optional_support_profile["visual_angle_count"]
+            > visual_optional_support_profile["max_visual_angles"]
+            or visual_optional_support_profile["visual_task_count"]
+            > visual_optional_support_profile["max_visual_tasks"]
+            or (
+                visual_optional_support_profile["text_task_count"] > 0
+                and visual_optional_support_profile["visual_task_count"]
+                >= visual_optional_support_profile["text_task_count"]
+            )
+        ):
+            failures.append(
+                {
+                    "code": "visual_optional_visual_work_dominates_primary_evidence",
+                    "visual_preference": request_visual_preference,
+                    "message": (
+                        "visual_optional support is too large for a prompt whose "
+                        "primary evidence is text/document/table/structured artifact."
+                    ),
+                    "profile": dict(visual_optional_support_profile),
+                }
+            )
+
     visual_required = request_visual_preference in {
         "visual_required",
         "visual_optional",
@@ -6733,6 +7403,10 @@ def validate_semantic_candidate_plan(
             str(angle.get("evidence_need") or "")
             for angle in visual_angles
         }
+        visual_evidence_hits = _visual_expected_evidence_hits(
+            visual_angles,
+            visual_tasks,
+        )
         if not visual_angles or not visual_tasks:
             failures.append({"code": "visual_requirement_missing_visual_route"})
             if not visual_angles and not visual_tasks:
@@ -6747,10 +7421,19 @@ def validate_semantic_candidate_plan(
                 )
         if not any(_string_list(task.get("expected_visual_targets")) for task in visual_tasks):
             failures.append({"code": "visual_requirement_missing_targets"})
-        if "visual_example" not in visual_evidence_needs:
-            failures.append({"code": "visual_example_expected_evidence_missing"})
-        if not (visual_evidence_needs & {"visual_observation", "vlm_analysis"}):
-            failures.append({"code": "visual_observation_expected_evidence_missing"})
+        if request_visual_preference == "visual_optional":
+            if int(visual_evidence_hits.get("visual_example") or 0) < 1:
+                failures.append({"code": "visual_example_expected_evidence_missing"})
+            observation_hits = int(
+                visual_evidence_hits.get("visual_observation") or 0
+            ) + int(visual_evidence_hits.get("vlm_analysis") or 0)
+            if observation_hits < 1:
+                failures.append({"code": "visual_observation_expected_evidence_missing"})
+        else:
+            if "visual_example" not in visual_evidence_needs:
+                failures.append({"code": "visual_example_expected_evidence_missing"})
+            if not (visual_evidence_needs & {"visual_observation", "vlm_analysis"}):
+                failures.append({"code": "visual_observation_expected_evidence_missing"})
     official_required = any(
         str(requirement.get("requirement_type") or "") == "source_quality"
         and (
@@ -6793,6 +7476,7 @@ def validate_semantic_candidate_plan(
         "expected_evidence_needs": expected_needs,
         "angle_count": len(angles),
         "task_count": len(tasks),
+        "visual_optional_support_profile": visual_optional_support_profile,
         "failure_count": len(failures),
         "failures": failures,
         "ok": not failures,
@@ -7242,6 +7926,13 @@ def _codex_semantic_raw_request(
     if normalized_visual_preference == "text_only":
         request_budget_cap["max_images"] = 0
         planner_instructions.append(_text_only_visual_contract_instruction())
+    elif normalized_visual_preference == "visual_optional":
+        planner_instructions.append(
+            _visual_optional_contract_instruction(
+                has_provided_images=bool(provided_images),
+                prompt_mentions_visual=question_mentions_visual_evidence(question),
+            )
+        )
     return {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
         "artifact_type": "semantic_planner_raw_request",

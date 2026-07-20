@@ -3064,6 +3064,401 @@ class SemanticPlannerTests(unittest.TestCase):
             (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
         )
 
+    def test_visual_optional_rejects_visual_dominance_for_nonvisual_prompt(self) -> None:
+        question = (
+            "Compare architectural model outputs against public design criteria "
+            "and tender document criteria."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "v" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(2, 3),
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=response["candidate_plan"],
+            visual_preference="visual_optional",
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("MODALITY_OPTIONALITY_REVERSED", failure_codes)
+        self.assertIn(
+            "visual_optional_visual_work_dominates_primary_evidence",
+            failure_codes,
+        )
+        profile = validation["visual_optional_support_profile"]
+        self.assertEqual(profile["visual_angle_count"], 2)
+        self.assertEqual(profile["visual_task_count"], 8)
+        self.assertEqual(profile["max_visual_angles"], 1)
+        self.assertEqual(profile["max_visual_tasks"], 5)
+
+    def test_visual_optional_accepts_bounded_support_without_dropping_visual(self) -> None:
+        question = (
+            "Compare architectural model outputs against public design criteria "
+            "and tender document criteria."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "w" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(2,),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        for angle in candidate["angles"]:
+            if angle["angle_id"] == "angle_002":
+                angle["route"] = "visual_optional"
+                angle["evidence_need"] = "visual_example"
+                angle["expected_visual_targets"] = [
+                    "public design document model-output figure, if available"
+                ]
+                continue
+            angle["route"] = "text_only"
+            angle["expected_visual_targets"] = []
+            if angle["evidence_need"] in {"visual_example", "visual_observation"}:
+                angle["evidence_need"] = "official_source"
+            angle["expected_artifacts"] = [
+                f"{angle['angle_id']} text document criteria notes"
+            ]
+            angle["success_criteria"] = [
+                f"Use official text or document sources for {question}."
+            ]
+        for task in candidate["bounded_tasks"]:
+            if task["angle_id"] == "angle_002":
+                task["route"] = "visual_optional"
+                task["expected_visual_targets"] = [
+                    "public design document model-output figure, if available"
+                ]
+                task["max_images"] = 1
+                task["expected_evidence"] = (
+                    ["visual_observation"]
+                    if task["task_id"].endswith(("006", "008"))
+                    else ["visual_example"]
+                )
+                continue
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task.pop("expected_evidence", None)
+            task["query"] = (
+                f"{question} official text document criteria task {task['task_id']}"
+            )
+            task["expected_artifacts"] = [
+                f"{task['task_id']} source criteria notes"
+            ]
+            task["success_criteria"] = [
+                f"Task must preserve subject: {question}.",
+                "Use official text or document sources as evidence.",
+            ]
+            task["done_condition"] = "Stop when text or document evidence is recorded."
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="visual_optional",
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        profile = validation["visual_optional_support_profile"]
+        self.assertEqual(profile["visual_angle_count"], 1)
+        self.assertEqual(profile["visual_task_count"], 4)
+
+        all_text = json.loads(json.dumps(candidate))
+        for angle in all_text["angles"]:
+            angle["route"] = "text_only"
+            angle["expected_visual_targets"] = []
+            if angle["evidence_need"] in {"visual_example", "visual_observation"}:
+                angle["evidence_need"] = "official_source"
+            angle["expected_artifacts"] = [
+                f"{angle['angle_id']} text document criteria notes"
+            ]
+            angle["success_criteria"] = [
+                f"Use official text or document sources for {question}."
+            ]
+        for task in all_text["bounded_tasks"]:
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task.pop("expected_evidence", None)
+            task["query"] = (
+                f"{question} official text document criteria task {task['task_id']}"
+            )
+            task["expected_artifacts"] = [
+                f"{task['task_id']} source criteria notes"
+            ]
+            task["success_criteria"] = [
+                f"Task must preserve subject: {question}.",
+                "Use official text or document sources as evidence.",
+            ]
+            task["done_condition"] = "Stop when text or document evidence is recorded."
+
+        all_text_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=all_text,
+            visual_preference="visual_optional",
+        )
+
+        self.assertFalse(all_text_validation["ok"], all_text_validation)
+        all_text_codes = {
+            failure["code"] for failure in all_text_validation["failures"]
+        }
+        self.assertIn("visual_requirement_missing_visual_route", all_text_codes)
+        self.assertIn("visual_question_all_text_only", all_text_codes)
+
+    def test_prepare_visual_optional_retries_visual_dominance_before_review(self) -> None:
+        question = (
+            "Compare architectural model outputs against public design criteria "
+            "and tender document criteria."
+        )
+
+        def bounded_visual_support(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            for angle in candidate["angles"]:
+                if angle["angle_id"] == "angle_002":
+                    angle["route"] = "visual_optional"
+                    angle["evidence_need"] = "visual_example"
+                    angle["expected_visual_targets"] = [
+                        "public design document model-output figure, if available"
+                    ]
+                    continue
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+                if angle["evidence_need"] in {"visual_example", "visual_observation"}:
+                    angle["evidence_need"] = "official_source"
+                angle["expected_artifacts"] = [
+                    f"{angle['angle_id']} text document criteria notes"
+                ]
+                angle["success_criteria"] = [
+                    f"Use official text or document sources for {question}."
+                ]
+            for task in candidate["bounded_tasks"]:
+                if task["angle_id"] == "angle_002":
+                    task["route"] = "visual_optional"
+                    task["expected_visual_targets"] = [
+                        "public design document model-output figure, if available"
+                    ]
+                    task["max_images"] = 1
+                    task["expected_evidence"] = (
+                        ["visual_observation"]
+                        if task["task_id"].endswith(("006", "008"))
+                        else ["visual_example"]
+                    )
+                    continue
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task.pop("expected_evidence", None)
+                task["query"] = (
+                    f"{question} official text document criteria task {task['task_id']}"
+                )
+                task["expected_artifacts"] = [
+                    f"{task['task_id']} source criteria notes"
+                ]
+                task["success_criteria"] = [
+                    f"Task must preserve subject: {question}.",
+                    "Use official text or document sources as evidence.",
+                ]
+                task["done_condition"] = "Stop when text or document evidence is recorded."
+            return response
+
+        def planner_mutator(response: dict, request: dict) -> dict:
+            if request.get("retry_attempt"):
+                return bounded_visual_support(response)
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(2, 3),
+            planner_response_mutator=planner_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(adapter_request["retry_attempt"], 2)
+        self.assertEqual(
+            adapter_request["_artifact_types"].count("semantic_planner_raw_request"),
+            2,
+        )
+        first_attempt_codes = set(
+            raw_response["previous_adapter_attempts"][0][
+                "deterministic_failure_codes"
+            ]
+        )
+        self.assertIn("MODALITY_OPTIONALITY_REVERSED", first_attempt_codes)
+        self.assertIn(
+            "visual_optional_visual_work_dominates_primary_evidence",
+            first_attempt_codes,
+        )
+        visual_angles = [
+            angle
+            for angle in semantic_plan["angles"]
+            if angle["route"] != "text_only"
+        ]
+        visual_tasks = [
+            task
+            for task in semantic_plan["bounded_tasks"]
+            if task["route"] != "text_only"
+        ]
+        self.assertEqual(len(visual_angles), 1)
+        self.assertEqual(len(visual_tasks), 4)
+
+    def test_req003_deliverable_remediation_and_structured_artifact_requirements(self) -> None:
+        question = (
+            "Compare architectural model outputs against public design criteria "
+            "and tender document criteria, then prioritize remediation."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "x" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        task_ids = [task["task_id"] for task in candidate["bounded_tasks"]]
+        angle_ids = [angle["angle_id"] for angle in candidate["angles"]]
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["query"] = (
+                f"Collect public design and tender criteria source evidence {index}."
+            )
+            task["expected_artifacts"] = ["source evidence notes"]
+            task["success_criteria"] = [
+                "Record official source evidence and caveats."
+            ]
+            task["done_condition"] = "Stop when source-backed criteria notes are recorded."
+        candidate["requirement_coverage_map"].append(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "analysis_comparison_output_shape",
+                "requirement_text": (
+                    "Produce a side-by-side comparison table for architectural "
+                    "model outputs and structured artifacts against public design "
+                    "criteria and tender document criteria, including match, "
+                    "partial, mismatch, unverifiable, evidence, caveats, and "
+                    "prioritized remediation recommendations."
+                ),
+                "prompt_text": "side-by-side comparison table",
+                "prompt_span": {"start": None, "end": None},
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": angle_ids,
+                "covered_by_task_ids": task_ids,
+                "coverage_status": "covered",
+            }
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+        self.assertIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
+        self.assertIn("STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE", failure_codes)
+
+        repaired = json.loads(json.dumps(candidate))
+        task = repaired["bounded_tasks"][0]
+        task["route"] = "text_only"
+        task["expected_visual_targets"] = []
+        task["max_images"] = 0
+        task["query"] = (
+            "Assess structured architectural model output artifacts by inventorying "
+            "files, fields, attributes, object classes, LOD, and IFC properties, then "
+            "build the side-by-side comparison table."
+        )
+        task["expected_artifacts"] = [
+            "structured artifact assessment inventory",
+            "consolidated side-by-side comparison table",
+            "prioritized remediation recommendations",
+        ]
+        task["success_criteria"] = [
+            (
+                "The table has fields for requirement or criterion, architectural "
+                "model output or structured artifact, public design criteria, tender "
+                "document criteria, match status, partial status, mismatch status, "
+                "unverifiable status, evidence citations, caveats, and remediation."
+            ),
+            (
+                "Remediation recommendations are ranked by priority, severity, "
+                "impact, effort, and evidence confidence."
+            ),
+        ]
+        task["done_condition"] = (
+            "Stop when each structured artifact requirement has assessment fields, "
+            "comparison evidence, caveats, and prioritized remediation next action."
+        )
+
+        repaired_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+
+        self.assertTrue(repaired_validation["ok"], repaired_validation)
+        repaired_codes = {
+            failure["code"] for failure in repaired_validation["failures"]
+        }
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", repaired_codes)
+        self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", repaired_codes)
+        self.assertNotIn("STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE", repaired_codes)
+
+    def test_semantic_planner_source_has_no_sem_reg_004_special_case(self) -> None:
+        source = (
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "src"
+            / "deepresearch"
+            / "semantic_planner.py"
+        ).read_text(encoding="utf-8")
+
+        for forbidden in (
+            "sem-reg-004",
+            "sem_reg_004",
+            "b9301c1",
+            "dr_20260720T141947",
+            "건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
     def test_default_codex_semantic_adapter_commands_use_schemas_when_env_absent(self) -> None:
         question = "Research lunar habitat material tests using official images and source records"
         result, adapter_request = self.prepare_with_codex_adapter(
@@ -3181,6 +3576,143 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(convergence["attempts"][1]["final_selection"])
         self.assertIn(repair_marker, json.dumps(semantic_plan, ensure_ascii=False))
         self.assertIn("semantic_planner_convergence", result["artifacts"])
+
+    def test_semantic_reviewer_specific_blockers_add_actionable_retry_guidance(self) -> None:
+        question = (
+            "Compare architectural model outputs against public design criteria "
+            "and tender document criteria."
+        )
+        repair_marker = "specific reviewer blockers repaired"
+
+        def bounded_visual_support(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            for angle in candidate["angles"]:
+                if angle["angle_id"] == "angle_002":
+                    angle["route"] = "visual_optional"
+                    angle["evidence_need"] = "visual_example"
+                    angle["expected_visual_targets"] = [
+                        "public design document model-output figure, if available"
+                    ]
+                    continue
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+                if angle["evidence_need"] in {"visual_example", "visual_observation"}:
+                    angle["evidence_need"] = "official_source"
+                angle["expected_artifacts"] = [
+                    f"{angle['angle_id']} text document criteria notes"
+                ]
+                angle["success_criteria"] = [
+                    f"Use official text or document sources for {question}."
+                ]
+            for task in candidate["bounded_tasks"]:
+                if task["angle_id"] == "angle_002":
+                    task["route"] = "visual_optional"
+                    task["expected_visual_targets"] = [
+                        "public design document model-output figure, if available"
+                    ]
+                    task["max_images"] = 1
+                    task["expected_evidence"] = (
+                        ["visual_observation"]
+                        if task["task_id"].endswith(("006", "008"))
+                        else ["visual_example"]
+                    )
+                    continue
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task.pop("expected_evidence", None)
+                task["query"] = (
+                    f"{question} official text document criteria task {task['task_id']}"
+                )
+                task["expected_artifacts"] = [
+                    f"{task['task_id']} source criteria notes"
+                ]
+                task["success_criteria"] = [
+                    f"Task must preserve subject: {question}.",
+                    "Use official text or document sources as evidence.",
+                ]
+                task["done_condition"] = "Stop when text or document evidence is recorded."
+            return response
+
+        def planner_mutator(response: dict, request: dict) -> dict:
+            response = bounded_visual_support(response)
+            if request.get("semantic_convergence_attempt"):
+                instructions = request["planner_retry_instructions"]
+                for expected in (
+                    "route=visual_optional rather than route=visual_required",
+                    "consolidated side-by-side comparison deliverable",
+                    "match/partial/mismatch/unverifiable",
+                    "prioritized remediation recommendations",
+                    "structured-artifact assessment tasks",
+                ):
+                    self.assertIn(expected, instructions)
+                candidate = response["candidate_plan"]
+                candidate["constraints"].append(repair_marker)
+                task = candidate["bounded_tasks"][0]
+                task["expected_artifacts"] = [
+                    "consolidated side-by-side comparison deliverable",
+                    "prioritized remediation recommendations",
+                    "structured-artifact assessment inventory",
+                ]
+                task["success_criteria"] = [
+                    (
+                        "Include criterion, architectural model output, public design "
+                        "criteria, tender document criteria, match, partial, mismatch, "
+                        "unverifiable, evidence, caveats, and remediation fields."
+                    ),
+                    (
+                        "Rank prioritized remediation recommendations by severity, "
+                        "impact, effort, and evidence confidence."
+                    ),
+                ]
+                task["done_condition"] = (
+                    "Stop when structured-artifact assessment tasks feed the "
+                    "comparison deliverable and remediation priorities."
+                )
+            return response
+
+        def reviewer_mutator(response: dict, request: dict) -> dict:
+            plan_text = json.dumps(request["semantic_plan"], ensure_ascii=False)
+            if repair_marker not in plan_text:
+                review = response["semantic_plan_review"]
+                review["semantic_fit_score"] = 7.4
+                review["blockers"] = [
+                    {"code": "MODALITY_OPTIONALITY_REVERSED"},
+                    {"code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE"},
+                    {"code": "REQ_003_PRIORITIZED_REMEDIATION_MISSING"},
+                    {"code": "STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE"},
+                ]
+                review["verdict"] = "release_ineligible"
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(2,),
+            planner_response_mutator=planner_mutator,
+            reviewer_response_mutator=reviewer_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        retry_request = adapter_request["_planner_requests"][1]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(convergence["status"], "converged", convergence)
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertIn(
+            "MODALITY_OPTIONALITY_REVERSED",
+            retry_request["previous_semantic_review_failure_codes"],
+        )
+        self.assertIn(
+            "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+            retry_request["planner_retry_instructions"],
+        )
+        self.assertIn(
+            "STRUCTURED_ARTIFACT_ROUTE_INCOMPLETE",
+            retry_request["planner_retry_instructions"],
+        )
 
     def test_semantic_reviewer_failure_terminal_after_bounded_convergence(self) -> None:
         def reviewer_mutator(response: dict, _request: dict) -> dict:
@@ -5217,12 +5749,69 @@ class SemanticPlannerTests(unittest.TestCase):
 
     def test_codex_semantic_sem_reg_004_oracle_capacity_retry_avoids_fixture(self) -> None:
         question = self.semantic_regression_prompt(3)
+
+        def bounded_visual_optional_response(response: dict, _request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            for angle in candidate["angles"]:
+                if angle["angle_id"] == "angle_002":
+                    angle["route"] = "visual_optional"
+                    angle["evidence_need"] = "visual_example"
+                    angle["expected_visual_targets"] = [
+                        "공식 문서에 포함된 건축 모델 산출물 예시가 있는 경우"
+                    ]
+                    continue
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+                if angle["evidence_need"] in {"visual_example", "visual_observation"}:
+                    angle["evidence_need"] = "official_source"
+                angle["expected_artifacts"] = [
+                    f"{angle['angle_id']} 공식 기준 및 입찰 문서 비교 notes"
+                ]
+                angle["success_criteria"] = [
+                    f"공식 텍스트 또는 문서 근거로 {question} 요구를 보존한다."
+                ]
+            for task in candidate["bounded_tasks"]:
+                if task["angle_id"] == "angle_002":
+                    task["route"] = "visual_optional"
+                    task["expected_visual_targets"] = [
+                        "공식 문서에 포함된 건축 모델 산출물 예시가 있는 경우"
+                    ]
+                    task["max_images"] = 1
+                    task["expected_evidence"] = (
+                        ["visual_observation"]
+                        if task["task_id"].endswith(("006", "008"))
+                        else ["visual_example"]
+                    )
+                    continue
+                task["route"] = "text_only"
+                task["expected_visual_targets"] = []
+                task["max_images"] = 0
+                task.pop("expected_evidence", None)
+                task["query"] = (
+                    f"{question} 공식 텍스트 문서 기준 비교 task {task['task_id']}"
+                )
+                task["expected_artifacts"] = [
+                    f"{task['task_id']} 공식 기준 및 입찰 문서 근거 notes",
+                    "requested table or matrix",
+                ]
+                task["success_criteria"] = [
+                    f"Task must preserve subject: {question}.",
+                    "Use official text or document sources as evidence.",
+                    "Preserve the requested table or matrix shape.",
+                ]
+                task["done_condition"] = (
+                    "Stop when text or document evidence and requested table details are recorded."
+                )
+            return response
+
         result, adapter_request = self.prepare_with_codex_adapter(
             question,
             route="visual_optional",
             requirement_types=("subject", "source_quality", "visual_modality", "deliverable_shape"),
-            visual_angle_indexes=(2, 3, 5),
+            visual_angle_indexes=(2,),
             capacity_failures_by_artifact={"semantic_oracle_raw_request": 1},
+            planner_response_mutator=bounded_visual_optional_response,
         )
         run_dir = Path(result["run_dir"])
         oracle_raw_response = self.load_json(
