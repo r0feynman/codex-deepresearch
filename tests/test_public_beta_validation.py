@@ -966,7 +966,65 @@ class PublicBetaValidationTests(unittest.TestCase):
             {finding["code"] for finding in scan["findings"]},
         )
         self.assertIn(
+            "known_registered_prompt_hash",
+            {finding["code"] for finding in scan["findings"]},
+        )
+        self.assertIn(
             "canned" + "_expected" + "_plan",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
+    def test_semantic_anti_overfit_scan_rejects_regression_prompt_id_and_hash(
+        self,
+    ) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_regression_bad.py"
+        regression = load_semantic_regression_manifest(
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST
+        )
+        prompt = regression["prompts"][0]
+        prompt_hash = hashlib.sha256(
+            " ".join(prompt["prompt"].strip().split()).encode("utf-8")
+        ).hexdigest()
+        bad.write_text(
+            "\n".join(
+                [
+                    f"REGRESSION_PROMPT_ID = {prompt['id']!r}",
+                    f"REGRESSION_PROMPT_HASH = {prompt_hash!r}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        codes = {finding["code"] for finding in scan["findings"]}
+        self.assertIn("known_registered_prompt_id", codes)
+        self.assertIn("known_registered_prompt_hash", codes)
+
+    def test_semantic_anti_overfit_scan_rejects_oracle_fragment_text(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_oracle_bad.py"
+        oracle_bundle = json.loads(
+            (
+                ROOT
+                / "plugins"
+                / "codex-deepresearch"
+                / "validation"
+                / "semantic_oracles.json"
+            ).read_text(encoding="utf-8")
+        )
+        oracle_note = oracle_bundle["oracles"]["sem-reg-001"][
+            "expected_source_policy"
+        ][-1]
+        bad.write_text(f"ORACLE_NOTE = {oracle_note!r}\n", encoding="utf-8")
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "known_oracle_fragment",
             {finding["code"] for finding in scan["findings"]},
         )
 

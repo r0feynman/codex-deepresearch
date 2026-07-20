@@ -24,6 +24,7 @@ SEMANTIC_PLANNER_VALIDATION_FILENAME = "semantic_planner_validation.json"
 SEMANTIC_EXPECTATION_ORACLE_FILENAME = "semantic_expectation_oracle.json"
 SEMANTIC_PLAN_FILENAME = "semantic_plan.json"
 SEMANTIC_PLAN_REVIEW_FILENAME = "semantic_plan_review.json"
+SEMANTIC_PLANNER_CONVERGENCE_FILENAME = "semantic_planner_convergence.json"
 SEMANTIC_PLAN_DELTA_FILENAME = "semantic_plan_delta.json"
 SEMANTIC_MATERIALIZATION_DIFF_FILENAME = "semantic_materialization_diff.json"
 SEMANTIC_REQUIREMENT_WAIVERS_FILENAME = "semantic_requirement_waivers.json"
@@ -802,7 +803,10 @@ def codex_semantic_candidate_plan(
                 _materialize_candidate_expected_evidence(candidate)
             )
             candidate, visual_image_cap_materializations = (
-                _materialize_candidate_visual_image_cap_feasibility(candidate)
+                _materialize_candidate_visual_image_cap_feasibility(
+                    candidate,
+                    budget_cap=raw_request.get("budget_cap"),
+                )
             )
             candidate, angle_title_materializations = (
                 _materialize_candidate_angle_title_prompt_anchors(
@@ -1933,12 +1937,23 @@ def _materialize_candidate_placeholder_selection_workflow(
 
 def _materialize_candidate_visual_image_cap_feasibility(
     candidate: Mapping[str, Any],
+    *,
+    budget_cap: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     normalized = copy.deepcopy(dict(candidate))
     raw_tasks = normalized.get("bounded_tasks")
     if not isinstance(raw_tasks, list):
         return normalized, []
 
+    run_image_budget = (
+        _semantic_task_source_cap_int(budget_cap.get("max_images"))
+        if isinstance(budget_cap, Mapping)
+        else None
+    )
+    schema_image_limit = 3
+    allowed_image_cap = schema_image_limit
+    if run_image_budget is not None:
+        allowed_image_cap = max(0, min(schema_image_limit, run_image_budget))
     normalized_tasks: list[Any] = []
     materializations: list[dict[str, Any]] = []
     for index, task in enumerate(raw_tasks, start=1):
@@ -1951,6 +1966,22 @@ def _materialize_candidate_visual_image_cap_feasibility(
             normalized_tasks.append(normalized_task)
             continue
         task_materializations: list[dict[str, Any]] = []
+        required_images, image_counts = _candidate_task_required_image_count(task)
+        if required_images > max_images and allowed_image_cap > max_images:
+            repaired_max_images = min(required_images, allowed_image_cap)
+            if repaired_max_images > max_images:
+                normalized_task["max_images"] = repaired_max_images
+                task_materializations.append(
+                    {
+                        "field": "bounded_tasks.max_images",
+                        "previous": max_images,
+                        "materialized": repaired_max_images,
+                        "required_images": required_images,
+                        "explicit_requirement_counts": image_counts,
+                        "materialization": "raised_visual_image_cap_within_budget",
+                    }
+                )
+                max_images = repaired_max_images
         for field_name in ("query", "done_condition"):
             current = str(normalized_task.get(field_name) or "")
             repaired = _cap_visual_image_demand_text(current, max_images=max_images)
@@ -2047,6 +2078,12 @@ def _semantic_count_word_to_int(value: str) -> int | None:
         "eight": 8,
         "nine": 9,
         "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "thirteen": 13,
+        "fourteen": 14,
+        "fifteen": 15,
+        "twenty": 20,
     }.get(value.lower())
 
 
@@ -2531,6 +2568,7 @@ def _candidate_task_min_executable_sources(
     text = _candidate_task_source_cap_text(task)
     source_family_count = _candidate_task_declared_source_family_count(task)
     named_source_entity_count = _candidate_task_named_source_entity_count(task)
+    explicit_counts = _candidate_task_explicit_requirement_counts(task)
     reasons = [
         label
         for label, needles in SEMANTIC_MULTI_SOURCE_CAP_NEEDLES.items()
@@ -2540,6 +2578,10 @@ def _candidate_task_min_executable_sources(
         reasons.append("multiple_declared_source_families")
     if named_source_entity_count >= 2:
         reasons.append("multiple_named_source_entities")
+    for kind in ("source", "vendor", "jurisdiction", "source_artifact"):
+        count = int(explicit_counts.get(kind) or 0)
+        if count >= 2:
+            reasons.append(f"explicit_{kind}_count")
     reason_set = set(reasons)
     minimum = SEMANTIC_TASK_MIN_SOURCES
     if reason_set & {"comparison", "freshness", "contradiction"}:
@@ -2556,7 +2598,226 @@ def _candidate_task_min_executable_sources(
         or reason_set & {"comparison", "freshness", "contradiction"}
     ):
         minimum = max(minimum, named_source_entity_count)
+    for kind in ("source", "vendor", "jurisdiction", "source_artifact"):
+        minimum = max(minimum, int(explicit_counts.get(kind) or 0))
     return min(SEMANTIC_TASK_MAX_SOURCES, minimum), list(dict.fromkeys(reasons))
+
+
+def _candidate_task_required_source_count(
+    task: Mapping[str, Any],
+) -> tuple[int, list[str], dict[str, int]]:
+    capped_minimum, reasons = _candidate_task_min_executable_sources(task)
+    explicit_counts = _candidate_task_explicit_requirement_counts(task)
+    required = capped_minimum
+    for kind in ("source", "vendor", "jurisdiction", "source_artifact"):
+        required = max(required, int(explicit_counts.get(kind) or 0))
+    return required, reasons, explicit_counts
+
+
+def _candidate_task_required_image_count(task: Mapping[str, Any]) -> tuple[int, dict[str, int]]:
+    counts = _candidate_task_explicit_requirement_counts(task)
+    required = int(counts.get("image") or 0)
+    return required, counts
+
+
+def _candidate_task_cap_feasibility_failures(
+    tasks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for task in tasks:
+        task_id = task.get("task_id")
+        max_sources = _semantic_task_source_cap_int(task.get("max_sources"))
+        required_sources, source_reasons, source_counts = (
+            _candidate_task_required_source_count(task)
+        )
+        if max_sources is not None and required_sources > max_sources:
+            dominant_kind = _dominant_cap_requirement_kind(
+                source_counts,
+                fallback="source",
+                source_reasons=source_reasons,
+            )
+            failures.append(
+                {
+                    "code": "bounded_task_requirement_exceeds_max_sources",
+                    "task_id": task_id,
+                    "requirement_kind": dominant_kind,
+                    "required_count": required_sources,
+                    "max_sources": max_sources,
+                    "explicit_requirement_counts": source_counts,
+                    "source_cap_reasons": source_reasons,
+                    "message": (
+                        "Bounded task requires more distinct source/vendor/"
+                        "jurisdiction/source-artifact evidence than max_sources permits."
+                    ),
+                }
+            )
+        max_images = _semantic_task_source_cap_int(task.get("max_images"))
+        required_images, image_counts = _candidate_task_required_image_count(task)
+        if max_images is not None and required_images > max_images:
+            failures.append(
+                {
+                    "code": "bounded_task_requirement_exceeds_max_images",
+                    "task_id": task_id,
+                    "requirement_kind": "image",
+                    "required_count": required_images,
+                    "max_images": max_images,
+                    "explicit_requirement_counts": image_counts,
+                    "message": (
+                        "Bounded task done condition or visual fields require more "
+                        "images than max_images permits."
+                    ),
+                }
+            )
+    return failures
+
+
+def _dominant_cap_requirement_kind(
+    counts: Mapping[str, int],
+    *,
+    fallback: str,
+    source_reasons: Sequence[str],
+) -> str:
+    explicit = [
+        (kind, int(value))
+        for kind, value in counts.items()
+        if kind != "image" and int(value or 0) > 0
+    ]
+    if explicit:
+        explicit.sort(key=lambda item: item[1], reverse=True)
+        return explicit[0][0]
+    for reason in source_reasons:
+        if reason.startswith("explicit_") and reason.endswith("_count"):
+            return reason.removeprefix("explicit_").removesuffix("_count")
+        if reason == "multiple_named_source_entities":
+            return "vendor"
+        if reason == "multiple_declared_source_families":
+            return "source"
+    return fallback
+
+
+def _candidate_task_explicit_requirement_counts(task: Mapping[str, Any]) -> dict[str, int]:
+    text_by_kind = {
+        "source": _candidate_task_requirement_count_text(task, "source"),
+        "vendor": _candidate_task_requirement_count_text(task, "vendor"),
+        "jurisdiction": _candidate_task_requirement_count_text(task, "jurisdiction"),
+        "source_artifact": _candidate_task_requirement_count_text(task, "source_artifact"),
+        "image": _candidate_task_requirement_count_text(task, "image"),
+    }
+    return {
+        kind: _max_explicit_requirement_count(text, kind=kind)
+        for kind, text in text_by_kind.items()
+    }
+
+
+def _candidate_task_requirement_count_text(
+    task: Mapping[str, Any],
+    kind: str,
+) -> str:
+    if kind == "image":
+        fields = (
+            "query",
+            "expected_visual_targets",
+            "expected_artifacts",
+            "success_criteria",
+            "done_condition",
+        )
+    elif kind == "source_artifact":
+        fields = (
+            "expected_artifacts",
+            "success_criteria",
+            "done_condition",
+        )
+    else:
+        fields = SEMANTIC_MULTI_SOURCE_CAP_FIELDS
+    return json.dumps([task.get(field) for field in fields], ensure_ascii=False, sort_keys=True)
+
+
+def _max_explicit_requirement_count(text: str, *, kind: str) -> int:
+    lowered = str(text or "").lower()
+    nouns = {
+        "source": (
+            "source",
+            "sources",
+            "official source",
+            "official sources",
+            "primary source",
+            "primary sources",
+            "regulatory source",
+            "regulatory sources",
+            "source record",
+            "source records",
+        ),
+        "vendor": (
+            "vendor",
+            "vendors",
+            "provider",
+            "providers",
+            "browser",
+            "browsers",
+            "product",
+            "products",
+        ),
+        "jurisdiction": (
+            "jurisdiction",
+            "jurisdictions",
+            "municipality",
+            "municipalities",
+            "city",
+            "cities",
+            "county",
+            "counties",
+            "region",
+            "regions",
+            "country",
+            "countries",
+        ),
+        "source_artifact": (
+            "source-backed artifact",
+            "source-backed artifacts",
+            "official record",
+            "official records",
+            "regulatory record",
+            "regulatory records",
+            "source excerpt",
+            "source excerpts",
+        ),
+        "image": (
+            "image",
+            "images",
+            "photo",
+            "photos",
+            "screenshot",
+            "screenshots",
+            "figure",
+            "figures",
+            "diagram",
+            "diagrams",
+            "chart",
+            "charts",
+            "poster",
+            "posters",
+            "visual example",
+            "visual examples",
+        ),
+    }[kind]
+    noun_pattern = "|".join(re.escape(noun) for noun in sorted(nouns, key=len, reverse=True))
+    digit_count_pattern = r"(?<![-_A-Za-z0-9])(?:[1-9]\d*)"
+    count_pattern = (
+        rf"{digit_count_pattern}|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|twenty"
+    )
+    patterns = (
+        rf"\b(?:at least|minimum of|no fewer than|compare|across|from|cover|collect|inspect|analyze|review|use|include)\s+"
+        rf"(?P<count>{count_pattern})\s+(?:distinct\s+|different\s+|representative\s+|official\s+|primary\s+|regulatory\s+)?(?:{noun_pattern})\b",
+        rf"\b(?P<count>{count_pattern})\s+(?:distinct\s+|different\s+|representative\s+|official\s+|primary\s+|regulatory\s+)?(?:{noun_pattern})\b",
+    )
+    counts: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, lowered):
+            count = _semantic_count_word_to_int(match.group("count"))
+            if count is not None:
+                counts.append(count)
+    return max(counts or [0])
 
 
 def _candidate_task_source_cap_text(task: Mapping[str, Any]) -> str:
@@ -3358,6 +3619,226 @@ def semantic_plan_with_review_result(
         status="semantic_review_passed" if eligible else "blocked_semantic_review_failed",
         diagnostics=diagnostics,
     )
+
+
+def semantic_plan_candidate_hash(plan: SemanticPlan | Mapping[str, Any]) -> str:
+    payload = plan.to_dict() if isinstance(plan, SemanticPlan) else dict(plan)
+    return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+
+
+def semantic_review_failure_codes(review: Mapping[str, Any]) -> list[str]:
+    codes: list[str] = []
+    for blocker in _list(review.get("blockers")):
+        if isinstance(blocker, Mapping) and blocker.get("code"):
+            codes.append(str(blocker["code"]))
+        elif isinstance(blocker, str) and blocker.strip():
+            codes.append(blocker.strip())
+    score = _numeric_score(review.get("semantic_fit_score"))
+    if score is None:
+        codes.append("semantic_fit_score_missing_or_non_finite")
+    elif score < SEMANTIC_FIT_SCORE_THRESHOLD:
+        codes.append("semantic_fit_score_below_threshold")
+    if review.get("verdict") != "pass" and review.get("final_verdict") != "pass":
+        codes.append("semantic_review_verdict_not_pass")
+    if review.get("non_negotiable_coverage_complete") is not True:
+        codes.append("non_negotiable_coverage_incomplete")
+    substitute = review.get("substitute_implementation_check")
+    if not isinstance(substitute, Mapping) or substitute.get("passed") is not True:
+        codes.append("substitute_implementation_check_failed")
+    return list(dict.fromkeys(codes))
+
+
+NON_RETRYABLE_SEMANTIC_REVIEW_FAILURE_CODES = {
+    "reviewer_adapter_unavailable",
+    "non_release_reviewer_fixture",
+    "non_release_oracle_fixture",
+    "reviewer_or_oracle_provenance_not_independent",
+    "semantic_reviewer_non_release_fixture",
+    "reviewer_raw_request_path_missing",
+    "reviewer_raw_response_path_missing",
+    "reviewer_provenance_incomplete",
+}
+
+
+def semantic_review_failure_retryable(review: Mapping[str, Any]) -> bool:
+    """Return whether reviewer blockers can be repaired by a fresh planner candidate."""
+
+    if semantic_review_release_eligible(review):
+        return False
+    codes = set(semantic_review_failure_codes(review))
+    if not codes:
+        return False
+    return not bool(codes & NON_RETRYABLE_SEMANTIC_REVIEW_FAILURE_CODES)
+
+
+def semantic_convergence_attempt_record(
+    *,
+    attempt: int,
+    plan: SemanticPlan,
+    deterministic_validation: Mapping[str, Any] | None,
+    semantic_review: Mapping[str, Any] | None,
+    repair_inputs: Mapping[str, Any] | None = None,
+    final_selection: bool = False,
+    terminal_failure: bool = False,
+) -> dict[str, Any]:
+    candidate_hash = semantic_plan_candidate_hash(plan)
+    deterministic = dict(deterministic_validation or {})
+    review = dict(semantic_review or {})
+    return {
+        "attempt": attempt,
+        "candidate_id": candidate_hash[:16],
+        "candidate_hash": candidate_hash,
+        "planner_status": plan.status,
+        "planner_mode": plan.planner_mode,
+        "raw_request_hash": plan.planner_provenance.get("raw_request_hash")
+        or plan.planner_provenance.get("adapter_request_hash"),
+        "raw_response_hash": plan.planner_provenance.get("raw_response_hash"),
+        "deterministic_ok": deterministic.get("ok"),
+        "deterministic_failure_codes": _candidate_validation_failure_codes(
+            deterministic
+        ),
+        "deterministic_failures": [
+            dict(failure)
+            for failure in _list(deterministic.get("failures"))
+            if isinstance(failure, Mapping)
+        ],
+        "reviewer_semantic_fit_score": review.get("semantic_fit_score"),
+        "reviewer_verdict": review.get("verdict") or review.get("final_verdict"),
+        "reviewer_release_eligible": semantic_review_release_eligible(review)
+        if review
+        else False,
+        "reviewer_blocker_codes": semantic_review_failure_codes(review)
+        if review
+        else [],
+        "reviewer_blockers": [
+            dict(blocker)
+            for blocker in _list(review.get("blockers"))
+            if isinstance(blocker, Mapping)
+        ],
+        "repair_inputs": dict(repair_inputs or {}),
+        "final_selection": final_selection,
+        "terminal_failure": terminal_failure,
+    }
+
+
+def semantic_convergence_artifact(
+    *,
+    run_id: str,
+    max_attempts: int,
+    attempts: Sequence[Mapping[str, Any]],
+    final_plan: SemanticPlan,
+    final_review: Mapping[str, Any] | None,
+    status: str,
+) -> dict[str, Any]:
+    final_candidate_hash = semantic_plan_candidate_hash(final_plan)
+    review = dict(final_review or {})
+    terminal_codes = []
+    if status != "converged":
+        terminal_codes = semantic_review_failure_codes(review)
+        if not terminal_codes:
+            diagnostics = final_plan.diagnostics if isinstance(final_plan.diagnostics, Mapping) else {}
+            blocked_reason = diagnostics.get("blocked_reason") or diagnostics.get(
+                "adapter_invalid_response_reason"
+            )
+            if blocked_reason:
+                terminal_codes = [str(blocked_reason)]
+    return {
+        "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+        "artifact_type": "semantic_planner_convergence",
+        "run_id": run_id,
+        "status": status,
+        "max_attempts": max_attempts,
+        "attempt_count": len(attempts),
+        "attempts": [dict(attempt) for attempt in attempts],
+        "final_selection": (
+            {
+                "attempt": len(attempts),
+                "candidate_id": final_candidate_hash[:16],
+                "candidate_hash": final_candidate_hash,
+                "semantic_fit_score": review.get("semantic_fit_score"),
+                "reviewer_verdict": review.get("verdict") or review.get("final_verdict"),
+            }
+            if status == "converged"
+            else None
+        ),
+        "terminal_failure": (
+            {
+                "candidate_id": final_candidate_hash[:16],
+                "candidate_hash": final_candidate_hash,
+                "reason_codes": terminal_codes,
+                "semantic_fit_score": review.get("semantic_fit_score"),
+                "reviewer_verdict": review.get("verdict") or review.get("final_verdict"),
+            }
+            if status != "converged"
+            else None
+        ),
+    }
+
+
+def codex_semantic_review_retry_raw_request(
+    *,
+    raw_request: Mapping[str, Any],
+    attempt: int,
+    deterministic_validation: Mapping[str, Any],
+    semantic_review: Mapping[str, Any],
+    candidate_hash: str,
+    max_attempts: int,
+) -> dict[str, Any]:
+    retry_request = _codex_semantic_retry_raw_request(
+        raw_request=raw_request,
+        attempt=attempt,
+        validation=deterministic_validation,
+    )
+    review_codes = semantic_review_failure_codes(semantic_review)
+    review_blockers = [
+        dict(blocker)
+        for blocker in _list(semantic_review.get("blockers"))[:8]
+        if isinstance(blocker, Mapping)
+    ]
+    repair_inputs = {
+        "previous_candidate_hash": candidate_hash,
+        "deterministic_failure_codes": _candidate_validation_failure_codes(
+            deterministic_validation
+        ),
+        "deterministic_failures": [
+            dict(failure)
+            for failure in _list(deterministic_validation.get("failures"))[:8]
+            if isinstance(failure, Mapping)
+        ],
+        "reviewer_failure_codes": review_codes,
+        "reviewer_blockers": review_blockers,
+        "reviewer_semantic_fit_score": semantic_review.get("semantic_fit_score"),
+        "reviewer_verdict": semantic_review.get("verdict")
+        or semantic_review.get("final_verdict"),
+    }
+    retry_request["semantic_convergence_attempt"] = attempt
+    retry_request["semantic_convergence_max_attempts"] = max_attempts
+    retry_request["previous_semantic_review_failure_codes"] = review_codes
+    retry_request["previous_semantic_review_blockers"] = review_blockers
+    retry_request["previous_semantic_review_score"] = semantic_review.get(
+        "semantic_fit_score"
+    )
+    retry_request["previous_semantic_review_verdict"] = (
+        semantic_review.get("verdict") or semantic_review.get("final_verdict")
+    )
+    retry_request["semantic_convergence_repair_inputs"] = repair_inputs
+    retry_request["planner_retry_instructions"] = (
+        str(retry_request.get("planner_retry_instructions") or "")
+        + " Independent semantic review also failed. Repair using the structured "
+        "semantic_convergence_repair_inputs: fix reviewer blockers and score "
+        f"failures without lowering the semantic_fit_score threshold {SEMANTIC_FIT_SCORE_THRESHOLD}. "
+        "Split over-broad visual, vendor, jurisdiction, or comparison tasks into "
+        "smaller bounded tasks when distinct obligations exceed per-task caps; "
+        "otherwise raise max_sources only up to 5 and max_images only up to 3 "
+        "and only within the supplied budget_cap. Preserve runner-level budgets "
+        "as executable reuse constraints. Preserve visual-required/optional work "
+        "for visual prompts and preserve text_only constraints when requested. "
+        "For ambiguous architecture, model, or testing prompts, use software/Codex "
+        "implementation templates only when the original question explicitly asks "
+        "about software, Codex, APIs, code, runners, or repositories."
+    )
+    retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
+    return retry_request
 
 
 def _run_codex_semantic_adapter_command_with_capacity_retry(
@@ -4668,6 +5149,14 @@ def _forbidden_internal_term_matches(
             if _architecture_term_is_internal_leakage(normalized_value):
                 return True
             continue
+        if compact_term == "model":
+            if _model_term_is_internal_leakage(normalized_value):
+                return True
+            continue
+        if compact_term in {"test", "testing"}:
+            if _testing_term_is_internal_leakage(normalized_value):
+                return True
+            continue
         return True
     return False
 
@@ -4826,6 +5315,104 @@ def _architecture_term_is_internal_leakage(normalized_value: str) -> bool:
     if tokens & physical_terms:
         return False
     return True
+
+
+def _model_term_is_internal_leakage(normalized_value: str) -> bool:
+    software_terms = {
+        "adapter",
+        "api",
+        "backend",
+        "code",
+        "codex",
+        "component",
+        "database",
+        "frontend",
+        "implementation",
+        "internal",
+        "module",
+        "planner",
+        "repository",
+        "runner",
+        "runtime",
+        "sdk",
+        "semantic",
+        "service",
+        "software",
+        "system",
+    }
+    non_software_terms = {
+        "architectural",
+        "building",
+        "clinical",
+        "construction",
+        "evaluation",
+        "foundation",
+        "hospital",
+        "language",
+        "learning",
+        "machine",
+        "physical",
+        "policy",
+        "public",
+        "safety",
+        "scale",
+        "statistical",
+        "건축",
+        "모델",
+        "안전",
+        "평가",
+    }
+    tokens = set(normalized_value.split())
+    if tokens & non_software_terms and not (tokens & software_terms):
+        return False
+    return bool(tokens & software_terms)
+
+
+def _testing_term_is_internal_leakage(normalized_value: str) -> bool:
+    software_terms = {
+        "adapter",
+        "api",
+        "automation",
+        "backend",
+        "code",
+        "codex",
+        "component",
+        "e2e",
+        "implementation",
+        "internal",
+        "module",
+        "pipeline",
+        "planner",
+        "repository",
+        "runner",
+        "runtime",
+        "sdk",
+        "semantic",
+        "software",
+        "unit",
+    }
+    non_software_terms = {
+        "clinical",
+        "crash",
+        "fire",
+        "hospital",
+        "laboratory",
+        "material",
+        "medical",
+        "physical",
+        "public",
+        "safety",
+        "standard",
+        "standards",
+        "안전",
+        "시험",
+        "테스트",
+        "평가",
+    }
+    tokens = set(normalized_value.split())
+    if tokens & non_software_terms and not (tokens & software_terms):
+        return False
+    return bool(tokens & software_terms)
 
 
 def _ambiguous_internal_term_has_context(term: str, normalized_value: str) -> bool:
@@ -5640,6 +6227,7 @@ def validate_semantic_candidate_plan(
                         "task_id": task.get("task_id"),
                     }
                 )
+    failures.extend(_candidate_task_cap_feasibility_failures(tasks))
     failures.extend(
         _candidate_source_cap_constraint_failures(
             plan=plan,
@@ -5757,6 +6345,16 @@ def validate_semantic_candidate_plan(
         }
         if not visual_angles or not visual_tasks:
             failures.append({"code": "visual_requirement_missing_visual_route"})
+            if not visual_angles and not visual_tasks:
+                failures.append(
+                    {
+                        "code": "visual_question_all_text_only",
+                        "message": (
+                            "Visual-required or visual-optional prompts must not produce "
+                            "only text-only angles and bounded tasks."
+                        ),
+                    }
+                )
         if not any(_string_list(task.get("expected_visual_targets")) for task in visual_tasks):
             failures.append({"code": "visual_requirement_missing_targets"})
         if "visual_example" not in visual_evidence_needs:
@@ -7723,16 +8321,13 @@ def _question_class_from_candidate(
         str(req.get("requirement_type") or "") in {"source_quality", "safety_risk"}
         for req in _list(candidate.get("constraints"))
         if isinstance(req, Mapping)
-    ):
+        ):
         return _CLASS_POLICY
     return _CLASS_GENERAL
 
 
-def classify_question(question: str) -> str:
-    text = question.lower()
-    if _mentions_strong_visual_route_evidence(text):
-        return _CLASS_VISUAL
-    if _contains_any(
+def _question_is_software_implementation_context(text: str) -> bool:
+    if not _contains_any(
         text,
         (
             "architecture",
@@ -7743,12 +8338,56 @@ def classify_question(question: str) -> str:
             "fan-out",
             "fanout",
             "test strategy",
+            "testing strategy",
             "\uc544\ud0a4\ud14d\ucc98",
             "\ud14c\uc2a4\ud2b8",
             "\uad6c\ud604",
             "\ucd94\uac00",
         ),
     ):
+        return False
+    if _contains_any(
+        text,
+        (
+            "codex",
+            "deepresearch",
+            "semantic planner",
+            "runner",
+            "fan-out",
+            "fanout",
+            "api",
+            "sdk",
+            "software",
+            "code",
+            "repository",
+            "repo",
+            "backend",
+            "frontend",
+            "service architecture",
+            "system architecture",
+            "runtime",
+            "pipeline",
+            "module",
+            "library",
+            "framework",
+            "next.js",
+            "nextjs",
+            "app router",
+            "saas",
+            "\uc18c\ud504\ud2b8\uc6e8\uc5b4",
+            "\ucf54\ub4dc",
+            "\ub7f0\ub108",
+        ),
+    ):
+        return True
+    return False
+
+
+def classify_question(question: str) -> str:
+    text = question.lower()
+    if _mentions_strong_visual_route_evidence(text):
+        return _CLASS_VISUAL
+    if _question_is_software_implementation_context(text):
         return _CLASS_IMPLEMENTATION
     if _contains_any(
         text,

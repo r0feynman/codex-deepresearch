@@ -38,6 +38,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_FIT_SCORE_THRESHOLD,
+    SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
     SemanticAngle,
     SemanticPlan,
     SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
@@ -46,6 +47,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     SemanticPlannerAdapterUnavailable,
     build_codex_semantic_raw_request,
     build_semantic_materialization_diff,
+    classify_question,
     heuristic_template_planner,
     question_mentions_visual_evidence,
     semantic_materialization_plan_hash_for_tasks,
@@ -1476,9 +1478,16 @@ class SemanticPlannerTests(unittest.TestCase):
         route: str | None = None,
         capacity_failures_by_artifact: dict[str, int] | None = None,
         non_capacity_failures_by_artifact: dict[str, int] | None = None,
+        planner_response_mutator: object | None = None,
+        reviewer_response_mutator: object | None = None,
         **adapter_kwargs: object,
     ) -> tuple[dict, dict]:
-        captured = {"commands": [], "artifact_types": []}
+        captured = {
+            "commands": [],
+            "artifact_types": [],
+            "planner_requests": [],
+            "reviewer_requests": [],
+        }
         capacity_failures = {
             str(key): int(value)
             for key, value in dict(capacity_failures_by_artifact or {}).items()
@@ -1512,6 +1521,9 @@ class SemanticPlannerTests(unittest.TestCase):
                 "semantic_reviewer_raw_request",
             }:
                 captured["request"] = dict(request)
+                captured["planner_requests"].append(dict(request))
+            elif artifact_type == "semantic_reviewer_raw_request":
+                captured["reviewer_requests"].append(dict(request))
             if capacity_failures.get(artifact_key, 0) > 0:
                 capacity_failures[artifact_key] -= 1
                 return subprocess.CompletedProcess(
@@ -1535,9 +1547,15 @@ class SemanticPlannerTests(unittest.TestCase):
                 response = self.oracle_adapter_response(request, **adapter_kwargs)
             elif artifact_type == "semantic_reviewer_raw_request":
                 response = self.reviewer_adapter_response(request)
+                if callable(reviewer_response_mutator):
+                    response = reviewer_response_mutator(response, request)
             else:
                 response = self.codex_adapter_response(request, **adapter_kwargs)
-            if artifact_type == "semantic_planner_raw_request" and callable(response_mutator):
+            if artifact_type == "semantic_planner_raw_request" and callable(
+                planner_response_mutator
+            ):
+                response = planner_response_mutator(response, request)
+            elif artifact_type == "semantic_planner_raw_request" and callable(response_mutator):
                 response = response_mutator(response)
             if stdout_format == "jsonl":
                 role = str(artifact_type or "semantic")
@@ -1632,6 +1650,8 @@ class SemanticPlannerTests(unittest.TestCase):
         request = dict(captured["request"])
         request["_commands"] = list(captured["commands"])
         request["_artifact_types"] = list(captured["artifact_types"])
+        request["_planner_requests"] = list(captured["planner_requests"])
+        request["_reviewer_requests"] = list(captured["reviewer_requests"])
         return result, request
 
     def text_only_oauth_candidate(self, *, question: str) -> dict:
@@ -2985,6 +3005,279 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(
             reviewer_response["semantic_plan_review"]["non_negotiable_coverage_complete"]
         )
+
+    def test_semantic_reviewer_failure_converges_with_retry_diagnostics(self) -> None:
+        question = "Compare official museum visitor map images with accessibility guidance."
+        repair_marker = "reviewer blocker repaired by semantic convergence"
+
+        def planner_mutator(response: dict, request: dict) -> dict:
+            candidate = response["candidate_plan"]
+            if request.get("semantic_convergence_attempt"):
+                candidate["constraints"].append(repair_marker)
+                candidate["bounded_tasks"][0]["done_condition"] = (
+                    "Stop when the reviewer blocker repair marker is present and the "
+                    "visual comparison task is bounded."
+                )
+            return response
+
+        def reviewer_mutator(response: dict, request: dict) -> dict:
+            plan_text = json.dumps(request["semantic_plan"], ensure_ascii=False).lower()
+            if repair_marker not in plan_text:
+                review = response["semantic_plan_review"]
+                review["semantic_fit_score"] = 8.4
+                review["blockers"] = [
+                    {
+                        "code": "NON_EXECUTABLE_TASK_SCOPE_CAP",
+                        "message": "Split or bound the visual comparison before release.",
+                    }
+                ]
+                review["verdict"] = "release_ineligible"
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "visual_modality", "source_quality"),
+            visual_angle_indexes=(2, 3),
+            planner_response_mutator=planner_mutator,
+            reviewer_response_mutator=reviewer_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+
+        self.assertEqual(result["status"], "awaiting_search_results")
+        self.assertEqual(convergence["status"], "converged")
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 2)
+        self.assertEqual(len(adapter_request["_reviewer_requests"]), 2)
+        first_attempt = convergence["attempts"][0]
+        self.assertIn(
+            "NON_EXECUTABLE_TASK_SCOPE_CAP",
+            first_attempt["reviewer_blocker_codes"],
+        )
+        self.assertIn(
+            "NON_EXECUTABLE_TASK_SCOPE_CAP",
+            first_attempt["repair_inputs"]["reviewer_failure_codes"],
+        )
+        retry_request = adapter_request["_planner_requests"][1]
+        self.assertIn(
+            "NON_EXECUTABLE_TASK_SCOPE_CAP",
+            retry_request["previous_semantic_review_failure_codes"],
+        )
+        self.assertIn("semantic_convergence_repair_inputs", retry_request)
+        self.assertTrue(convergence["attempts"][1]["final_selection"])
+        self.assertIn(repair_marker, json.dumps(semantic_plan, ensure_ascii=False))
+        self.assertIn("semantic_planner_convergence", result["artifacts"])
+
+    def test_semantic_reviewer_failure_terminal_after_bounded_convergence(self) -> None:
+        def reviewer_mutator(response: dict, _request: dict) -> dict:
+            review = response["semantic_plan_review"]
+            review["semantic_fit_score"] = 8.3
+            review["blockers"] = [
+                {
+                    "code": "NON_EXECUTABLE_TASK_SCOPE_CAP",
+                    "message": "Still not executable within declared caps.",
+                }
+            ]
+            review["verdict"] = "release_ineligible"
+            return response
+
+        with mock.patch.dict(
+            "os.environ",
+            {CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV: "2"},
+        ):
+            result, adapter_request = self.prepare_with_codex_adapter(
+                "Compare official transit station map images with wayfinding guidance.",
+                requirement_types=("subject", "visual_modality", "source_quality"),
+                visual_angle_indexes=(2, 3),
+                reviewer_response_mutator=reviewer_mutator,
+            )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+
+        self.assertEqual(result["status"], "blocked_semantic_review_failed")
+        self.assertEqual(convergence["status"], "blocked_convergence_failed")
+        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 2)
+        self.assertEqual(len(adapter_request["_reviewer_requests"]), 2)
+        self.assertTrue(convergence["attempts"][-1]["terminal_failure"])
+        self.assertIn(
+            "NON_EXECUTABLE_TASK_SCOPE_CAP",
+            convergence["terminal_failure"]["reason_codes"],
+        )
+
+    def test_visual_cap_repair_raises_image_budget_within_schema_limit(self) -> None:
+        def planner_mutator(response: dict, _request: dict) -> dict:
+            for task in response["candidate_plan"]["bounded_tasks"]:
+                if task["route"] != "text_only":
+                    task["max_images"] = 1
+                    task["done_condition"] = (
+                        "Done when three official images are compared with source-backed notes."
+                    )
+                    break
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            "Compare official science diagram images with textual safety guidance.",
+            requirement_types=("subject", "visual_modality", "source_quality"),
+            visual_angle_indexes=(2, 3),
+            planner_response_mutator=planner_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        repaired_visual_tasks = [
+            task
+            for task in semantic_plan["bounded_tasks"]
+            if task["route"] != "text_only" and task["max_images"] == 3
+        ]
+
+        self.assertEqual(result["status"], "awaiting_search_results")
+        self.assertTrue(repaired_visual_tasks)
+        materializations = raw_response[
+            "candidate_plan_visual_image_cap_materializations"
+        ]
+        self.assertTrue(
+            any(
+                field.get("materialization") == "raised_visual_image_cap_within_budget"
+                for materialization in materializations
+                for field in materialization["fields"]
+            ),
+            materializations,
+        )
+
+    def test_source_budget_feasibility_repair_raises_task_source_cap(self) -> None:
+        question = "Compare official provider documentation for permission behavior."
+
+        def planner_mutator(response: dict, _request: dict) -> dict:
+            task = response["candidate_plan"]["bounded_tasks"][0]
+            task["max_sources"] = 2
+            task["query"] = "Compare four vendors using official source records."
+            task["done_condition"] = (
+                "Done when four vendors have official source records and caveats."
+            )
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(),
+            planner_response_mutator=planner_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        first_task = semantic_plan["bounded_tasks"][0]
+
+        self.assertEqual(result["status"], "awaiting_search_results")
+        self.assertGreaterEqual(first_task["max_sources"], 4)
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=semantic_plan,
+        )
+        self.assertTrue(validation["ok"], validation)
+
+    def test_source_cap_validation_ignores_task_id_range_reuse_references(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official provider documentation."
+        candidate = self.text_only_oauth_candidate(question=question)
+        task = candidate["bounded_tasks"][15]
+        task["task_id"] = "task_016"
+        task["max_sources"] = 5
+        task["query"] = (
+            "Compare OAuth device-flow implementation hazards across official provider "
+            "documentation and define evidence-backed mitigations."
+        )
+        task["source_policy"] = {
+            "allow_secondary": False,
+            "policy": "Official provider documentation only; synthesis may reuse tasks 013-015 sources.",
+            "required_source_quality": ["official", "primary"],
+        }
+        task["success_criteria"] = [
+            "Include at least four hazards involving defaults, mutation contexts, or router boundaries.",
+            "Give each hazard a mitigation and acceptance check.",
+        ]
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertNotIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_source_cap_validation_still_rejects_true_source_count_over_cap(self) -> None:
+        question = "Research cache invalidation implementation hazards for a Next.js migration."
+        candidate = self.text_only_oauth_candidate(question=question)
+        task = candidate["bounded_tasks"][0]
+        task["max_sources"] = 5
+        task["source_policy"] = {
+            "allow_secondary": False,
+            "policy": "Use at least 15 sources from official documentation families.",
+            "required_source_quality": ["official", "primary"],
+        }
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_ambiguous_architecture_model_testing_classification_preserves_domain(self) -> None:
+        self.assertNotEqual(
+            classify_question(
+                "Review hospital architecture model testing evidence from official facility guidance."
+            ),
+            "implementation_architecture",
+        )
+        self.assertEqual(
+            classify_question(
+                "Review Codex DeepResearch semantic planner architecture and testing strategy."
+            ),
+            "implementation_architecture",
+        )
+
+    def test_planner_code_does_not_special_case_semantic_regression_prompts(self) -> None:
+        manifest_path = (
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_regression_prompts.json"
+        )
+        manifest = self.load_json(manifest_path)
+        code_text = "\n".join(
+            [
+                (
+                    ROOT
+                    / "plugins"
+                    / "codex-deepresearch"
+                    / "src"
+                    / "deepresearch"
+                    / "semantic_planner.py"
+                ).read_text(encoding="utf-8"),
+                (
+                    ROOT
+                    / "plugins"
+                    / "codex-deepresearch"
+                    / "src"
+                    / "deepresearch"
+                    / "search_handoff.py"
+                ).read_text(encoding="utf-8"),
+            ]
+        )
+
+        for prompt in manifest["prompts"]:
+            with self.subTest(prompt_id=prompt["id"]):
+                self.assertNotIn(prompt["id"], code_text)
+                self.assertNotIn(prompt["prompt"], code_text)
 
     def test_oracle_is_locked_before_planner_request_with_trace_hashes(self) -> None:
         question = "Research lunar habitat material tests using official images and source records"

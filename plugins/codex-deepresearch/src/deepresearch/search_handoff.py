@@ -41,13 +41,20 @@ from .semantic_planner import (
     SEMANTIC_EXPECTATION_ORACLE_FILENAME,
     SEMANTIC_PLAN_FILENAME,
     SEMANTIC_PLAN_REVIEW_FILENAME,
+    SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
     SEMANTIC_PLANNER_SCHEMA_VERSION,
     SEMANTIC_PLANNER_VALIDATION_FILENAME,
     build_codex_semantic_raw_request,
+    codex_semantic_review_retry_raw_request,
+    semantic_convergence_artifact,
+    semantic_convergence_attempt_record,
     plan_semantic_angles,
     semantic_materialization_plan_hash_for_file,
+    semantic_plan_candidate_hash,
     semantic_plan_with_review_result,
+    semantic_review_failure_retryable,
     semantic_review_release_eligible,
+    _codex_semantic_planner_validation_max_attempts,
     write_semantic_integrity_artifacts,
     write_semantic_expectation_oracle,
     write_semantic_materialization_diff,
@@ -248,20 +255,26 @@ def prepare_run(
             status="semantic_planner_request_created",
         )
 
-    with _default_semantic_adapter_disabled_for_fixture_runs(
-        _allow_release_ineligible_materialization_for_tests
-    ):
-        semantic_plan = plan_semantic_angles(
-            question=normalized_question,
+    semantic_plan, semantic_review, semantic_integrity_artifacts = (
+        _prepare_semantic_plan_with_convergence(
+            normalized_question=normalized_question,
             explicit_angles=explicit_angles,
             user_constraints=user_constraints,
-            depth_preset=budget_preset,
-            visual_preference=route,
+            budget_preset=budget_preset,
+            route=route,
             budget_cap=budget_cap,
             provided_sources=provided_sources,
             provided_images=provided_images,
-            raw_request_payload=planner_raw_request,
+            planner_raw_request=planner_raw_request,
+            run_dir=run_dir,
+            locked_oracle=locked_oracle,
+            created_at=now,
+            release_identity=release_identity,
+            allow_release_ineligible_materialization_for_tests=(
+                _allow_release_ineligible_materialization_for_tests
+            ),
         )
+    )
     if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
         return _finalize_blocked_semantic_run(
             normalized_question=normalized_question,
@@ -269,25 +282,16 @@ def prepare_run(
             semantic_plan=semantic_plan,
             run_dir=run_dir,
             locked_oracle=locked_oracle,
-            semantic_review=None,
+            semantic_review=semantic_review,
             release_identity=release_identity,
             status=semantic_plan.status,
+            semantic_integrity_artifacts=semantic_integrity_artifacts,
         )
-    semantic_integrity_artifacts = write_semantic_integrity_artifacts(
-        run_dir=run_dir,
-        question=normalized_question,
-        plan=semantic_plan,
-        routing=[],
-        search_tasks=[],
-        created_at=now,
-        locked_oracle=locked_oracle,
-    )
     _sync_semantic_trace_artifact_hash(
         run_dir,
         event_type="semantic_planner_request_created",
         artifact_key="semantic_planner_raw_request",
     )
-    pre_review_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
     _record_semantic_artifact_trace(
         run_dir,
         event_type="semantic_plan_created",
@@ -299,19 +303,6 @@ def prepare_run(
         timestamp=_semantic_event_timestamp(now, 4),
         status="semantic_plan_created",
     )
-    with _default_semantic_adapter_disabled_for_fixture_runs(
-        _allow_release_ineligible_materialization_for_tests
-    ):
-        semantic_review = write_semantic_plan_review(
-            run_dir=run_dir,
-            question=normalized_question,
-            plan=semantic_plan,
-            oracle=locked_oracle,
-            created_at=now,
-            manifest_oracle_binding=release_identity,
-        )
-    semantic_review["semantic_plan_candidate_artifact_hash"] = pre_review_semantic_plan_hash
-    _write_json(run_dir / SEMANTIC_PLAN_REVIEW_FILENAME, semantic_review)
     _record_semantic_artifact_trace(
         run_dir,
         event_type="semantic_reviewer_request_created",
@@ -321,17 +312,6 @@ def prepare_run(
         },
         timestamp=_semantic_event_timestamp(now, 5),
         status="semantic_reviewer_request_created",
-    )
-    semantic_plan = semantic_plan_with_review_result(semantic_plan, semantic_review)
-    semantic_integrity_artifacts = write_semantic_integrity_artifacts(
-        run_dir=run_dir,
-        question=normalized_question,
-        plan=semantic_plan,
-        routing=[],
-        search_tasks=[],
-        created_at=now,
-        locked_oracle=locked_oracle,
-        semantic_review=semantic_review,
     )
     accepted_semantic_plan_hash = (
         semantic_materialization_plan_hash_for_file(run_dir / SEMANTIC_PLAN_FILENAME)
@@ -349,7 +329,7 @@ def prepare_run(
         status="semantic_review_completed",
     )
     if (
-        not semantic_review_release_eligible(semantic_review)
+        not semantic_review_release_eligible(semantic_review or {})
         and not _allow_release_ineligible_materialization_for_tests
     ):
         return _finalize_blocked_semantic_run(
@@ -577,6 +557,11 @@ def prepare_run(
         locked_oracle=locked_oracle,
         semantic_review=semantic_review,
     )
+    convergence_path = run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME
+    if convergence_path.exists():
+        semantic_integrity_artifacts["semantic_planner_convergence"] = str(
+            convergence_path
+        )
     final_semantic_plan_hash = (
         semantic_materialization_plan_hash_for_file(run_dir / SEMANTIC_PLAN_FILENAME)
         or _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
@@ -591,6 +576,16 @@ def prepare_run(
         require_research_tasks=False,
         require_downstream=False,
         created_at=now,
+    )
+    _sync_semantic_trace_artifact_hash(
+        run_dir,
+        event_type="semantic_plan_created",
+        artifact_key="semantic_plan",
+    )
+    _sync_semantic_trace_artifact_hash(
+        run_dir,
+        event_type="semantic_review_completed",
+        artifact_key="semantic_plan_review",
     )
     status["artifacts"].update(semantic_integrity_artifacts)
     semantic_validation = write_semantic_planner_validation(run_dir=run_dir, evidence=evidence)
@@ -716,6 +711,256 @@ def prepare_run(
         **({"diagnostics": dict(status["diagnostics"])} if "diagnostics" in status else {}),
         **release_identity,
     }
+
+
+def _prepare_semantic_plan_with_convergence(
+    *,
+    normalized_question: str,
+    explicit_angles: Sequence[str] | None,
+    user_constraints: Sequence[str] | None,
+    budget_preset: str,
+    route: str | None,
+    budget_cap: Mapping[str, Any],
+    provided_sources: Sequence[Mapping[str, Any]] | None,
+    provided_images: Sequence[Mapping[str, Any]] | None,
+    planner_raw_request: Mapping[str, Any] | None,
+    run_dir: Path,
+    locked_oracle: Mapping[str, Any],
+    created_at: str,
+    release_identity: Mapping[str, Any],
+    allow_release_ineligible_materialization_for_tests: bool,
+) -> tuple[Any, Mapping[str, Any] | None, dict[str, str]]:
+    max_attempts = (
+        1
+        if explicit_angles is not None or allow_release_ineligible_materialization_for_tests
+        else _codex_semantic_planner_validation_max_attempts()
+    )
+    attempts: list[dict[str, Any]] = []
+    next_raw_request = dict(planner_raw_request or {})
+    semantic_plan = None
+    semantic_review: Mapping[str, Any] | None = None
+    semantic_integrity_artifacts: dict[str, str] = {}
+
+    for attempt in range(1, max_attempts + 1):
+        with _default_semantic_adapter_disabled_for_fixture_runs(
+            allow_release_ineligible_materialization_for_tests
+        ):
+            semantic_plan = plan_semantic_angles(
+                question=normalized_question,
+                explicit_angles=explicit_angles,
+                user_constraints=user_constraints,
+                depth_preset=budget_preset,
+                visual_preference=route,
+                budget_cap=budget_cap,
+                provided_sources=provided_sources,
+                provided_images=provided_images,
+                raw_request_payload=next_raw_request if next_raw_request else None,
+            )
+        deterministic_validation = _semantic_candidate_validation_from_plan(
+            semantic_plan
+        )
+        if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
+            attempts.append(
+                semantic_convergence_attempt_record(
+                    attempt=attempt,
+                    plan=semantic_plan,
+                    deterministic_validation=deterministic_validation,
+                    semantic_review=None,
+                    repair_inputs={"terminal_reason": semantic_plan.status},
+                    terminal_failure=True,
+                )
+            )
+            semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+                run_dir=run_dir,
+                question=normalized_question,
+                plan=semantic_plan,
+                routing=[],
+                search_tasks=[],
+                created_at=created_at,
+                locked_oracle=locked_oracle,
+                semantic_review=None,
+            )
+            _write_semantic_convergence_artifact(
+                run_dir=run_dir,
+                max_attempts=max_attempts,
+                attempts=attempts,
+                final_plan=semantic_plan,
+                final_review=None,
+                status=semantic_plan.status,
+                artifacts=semantic_integrity_artifacts,
+            )
+            return semantic_plan, None, semantic_integrity_artifacts
+
+        semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+            run_dir=run_dir,
+            question=normalized_question,
+            plan=semantic_plan,
+            routing=[],
+            search_tasks=[],
+            created_at=created_at,
+            locked_oracle=locked_oracle,
+        )
+        pre_review_semantic_plan_hash = _sha256_file(run_dir / SEMANTIC_PLAN_FILENAME)
+        with _default_semantic_adapter_disabled_for_fixture_runs(
+            allow_release_ineligible_materialization_for_tests
+        ):
+            semantic_review = write_semantic_plan_review(
+                run_dir=run_dir,
+                question=normalized_question,
+                plan=semantic_plan,
+                oracle=locked_oracle,
+                created_at=created_at,
+                manifest_oracle_binding=release_identity,
+            )
+        semantic_review = dict(semantic_review)
+        semantic_review["semantic_plan_candidate_artifact_hash"] = (
+            pre_review_semantic_plan_hash
+        )
+        _write_json(run_dir / SEMANTIC_PLAN_REVIEW_FILENAME, semantic_review)
+        deterministic_validation = _semantic_candidate_validation_from_review_or_plan(
+            semantic_review=semantic_review,
+            semantic_plan=semantic_plan,
+        )
+        reviewed_plan = semantic_plan_with_review_result(semantic_plan, semantic_review)
+        review_passed = semantic_review_release_eligible(semantic_review)
+        retryable_review_failure = semantic_review_failure_retryable(semantic_review)
+        last_attempt = attempt >= max_attempts
+        if (
+            review_passed
+            or not retryable_review_failure
+            or last_attempt
+            or allow_release_ineligible_materialization_for_tests
+            or explicit_angles is not None
+        ):
+            attempts.append(
+                semantic_convergence_attempt_record(
+                    attempt=attempt,
+                    plan=reviewed_plan,
+                    deterministic_validation=deterministic_validation,
+                    semantic_review=semantic_review,
+                    repair_inputs=(
+                        {}
+                        if review_passed
+                        else {
+                            "terminal_reason": "max_attempts_exhausted"
+                            if last_attempt
+                            else (
+                                "non_retryable_review_failure"
+                                if not retryable_review_failure
+                                else "release_ineligible_materialized_for_tests"
+                            ),
+                            "attempt": attempt,
+                        }
+                    ),
+                    final_selection=review_passed,
+                    terminal_failure=not review_passed
+                    and not allow_release_ineligible_materialization_for_tests,
+                )
+            )
+            convergence_status = (
+                "converged"
+                if review_passed
+                else (
+                    "release_ineligible_materialized_for_tests"
+                    if allow_release_ineligible_materialization_for_tests
+                    else "blocked_convergence_failed"
+                )
+            )
+            _write_semantic_convergence_artifact(
+                run_dir=run_dir,
+                max_attempts=max_attempts,
+                attempts=attempts,
+                final_plan=reviewed_plan,
+                final_review=semantic_review,
+                status=convergence_status,
+                artifacts=semantic_integrity_artifacts,
+            )
+            semantic_integrity_artifacts = write_semantic_integrity_artifacts(
+                run_dir=run_dir,
+                question=normalized_question,
+                plan=reviewed_plan,
+                routing=[],
+                search_tasks=[],
+                created_at=created_at,
+                locked_oracle=locked_oracle,
+                semantic_review=semantic_review,
+            )
+            semantic_integrity_artifacts["semantic_planner_convergence"] = str(
+                run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME
+            )
+            return reviewed_plan, semantic_review, semantic_integrity_artifacts
+
+        candidate_hash = semantic_plan_candidate_hash(semantic_plan)
+        retry_request = codex_semantic_review_retry_raw_request(
+            raw_request=semantic_plan.raw_request_payload or next_raw_request,
+            attempt=attempt + 1,
+            deterministic_validation=deterministic_validation,
+            semantic_review=semantic_review,
+            candidate_hash=candidate_hash,
+            max_attempts=max_attempts,
+        )
+        repair_inputs = dict(
+            retry_request.get("semantic_convergence_repair_inputs") or {}
+        )
+        repair_inputs["next_attempt"] = attempt + 1
+        repair_inputs["retry_request_hash"] = retry_request.get("adapter_request_hash")
+        attempts.append(
+            semantic_convergence_attempt_record(
+                attempt=attempt,
+                plan=reviewed_plan,
+                deterministic_validation=deterministic_validation,
+                semantic_review=semantic_review,
+                repair_inputs=repair_inputs,
+            )
+        )
+        next_raw_request = retry_request
+
+    if semantic_plan is None:  # pragma: no cover - defensive loop guard
+        raise SearchHandoffError("semantic planner convergence produced no plan")
+    return semantic_plan, semantic_review, semantic_integrity_artifacts
+
+
+def _semantic_candidate_validation_from_review_or_plan(
+    *,
+    semantic_review: Mapping[str, Any],
+    semantic_plan: Any,
+) -> Mapping[str, Any]:
+    candidate_validation = semantic_review.get("candidate_validation")
+    if isinstance(candidate_validation, Mapping):
+        return candidate_validation
+    return _semantic_candidate_validation_from_plan(semantic_plan)
+
+
+def _semantic_candidate_validation_from_plan(semantic_plan: Any) -> Mapping[str, Any]:
+    raw_response = getattr(semantic_plan, "raw_response_payload", None)
+    if isinstance(raw_response, Mapping):
+        candidate_validation = raw_response.get("candidate_validation")
+        if isinstance(candidate_validation, Mapping):
+            return candidate_validation
+    return {}
+
+
+def _write_semantic_convergence_artifact(
+    *,
+    run_dir: Path,
+    max_attempts: int,
+    attempts: Sequence[Mapping[str, Any]],
+    final_plan: Any,
+    final_review: Mapping[str, Any] | None,
+    status: str,
+    artifacts: dict[str, str],
+) -> None:
+    convergence = semantic_convergence_artifact(
+        run_id=run_dir.name,
+        max_attempts=max_attempts,
+        attempts=attempts,
+        final_plan=final_plan,
+        final_review=final_review,
+        status=status,
+    )
+    path = run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME
+    _write_json(path, convergence)
+    artifacts["semantic_planner_convergence"] = str(path)
 
 
 def _prepare_blocked_semantic_planner_run(
