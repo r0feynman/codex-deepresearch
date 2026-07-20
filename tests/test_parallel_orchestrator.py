@@ -4542,6 +4542,38 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
         self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
 
+    def test_run_parallel_orchestration_reports_failed_validation_when_runner_source_budget_exceeded(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("semantic_planner", {})["runner_source_budget"] = {
+            "max_unique_sources": 1,
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        class SuccessfulCodexNamedFixture(FixtureAdapter):
+            name = "codex-exec"
+
+        with mock.patch(
+            "deepresearch.parallel_orchestrator._adapter",
+            return_value=SuccessfulCodexNamedFixture(),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                min_tasks=2,
+                max_tasks=2,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_validation", result)
+        self.assertFalse(result["ok"])
+        self.assertNotEqual(result["status"], "completed_parallel")
+        self.assertEqual(result["merge"]["status"], "failed_validation")
+        budget = result["diagnostics"]["runner_source_budget"]
+        self.assertEqual(budget["cap"], 1)
+        self.assertEqual(budget["observed_unique_sources"], 2)
+        self.assertFalse(budget["within_budget"])
+
     def test_release_visual_obligation_classifier_ignores_zero_image_visual_helpers(self) -> None:
         helper_task = {
             "id": "task_helper_visual",
@@ -4881,6 +4913,61 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(merge["source_dedupe"])
         self.assertTrue(merge["image_dedupe"])
         self.assertTrue(merge["claim_dedupe"])
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_fails_when_runner_source_budget_is_exceeded(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("semantic_planner", {})["runner_source_budget"] = {
+            "max_unique_sources": 1,
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        for task in tasks_artifact["tasks"]:
+            task["state"] = "completed"
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        budget = merge["diagnostics"]["runner_source_budget"]
+        self.assertEqual(merge["status"], "failed_validation", merge)
+        self.assertEqual(budget["cap"], 1)
+        self.assertEqual(budget["observed_unique_sources"], 2)
+        self.assertFalse(budget["within_budget"])
+        self.assertEqual(budget["reason"], "runner_source_budget_exceeded")
+        self.assertEqual(budget["exceeded_by"], 1)
+        self.assertEqual(len(budget["sample_sources"]), 2)
+        self.assertIn("actionable_cause", merge["diagnostics"])
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_passes_when_runner_source_budget_is_within_limit(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("semantic_planner", {})["runner_source_budget"] = {
+            "max_unique_sources": 2,
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        for task in tasks_artifact["tasks"]:
+            task["state"] = "completed"
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        budget = merge["diagnostics"]["runner_source_budget"]
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(budget["cap"], 2)
+        self.assertEqual(budget["observed_unique_sources"], 2)
+        self.assertTrue(budget["within_budget"])
+        self.assertEqual(len(budget["sample_sources"]), 2)
         self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
 
     def test_shard_merge_preserves_duplicate_image_visual_observation_supports(self) -> None:

@@ -2014,6 +2014,17 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         rejected_shards=rejected_shards,
         discarded_tasks=discarded_tasks,
     )
+    runner_source_budget_validation = _runner_source_budget_validation(
+        run_dir=run_dir,
+        evidence=evidence,
+        tasks_artifact=tasks_artifact,
+    )
+    merge_status_value = "completed" if validation.valid else "failed_validation"
+    if (
+        runner_source_budget_validation
+        and not runner_source_budget_validation.get("within_budget", True)
+    ):
+        merge_status_value = "failed_validation"
     retry_summary = _retry_summary(
         tasks,
         retry_policy=tasks_artifact.get("codex_exec_retry_policy"),
@@ -2030,7 +2041,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
         "schema_version": PARALLEL_SCHEMA_VERSION,
         "run_id": str(evidence.get("run_id") or run_dir.name),
         "generated_at": _utc_now(),
-        "status": "completed" if validation.valid else "failed_validation",
+        "status": merge_status_value,
         "parallel_degraded": bool(tasks_artifact.get("parallel_degraded")),
         "evidence_source": evidence_source,
         "accepted_shard_count": len(accepted_shards),
@@ -2056,6 +2067,7 @@ def merge_evidence_shards(*, run: str | Path, runs_dir: str | Path | None = None
             rejected_shards=rejected_shards,
             discarded_tasks=discarded_tasks,
             retry_summary=retry_summary,
+            runner_source_budget_validation=runner_source_budget_validation,
         ),
         "source_dedupe": source_dedupe,
         "image_dedupe": image_dedupe,
@@ -8829,6 +8841,119 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _runner_source_budget_from_artifacts(
+    *,
+    evidence: Mapping[str, Any],
+    tasks_artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    runner_source_budget = _semantic_runner_source_budget(evidence)
+    if runner_source_budget:
+        return runner_source_budget
+    task_budget = tasks_artifact.get("runner_source_budget")
+    if not isinstance(task_budget, Mapping):
+        return {}
+    max_unique_sources = task_budget.get("max_unique_sources")
+    if not isinstance(max_unique_sources, int) or isinstance(max_unique_sources, bool):
+        return {}
+    if max_unique_sources <= 0:
+        return {}
+    return dict(task_budget)
+
+
+def _runner_source_budget_validation(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+    tasks_artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    runner_source_budget = _runner_source_budget_from_artifacts(
+        evidence=evidence,
+        tasks_artifact=tasks_artifact,
+    )
+    if not runner_source_budget:
+        return {}
+    max_unique_sources = int(runner_source_budget["max_unique_sources"])
+    samples_by_key = _merged_source_budget_samples(run_dir=run_dir, evidence=evidence)
+    observed_unique_sources = len(samples_by_key)
+    within_budget = observed_unique_sources <= max_unique_sources
+    diagnostic = {
+        "configured": True,
+        "cap": max_unique_sources,
+        "max_unique_sources": max_unique_sources,
+        "observed_unique_sources": observed_unique_sources,
+        "within_budget": within_budget,
+        "sample_sources": list(samples_by_key.values())[:10],
+    }
+    if not within_budget:
+        diagnostic.update(
+            {
+                "reason": "runner_source_budget_exceeded",
+                "exceeded_by": observed_unique_sources - max_unique_sources,
+                "message": (
+                    "merged unique evidence/search-result sources exceed "
+                    "runner_source_budget.max_unique_sources"
+                ),
+            }
+        )
+    return diagnostic
+
+
+def _merged_source_budget_samples(
+    *,
+    run_dir: Path,
+    evidence: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    samples_by_key: dict[str, dict[str, Any]] = {}
+    for source in _list(evidence.get("sources")):
+        key = _source_budget_key(source)
+        if not key or key in samples_by_key:
+            continue
+        sample = {"key": key, "modality": "evidence_source"}
+        source_id = _string_or_none(source.get("id"))
+        url = _string_or_none(source.get("url"))
+        if source_id:
+            sample["id"] = source_id
+        if url:
+            sample["url"] = url
+        samples_by_key[key] = sample
+
+    search_results_path = run_dir / "search_results.jsonl"
+    if search_results_path.exists():
+        for record in _read_jsonl(search_results_path):
+            if not isinstance(record, Mapping):
+                continue
+            key = _source_budget_key(record)
+            if not key or key in samples_by_key:
+                continue
+            sample = {"key": key, "modality": "search_result"}
+            result_id = _string_or_none(record.get("id"))
+            url = _source_budget_url(record)
+            if result_id:
+                sample["id"] = result_id
+            if url:
+                sample["url"] = url
+            samples_by_key[key] = sample
+    return samples_by_key
+
+
+def _source_budget_key(record: Mapping[str, Any]) -> str:
+    url = _source_budget_url(record)
+    if url:
+        return url.strip().lower()
+    record_id = _string_or_none(record.get("id"))
+    if record_id:
+        return f"id:{record_id}"
+    return ""
+
+
+def _source_budget_url(record: Mapping[str, Any]) -> str:
+    for field in ("url", "source_url", "page_url"):
+        value = _string_or_none(record.get(field))
+        if value:
+            return value
+    return ""
+
+
 def _merge_diagnostics(
     *,
     accepted_shards: Sequence[Mapping[str, Any]],
@@ -8837,8 +8962,14 @@ def _merge_diagnostics(
     rejected_shards: Sequence[Mapping[str, Any]],
     discarded_tasks: Sequence[Mapping[str, Any]],
     retry_summary: Mapping[str, Any] | None = None,
+    runner_source_budget_validation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     retry_summary = retry_summary if isinstance(retry_summary, Mapping) else {}
+    runner_source_budget_validation = (
+        runner_source_budget_validation
+        if isinstance(runner_source_budget_validation, Mapping)
+        else {}
+    )
     shard_counts = _shard_count_diagnostics(
         accepted_shards=accepted_shards,
         failed_tasks=failed_tasks,
@@ -8849,6 +8980,10 @@ def _merge_diagnostics(
     if accepted_shards:
         accepted_warnings = _accepted_shard_warnings(accepted_shards)
         diagnostics: dict[str, Any] = {"shard_counts": shard_counts}
+        if runner_source_budget_validation:
+            diagnostics["runner_source_budget"] = dict(runner_source_budget_validation)
+            if not runner_source_budget_validation.get("within_budget", True):
+                diagnostics["actionable_cause"] = "runner source budget exceeded after merge"
         if accepted_warnings:
             diagnostics.update({
                 "accepted_shard_warning_count": len(accepted_warnings),
@@ -8895,10 +9030,12 @@ def _merge_diagnostics(
             diagnostics["retry_exhausted"] = True
             diagnostics["retry_exhausted_count"] = retry_summary.get("retry_exhausted_count")
             diagnostics["capacity_failure_count"] = retry_summary.get("capacity_failure_count")
+        if runner_source_budget_validation:
+            diagnostics["runner_source_budget"] = dict(runner_source_budget_validation)
         return diagnostics
     if blocked_tasks:
         first = blocked_tasks[0]
-        return {
+        diagnostics = {
             "shard_counts": shard_counts,
             "actionable_cause": "no evidence shards were accepted because child tasks were blocked",
             "first_blocked_task_id": first.get("task_id"),
@@ -8909,18 +9046,27 @@ def _merge_diagnostics(
             "first_blocked_diagnostic": first.get("diagnostic"),
             "first_blocked_stdout_stderr_summary": first.get("stdout_stderr_summary"),
         }
+        if runner_source_budget_validation:
+            diagnostics["runner_source_budget"] = dict(runner_source_budget_validation)
+        return diagnostics
     if rejected_shards:
         first = rejected_shards[0]
-        return {
+        diagnostics = {
             "shard_counts": shard_counts,
             "actionable_cause": "no evidence shards were accepted because shard validation rejected the output",
             "first_rejected_task_id": first.get("task_id"),
             "first_rejected_reason": first.get("reason"),
         }
-    return {
+        if runner_source_budget_validation:
+            diagnostics["runner_source_budget"] = dict(runner_source_budget_validation)
+        return diagnostics
+    diagnostics = {
         "shard_counts": shard_counts,
         "actionable_cause": "no evidence shards were accepted",
     }
+    if runner_source_budget_validation:
+        diagnostics["runner_source_budget"] = dict(runner_source_budget_validation)
+    return diagnostics
 
 
 def _shard_count_diagnostics(
