@@ -3528,6 +3528,76 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
         self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
 
+    def test_visual_difference_table_does_not_require_prioritized_remediation(self) -> None:
+        question = "한국 지하철 안전 픽토그램 이미지와 공식 행동요령의 차이를 분석해줘."
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "p" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        req_003 = candidate["requirement_coverage_map"][2]
+        req_003.update(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "requested analysis/comparison/output shape",
+                "requirement_text": (
+                    "안전 상황별로 픽토그램의 의미를 해석하고 공식 행동요령과 "
+                    "대조하여 일치점, 누락, 단순화, 모호성, 순서·조건·예외의 "
+                    "차이 및 잠재적 안전 영향을 구조적으로 설명한다."
+                ),
+                "prompt_text": question,
+                "expected_modalities": ["visual interpretation", "textual comparison"],
+                "output_shape_constraints": [
+                    "상황별 비교표",
+                    "이미지 또는 이미지 링크·식별 정보",
+                    "핵심 차이 요약",
+                    "안전상 의미 또는 개선점",
+                    "출처 인용",
+                ],
+            }
+        )
+        comparison_task = candidate["bounded_tasks"][0]
+        comparison_task["route"] = "text_only"
+        comparison_task["max_images"] = 0
+        comparison_task["expected_visual_targets"] = []
+        comparison_task["query"] = (
+            "한국 지하철 안전 픽토그램 시각 메시지와 공식 행동요령 차이 "
+            "상황별 비교표 근거 출처"
+        )
+        comparison_task["expected_artifacts"] = [
+            "상황별 비교표",
+            "픽토그램 시각 메시지와 공식 행동요령 차이 근거",
+        ]
+        comparison_task["success_criteria"] = [
+            "Compare each pictogram visual message with the official behavior guidance.",
+            "Record differences, omissions, ambiguity, safety meaning, and source evidence.",
+        ]
+        comparison_task["done_condition"] = (
+            "Stop when the situation-by-situation comparison table has source-backed "
+            "pictogram meanings, official guidance, differences, and caveats."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="visual_required",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+        self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
+
     def test_semantic_planner_source_has_no_sem_reg_004_special_case(self) -> None:
         source = (
             ROOT

@@ -5623,7 +5623,18 @@ def _semantic_review_oracle_semantic_blockers(
         if isinstance(requirement, Mapping)
     ]
     if any(_candidate_requirement_is_req003_comparison(req) for req in requirements):
-        if not _candidate_has_comparison_deliverable_task(tasks=tasks):
+        comparison_requirements = [
+            req
+            for req in requirements
+            if _candidate_requirement_is_req003_comparison(req)
+        ]
+        if not any(
+            _candidate_has_comparison_deliverable_task(
+                tasks=tasks,
+                requirement=req,
+            )
+            for req in comparison_requirements
+        ):
             blockers.append(
                 {
                     "code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
@@ -6704,7 +6715,11 @@ def _candidate_requirement_is_req003_comparison(
 def _candidate_has_comparison_deliverable_task(
     *,
     tasks: Sequence[Mapping[str, Any]],
+    requirement: Mapping[str, Any],
 ) -> bool:
+    strict_status_fields = _candidate_requirement_needs_compliance_status_fields(
+        requirement
+    )
     status_groups = (
         ("match", "matched", "meets", "\ub9e4\uce58", "\uc77c\uce58", "\ucda9\uc871"),
         ("partial", "partially", "\ubd80\ubd84", "\ubd80\ubd84 \ucda9\uc871"),
@@ -6737,6 +6752,9 @@ def _candidate_has_comparison_deliverable_task(
                 "compared item",
                 "policy",
                 "guidance",
+                "pictogram",
+                "visual message",
+                "behavior guidance",
                 "model output",
                 "structured artifact",
                 "artifact",
@@ -6748,6 +6766,10 @@ def _candidate_has_comparison_deliverable_task(
                 "\ud56d\ubaa9",
                 "\uaddc\uc815",
                 "\uc9c0\uce68",
+                "\ud53d\ud1a0\uadf8\ub7a8",
+                "\uc2dc\uac01 \uba54\uc2dc\uc9c0",
+                "\ud589\ub3d9\uc694\ub839",
+                "\ucc28\uc774",
                 "\ubaa8\ub378 \uc0b0\ucd9c\ubb3c",
                 "\uc0b0\ucd9c\ubb3c",
                 "\uacf5\uacf5 \uc124\uacc4",
@@ -6755,14 +6777,54 @@ def _candidate_has_comparison_deliverable_task(
             ),
         ):
             continue
-        if not all(_contains_any(text, group) for group in status_groups):
+        if strict_status_fields:
+            if not all(_contains_any(text, group) for group in status_groups):
+                continue
+        elif not _contains_any(
+            text,
+            (
+                "difference",
+                "differences",
+                "alignment",
+                "mapping",
+                "maps",
+                "gap",
+                "omission",
+                "ambiguity",
+                "\ucc28\uc774",
+                "\ub300\uc870",
+                "\ub300\uc751",
+                "\uc77c\uce58",
+                "\ub204\ub77d",
+                "\ubaa8\ud638",
+            ),
+        ):
             continue
         if not _contains_any(text, ("evidence", "citation", "source", "\uadfc\uac70", "\uc778\uc6a9")):
             continue
-        if not _contains_any(text, ("remediation", "recommendation", "next action", "\uac1c\uc120", "\ubcf4\uc644", "\uc870\uce58", "\uad8c\uace0")):
-            continue
         return True
     return False
+
+
+def _candidate_requirement_needs_compliance_status_fields(
+    requirement: Mapping[str, Any],
+) -> bool:
+    text = _candidate_requirement_text(requirement).lower()
+    return _contains_any(
+        text,
+        (
+            "partial",
+            "mismatch",
+            "unverifiable",
+            "compliance",
+            "non-compliant",
+            "\ubd80\ubd84 \uc77c\uce58",
+            "\ubd88\uc77c\uce58",
+            "\ud310\ub2e8 \ubd88\uac00",
+            "\uc900\uc218",
+            "\ucda9\uc871\ub3c4",
+        ),
+    )
 
 
 def _candidate_requirement_needs_prioritized_remediation(
@@ -6790,13 +6852,11 @@ def _candidate_requirement_needs_prioritized_remediation(
             "priority",
             "rank",
             "severity",
-            "impact",
             "effort",
             "\uc6b0\uc120\uc21c\uc704",
             "\uc6b0\uc120",
             "\uc21c\uc704",
             "\uc911\ub300\uc131",
-            "\uc601\ud5a5",
         ),
     )
     return action_requested and priority_requested
@@ -7091,7 +7151,10 @@ def validate_semantic_candidate_plan(
             requirement.get("non_negotiable") is True
             and _candidate_requirement_is_req003_comparison(requirement)
         ):
-            if not _candidate_has_comparison_deliverable_task(tasks=tasks):
+            if not _candidate_has_comparison_deliverable_task(
+                tasks=tasks,
+                requirement=requirement,
+            ):
                 failures.append(
                     {
                         "code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
