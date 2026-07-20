@@ -5283,7 +5283,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 self.assertEqual(search_task["max_images"], 0)
         self.assertEqual(plan_by_id["task_semantic_004"]["max_sources"], 5)
 
-    def test_source_cap_constraint_materialization_removes_global_and_one_source_contradictions(self) -> None:
+    def test_source_cap_constraint_materialization_preserves_global_budget_as_runner_budget(self) -> None:
         question = "Compare official agency permit evidence across Korea municipalities"
         request = {
             "original_question": question,
@@ -5327,10 +5327,53 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(materializations)
         constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
         self.assertIn("bounded_tasks.max_sources is authoritative", constraints_text)
-        self.assertIn("Runner-level source and image budgets remain authoritative", constraints_text)
+        self.assertIn("max_unique_sources=20", constraints_text)
+        self.assertIn("runner-level unique-source reuse budget", constraints_text)
         self.assertNotIn("sum <=20", constraints_text)
         self.assertNotIn("one decisive source per task", constraints_text)
         self.assertNotIn("must not override", constraints_text)
+        self.assertEqual(repaired["runner_source_budget"]["max_unique_sources"], 20)
+        self.assertEqual(repaired["runner_source_budget"]["declared_source_budget"], 20)
+        self.assertEqual(repaired["runner_source_budget"]["task_max_sources_sum"], 60)
+        self.assertTrue(repaired["runner_source_budget"]["reuse_required"])
+        self.assertEqual(
+            materializations[0]["preserved_declared_source_budget"],
+            20,
+        )
+        self.assertEqual(
+            materializations[0]["runner_source_budget"]["max_unique_sources"],
+            20,
+        )
+
+        missing_metadata = json.loads(json.dumps(repaired))
+        missing_metadata.pop("runner_source_budget")
+        missing_metadata_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=missing_metadata,
+        )
+        self.assertFalse(missing_metadata_validation["ok"], missing_metadata_validation)
+        self.assertIn(
+            "global_source_budget_missing_executable_runner_budget",
+            {failure["code"] for failure in missing_metadata_validation["failures"]},
+        )
+
+        missing_numeric_cap = json.loads(json.dumps(repaired))
+        missing_numeric_cap["constraints"] = [
+            (
+                "Executable source caps are task-specific: bounded_tasks.max_sources "
+                "is authoritative after source-cap consistency repair. Runner-level "
+                "unique-source reuse budget is preserved for execution."
+            )
+        ]
+        missing_numeric_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=missing_numeric_cap,
+        )
+        self.assertFalse(missing_numeric_validation["ok"], missing_numeric_validation)
+        self.assertIn(
+            "global_source_budget_not_preserved_in_constraints",
+            {failure["code"] for failure in missing_numeric_validation["failures"]},
+        )
         repaired_validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=repaired,
@@ -5421,6 +5464,21 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("unbound_jurisdiction_placeholders", failure_codes)
         self.assertIn("missing_placeholder_selection_workflow", failure_codes)
 
+        workflow_only = json.loads(json.dumps(candidate))
+        workflow_only["constraints"].append(
+            "Select and name each municipality placeholder using explicit criteria before collection."
+        )
+        workflow_only_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=workflow_only,
+        )
+        workflow_only_codes = {
+            failure["code"] for failure in workflow_only_validation["failures"]
+        }
+        self.assertFalse(workflow_only_validation["ok"], workflow_only_validation)
+        self.assertIn("unbound_jurisdiction_placeholders", workflow_only_codes)
+        self.assertNotIn("missing_placeholder_selection_workflow", workflow_only_codes)
+
         repaired, materializations = (
             _materialize_candidate_placeholder_selection_workflow(candidate)
         )
@@ -5429,6 +5487,31 @@ class SemanticPlannerTests(unittest.TestCase):
         repaired_text = json.dumps(repaired, ensure_ascii=False).lower()
         self.assertIn("selection workflow", repaired_text)
         self.assertIn("bind placeholder jurisdictions", repaired_text)
+        self.assertIn("placeholder_binding", repaired)
+        self.assertEqual(
+            sorted(repaired["placeholder_binding"].keys()),
+            ["municipality 1", "municipality 2", "municipality 3", "municipality 4"],
+        )
+        bound_names = [
+            binding["jurisdiction_name"]
+            for binding in repaired["placeholder_binding"].values()
+        ]
+        self.assertEqual(
+            bound_names,
+            [
+                "Seoul, South Korea",
+                "Busan, South Korea",
+                "Incheon, South Korea",
+                "Daegu, South Korea",
+            ],
+        )
+        self.assertFalse(any("municipality " in name.lower() for name in bound_names))
+        self.assertEqual(
+            materializations[0]["placeholder_binding"]["municipality 1"][
+                "jurisdiction_name"
+            ],
+            "Seoul, South Korea",
+        )
         repaired_validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=repaired,

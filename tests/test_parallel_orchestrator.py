@@ -777,6 +777,43 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(merged_record["angle_id"], task["angle_id"])
         self.assertEqual(merged_record["route"], task["route"])
         self.assertEqual(merged_record["semantic_task_query"], task["query"])
+        lineage_diagnostics = merged_record["raw_provider_metadata"][
+            "semantic_lineage_diagnostics"
+        ]
+        self.assertEqual(
+            lineage_diagnostics["diagnostic_type"],
+            "raw_child_lineage_mismatch",
+        )
+        self.assertTrue(lineage_diagnostics["canonicalized_to_parent"])
+        mismatches = {
+            mismatch["field"]: mismatch
+            for mismatch in lineage_diagnostics["mismatches"]
+        }
+        self.assertEqual(
+            mismatches["semantic_plan_task_id"]["raw_child_value"],
+            "stale-child-task-id",
+        )
+        self.assertEqual(
+            mismatches["semantic_plan_task_id"]["canonical_parent_value"],
+            task["semantic_plan_task_id"],
+        )
+        self.assertEqual(mismatches["semantic_plan_hash"]["raw_child_value"], "0" * 64)
+        self.assertEqual(
+            mismatches["semantic_plan_hash"]["canonical_parent_value"],
+            task["semantic_plan_hash"],
+        )
+        self.assertEqual(
+            mismatches["approved_delta_id"]["raw_child_value"],
+            "stale-child-delta",
+        )
+        self.assertEqual(
+            mismatches["semantic_task_query"]["raw_child_value"],
+            "stale child query",
+        )
+        self.assertEqual(
+            mismatches["semantic_task_query"]["canonical_parent_value"],
+            task["query"],
+        )
 
     def test_release_visual_merge_preserves_child_lineage_and_materializes_handoffs(self) -> None:
         prepared = prepare_run(

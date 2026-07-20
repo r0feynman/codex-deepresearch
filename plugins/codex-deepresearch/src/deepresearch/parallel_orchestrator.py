@@ -728,6 +728,7 @@ def plan_research_tasks(
     now = _utc_now()
     tasks: list[dict[str, Any]] = []
     angle_occurrences: dict[str, int] = {}
+    runner_source_budget = _semantic_runner_source_budget(evidence)
     for index in range(1, task_count + 1):
         base = planner_tasks[(index - 1) % len(planner_tasks)]
         if not isinstance(base, Mapping):
@@ -793,6 +794,8 @@ def plan_research_tasks(
         task["expected_artifacts"] = _string_list(base.get("expected_artifacts"))
         task["done_condition"] = str(base.get("done_condition") or "")
         task["search_task_id"] = str(base.get("id") or task_id)
+        if runner_source_budget:
+            task["runner_source_budget"] = copy.deepcopy(runner_source_budget)
         apply_release_validation_identity(
             task,
             release_validation_identity_from_payload(evidence),
@@ -817,6 +820,8 @@ def plan_research_tasks(
         ),
         "tasks": tasks,
     }
+    if runner_source_budget:
+        payload["runner_source_budget"] = copy.deepcopy(runner_source_budget)
     apply_release_validation_identity(
         payload,
         release_validation_identity_from_payload(evidence),
@@ -909,6 +914,21 @@ def _semantic_bounded_tasks_by_id(evidence: Mapping[str, Any]) -> dict[str, Mapp
             )
         task_map[task_id] = task
     return task_map
+
+
+def _semantic_runner_source_budget(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    semantic_planner = evidence.get("semantic_planner")
+    if not isinstance(semantic_planner, Mapping):
+        return {}
+    runner_source_budget = semantic_planner.get("runner_source_budget")
+    if not isinstance(runner_source_budget, Mapping):
+        return {}
+    max_unique_sources = runner_source_budget.get("max_unique_sources")
+    if not isinstance(max_unique_sources, int) or isinstance(max_unique_sources, bool):
+        return {}
+    if max_unique_sources <= 0:
+        return {}
+    return dict(runner_source_budget)
 
 
 def _enforce_semantic_bounded_task_alignment(
@@ -2379,10 +2399,25 @@ def _release_validation_search_result(
             result[key] = value
     if "policy_flags" in record:
         result["policy_flags"] = list(record.get("policy_flags") or [])
-    if raw_metadata is not None:
-        result["raw_provider_metadata"] = (
-            dict(raw_metadata) if isinstance(raw_metadata, Mapping) else raw_metadata
-        )
+    lineage_mismatches = _release_search_result_lineage_mismatches(
+        child_record=record,
+        canonical_result=result,
+        canonical_task_lineage=_semantic_task_search_result_lineage(task),
+    )
+    if raw_metadata is not None or lineage_mismatches:
+        if isinstance(raw_metadata, Mapping):
+            metadata: dict[str, Any] = dict(raw_metadata)
+        elif raw_metadata is not None:
+            metadata = {"child_raw_provider_metadata": raw_metadata}
+        else:
+            metadata = {}
+        if lineage_mismatches:
+            metadata["semantic_lineage_diagnostics"] = {
+                "diagnostic_type": "raw_child_lineage_mismatch",
+                "canonicalized_to_parent": True,
+                "mismatches": lineage_mismatches,
+            }
+        result["raw_provider_metadata"] = metadata
     return result, None
 
 
@@ -2439,6 +2474,48 @@ def _semantic_task_search_result_lineage(task: Mapping[str, Any]) -> dict[str, A
             copy.deepcopy(task.get(field))
         )
     return lineage
+
+
+def _release_search_result_lineage_mismatches(
+    *,
+    child_record: Mapping[str, Any],
+    canonical_result: Mapping[str, Any],
+    canonical_task_lineage: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    expected_values: dict[str, Any] = {
+        "semantic_plan_task_id": canonical_result.get("semantic_plan_task_id"),
+        "semantic_plan_hash": canonical_result.get("semantic_plan_hash"),
+        "approved_delta_id": canonical_result.get("approved_delta_id"),
+    }
+    expected_values.update(canonical_task_lineage)
+    mismatches: list[dict[str, Any]] = []
+    for field_name, canonical_value in expected_values.items():
+        if field_name not in child_record:
+            continue
+        child_value = child_record.get(field_name)
+        if _release_lineage_values_equal(child_value, canonical_value):
+            continue
+        mismatches.append(
+            {
+                "field": field_name,
+                "raw_child_value": copy.deepcopy(child_value),
+                "canonical_parent_value": copy.deepcopy(canonical_value),
+            }
+        )
+    return mismatches
+
+
+def _release_lineage_values_equal(left: Any, right: Any) -> bool:
+    if left == right:
+        return True
+    if left is None or right is None:
+        return False
+    if isinstance(left, (str, int, float, bool)) and isinstance(
+        right,
+        (str, int, float, bool),
+    ):
+        return str(left) == str(right)
+    return False
 
 
 def _release_child_field_present(record: Mapping[str, Any], field: str) -> bool:
@@ -7355,6 +7432,18 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
             "otherwise do not include the image. Do not use user-uploaded, manual, login-walled, "
             "paywalled, CAPTCHA-gated, DRM-restricted, or robots-disallowed images. "
         )
+    runner_source_budget = task.get("runner_source_budget")
+    budget_instruction = ""
+    if isinstance(runner_source_budget, Mapping):
+        max_unique_sources = runner_source_budget.get("max_unique_sources")
+        if isinstance(max_unique_sources, int) and not isinstance(max_unique_sources, bool):
+            budget_instruction = (
+                "This run has a runner-level unique-source reuse budget: "
+                f"max_unique_sources={max_unique_sources}. Treat per-task max_sources "
+                "as a local ceiling, not additive permission to exceed the shared "
+                "run budget; prefer reusing already relevant sources and record "
+                "budget-limited caveats instead of expanding unique source retrievals. "
+            )
     release_identity = release_validation_identity_from_payload(task)
     release_instruction = ""
     if release_identity:
@@ -7410,6 +7499,7 @@ def _child_prompt(task: Mapping[str, Any], *, run_dir: Path, shard_path: Path | 
         "Prioritize a compact shard with decision-ready claims and do not read repository docs or skills unless the schema is otherwise impossible to satisfy. "
         f"{release_instruction}"
         f"{visual_instruction}"
+        f"{budget_instruction}"
         f"{retry_feedback}"
         "Every source must include a non-empty `local_artifact_path`, such as `evidence_shards/<task_id>/source_001.html`. "
         "Verifier vote `method` must be one of `codex-subagent`, `runner-agent`, `model-call`, or `manual-review`; "
