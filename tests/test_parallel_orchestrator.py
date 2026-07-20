@@ -738,6 +738,83 @@ class ParallelOrchestratorTests(unittest.TestCase):
         )
         self.assertTrue(validation.valid, validation.to_dict())
 
+    def test_release_validation_merge_canonicalizes_child_search_lineage(self) -> None:
+        prepared = prepare_run(
+            question="Public release search lineage canonicalization fixture.",
+            runs_dir=self.temp_runs_dir(),
+            route="text_only",
+            prompt_id="pb-text-lineage",
+            suite_id="issue-133-suite",
+        )
+        run_dir = Path(prepared["run_dir"])
+        plan_research_tasks(run=run_dir, min_tasks=1)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        task = tasks_artifact["tasks"][0]
+        task["state"] = "completed"
+        task["last_adapter"] = "codex-exec"
+        shard_path = run_dir / task["output_shard_path"]
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(shard_path, self.shard(run_dir, task))
+        record = self.release_search_result(
+            task,
+            semantic_plan_task_id="stale-child-task-id",
+            semantic_plan_hash="0" * 64,
+            approved_delta_id="stale-child-delta",
+            semantic_task_query="stale child query",
+        )
+        self.write_jsonl(shard_path.parent / "search_results.jsonl", [record])
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        self.assertEqual(merge["status"], "completed", merge)
+        records = self.load_jsonl(run_dir / "search_results.jsonl")
+        self.assertEqual(len(records), 1)
+        merged_record = records[0]
+        self.assertEqual(merged_record["semantic_plan_task_id"], task["semantic_plan_task_id"])
+        self.assertEqual(merged_record["semantic_plan_hash"], task["semantic_plan_hash"])
+        self.assertEqual(merged_record["approved_delta_id"], task["approved_delta_id"])
+        self.assertEqual(merged_record["angle_id"], task["angle_id"])
+        self.assertEqual(merged_record["route"], task["route"])
+        self.assertEqual(merged_record["semantic_task_query"], task["query"])
+        lineage_diagnostics = merged_record["raw_provider_metadata"][
+            "semantic_lineage_diagnostics"
+        ]
+        self.assertEqual(
+            lineage_diagnostics["diagnostic_type"],
+            "raw_child_lineage_mismatch",
+        )
+        self.assertTrue(lineage_diagnostics["canonicalized_to_parent"])
+        mismatches = {
+            mismatch["field"]: mismatch
+            for mismatch in lineage_diagnostics["mismatches"]
+        }
+        self.assertEqual(
+            mismatches["semantic_plan_task_id"]["raw_child_value"],
+            "stale-child-task-id",
+        )
+        self.assertEqual(
+            mismatches["semantic_plan_task_id"]["canonical_parent_value"],
+            task["semantic_plan_task_id"],
+        )
+        self.assertEqual(mismatches["semantic_plan_hash"]["raw_child_value"], "0" * 64)
+        self.assertEqual(
+            mismatches["semantic_plan_hash"]["canonical_parent_value"],
+            task["semantic_plan_hash"],
+        )
+        self.assertEqual(
+            mismatches["approved_delta_id"]["raw_child_value"],
+            "stale-child-delta",
+        )
+        self.assertEqual(
+            mismatches["semantic_task_query"]["raw_child_value"],
+            "stale child query",
+        )
+        self.assertEqual(
+            mismatches["semantic_task_query"]["canonical_parent_value"],
+            task["query"],
+        )
+
     def test_release_visual_merge_preserves_child_lineage_and_materializes_handoffs(self) -> None:
         prepared = prepare_run(
             question="Release validation visual handoff fixture.",
@@ -4465,6 +4542,38 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertEqual(stages["ingest_vision"]["status"], "skipped")
         self.assertEqual(state["next_safe_stage"], "enforce_guardrails")
 
+    def test_run_parallel_orchestration_reports_failed_validation_when_runner_source_budget_exceeded(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("semantic_planner", {})["runner_source_budget"] = {
+            "max_unique_sources": 1,
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+
+        class SuccessfulCodexNamedFixture(FixtureAdapter):
+            name = "codex-exec"
+
+        with mock.patch(
+            "deepresearch.parallel_orchestrator._adapter",
+            return_value=SuccessfulCodexNamedFixture(),
+        ):
+            result = run_parallel_orchestration(
+                run=run_dir,
+                adapter_name="codex-exec",
+                min_tasks=2,
+                max_tasks=2,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result["status"], "failed_validation", result)
+        self.assertFalse(result["ok"])
+        self.assertNotEqual(result["status"], "completed_parallel")
+        self.assertEqual(result["merge"]["status"], "failed_validation")
+        budget = result["diagnostics"]["runner_source_budget"]
+        self.assertEqual(budget["cap"], 1)
+        self.assertEqual(budget["observed_unique_sources"], 2)
+        self.assertFalse(budget["within_budget"])
+
     def test_release_visual_obligation_classifier_ignores_zero_image_visual_helpers(self) -> None:
         helper_task = {
             "id": "task_helper_visual",
@@ -4804,6 +4913,61 @@ class ParallelOrchestratorTests(unittest.TestCase):
         self.assertTrue(merge["source_dedupe"])
         self.assertTrue(merge["image_dedupe"])
         self.assertTrue(merge["claim_dedupe"])
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_fails_when_runner_source_budget_is_exceeded(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("semantic_planner", {})["runner_source_budget"] = {
+            "max_unique_sources": 1,
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        for task in tasks_artifact["tasks"]:
+            task["state"] = "completed"
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        budget = merge["diagnostics"]["runner_source_budget"]
+        self.assertEqual(merge["status"], "failed_validation", merge)
+        self.assertEqual(budget["cap"], 1)
+        self.assertEqual(budget["observed_unique_sources"], 2)
+        self.assertFalse(budget["within_budget"])
+        self.assertEqual(budget["reason"], "runner_source_budget_exceeded")
+        self.assertEqual(budget["exceeded_by"], 1)
+        self.assertEqual(len(budget["sample_sources"]), 2)
+        self.assertIn("actionable_cause", merge["diagnostics"])
+        self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
+
+    def test_shard_merge_passes_when_runner_source_budget_is_within_limit(self) -> None:
+        run_dir = self.prepare()
+        evidence = self.load_json(run_dir / "evidence.json")
+        evidence.setdefault("semantic_planner", {})["runner_source_budget"] = {
+            "max_unique_sources": 2,
+        }
+        self.write_json(run_dir / "evidence.json", evidence)
+        plan_research_tasks(run=run_dir, min_tasks=2)
+        tasks_artifact = self.load_json(run_dir / "research_tasks.json")
+        for task in tasks_artifact["tasks"]:
+            task["state"] = "completed"
+            shard_path = run_dir / task["output_shard_path"]
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            self.write_json(shard_path, self.shard(run_dir, task))
+        self.write_json(run_dir / "research_tasks.json", tasks_artifact)
+
+        merge = merge_evidence_shards(run=run_dir)
+
+        budget = merge["diagnostics"]["runner_source_budget"]
+        self.assertEqual(merge["status"], "completed", merge)
+        self.assertEqual(budget["cap"], 2)
+        self.assertEqual(budget["observed_unique_sources"], 2)
+        self.assertTrue(budget["within_budget"])
+        self.assertEqual(len(budget["sample_sources"]), 2)
         self.assertTrue(validate_artifacts(evidence_path=run_dir / "evidence.json").valid)
 
     def test_shard_merge_preserves_duplicate_image_visual_observation_supports(self) -> None:

@@ -497,6 +497,7 @@ class SemanticPlan:
     intent_summary: str = ""
     domain_entities: list[dict[str, Any]] = field(default_factory=list)
     constraints: list[dict[str, Any]] = field(default_factory=list)
+    runner_source_budget: dict[str, Any] = field(default_factory=dict)
     question_scope: str = "narrow"
     decomposition_strategy: str = ""
     requirement_coverage_map: list[dict[str, Any]] = field(default_factory=list)
@@ -800,6 +801,9 @@ def codex_semantic_candidate_plan(
             candidate, expected_evidence_materializations = (
                 _materialize_candidate_expected_evidence(candidate)
             )
+            candidate, visual_image_cap_materializations = (
+                _materialize_candidate_visual_image_cap_feasibility(candidate)
+            )
             candidate, angle_title_materializations = (
                 _materialize_candidate_angle_title_prompt_anchors(
                     candidate,
@@ -808,6 +812,9 @@ def codex_semantic_candidate_plan(
             )
             candidate, requirement_coverage_repairs = (
                 _repair_candidate_requirement_coverage(candidate)
+            )
+            candidate, placeholder_selection_materializations = (
+                _materialize_candidate_placeholder_selection_workflow(candidate)
             )
             if source_cap_normalizations:
                 raw_response["candidate_plan"] = candidate
@@ -829,6 +836,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan_expected_evidence_materializations"] = (
                     expected_evidence_materializations
                 )
+            if visual_image_cap_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response[
+                    "candidate_plan_visual_image_cap_materializations"
+                ] = visual_image_cap_materializations
             if angle_title_materializations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_angle_title_materializations"] = (
@@ -839,6 +851,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan_requirement_coverage_repairs"] = (
                     requirement_coverage_repairs
                 )
+            if placeholder_selection_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response[
+                    "candidate_plan_placeholder_selection_materializations"
+                ] = placeholder_selection_materializations
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
                 candidate=candidate,
@@ -952,6 +969,11 @@ def codex_semantic_candidate_plan(
         intent_summary=str(candidate["intent_summary"]),
         domain_entities=list(candidate["domain_entities"]),
         constraints=list(candidate["constraints"]),
+        runner_source_budget=(
+            dict(candidate.get("runner_source_budget"))
+            if isinstance(candidate.get("runner_source_budget"), Mapping)
+            else {}
+        ),
         question_scope=str(candidate["question_scope"]),
         decomposition_strategy=str(candidate["decomposition_strategy"]),
         requirement_coverage_map=list(candidate["requirement_coverage_map"]),
@@ -1309,8 +1331,6 @@ def _materialize_candidate_source_cap_constraints(
     *,
     source_cap_normalizations: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if not source_cap_normalizations:
-        return copy.deepcopy(dict(candidate)), []
     normalized = copy.deepcopy(dict(candidate))
     raw_constraints = normalized.get("constraints")
     if not isinstance(raw_constraints, list):
@@ -1334,12 +1354,15 @@ def _materialize_candidate_source_cap_constraints(
 
     kept_constraints: list[Any] = []
     removed_constraints: list[str] = []
+    conflict_records: list[dict[str, Any]] = []
     for constraint in raw_constraints:
-        if _candidate_source_cap_constraint_conflicts_with_normalization(
+        conflict = _candidate_source_cap_constraint_conflict_record(
             constraint,
             normalized_caps=caps,
-        ):
+        )
+        if conflict:
             removed_constraints.append(str(constraint))
+            conflict_records.append(conflict)
             continue
         kept_constraints.append(constraint)
 
@@ -1348,26 +1371,165 @@ def _materialize_candidate_source_cap_constraints(
 
     min_cap = min(caps)
     max_cap = max(caps)
-    replacement = (
-        "Executable source caps are task-specific: bounded_tasks.max_sources "
-        f"is authoritative after source-cap normalization and ranges from "
-        f"{min_cap} to {max_cap}. Earlier single-source per-task caps must not "
-        "override tasks that require multiple official, freshness, or "
-        "contradiction-check sources."
-    )
+    total_cap = sum(caps)
+    declared_global_budgets = [
+        int(conflict["declared_source_budget"])
+        for conflict in conflict_records
+        if _semantic_task_source_cap_int(conflict.get("declared_source_budget")) is not None
+    ]
+    declared_global_budget = min(declared_global_budgets) if declared_global_budgets else None
+    runner_source_budget: dict[str, Any] | None = None
+    if declared_global_budget is not None:
+        runner_source_budget = _candidate_runner_source_budget_record(
+            declared_source_budget=declared_global_budget,
+            task_max_sources_sum=total_cap,
+            bounded_task_count=len(caps),
+            removed_constraints=removed_constraints,
+        )
+        existing_runner_budget = normalized.get("runner_source_budget")
+        if isinstance(existing_runner_budget, Mapping):
+            merged_runner_budget = dict(existing_runner_budget)
+            merged_runner_budget.update(runner_source_budget)
+            runner_source_budget = merged_runner_budget
+        normalized["runner_source_budget"] = runner_source_budget
+        replacement = (
+            "Executable source caps are task-specific: bounded_tasks.max_sources "
+            "is authoritative after source-cap consistency repair. The declared "
+            "global source budget is preserved as a runner-level unique-source "
+            f"reuse budget: max_unique_sources={declared_global_budget}. The "
+            f"combined per-task source ceilings total {total_cap}, so execution must "
+            "reuse sources through a shared source pool and must not treat "
+            "per-task ceilings as additive permission for unique source retrievals."
+        )
+    else:
+        replacement = (
+            "Executable source caps are task-specific: bounded_tasks.max_sources "
+            f"is authoritative after source-cap consistency repair and ranges from "
+            f"{min_cap} to {max_cap}. Runner-level source and image budgets remain "
+            "authoritative execution limits; tasks must reuse sources and record "
+            "cap-limited caveats rather than exceed confirmed run budgets."
+        )
     kept_constraints.append(replacement)
     normalized["constraints"] = kept_constraints
-    return normalized, [
-        {
-            "field": "constraints",
-            "materialization": "replaced_stale_source_cap_constraint",
-            "removed_constraints": removed_constraints,
-            "normalized_min_sources": min_cap,
-            "normalized_max_sources": max_cap,
-            "normalized_task_count": len(source_cap_normalizations),
-            "replacement_constraint": replacement,
+    materialization = {
+        "field": "constraints",
+        "materialization": "replaced_stale_source_cap_constraint",
+        "removed_constraints": removed_constraints,
+        "normalized_min_sources": min_cap,
+        "normalized_max_sources": max_cap,
+        "normalized_total_sources": total_cap,
+        "normalized_task_count": len(source_cap_normalizations),
+        "bounded_task_count": len(caps),
+        "conflicts": conflict_records,
+        "replacement_constraint": replacement,
+    }
+    if declared_global_budget is not None:
+        materialization.update(
+            {
+                "preserved_declared_source_budget": declared_global_budget,
+                "runner_source_budget": copy.deepcopy(runner_source_budget),
+            }
+        )
+    return normalized, [materialization]
+
+
+def _candidate_source_cap_constraint_conflict_record(
+    constraint: Any,
+    *,
+    normalized_caps: Sequence[int],
+) -> dict[str, Any] | None:
+    if (
+        "bounded_tasks.max_sources is authoritative" in str(constraint).lower()
+        and _candidate_declared_global_source_budget(constraint) is None
+    ):
+        return None
+    global_budget = _candidate_declared_global_source_budget(constraint)
+    total_cap = sum(normalized_caps)
+    global_budget_conflict = (
+        global_budget is not None
+        and total_cap > global_budget
+        and not _candidate_constraint_preserves_executable_source_budget(
+            constraint,
+            declared_source_budget=global_budget,
+        )
+    )
+    if _candidate_source_cap_constraint_conflicts_with_normalization(
+        constraint,
+        normalized_caps=normalized_caps,
+    ):
+        record = {
+            "conflict_type": "per_task_single_source_cap",
+            "max_task_cap": max(normalized_caps) if normalized_caps else None,
         }
-    ]
+        if global_budget_conflict:
+            record.update(
+                {
+                    "declared_source_budget": global_budget,
+                    "task_max_sources_sum": total_cap,
+                    "bounded_task_count": len(normalized_caps),
+                }
+            )
+        return record
+    if global_budget_conflict:
+        return {
+            "conflict_type": "global_source_budget_less_than_task_caps",
+            "declared_source_budget": global_budget,
+            "task_max_sources_sum": total_cap,
+            "bounded_task_count": len(normalized_caps),
+        }
+    return None
+
+
+def _candidate_runner_source_budget_record(
+    *,
+    declared_source_budget: int,
+    task_max_sources_sum: int,
+    bounded_task_count: int,
+    removed_constraints: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "budget_type": "runner_level_unique_source_reuse",
+        "max_unique_sources": declared_source_budget,
+        "declared_source_budget": declared_source_budget,
+        "task_max_sources_sum": task_max_sources_sum,
+        "bounded_task_count": bounded_task_count,
+        "reuse_required": task_max_sources_sum > declared_source_budget,
+        "allocation_strategy": "shared_source_pool",
+        "enforcement_scope": "run",
+        "materialized_from_constraints": list(removed_constraints),
+    }
+
+
+def _candidate_constraint_preserves_executable_source_budget(
+    constraint: Any,
+    *,
+    declared_source_budget: int,
+) -> bool:
+    text = str(constraint)
+    lowered = text.lower()
+    if str(declared_source_budget) not in lowered:
+        return False
+    has_runner_scope = (
+        "runner-level" in lowered
+        or "runner level" in lowered
+        or "run-level" in lowered
+        or "execution" in lowered
+        or "executable" in lowered
+    )
+    has_reuse_budget = (
+        "max_unique_sources" in lowered
+        or "unique-source" in lowered
+        or "unique source" in lowered
+        or "reuse" in lowered
+        or "shared source pool" in lowered
+    )
+    if not (has_runner_scope and has_reuse_budget):
+        return False
+    stale_sum_patterns = (
+        r"\bsum\s*(?:of\s*)?(?:bounded_tasks\.)?max_sources\s*(?:<=|≤|=|is|must not exceed|not exceed|at most|no more than)",
+        r"\btask\s+max_sources\s+sum\s*(?:<=|≤|=|is|must not exceed|not exceed|at most|no more than)",
+    )
+    return not any(re.search(pattern, lowered) for pattern in stale_sum_patterns)
 
 
 def _candidate_source_cap_constraint_conflicts_with_normalization(
@@ -1379,6 +1541,8 @@ def _candidate_source_cap_constraint_conflicts_with_normalization(
     lowered = text.lower()
     max_normalized_cap = max(normalized_caps) if normalized_caps else 1
     if max_normalized_cap <= 1:
+        return False
+    if "bounded_tasks.max_sources is authoritative" in lowered:
         return False
     mentions_source_cap = (
         "max_sources" in lowered
@@ -1395,7 +1559,12 @@ def _candidate_source_cap_constraint_conflicts_with_normalization(
         r"\bmax_sources\b[^0-9]{0,80}\b1\b",
         r"\b1\b[^0-9]{0,80}\bmax_sources\b",
         r"\bper[- ]?task\b[^0-9]{0,80}\b1\b",
+        r"\bper[- ]?task\b[^.\n;]{0,80}\bone\b[^.\n;]{0,40}\bsource\b",
         r"\beach\b[^0-9]{0,80}\btask\b[^0-9]{0,80}\b1\b",
+        r"\beach\b[^.\n;]{0,80}\btask\b[^.\n;]{0,80}\bone\b[^.\n;]{0,40}\bsource\b",
+        r"\bcapped\b[^.\n;]{0,40}\bone\b[^.\n;]{0,40}\bsource\b",
+        r"\bone\b[^.\n;]{0,40}\bdecisive\b[^.\n;]{0,40}\bsource\b",
+        r"\bone\b[^.\n;]{0,40}\bsource\b[^.\n;]{0,40}\bper[- ]?task\b",
         r"\bsingle[- ]?source\b",
         r"각\s*bounded\s*task[^0-9]{0,80}1",
         r"max_sources[^0-9]{0,80}1",
@@ -1404,6 +1573,45 @@ def _candidate_source_cap_constraint_conflicts_with_normalization(
         re.search(pattern, lowered if pattern.isascii() else text)
         for pattern in single_source_patterns
     )
+
+
+def _candidate_declared_global_source_budget(constraint: Any) -> int | None:
+    if not isinstance(constraint, str):
+        return None
+    text = str(constraint)
+    lowered = text.lower()
+    if not (
+        "source" in lowered
+        or "retrieval" in lowered
+        or "max_sources" in lowered
+        or "출처" in text
+    ):
+        return None
+    if "per-task" in lowered or "per task" in lowered or "each bounded task" in lowered:
+        if not any(
+            marker in lowered
+            for marker in ("overall", "global", "total", "aggregate", "sum", "budget")
+        ):
+            return None
+    patterns = (
+        r"\b(?:overall|global|total|aggregate|cumulative)\s+source\s+budget\s*(?:is|=|:)?\s*(?P<cap>\d{1,4})\b",
+        r"\bmax_unique_sources\b\s*(?:=|:|is|must be|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
+        r"\b(?:overall|global|total|aggregate|cumulative)\b[^.\n;]{0,120}\b(?:source|sources|retrievals?|max_sources)\b[^0-9]{0,40}\b(?P<cap>\d{1,4})\b",
+        r"\b(?:source|sources|retrievals?|max_sources)\b[^.\n;]{0,120}\b(?:overall|global|total|aggregate|cumulative|budget|cap|limit|sum)\b[^0-9]{0,40}\b(?P<cap>\d{1,4})\b",
+        r"\bsum\s*(?:of\s*)?(?:bounded_tasks\.)?max_sources\s*(?:<=|≤|=|is|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
+        r"\b(?:budget|cap|limit|max(?:imum)?|at most|no more than)\b[^.\n;]{0,80}\b(?P<cap>\d{1,4})\b[^.\n;]{0,80}\b(?:source|sources|source retrievals|retrievals?)\b",
+        r"\b(?P<cap>\d{1,4})\b\s*(?:source|sources|source retrievals|retrievals?)\b[^.\n;]{0,100}\b(?:budget|cap|limit|max(?:imum)?|overall|total|aggregate|sum)\b",
+    )
+    budgets: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, lowered):
+            try:
+                budgets.append(int(match.group("cap")))
+            except (TypeError, ValueError):
+                continue
+    if not budgets:
+        return None
+    return budgets[0]
 
 
 def _semantic_task_source_cap_int(value: Any) -> int | None:
@@ -1552,6 +1760,294 @@ def _materialize_candidate_expected_evidence(
         )
     normalized["bounded_tasks"] = normalized_tasks
     return normalized, materializations
+
+
+def _materialize_candidate_placeholder_selection_workflow(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    angles = [
+        angle
+        for angle in normalized.get("angles") or []
+        if isinstance(angle, Mapping)
+    ]
+    tasks = [
+        task
+        for task in normalized.get("bounded_tasks") or []
+        if isinstance(task, Mapping)
+    ]
+    constraints = normalized.get("constraints")
+    constraint_records = constraints if isinstance(constraints, list) else []
+    labels = _candidate_placeholder_jurisdiction_labels(
+        angles=angles,
+        tasks=tasks,
+        constraints=constraint_records,
+    )
+    if not labels:
+        return normalized, []
+    has_selection_workflow = _candidate_has_placeholder_selection_workflow(
+        angles=angles,
+        tasks=tasks,
+        constraints=constraint_records,
+    )
+    existing_unbound_labels = _candidate_unbound_placeholder_jurisdiction_labels(
+        plan=normalized,
+        placeholder_labels=labels,
+    )
+    if not existing_unbound_labels:
+        return normalized, []
+    materialized_bindings = _candidate_materialized_placeholder_bindings(
+        normalized,
+        placeholder_labels=existing_unbound_labels,
+    )
+    if materialized_bindings:
+        existing_binding = normalized.get("placeholder_binding")
+        merged_binding = (
+            dict(existing_binding) if isinstance(existing_binding, Mapping) else {}
+        )
+        merged_binding.update(materialized_bindings)
+        normalized["placeholder_binding"] = merged_binding
+
+    selection_constraint = (
+        "Placeholder jurisdiction labels must be bound before evidence collection: "
+        f"select and name the jurisdictions represented by {', '.join(labels[:6])} "
+        "using explicit selection criteria, then map every placeholder-dependent "
+        "claim back to the selected named jurisdiction."
+    )
+    if isinstance(constraints, list):
+        normalized_constraints = list(constraints)
+        if not has_selection_workflow:
+            normalized_constraints.append(selection_constraint)
+        if materialized_bindings:
+            normalized_constraints.append(
+                {
+                    "constraint_type": "placeholder_binding",
+                    "placeholder_binding": copy.deepcopy(materialized_bindings),
+                    "selection_basis": "deterministic_question_context",
+                    "message": (
+                        "Use these concrete named jurisdictions whenever placeholder "
+                        "jurisdiction labels appear in tasks, angles, constraints, or claims."
+                    ),
+                }
+            )
+        normalized["constraints"] = normalized_constraints
+
+    raw_tasks = normalized.get("bounded_tasks")
+    task_materialization: dict[str, Any] | None = None
+    if isinstance(raw_tasks, list):
+        normalized_tasks: list[Any] = []
+        task_updated = False
+        for index, task in enumerate(raw_tasks, start=1):
+            if not isinstance(task, Mapping):
+                normalized_tasks.append(task)
+                continue
+            normalized_task = dict(task)
+            record_bindings = _candidate_record_placeholder_bindings(
+                task,
+                placeholder_binding=materialized_bindings,
+            )
+            if record_bindings:
+                normalized_task["placeholder_binding"] = record_bindings
+            if not task_updated and record_bindings:
+                criteria = _string_list(normalized_task.get("success_criteria"))
+                normalized_task["success_criteria"] = [
+                    *criteria,
+                    (
+                        "Before comparing evidence, run a jurisdiction selection "
+                        "workflow that binds each placeholder municipality to a named "
+                        "jurisdiction with explicit selection criteria."
+                    ),
+                ]
+                done_condition = str(normalized_task.get("done_condition") or "")
+                if "selection workflow" not in done_condition.lower():
+                    normalized_task["done_condition"] = (
+                        f"{done_condition.rstrip()} First bind placeholder "
+                        "jurisdictions to named municipalities through the selection "
+                        "workflow before recording source-backed findings."
+                    ).strip()
+                task_materialization = {
+                    "task_id": normalized_task.get("task_id"),
+                    "task_index": index,
+                    "field": "bounded_tasks.success_criteria",
+                    "materialization": "added_placeholder_jurisdiction_selection_workflow",
+                    "placeholder_binding": copy.deepcopy(record_bindings),
+                }
+                task_updated = True
+            normalized_tasks.append(normalized_task)
+        normalized["bounded_tasks"] = normalized_tasks
+
+    raw_angles = normalized.get("angles")
+    angle_materialization: dict[str, Any] | None = None
+    if isinstance(raw_angles, list):
+        normalized_angles: list[Any] = []
+        angle_updated = False
+        for index, angle in enumerate(raw_angles, start=1):
+            if not isinstance(angle, Mapping):
+                normalized_angles.append(angle)
+                continue
+            normalized_angle = dict(angle)
+            record_bindings = _candidate_record_placeholder_bindings(
+                angle,
+                placeholder_binding=materialized_bindings,
+            )
+            if record_bindings:
+                normalized_angle["placeholder_binding"] = record_bindings
+            if not angle_updated and record_bindings:
+                checks = _string_list(normalized_angle.get("risk_or_contradiction_checks"))
+                normalized_angle["risk_or_contradiction_checks"] = [
+                    *checks,
+                    (
+                        "Verify that the jurisdiction selection workflow resolves each "
+                        "placeholder municipality to a named jurisdiction before synthesis."
+                    ),
+                ]
+                angle_materialization = {
+                    "angle_id": normalized_angle.get("angle_id"),
+                    "angle_index": index,
+                    "field": "angles.risk_or_contradiction_checks",
+                    "materialization": "added_placeholder_jurisdiction_selection_check",
+                    "placeholder_binding": copy.deepcopy(record_bindings),
+                }
+                angle_updated = True
+            normalized_angles.append(normalized_angle)
+        normalized["angles"] = normalized_angles
+
+    materialization = {
+        "field": "placeholder_jurisdiction_workflow",
+        "materialization": "bound_placeholder_jurisdictions",
+        "placeholder_labels": labels,
+        "unbound_placeholder_labels": existing_unbound_labels,
+        "placeholder_binding": copy.deepcopy(materialized_bindings),
+        "selection_constraint": selection_constraint,
+    }
+    if not materialized_bindings:
+        materialization["binding_status"] = "unresolved_no_question_context"
+    else:
+        materialization["binding_status"] = "bound_from_question_context"
+    if task_materialization:
+        materialization["task_materialization"] = task_materialization
+    if angle_materialization:
+        materialization["angle_materialization"] = angle_materialization
+    return normalized, [materialization]
+
+
+def _materialize_candidate_visual_image_cap_feasibility(
+    candidate: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized = copy.deepcopy(dict(candidate))
+    raw_tasks = normalized.get("bounded_tasks")
+    if not isinstance(raw_tasks, list):
+        return normalized, []
+
+    normalized_tasks: list[Any] = []
+    materializations: list[dict[str, Any]] = []
+    for index, task in enumerate(raw_tasks, start=1):
+        if not isinstance(task, Mapping):
+            normalized_tasks.append(task)
+            continue
+        normalized_task = dict(task)
+        max_images = _semantic_task_source_cap_int(task.get("max_images")) or 0
+        if str(task.get("route") or "") == "text_only" or max_images <= 0:
+            normalized_tasks.append(normalized_task)
+            continue
+        task_materializations: list[dict[str, Any]] = []
+        for field_name in ("query", "done_condition"):
+            current = str(normalized_task.get(field_name) or "")
+            repaired = _cap_visual_image_demand_text(current, max_images=max_images)
+            if repaired != current:
+                normalized_task[field_name] = repaired
+                task_materializations.append(
+                    {
+                        "field": f"bounded_tasks.{field_name}",
+                        "previous": current,
+                        "materialized": repaired,
+                    }
+                )
+        success_criteria = _string_list(normalized_task.get("success_criteria"))
+        if success_criteria:
+            repaired_criteria: list[str] = []
+            for criterion in success_criteria:
+                repaired_criteria.append(
+                    _cap_visual_image_demand_text(criterion, max_images=max_images)
+                )
+            if repaired_criteria != success_criteria:
+                normalized_task["success_criteria"] = repaired_criteria
+                task_materializations.append(
+                    {
+                        "field": "bounded_tasks.success_criteria",
+                        "previous": success_criteria,
+                        "materialized": repaired_criteria,
+                    }
+                )
+        if task_materializations:
+            materializations.append(
+                {
+                    "task_id": normalized_task.get("task_id"),
+                    "task_index": index,
+                    "max_images": max_images,
+                    "materialization": "capped_visual_image_demands_to_task_budget",
+                    "fields": task_materializations,
+                }
+            )
+        normalized_tasks.append(normalized_task)
+    normalized["bounded_tasks"] = normalized_tasks
+    return normalized, materializations
+
+
+def _cap_visual_image_demand_text(text: str, *, max_images: int) -> str:
+    if not text or max_images <= 0:
+        return text
+
+    def replace_at_least(match: re.Match[str]) -> str:
+        requested = _semantic_count_word_to_int(match.group("count"))
+        if requested is None or requested <= max_images:
+            return match.group(0)
+        target = match.group("target").strip()
+        suffix = match.group("suffix") or ""
+        return (
+            f"Up to {max_images} {target} are acquired in this bounded task; "
+            "additional required visual examples must be covered by adjacent "
+            f"visual tasks or recorded as cap-limited caveats{suffix}"
+        )
+
+    repaired = re.sub(
+        r"\b[Aa]t least\s+(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?P<target>[^.;]{0,100}?(?:poster|posters|image|images|visual example|visual examples)[^.;]{0,100}?)"
+        r"(?P<suffix>[.;]|$)",
+        replace_at_least,
+        text,
+    )
+    if max_images < 4:
+        repaired = re.sub(
+            r"\bacquir(?:e|ing)\s+one representative image per program\b",
+            f"acquiring up to {max_images} representative images within this task's cap",
+            repaired,
+            flags=re.IGNORECASE,
+        )
+        repaired = re.sub(
+            r"\bfor the sampled programs\b",
+            f"for up to {max_images} sampled programs in this bounded task",
+            repaired,
+            flags=re.IGNORECASE,
+        )
+    return repaired
+
+
+def _semantic_count_word_to_int(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    return {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+    }.get(value.lower())
 
 
 def _candidate_task_expected_evidence_from_context(
@@ -2034,6 +2530,7 @@ def _candidate_task_min_executable_sources(
 ) -> tuple[int, list[str]]:
     text = _candidate_task_source_cap_text(task)
     source_family_count = _candidate_task_declared_source_family_count(task)
+    named_source_entity_count = _candidate_task_named_source_entity_count(task)
     reasons = [
         label
         for label, needles in SEMANTIC_MULTI_SOURCE_CAP_NEEDLES.items()
@@ -2041,6 +2538,8 @@ def _candidate_task_min_executable_sources(
     ]
     if source_family_count >= 2:
         reasons.append("multiple_declared_source_families")
+    if named_source_entity_count >= 2:
+        reasons.append("multiple_named_source_entities")
     reason_set = set(reasons)
     minimum = SEMANTIC_TASK_MIN_SOURCES
     if reason_set & {"comparison", "freshness", "contradiction"}:
@@ -2052,6 +2551,11 @@ def _candidate_task_min_executable_sources(
         minimum = max(minimum, 2)
     if source_family_count >= 2 and reason_set:
         minimum = max(minimum, source_family_count)
+    if named_source_entity_count >= 2 and (
+        "official_record" in reason_set
+        or reason_set & {"comparison", "freshness", "contradiction"}
+    ):
+        minimum = max(minimum, named_source_entity_count)
     return min(SEMANTIC_TASK_MAX_SOURCES, minimum), list(dict.fromkeys(reasons))
 
 
@@ -2075,6 +2579,80 @@ def _candidate_task_declared_source_family_count(task: Mapping[str, Any]) -> int
         }
         counts.append(len(normalized))
     return max(counts or [0])
+
+
+def _candidate_task_named_source_entity_count(task: Mapping[str, Any]) -> int:
+    raw_text = json.dumps(
+        [task.get(field_name) for field_name in SEMANTIC_MULTI_SOURCE_CAP_FIELDS],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    lower = raw_text.lower()
+    if not any(
+        token in lower
+        for token in (
+            "official",
+            "regulatory",
+            "primary",
+            "documentation",
+            "docs",
+            "vendor",
+            "provider",
+            "browser",
+            "source",
+            "record",
+            "공식",
+            "규제",
+            "원문",
+        )
+    ):
+        return 0
+    named_entities: set[str] = set()
+    vendor_tokens = {
+        "adobe",
+        "airbnb",
+        "amazon",
+        "anthropic",
+        "apple",
+        "atlassian",
+        "aws",
+        "azure",
+        "box",
+        "chrome",
+        "cloudflare",
+        "edge",
+        "figma",
+        "firebase",
+        "firefox",
+        "github",
+        "gitlab",
+        "google",
+        "gpt",
+        "ibm",
+        "jira",
+        "meta",
+        "microsoft",
+        "mozilla",
+        "notion",
+        "openai",
+        "oracle",
+        "safari",
+        "salesforce",
+        "slack",
+        "teams",
+        "vercel",
+        "xcode",
+    }
+    for token in vendor_tokens:
+        if re.search(rf"\b{re.escape(token)}\b", lower):
+            named_entities.add(token)
+    proper_pair_pattern = re.compile(
+        r"\b([A-Z][A-Za-z0-9.+#-]{1,})\s*(?:\+|/|,|\bvs\.?\b|\bversus\b|\band\b)\s*([A-Z][A-Za-z0-9.+#-]{1,})\b"
+    )
+    for left, right in proper_pair_pattern.findall(raw_text):
+        named_entities.add(left.lower())
+        named_entities.add(right.lower())
+    return len(named_entities)
 
 
 def _semantic_source_cap_text_has_any(text: str, needles: Sequence[str]) -> bool:
@@ -3976,10 +4554,15 @@ def _semantic_substitute_implementation_check(
     plan: SemanticPlan,
     oracle: Mapping[str, Any],
 ) -> dict[str, Any]:
-    text = _plan_executable_review_text(plan)
+    records = _plan_executable_review_records(plan)
+    text = json.dumps([value for _field_name, value in records], ensure_ascii=False).lower()
     forbidden_angles = [item.lower() for item in _string_list(oracle.get("forbidden_angles"))]
     leakage_terms = _forbidden_internal_leakage_terms(plan=plan, oracle=oracle)
-    forbidden_angle_hits = [term for term in forbidden_angles if term and term in text]
+    forbidden_angle_hits = [
+        term
+        for term in forbidden_angles
+        if term and _forbidden_angle_term_matches(term=term, records=records)
+    ]
     generic_hits = [
         phrase
         for phrase in (
@@ -3998,6 +4581,50 @@ def _semantic_substitute_implementation_check(
         "generic_wrapper_terms_found": generic_hits,
         "blocked_reason": None if passed else "substitute_or_forbidden_implementation_detected",
     }
+
+
+def _forbidden_angle_term_matches(
+    *,
+    term: str,
+    records: Sequence[tuple[str, str]],
+) -> bool:
+    normalized_term = _normalize_text(term)
+    if not normalized_term:
+        return False
+    for field_name, value in records:
+        normalized_value = _normalize_text(value)
+        if not _contains_normalized_phrase(normalized_value, normalized_term):
+            continue
+        if _forbidden_angle_reference_is_negative_scope(
+            field_name=field_name,
+            normalized_term=normalized_term,
+            normalized_value=normalized_value,
+        ):
+            continue
+        return True
+    return False
+
+
+def _forbidden_angle_reference_is_negative_scope(
+    *,
+    field_name: str,
+    normalized_term: str,
+    normalized_value: str,
+) -> bool:
+    if any(
+        marker in field_name
+        for marker in ("excluded_scope", "negative_scope")
+    ):
+        return True
+    negative_patterns = (
+        rf"\b(?:no|not|exclude|excluded|excludes|excluding|avoid|avoids|avoided|without)\b"
+        rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"\b{re.escape(normalized_term)}\b(?:\s+\w+){{0,6}}\s+"
+        rf"(?:excluded|out of scope|not in scope|not part of scope)\b",
+        rf"\bdo\s+not\b(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"\b(?:rather\s+than|instead\s+of)\b(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+    )
+    return any(re.search(pattern, normalized_value) for pattern in negative_patterns)
 
 
 def _forbidden_internal_leakage_terms(
@@ -4035,6 +4662,10 @@ def _forbidden_internal_term_matches(
             continue
         if compact_term in {"planner", "adapter", "oracle", "budget"}:
             if _ambiguous_internal_term_has_context(compact_term, normalized_value):
+                return True
+            continue
+        if compact_term == "architecture":
+            if _architecture_term_is_internal_leakage(normalized_value):
                 return True
             continue
         return True
@@ -4121,6 +4752,78 @@ def _schema_term_is_internal_leakage(normalized_value: str) -> bool:
         "outline",
     }
     if _normalized_text_has_any_token(normalized_value, deliverable_terms):
+        return False
+    return True
+
+
+def _architecture_term_is_internal_leakage(normalized_value: str) -> bool:
+    software_terms = {
+        "adapter",
+        "api",
+        "backend",
+        "code",
+        "codex",
+        "component",
+        "data",
+        "database",
+        "deployment",
+        "frontend",
+        "implementation",
+        "infrastructure",
+        "internal",
+        "internals",
+        "module",
+        "pipeline",
+        "planner",
+        "repository",
+        "runner",
+        "runtime",
+        "sdk",
+        "semantic",
+        "service",
+        "software",
+        "system",
+        "technical",
+        "test",
+    }
+    physical_terms = {
+        "building",
+        "campus",
+        "clinical",
+        "construction",
+        "facility",
+        "floor",
+        "healthcare",
+        "hospital",
+        "layout",
+        "medical",
+        "patient",
+        "physical",
+        "room",
+        "site",
+        "spatial",
+        "ward",
+        "건축",
+        "공간",
+        "병원",
+        "시설",
+    }
+    tokens = set(normalized_value.split())
+    if tokens & physical_terms:
+        if not (tokens & software_terms):
+            return False
+        negative_software_architecture = (
+            _forbidden_angle_reference_is_negative_scope(
+                field_name="architecture_context",
+                normalized_term="software architecture",
+                normalized_value=normalized_value,
+            )
+        )
+        if negative_software_architecture:
+            return False
+    if tokens & software_terms:
+        return True
+    if tokens & physical_terms:
         return False
     return True
 
@@ -4682,6 +5385,47 @@ def validate_semantic_candidate_plan(
     subject_tokens = _core_question_tokens(question)
     if subject_tokens and not _candidate_text_covers_subject(executable_text, subject_tokens):
         failures.append({"code": "subject_requirement_drift"})
+    placeholder_labels = _candidate_placeholder_jurisdiction_labels(
+        angles=angles,
+        tasks=tasks,
+        constraints=plan.get("constraints") if isinstance(plan.get("constraints"), list) else [],
+    )
+    if placeholder_labels:
+        constraints_for_placeholder = (
+            plan.get("constraints") if isinstance(plan.get("constraints"), list) else []
+        )
+        unbound_placeholder_labels = _candidate_unbound_placeholder_jurisdiction_labels(
+            plan=plan,
+            placeholder_labels=placeholder_labels,
+        )
+        if unbound_placeholder_labels:
+            failures.append(
+                {
+                    "code": "unbound_jurisdiction_placeholders",
+                    "placeholder_labels": unbound_placeholder_labels[:10],
+                    "placeholder_label_count": len(unbound_placeholder_labels),
+                    "requires_concrete_binding": True,
+                    "message": (
+                        "Placeholder jurisdiction labels must be bound to concrete "
+                        "named jurisdictions in placeholder_binding metadata."
+                    ),
+                }
+            )
+        if unbound_placeholder_labels and not _candidate_has_placeholder_selection_workflow(
+            angles=angles,
+            tasks=tasks,
+            constraints=constraints_for_placeholder,
+        ):
+            failures.append(
+                {
+                    "code": "missing_placeholder_selection_workflow",
+                    "placeholder_labels": unbound_placeholder_labels[:10],
+                    "message": (
+                        "Placeholder jurisdiction labels require a selection, matching, "
+                        "or binding workflow before evidence collection."
+                    ),
+                }
+            )
     for requirement in requirements:
         if requirement.get("coverage_status") != "covered":
             failures.append(
@@ -4896,6 +5640,13 @@ def validate_semantic_candidate_plan(
                         "task_id": task.get("task_id"),
                     }
                 )
+    failures.extend(
+        _candidate_source_cap_constraint_failures(
+            plan=plan,
+            constraints=plan.get("constraints"),
+            tasks=tasks,
+        )
+    )
     if request_visual_preference == "text_only":
         text_only_violations: list[dict[str, Any]] = []
         for angle in angles:
@@ -6150,6 +6901,411 @@ def _candidate_executable_text(
     return json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
 
 
+PLACEHOLDER_JURISDICTION_PATTERN = re.compile(
+    r"\b(?:municipality|municipalities|jurisdiction|jurisdictions|city|cities|county|counties|region|regions|province|provinces|locality|localities|district|districts)\s*(?:#|no\.?|number)?\s*\d+\b",
+    re.IGNORECASE,
+)
+
+
+def _candidate_placeholder_jurisdiction_labels(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Any],
+) -> list[str]:
+    text = _candidate_placeholder_jurisdiction_text(
+        angles=angles,
+        tasks=tasks,
+        constraints=constraints,
+    )
+    labels = [
+        " ".join(match.group(0).lower().split())
+        for match in PLACEHOLDER_JURISDICTION_PATTERN.finditer(text)
+    ]
+    return _ordered_unique(labels)
+
+
+def _candidate_has_placeholder_selection_workflow(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Any],
+) -> bool:
+    text = _normalize_text(
+        _candidate_placeholder_jurisdiction_text(
+            angles=angles,
+            tasks=tasks,
+            constraints=constraints,
+        )
+    )
+    if not text:
+        return False
+    selection_phrase = (
+        r"(?:select|selection|selected|choose|chosen|shortlist|sampling|sample|"
+        r"bind|binding|map|mapped|mapping|match|matching|identify|identified|"
+        r"name|named)"
+    )
+    jurisdiction_phrase = (
+        r"(?:placeholder|municipality|municipalities|jurisdiction|jurisdictions|"
+        r"city|cities|county|counties|region|regions|locality|localities|"
+        r"district|districts)"
+    )
+    proximity_patterns = (
+        rf"\b{selection_phrase}\b(?:\s+\w+){{0,12}}\s+\b{jurisdiction_phrase}\b",
+        rf"\b{jurisdiction_phrase}\b(?:\s+\w+){{0,12}}\s+\b{selection_phrase}\b",
+        r"(?:선정|선택|매핑|대응)(?:\s+\w+){0,12}\s+(?:지자체|관할|지역|도시)",
+        r"(?:지자체|관할|지역|도시)(?:\s+\w+){0,12}\s+(?:선정|선택|매핑|대응)",
+    )
+    return any(re.search(pattern, text) for pattern in proximity_patterns)
+
+
+def _candidate_record_mentions_placeholder_jurisdiction(record: Mapping[str, Any]) -> bool:
+    text = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    return bool(PLACEHOLDER_JURISDICTION_PATTERN.search(text))
+
+
+def _candidate_placeholder_jurisdiction_text(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Any],
+) -> str:
+    values: list[Any] = [constraints]
+    for angle in angles:
+        values.extend(
+            [
+                angle.get("title"),
+                angle.get("research_question"),
+                angle.get("why_this_angle_matters"),
+                angle.get("included_scope"),
+                angle.get("excluded_scope"),
+                angle.get("expected_artifacts"),
+                angle.get("search_queries"),
+                angle.get("success_criteria"),
+                angle.get("risk_or_contradiction_checks"),
+            ]
+        )
+    for task in tasks:
+        values.extend(
+            [
+                task.get("query"),
+                task.get("source_policy"),
+                task.get("expected_source_types"),
+                task.get("expected_artifacts"),
+                task.get("success_criteria"),
+                task.get("done_condition"),
+            ]
+        )
+    return json.dumps(values, ensure_ascii=False, sort_keys=True)
+
+
+def _candidate_placeholder_binding_map(plan: Mapping[str, Any]) -> dict[str, Any]:
+    for field_name in (
+        "placeholder_binding",
+        "placeholder_bindings",
+        "placeholder_jurisdiction_binding",
+        "placeholder_jurisdiction_bindings",
+    ):
+        value = plan.get(field_name)
+        if isinstance(value, Mapping):
+            return {str(key).lower(): copy.deepcopy(binding) for key, binding in value.items()}
+    return {}
+
+
+def _candidate_unbound_placeholder_jurisdiction_labels(
+    *,
+    plan: Mapping[str, Any],
+    placeholder_labels: Sequence[str],
+) -> list[str]:
+    binding_map = _candidate_placeholder_binding_map(plan)
+    unbound: list[str] = []
+    for label in placeholder_labels:
+        normalized_label = str(label).lower()
+        binding = binding_map.get(normalized_label)
+        if not _candidate_placeholder_binding_is_concrete(binding):
+            unbound.append(str(label))
+    return _ordered_unique(unbound)
+
+
+def _candidate_placeholder_binding_is_concrete(binding: Any) -> bool:
+    if isinstance(binding, Mapping):
+        for field_name in (
+            "jurisdiction_name",
+            "name",
+            "bound_to",
+            "selected_jurisdiction",
+            "municipality_name",
+        ):
+            value = binding.get(field_name)
+            if _candidate_placeholder_binding_name_is_concrete(value):
+                return True
+        return False
+    return _candidate_placeholder_binding_name_is_concrete(binding)
+
+
+def _candidate_placeholder_binding_name_is_concrete(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    name = " ".join(value.split())
+    if not name:
+        return False
+    lowered = name.lower()
+    if PLACEHOLDER_JURISDICTION_PATTERN.search(name):
+        return False
+    generic_phrases = (
+        "named jurisdiction",
+        "selected jurisdiction",
+        "selected municipality",
+        "chosen jurisdiction",
+        "chosen municipality",
+        "placeholder",
+        "to be selected",
+        "tbd",
+        "n/a",
+    )
+    if any(phrase in lowered for phrase in generic_phrases):
+        return False
+    return bool(re.search(r"[A-Za-z\uac00-\ud7a3]", name))
+
+
+def _candidate_materialized_placeholder_bindings(
+    candidate: Mapping[str, Any],
+    *,
+    placeholder_labels: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    jurisdiction_names = _candidate_context_jurisdiction_names(
+        candidate,
+        needed=len(placeholder_labels),
+    )
+    if len(jurisdiction_names) < len(placeholder_labels):
+        return {}
+    bindings: dict[str, dict[str, Any]] = {}
+    for label, jurisdiction_name in zip(placeholder_labels, jurisdiction_names):
+        bindings[str(label)] = {
+            "jurisdiction_name": jurisdiction_name,
+            "binding_source": "deterministic_question_context",
+            "selection_basis": (
+                "Derived from the geographic context in the original question and "
+                "ordered deterministically for reproducible release validation."
+            ),
+        }
+    return bindings
+
+
+def _candidate_context_jurisdiction_names(
+    candidate: Mapping[str, Any],
+    *,
+    needed: int,
+) -> list[str]:
+    values = [
+        candidate.get("original_question"),
+        candidate.get("intent_summary"),
+        candidate.get("domain_entities"),
+        candidate.get("constraints"),
+        candidate.get("requirement_coverage_map"),
+    ]
+    text = json.dumps(values, ensure_ascii=False, sort_keys=True)
+    lowered = text.lower()
+    explicit_names = _candidate_explicit_jurisdiction_names(candidate)
+    if len(explicit_names) >= needed:
+        return explicit_names[:needed]
+    if (
+        "south korea" in lowered
+        or "korea" in lowered
+        or "대한민국" in text
+        or "한국" in text
+    ):
+        defaults = [
+            "Seoul, South Korea",
+            "Busan, South Korea",
+            "Incheon, South Korea",
+            "Daegu, South Korea",
+            "Daejeon, South Korea",
+            "Gwangju, South Korea",
+            "Ulsan, South Korea",
+            "Sejong, South Korea",
+        ]
+        return _ordered_unique([*explicit_names, *defaults])[:needed]
+    if "united states" in lowered or "u.s." in lowered or " usa" in f" {lowered}":
+        defaults = [
+            "New York City, United States",
+            "Los Angeles, United States",
+            "Chicago, United States",
+            "Houston, United States",
+            "Phoenix, United States",
+            "Philadelphia, United States",
+        ]
+        return _ordered_unique([*explicit_names, *defaults])[:needed]
+    return explicit_names[:needed]
+
+
+def _candidate_explicit_jurisdiction_names(candidate: Mapping[str, Any]) -> list[str]:
+    names: list[str] = []
+    for entity in _list(candidate.get("domain_entities")):
+        if not isinstance(entity, Mapping):
+            continue
+        entity_type = str(entity.get("type") or "").lower()
+        if not any(
+            token in entity_type
+            for token in ("jurisdiction", "municipality", "city", "county", "region")
+        ):
+            continue
+        name = str(entity.get("name") or "").strip()
+        if _candidate_placeholder_binding_name_is_concrete(name):
+            names.append(name)
+    return _ordered_unique(names)
+
+
+def _candidate_record_placeholder_bindings(
+    record: Mapping[str, Any],
+    *,
+    placeholder_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not placeholder_binding:
+        return {}
+    text = json.dumps(record, ensure_ascii=False, sort_keys=True).lower()
+    bindings: dict[str, Any] = {}
+    for label, binding in placeholder_binding.items():
+        if str(label).lower() in text:
+            bindings[str(label)] = copy.deepcopy(binding)
+    return bindings
+
+
+def _candidate_source_cap_constraint_failures(
+    *,
+    plan: Mapping[str, Any] | None = None,
+    constraints: Any,
+    tasks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(constraints, list):
+        return []
+    caps = [
+        cap
+        for cap in (
+            _semantic_task_source_cap_int(task.get("max_sources"))
+            for task in tasks
+            if isinstance(task, Mapping)
+        )
+        if cap is not None
+    ]
+    if not caps:
+        return []
+    failures: list[dict[str, Any]] = []
+    executable_budgets: list[int] = []
+    for index, constraint in enumerate(constraints, start=1):
+        global_budget = _candidate_declared_global_source_budget(constraint)
+        if (
+            global_budget is not None
+            and _candidate_constraint_preserves_executable_source_budget(
+                constraint,
+                declared_source_budget=global_budget,
+            )
+        ):
+            executable_budgets.append(global_budget)
+        conflict = _candidate_source_cap_constraint_conflict_record(
+            constraint,
+            normalized_caps=caps,
+        )
+        if not conflict:
+            continue
+        failures.append(
+            {
+                "code": "source_cap_constraint_conflicts_with_tasks",
+                "constraint_index": index,
+                "constraint": _preview_text(str(constraint), limit=240),
+                **conflict,
+            }
+        )
+    total_cap = sum(caps)
+    runner_source_budget = (
+        plan.get("runner_source_budget")
+        if isinstance(plan, Mapping)
+        else None
+    )
+    for declared_budget in sorted(set(executable_budgets)):
+        if total_cap <= declared_budget:
+            continue
+        if not _candidate_runner_source_budget_preserves_cap(
+            runner_source_budget,
+            declared_source_budget=declared_budget,
+            task_max_sources_sum=total_cap,
+        ):
+            failures.append(
+                {
+                    "code": "global_source_budget_missing_executable_runner_budget",
+                    "declared_source_budget": declared_budget,
+                    "task_max_sources_sum": total_cap,
+                    "message": (
+                        "Executable global source budgets must be preserved as "
+                        "machine-readable runner_source_budget metadata."
+                    ),
+                }
+            )
+    runner_budget_cap = _candidate_runner_source_budget_cap(runner_source_budget)
+    if (
+        runner_budget_cap is not None
+        and total_cap > runner_budget_cap
+        and runner_budget_cap not in set(executable_budgets)
+    ):
+        failures.append(
+            {
+                "code": "global_source_budget_not_preserved_in_constraints",
+                "declared_source_budget": runner_budget_cap,
+                "task_max_sources_sum": total_cap,
+                "message": (
+                    "runner_source_budget metadata must also be visible in plan "
+                    "constraints with the numeric global cap preserved."
+                ),
+            }
+        )
+    return failures
+
+
+def _candidate_runner_source_budget_cap(runner_source_budget: Any) -> int | None:
+    if not isinstance(runner_source_budget, Mapping):
+        return None
+    for field_name in ("max_unique_sources", "declared_source_budget", "max_sources"):
+        value = _semantic_task_source_cap_int(runner_source_budget.get(field_name))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _candidate_runner_source_budget_preserves_cap(
+    runner_source_budget: Any,
+    *,
+    declared_source_budget: int,
+    task_max_sources_sum: int,
+) -> bool:
+    if not isinstance(runner_source_budget, Mapping):
+        return False
+    cap = _candidate_runner_source_budget_cap(runner_source_budget)
+    if cap != declared_source_budget:
+        return False
+    budget_type = str(runner_source_budget.get("budget_type") or "").lower()
+    allocation_strategy = str(runner_source_budget.get("allocation_strategy") or "").lower()
+    enforcement_scope = str(runner_source_budget.get("enforcement_scope") or "").lower()
+    if "unique" not in budget_type and "unique" not in allocation_strategy:
+        return False
+    if not (
+        "reuse" in budget_type
+        or "reuse" in allocation_strategy
+        or "shared_source_pool" in allocation_strategy
+        or "shared source pool" in allocation_strategy
+    ):
+        return False
+    if enforcement_scope not in {"run", "runner", "runner_level", "run_level"}:
+        return False
+    recorded_sum = _semantic_task_source_cap_int(
+        runner_source_budget.get("task_max_sources_sum")
+    )
+    if recorded_sum is not None and recorded_sum != task_max_sources_sum:
+        return False
+    if task_max_sources_sum > declared_source_budget:
+        return runner_source_budget.get("reuse_required") is True
+    return True
+
+
 def _core_question_tokens(question: str) -> set[str]:
     stopwords = {
         "research",
@@ -6886,6 +8042,7 @@ def write_semantic_integrity_artifacts(
             "intent_summary": plan.intent_summary,
             "domain_entities": list(plan.domain_entities),
             "constraints": list(plan.constraints),
+            "runner_source_budget": dict(plan.runner_source_budget),
             "candidate_question_scope": plan.question_scope,
             "decomposition_strategy": plan.decomposition_strategy,
             "negative_scope": list(plan.negative_scope),

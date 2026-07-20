@@ -56,6 +56,10 @@ from deepresearch.semantic_planner import (  # noqa: E402
     write_semantic_planner_validation,
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
+    _materialize_candidate_placeholder_selection_workflow,
+    _materialize_candidate_source_cap_constraints,
+    _materialize_candidate_visual_image_cap_feasibility,
+    _normalize_candidate_executable_source_caps,
     _repair_candidate_requirement_coverage,
     _semantic_adapter_command,
     _semantic_adapter_prompt,
@@ -1906,6 +1910,65 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(
             substitute["forbidden_internal_implementation_terms_found"],
             [],
+        )
+
+    def test_semantic_substitute_check_allows_physical_architecture_domain(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        oracle["forbidden_internal_implementation_terms"].append("architecture")
+        oracle["forbidden_angles"].append("software architecture")
+        plan = self.semantic_internal_leakage_review_plan(
+            query=(
+                "Research hospital physical architecture and facility layout, "
+                "not software architecture, using public hospital design standards."
+            ),
+            expected_artifacts=[
+                "hospital physical architecture comparison table",
+                "facility layout evidence notes",
+            ],
+            success_criteria=[
+                (
+                    "Distinguish physical facility architecture, ward layout, "
+                    "and patient-flow evidence."
+                ),
+                "Exclude software architecture material from the hospital facility review.",
+            ],
+            done_condition=(
+                "Stop when hospital facility architecture evidence is source-backed "
+                "and no software-architecture content remains."
+            ),
+        )
+
+        substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+
+        self.assertFalse(_has_forbidden_internal_leakage(plan=plan, oracle=oracle))
+        self.assertTrue(substitute["passed"], substitute)
+        self.assertNotIn(
+            "architecture",
+            substitute["forbidden_internal_implementation_terms_found"],
+        )
+        self.assertNotIn(
+            "software architecture",
+            substitute["forbidden_angle_terms_found"],
+        )
+
+    def test_semantic_substitute_check_still_blocks_software_architecture_leakage(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        oracle["forbidden_internal_implementation_terms"].append("architecture")
+        plan = self.semantic_internal_leakage_review_plan(
+            query="Compare software architecture for API runtime modules.",
+            expected_artifacts=["software architecture notes"],
+            success_criteria=[
+                "Document software architecture boundaries for runtime modules."
+            ],
+        )
+
+        substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+
+        self.assertTrue(_has_forbidden_internal_leakage(plan=plan, oracle=oracle))
+        self.assertFalse(substitute["passed"], substitute)
+        self.assertIn(
+            "architecture",
+            substitute["forbidden_internal_implementation_terms_found"],
         )
 
     def test_semantic_substitute_check_blocks_internal_implementation_leakage(self) -> None:
@@ -5219,6 +5282,282 @@ class SemanticPlannerTests(unittest.TestCase):
                 self.assertEqual(plan_task["max_images"], 0)
                 self.assertEqual(search_task["max_images"], 0)
         self.assertEqual(plan_by_id["task_semantic_004"]["max_sources"], 5)
+
+    def test_source_cap_constraint_materialization_preserves_global_budget_as_runner_budget(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "c" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+        candidate["constraints"].append(
+            "Global source budget: task max_sources sum <=20, total max 20 "
+            "sources, and one decisive source per task."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+        self.assertFalse(validation["ok"])
+        self.assertIn(
+            "source_cap_constraint_conflicts_with_tasks",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+        normalized, cap_repairs = _normalize_candidate_executable_source_caps(candidate)
+        self.assertEqual(cap_repairs, [])
+        repaired, materializations = _materialize_candidate_source_cap_constraints(
+            normalized,
+            source_cap_normalizations=cap_repairs,
+        )
+
+        self.assertTrue(materializations)
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("bounded_tasks.max_sources is authoritative", constraints_text)
+        self.assertIn("max_unique_sources=20", constraints_text)
+        self.assertIn("runner-level unique-source reuse budget", constraints_text)
+        self.assertNotIn("sum <=20", constraints_text)
+        self.assertNotIn("one decisive source per task", constraints_text)
+        self.assertNotIn("must not override", constraints_text)
+        self.assertEqual(repaired["runner_source_budget"]["max_unique_sources"], 20)
+        self.assertEqual(repaired["runner_source_budget"]["declared_source_budget"], 20)
+        self.assertEqual(repaired["runner_source_budget"]["task_max_sources_sum"], 60)
+        self.assertTrue(repaired["runner_source_budget"]["reuse_required"])
+        self.assertEqual(
+            materializations[0]["preserved_declared_source_budget"],
+            20,
+        )
+        self.assertEqual(
+            materializations[0]["runner_source_budget"]["max_unique_sources"],
+            20,
+        )
+
+        missing_metadata = json.loads(json.dumps(repaired))
+        missing_metadata.pop("runner_source_budget")
+        missing_metadata_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=missing_metadata,
+        )
+        self.assertFalse(missing_metadata_validation["ok"], missing_metadata_validation)
+        self.assertIn(
+            "global_source_budget_missing_executable_runner_budget",
+            {failure["code"] for failure in missing_metadata_validation["failures"]},
+        )
+
+        missing_numeric_cap = json.loads(json.dumps(repaired))
+        missing_numeric_cap["constraints"] = [
+            (
+                "Executable source caps are task-specific: bounded_tasks.max_sources "
+                "is authoritative after source-cap consistency repair. Runner-level "
+                "unique-source reuse budget is preserved for execution."
+            )
+        ]
+        missing_numeric_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=missing_numeric_cap,
+        )
+        self.assertFalse(missing_numeric_validation["ok"], missing_numeric_validation)
+        self.assertIn(
+            "global_source_budget_not_preserved_in_constraints",
+            {failure["code"] for failure in missing_numeric_validation["failures"]},
+        )
+        repaired_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(repaired_validation["ok"], repaired_validation)
+
+    def test_multi_vendor_official_tasks_raise_source_cap_without_multiple_source_types(self) -> None:
+        candidate = {
+            "bounded_tasks": [
+                {
+                    "task_id": "task_edge_safari",
+                    "query": (
+                        "Edge+Safari official browser documentation parity notes "
+                        "for storage behavior"
+                    ),
+                    "route": "text_only",
+                    "freshness_requirement": "any",
+                    "source_policy": {
+                        "decision": "allowed",
+                        "required_source_quality": [
+                            "official browser vendor documentation"
+                        ],
+                    },
+                    "expected_source_types": ["official vendor documentation"],
+                    "expected_visual_targets": [],
+                    "expected_artifacts": ["vendor documentation notes"],
+                    "success_criteria": [
+                        "Use official docs from each named browser vendor."
+                    ],
+                    "max_sources": 1,
+                    "max_images": 0,
+                    "done_condition": (
+                        "Stop after official source-backed notes are recorded."
+                    ),
+                }
+            ]
+        }
+
+        normalized, repairs = _normalize_candidate_executable_source_caps(candidate)
+
+        self.assertEqual(normalized["bounded_tasks"][0]["max_sources"], 2)
+        self.assertEqual(repairs[0]["task_id"], "task_edge_safari")
+        self.assertIn("multiple_named_source_entities", repairs[0]["reasons"])
+
+    def test_placeholder_municipalities_require_and_materialize_selection_workflow(self) -> None:
+        question = "Compare public health permit evidence across four Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality", "geography"),
+        )
+        candidate = response["candidate_plan"]
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            municipality_number = ((index - 1) % 4) + 1
+            task["query"] = (
+                f"{question}: collect official permit records for "
+                f"municipality {municipality_number}."
+            )
+            task["success_criteria"] = [
+                (
+                    "Find official source evidence for "
+                    f"municipality {municipality_number}."
+                )
+            ]
+            task["done_condition"] = (
+                f"Stop after municipality {municipality_number} evidence is recorded."
+            )
+        candidate["constraints"].append(
+            "Compare municipality 1, municipality 2, municipality 3, and "
+            "municipality 4 using official records."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+        self.assertFalse(validation["ok"])
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("unbound_jurisdiction_placeholders", failure_codes)
+        self.assertIn("missing_placeholder_selection_workflow", failure_codes)
+
+        workflow_only = json.loads(json.dumps(candidate))
+        workflow_only["constraints"].append(
+            "Select and name each municipality placeholder using explicit criteria before collection."
+        )
+        workflow_only_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=workflow_only,
+        )
+        workflow_only_codes = {
+            failure["code"] for failure in workflow_only_validation["failures"]
+        }
+        self.assertFalse(workflow_only_validation["ok"], workflow_only_validation)
+        self.assertIn("unbound_jurisdiction_placeholders", workflow_only_codes)
+        self.assertNotIn("missing_placeholder_selection_workflow", workflow_only_codes)
+
+        repaired, materializations = (
+            _materialize_candidate_placeholder_selection_workflow(candidate)
+        )
+
+        self.assertTrue(materializations)
+        repaired_text = json.dumps(repaired, ensure_ascii=False).lower()
+        self.assertIn("selection workflow", repaired_text)
+        self.assertIn("bind placeholder jurisdictions", repaired_text)
+        self.assertIn("placeholder_binding", repaired)
+        self.assertEqual(
+            sorted(repaired["placeholder_binding"].keys()),
+            ["municipality 1", "municipality 2", "municipality 3", "municipality 4"],
+        )
+        bound_names = [
+            binding["jurisdiction_name"]
+            for binding in repaired["placeholder_binding"].values()
+        ]
+        self.assertEqual(
+            bound_names,
+            [
+                "Seoul, South Korea",
+                "Busan, South Korea",
+                "Incheon, South Korea",
+                "Daegu, South Korea",
+            ],
+        )
+        self.assertFalse(any("municipality " in name.lower() for name in bound_names))
+        self.assertEqual(
+            materializations[0]["placeholder_binding"]["municipality 1"][
+                "jurisdiction_name"
+            ],
+            "Seoul, South Korea",
+        )
+        repaired_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(repaired_validation["ok"], repaired_validation)
+
+    def test_visual_task_image_demands_are_capped_to_task_budget(self) -> None:
+        candidate = {
+            "bounded_tasks": [
+                {
+                    "task_id": "task_visual_cap",
+                    "angle_id": "angle_visual",
+                    "query": (
+                        "Find downloadable public recycling posters and acquire "
+                        "one representative image per program where available."
+                    ),
+                    "route": "visual_required",
+                    "freshness_requirement": "any",
+                    "source_policy": {"decision": "allowed", "flags": []},
+                    "expected_source_types": ["official municipal poster page"],
+                    "expected_visual_targets": ["poster pages"],
+                    "expected_artifacts": ["poster manifest"],
+                    "success_criteria": [
+                        "At least four jurisdiction-linked poster examples are sought.",
+                        "Every acquired image is provenance-verified.",
+                    ],
+                    "max_sources": 2,
+                    "max_images": 3,
+                    "done_condition": (
+                        "Done when representative posters are obtained for the sampled programs."
+                    ),
+                }
+            ]
+        }
+
+        repaired, materializations = _materialize_candidate_visual_image_cap_feasibility(
+            candidate
+        )
+
+        self.assertTrue(materializations)
+        task = repaired["bounded_tasks"][0]
+        text = json.dumps(task, ensure_ascii=False)
+        self.assertIn("Up to 3", text)
+        self.assertIn("within this task's cap", text)
+        self.assertNotIn("At least four", text)
+        self.assertNotIn("one representative image per program", text)
 
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
         with self.assertRaisesRegex(
