@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -56,6 +58,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     validate_codex_semantic_adapter_provenance,
     write_semantic_materialization_diff,
     write_semantic_planner_validation,
+    _codex_semantic_candidate_validation,
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
     _materialize_candidate_budget_caps,
@@ -200,6 +203,17 @@ class SemanticPlannerTests(unittest.TestCase):
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    def write_fake_codex_executable(self, bin_dir: Path) -> Path:
+        fake_codex = bin_dir / "codex"
+        fixture = ROOT / "tests" / "fixtures" / "semantic_scope_downgrade_adapter.py"
+        fake_codex.write_text(
+            "#!/usr/bin/env sh\n"
+            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(fixture))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        return fake_codex
 
     def parse_timestamp(self, value: str) -> datetime:
         raw = value[:-1] + "+00:00" if value.endswith("Z") else value
@@ -1380,6 +1394,11 @@ class SemanticPlannerTests(unittest.TestCase):
             constraints=list(candidate.get("constraints") or []),
             runner_source_budget=dict(candidate.get("runner_source_budget") or {}),
             question_scope=str(candidate["question_scope"]),
+            scope_downgrade=(
+                dict(candidate["scope_downgrade"])
+                if isinstance(candidate.get("scope_downgrade"), dict)
+                else None
+            ),
             decomposition_strategy=str(candidate["decomposition_strategy"]),
             requirement_coverage_map=list(candidate["requirement_coverage_map"]),
             negative_scope=list(candidate.get("negative_scope") or []),
@@ -1465,8 +1484,20 @@ class SemanticPlannerTests(unittest.TestCase):
                 "oracle_requirement_map": requirements,
                 "question_scope": question_scope,
                 "bounded_task_range": {
-                    "min": 20 if question_scope == "broad" else 6,
-                    "max": 40 if question_scope == "broad" else 12,
+                    "min": (
+                        20
+                        if question_scope == "broad"
+                        else 10
+                        if question_scope == "medium"
+                        else 6
+                    ),
+                    "max": (
+                        40
+                        if question_scope == "broad"
+                        else 19
+                        if question_scope == "medium"
+                        else 12
+                    ),
                     "depth_preset": request["depth_preset"],
                 },
                 "expected_entities": [
@@ -1611,13 +1642,19 @@ class SemanticPlannerTests(unittest.TestCase):
                     ),
                 )
             if artifact_type == "semantic_oracle_raw_request":
-                response = self.oracle_adapter_response(request, **adapter_kwargs)
+                oracle_kwargs = dict(adapter_kwargs)
+                oracle_question_scope = oracle_kwargs.pop("oracle_question_scope", None)
+                if oracle_question_scope is not None:
+                    oracle_kwargs["question_scope"] = str(oracle_question_scope)
+                response = self.oracle_adapter_response(request, **oracle_kwargs)
             elif artifact_type == "semantic_reviewer_raw_request":
                 response = self.reviewer_adapter_response(request)
                 if callable(reviewer_response_mutator):
                     response = reviewer_response_mutator(response, request)
             else:
-                response = self.codex_adapter_response(request, **adapter_kwargs)
+                planner_kwargs = dict(adapter_kwargs)
+                planner_kwargs.pop("oracle_question_scope", None)
+                response = self.codex_adapter_response(request, **planner_kwargs)
             if artifact_type == "semantic_planner_raw_request" and callable(
                 planner_response_mutator
             ):
@@ -1792,6 +1829,107 @@ class SemanticPlannerTests(unittest.TestCase):
                 "Use official provider documentation as evidence."
             ]
             task["done_condition"] = "Stop when source-backed guidance notes are ready."
+        return candidate
+
+    def reduce_candidate_to_scope(
+        self,
+        candidate: dict,
+        *,
+        angle_count: int,
+        tasks_per_angle: int,
+        question_scope: str = "broad",
+        coverage_complete: bool = True,
+    ) -> dict:
+        candidate = json.loads(json.dumps(candidate))
+        kept_angles = candidate["angles"][:angle_count]
+        kept_angle_ids = [angle["angle_id"] for angle in kept_angles]
+        kept_tasks = []
+        for angle_id in kept_angle_ids:
+            kept_tasks.extend(
+                [
+                    task
+                    for task in candidate["bounded_tasks"]
+                    if task["angle_id"] == angle_id
+                ][:tasks_per_angle]
+            )
+        kept_task_ids = [task["task_id"] for task in kept_tasks]
+        candidate["question_scope"] = question_scope
+        candidate["angles"] = kept_angles
+        candidate["bounded_tasks"] = kept_tasks
+        for requirement in candidate["requirement_coverage_map"]:
+            requirement["covered_by_angle_ids"] = list(kept_angle_ids)
+            requirement["covered_by_task_ids"] = list(kept_task_ids)
+            requirement["coverage_status"] = "covered" if coverage_complete else "not_covered"
+        return candidate
+
+    def sanitize_city_planning_candidate_for_text_only(
+        self, candidate: dict, *, question: str
+    ) -> dict:
+        angle_specs = (
+            (
+                "primary_source",
+                "Adopted Plan Metrics",
+                "Which adopted plans define measurable implementation indicators?",
+                "adopted plan metric inventory",
+            ),
+            (
+                "official_source",
+                "Agency Responsibility Mapping",
+                "Which departments or partner agencies are assigned delivery responsibility?",
+                "agency responsibility matrix",
+            ),
+            (
+                "recent_change",
+                "Update Cycle And Amendments",
+                "What recent amendments or annual reports changed the implementation baseline?",
+                "recent plan update timeline",
+            ),
+            (
+                "comparative_analysis",
+                "Cross-Jurisdiction Differences",
+                "How do indicator definitions and agency roles differ across jurisdictions?",
+                "cross-jurisdiction comparison table",
+            ),
+            (
+                "counter_evidence",
+                "Gaps And Conflicting Duties",
+                "Where do official records omit owners or assign overlapping responsibilities?",
+                "implementation gap register",
+            ),
+        )
+        for index, angle in enumerate(candidate["angles"], start=1):
+            need, title, research_question, artifact = angle_specs[
+                (index - 1) % len(angle_specs)
+            ]
+            angle["route"] = "text_only"
+            angle["evidence_need"] = need
+            angle["title"] = title
+            angle["research_question"] = f"{research_question} Scope: {question}."
+            angle["expected_source_types"] = ["official local government plans"]
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = [artifact, "official source notes"]
+            angle["search_queries"] = [
+                f"{question} {need} official local government plan"
+            ]
+            angle["success_criteria"] = [
+                "Use official local government planning records.",
+                "Record indicators, agencies, caveats, and unknowns.",
+            ]
+            angle["report_section"] = f"Planning Indicators {index}"
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["query"] = f"{question} official planning records task {index}"
+            task["expected_visual_targets"] = []
+            task["expected_artifacts"] = [
+                "planning indicator source notes",
+                "responsible agency comparison table",
+            ]
+            task["success_criteria"] = [
+                "Use official local government planning records.",
+                "Record indicators, agencies, caveats, and unknowns.",
+            ]
+            task["max_images"] = 0
+            task.pop("expected_evidence", None)
         return candidate
 
     def prepare_fixture(self, fixture: dict) -> Path:
@@ -4696,7 +4834,7 @@ class SemanticPlannerTests(unittest.TestCase):
             failure_codes,
         )
 
-    def test_sem_reg_012_like_retry_materializes_broad_cardinality_and_source_split(self) -> None:
+    def test_sem_reg_012_like_retry_records_scope_downgrade_and_source_split(self) -> None:
         question = (
             "Research cache invalidation implementation hazards for a Next.js "
             "migration using current official docs."
@@ -4856,7 +4994,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 review["verdict"] = "release_ineligible"
             return response
 
-        result, _adapter_request = self.prepare_with_codex_adapter(
+        result, adapter_request = self.prepare_with_codex_adapter(
             question,
             route="text_only",
             requirement_types=("subject", "source_quality", "time_range"),
@@ -4887,9 +5025,18 @@ class SemanticPlannerTests(unittest.TestCase):
             "candidate_plan_broad_cardinality_materializations",
             raw_response,
         )
-        self.assertEqual(len(semantic_plan["angles"]), 5)
-        self.assertEqual(len(semantic_plan["bounded_tasks"]), 20)
-        self.assertEqual(semantic_plan["question_scope"], "broad")
+        self.assertEqual(len(semantic_plan["angles"]), 4)
+        self.assertGreaterEqual(len(semantic_plan["bounded_tasks"]), 6)
+        self.assertLessEqual(len(semantic_plan["bounded_tasks"]), 12)
+        self.assertEqual(semantic_plan["question_scope"], "medium")
+        self.assertEqual(
+            semantic_plan["scope_downgrade"]["status"],
+            "oracle_bounded_semantic_scope_downgrade",
+        )
+        self.assertEqual(semantic_plan["scope_downgrade"]["from_scope"], "broad")
+        self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], "medium")
+        self.assertGreaterEqual(semantic_plan["scope_downgrade"]["retry_attempt"], 2)
+        self.assertFalse(semantic_plan["scope_downgrade"]["generic_padding_added"])
         self.assertEqual(
             semantic_plan["question_class"],
             "implementation_architecture",
@@ -4900,6 +5047,7 @@ class SemanticPlannerTests(unittest.TestCase):
         validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=semantic_plan,
+            raw_request=adapter_request["_planner_requests"][-1],
             visual_preference="text_only",
         )
         self.assertTrue(validation["ok"], validation)
@@ -5618,12 +5766,13 @@ class SemanticPlannerTests(unittest.TestCase):
         ):
             self.assertEqual(_codex_semantic_planner_validation_max_attempts(), 3)
 
-    def test_codex_semantic_repairs_effective_broad_narrow_self_label_before_reviewer(self) -> None:
+    def test_codex_semantic_retries_then_records_explicit_narrow_scope_downgrade(self) -> None:
         question = "Compare official product screenshots and chart images for onboarding workflows"
 
         result, adapter_request = self.prepare_with_codex_adapter(
             question,
             stdout_format="jsonl_item_text",
+            oracle_question_scope="broad",
             question_scope="narrow",
             angle_count=4,
             tasks_per_angle=2,
@@ -5635,7 +5784,9 @@ class SemanticPlannerTests(unittest.TestCase):
         run_dir = Path(result["run_dir"])
         convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
         self.assertEqual(convergence["status"], "converged", convergence)
-        self.assertGreaterEqual(convergence["attempt_count"], 2)
+        self.assertEqual(convergence["attempt_count"], 1)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 2)
+        self.assertEqual(adapter_request["_planner_requests"][1]["retry_attempt"], 2)
         self.assertTrue(
             (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
         )
@@ -5646,17 +5797,51 @@ class SemanticPlannerTests(unittest.TestCase):
             "candidate_plan_broad_cardinality_materializations",
             raw_response,
         )
-        first_attempt = convergence["attempts"][0]
+        materializations = raw_response["candidate_plan_broad_cardinality_materializations"]
+        self.assertTrue(
+            any(
+                item.get("materialization")
+                == "oracle_bounded_semantic_scope_downgrade"
+                and item.get("content_added") is False
+                for item in materializations
+            ),
+            materializations,
+        )
+        first_attempt = convergence["attempts"][0]["adapter_candidate_attempts"][0]
         self.assertIn(
             "broad_question_angle_count_out_of_range",
             first_attempt["deterministic_failure_codes"],
         )
+        self.assertIn(
+            "broad_cardinality_replan_required",
+            first_attempt["deterministic_failure_codes"],
+        )
         candidate_validation = raw_response["candidate_validation"]
         self.assertTrue(candidate_validation["ok"], candidate_validation)
-        self.assertEqual(candidate_validation["declared_question_scope"], "broad")
+        self.assertEqual(candidate_validation["declared_question_scope"], "narrow")
+        self.assertEqual(candidate_validation["scope_tier"], "narrow")
+        self.assertTrue(candidate_validation["scope_downgrade_valid"])
         self.assertEqual(candidate_validation["question_class"], "visual_style")
-        self.assertEqual(candidate_validation["angle_count"], 5)
-        self.assertEqual(candidate_validation["task_count"], 20)
+        self.assertEqual(candidate_validation["angle_count"], 4)
+        self.assertEqual(candidate_validation["task_count"], 8)
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+        self.assertEqual(semantic_plan["question_scope"], "narrow")
+        self.assertEqual(
+            semantic_plan["scope_downgrade"]["status"],
+            "oracle_bounded_semantic_scope_downgrade",
+        )
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assertTrue(validation["scope_downgrade_valid"], validation)
+        retry_request = adapter_request["_planner_requests"][1]
+        self.assertIn("locked_semantic_expectation_oracle", retry_request)
+        self.assertEqual(
+            retry_request["locked_semantic_expectation_oracle"]["question_scope"],
+            "broad",
+        )
+        self.assertIn("locked semantic expectation oracle", retry_request["planner_retry_instructions"])
+        self.assertIn("generic suffix padding", retry_request["planner_retry_instructions"])
         self.assertEqual(
             set(candidate_validation["expected_evidence_needs"]),
             {
@@ -5664,9 +5849,855 @@ class SemanticPlannerTests(unittest.TestCase):
                 "visual_example",
                 "visual_observation",
                 "official_source",
-                "comparative_analysis",
             },
         )
+
+    def test_codex_semantic_retries_then_records_explicit_medium_scope_downgrade(self) -> None:
+        question = (
+            "Compare official city planning implementation indicators and "
+            "responsible agencies across local government plans"
+        )
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            oracle_question_scope="broad",
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 2)
+        first_request, retry_request = adapter_request["_planner_requests"]
+        self.assertNotIn("retry_attempt", first_request)
+        self.assertEqual(retry_request["retry_attempt"], 2)
+        self.assertIn("locked_semantic_expectation_oracle", retry_request)
+        self.assertEqual(
+            retry_request["locked_semantic_expectation_oracle"]["question_scope"],
+            "broad",
+        )
+        self.assertGreaterEqual(
+            retry_request["locked_semantic_expectation_oracle"]["bounded_task_range"]["min"],
+            20,
+        )
+        self.assertIn(
+            "locked semantic expectation oracle",
+            retry_request["planner_retry_instructions"],
+        )
+        self.assertIn("generic suffix padding", retry_request["planner_retry_instructions"])
+
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        inner_attempts = convergence["attempts"][0]["adapter_candidate_attempts"]
+        self.assertEqual([attempt["attempt"] for attempt in inner_attempts], [1, 2])
+        self.assertIn(
+            "broad_cardinality_replan_required",
+            inner_attempts[0]["deterministic_failure_codes"],
+        )
+
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        materializations = raw_response["candidate_plan_broad_cardinality_materializations"]
+        self.assertTrue(
+            any(
+                item.get("materialization")
+                == "oracle_bounded_semantic_scope_downgrade"
+                and item.get("final_question_scope") == "medium"
+                and item.get("content_added") is False
+                for item in materializations
+            ),
+            materializations,
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+        self.assertEqual(semantic_plan["question_scope"], "medium")
+        self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], "medium")
+        self.assertEqual(len(semantic_plan["angles"]), 5)
+        self.assertEqual(len(semantic_plan["bounded_tasks"]), 10)
+
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(validation["scope_tier"], "medium")
+        self.assertTrue(validation["scope_downgrade_valid"], validation)
+
+    def test_cli_prepare_accepts_release_compliant_scope_downgrade_adapter(self) -> None:
+        cases = (
+            (
+                "medium",
+                (
+                    "Compare official city planning implementation indicators and "
+                    "responsible agencies across local government plans"
+                ),
+                "text_only",
+            ),
+            (
+                "narrow",
+                "Compare official product screenshots and chart images for onboarding workflows",
+                "visual_required",
+            ),
+            (
+                "narrow",
+                "Compare official product screenshots and chart images for onboarding workflows",
+                "visual_optional",
+            ),
+        )
+        for target_scope, question, route in cases:
+            with self.subTest(target_scope=target_scope, route=route):
+                temp_dir = self.temp_runs_dir()
+                bin_dir = temp_dir / "bin"
+                bin_dir.mkdir()
+                self.write_fake_codex_executable(bin_dir)
+                runs_dir = temp_dir / "runs"
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PATH": f"{bin_dir}{os.pathsep}{env.get('PATH', '')}",
+                        CODEX_SEMANTIC_PLANNER_COMMAND_ENV: "codex exec --json",
+                        CODEX_SEMANTIC_ORACLE_COMMAND_ENV: "codex exec --json",
+                        CODEX_SEMANTIC_REVIEWER_COMMAND_ENV: "codex exec --json",
+                        CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS_ENV: "0",
+                        "CODEX_DEEPRESEARCH_TEST_SCOPE_DOWNGRADE": target_scope,
+                    }
+                )
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "plugins" / "codex-deepresearch" / "scripts" / "codex-deepresearch"),
+                        "prepare",
+                        question,
+                        "--runs-dir",
+                        str(runs_dir),
+                        "--route",
+                        route,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=60,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual(result["status"], "awaiting_search_results", result)
+                self.assertEqual(result["planner_mode"], PLANNER_MODE_CODEX_SEMANTIC)
+                self.assertTrue(result["semantic_release_eligible"], result)
+
+                run_dir = Path(result["run_dir"])
+                raw_response = self.load_json(
+                    run_dir / "semantic_planner_raw" / "planner_response.json"
+                )
+                raw_request = self.load_json(
+                    run_dir / "semantic_planner_raw" / "planner_request.json"
+                )
+                semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+                    "semantic_plan"
+                ]
+                validation = self.load_json(run_dir / "semantic_planner_validation.json")
+                convergence = self.load_json(
+                    run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME
+                )
+
+                self.assertEqual(
+                    raw_response["provenance"]["adapter_command"],
+                    ["codex", "exec", "--json"],
+                )
+                self.assertEqual(raw_request["retry_attempt"], 2)
+                self.assertEqual(
+                    raw_request["locked_semantic_expectation_oracle"]["question_scope"],
+                    "broad",
+                )
+                self.assertGreaterEqual(
+                    raw_request["locked_semantic_expectation_oracle"]["bounded_task_range"]["min"],
+                    20,
+                )
+                self.assertIn(
+                    "broad_cardinality_replan_required",
+                    raw_request["previous_candidate_validation_failure_codes"],
+                )
+                self.assertIn(
+                    "locked semantic expectation oracle",
+                    raw_request["planner_retry_instructions"],
+                )
+                self.assertIn("generic suffix padding", raw_request["planner_retry_instructions"])
+                self.assertEqual(convergence["status"], "converged", convergence)
+                self.assertEqual(
+                    [
+                        attempt["attempt"]
+                        for attempt in convergence["attempts"][0][
+                            "adapter_candidate_attempts"
+                        ]
+                    ],
+                    [1, 2],
+                )
+                self.assertEqual(semantic_plan["question_scope"], target_scope)
+                self.assertEqual(
+                    semantic_plan["scope_downgrade"]["status"],
+                    "oracle_bounded_semantic_scope_downgrade",
+                )
+                self.assertEqual(semantic_plan["scope_downgrade"]["from_scope"], "broad")
+                self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], target_scope)
+                self.assertGreaterEqual(
+                    semantic_plan["scope_downgrade"]["retry_attempt"],
+                    2,
+                )
+                materializations = raw_response[
+                    "candidate_plan_broad_cardinality_materializations"
+                ]
+                self.assertTrue(
+                    any(
+                        item.get("materialization")
+                        == "oracle_bounded_semantic_scope_downgrade"
+                        and item.get("content_added") is False
+                        and item.get("final_question_scope") == target_scope
+                        for item in materializations
+                    ),
+                    materializations,
+                )
+                self.assertTrue(validation["ok"], validation)
+                self.assertEqual(validation["scope_tier"], target_scope)
+                self.assertTrue(validation["scope_downgrade_valid"], validation)
+                if route == "text_only":
+                    self.assertTrue(
+                        all(task["route"] == "text_only" for task in semantic_plan["bounded_tasks"])
+                    )
+                elif route == "visual_required":
+                    self.assertTrue(
+                        any(
+                            task["route"] == "visual_required"
+                            for task in semantic_plan["bounded_tasks"]
+                        )
+                    )
+                elif route == "visual_optional":
+                    self.assertTrue(
+                        any(
+                            task["route"] == "visual_optional"
+                            for task in semantic_plan["bounded_tasks"]
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            task["route"] == "visual_required"
+                            for task in semantic_plan["bounded_tasks"]
+                        )
+                    )
+
+    def test_broad_cardinality_shortfall_requests_replan_without_generic_padding(self) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "b" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality"),
+        )
+        original_tasks = json.loads(json.dumps(response["candidate_plan"]["bounded_tasks"]))
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            response["candidate_plan"],
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["bounded_tasks"], original_tasks)
+        self.assertEqual(len(candidate["bounded_tasks"]), 10)
+        self.assertTrue(
+            any(
+                item.get("materialization") == "broad_cardinality_replan_required"
+                and item.get("content_added") is False
+                for item in materializations
+            ),
+            materializations,
+        )
+        forbidden_suffixes = {
+            "official documentation baseline",
+            "current behavior constraints",
+            "migration hazard evidence",
+            "remediation evidence",
+            "implementation boundary check",
+            "synthesis readiness check",
+        }
+        task_text = "\n".join(
+            str(task.get("query") or "") for task in candidate["bounded_tasks"]
+        ).lower()
+        self.assertFalse(forbidden_suffixes & set(task_text.splitlines()))
+        self.assertFalse(any(suffix in task_text for suffix in forbidden_suffixes))
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("broad_cardinality_replan_required", failure_codes)
+        self.assertIn("broad_question_task_count_out_of_range", failure_codes)
+
+    def test_locked_medium_oracle_accepts_medium_candidate_without_broad_replan(self) -> None:
+        question = (
+            "테스트라는 말이 의료 진단검사 맥락에서 쓰일 때, 국내외 공식 "
+            "가이드라인의 민감도와 특이도 보고 기준을 조사해줘."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "medium",
+                "bounded_task_range": {
+                    "min": 12,
+                    "max": 18,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=6,
+            tasks_per_angle=3,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = response["candidate_plan"]
+        angle_specs = [
+            ("primary_source", "민감도 특이도 정의 산식", "정의·산식 근거 노트"),
+            ("official_source", "민감도 특이도 공식 가이드라인 원문", "공식 원문 근거표"),
+            ("implementation_detail", "민감도 특이도 참조표준 임계값", "참조표준 적용 메모"),
+            ("comparative_analysis", "민감도 특이도 국내외 보고 기준 비교", "국내외 비교표"),
+            ("recent_change", "민감도 특이도 최신판 개정 이력", "최신성 확인표"),
+            ("counter_evidence", "민감도 특이도 불일치 적용 한계", "한계와 미확인 사항 목록"),
+        ]
+        for index, angle in enumerate(candidate_input["angles"], start=1):
+            need, title, artifact = angle_specs[index - 1]
+            angle["route"] = "text_only"
+            angle["evidence_need"] = need
+            angle["title"] = title
+            angle["research_question"] = f"{title}을 공식 문서 근거로 어떻게 확인할 수 있는가?"
+            angle["expected_source_types"] = [
+                "대한민국 정부·규제기관 공식 원문",
+                "국제·해외 공식 가이드라인",
+            ]
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = [
+                artifact,
+                "출처별 인용 위치",
+                "requested table or matrix",
+            ]
+            angle["success_criteria"] = [
+                "공식 또는 일차 출처를 사용한다.",
+                "민감도와 특이도 보고 기준에 직접 연결한다.",
+                "Preserve the requested table or matrix shape.",
+            ]
+            angle["report_section"] = f"진단검사 보고 기준 {index}"
+        for index, task in enumerate(candidate_input["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["query"] = f"{question} 공식 가이드라인 텍스트 근거 task {index}"
+            task["expected_source_types"] = [
+                "대한민국 정부·규제기관 공식 원문",
+                "국제·해외 공식 가이드라인",
+            ]
+            task["source_policy"] = {
+                "allow_secondary": False,
+                "policy": "정부·규제기관의 공식 원문과 공식 링크만 핵심 근거로 사용한다.",
+                "required_source_quality": ["공식 원문", "일차 출처", "현행 판본"],
+            }
+            task["expected_visual_targets"] = []
+            task["expected_artifacts"] = [
+                "공식 문서 근거 노트",
+                "출처별 인용 위치",
+                "requested table or matrix",
+            ]
+            task["success_criteria"] = [
+                "공식 또는 일차 출처를 사용한다.",
+                "민감도와 특이도 보고 기준에 직접 연결한다.",
+                "Preserve the requested table or matrix shape.",
+            ]
+            task["max_images"] = 0
+        kept_tasks = []
+        for index, angle in enumerate(candidate_input["angles"], start=1):
+            tasks_for_angle = [
+                task
+                for task in candidate_input["bounded_tasks"]
+                if task["angle_id"] == angle["angle_id"]
+            ]
+            kept_tasks.extend(tasks_for_angle[: 3 if index <= 2 else 2])
+        candidate_input["bounded_tasks"] = kept_tasks
+        kept_task_ids = [task["task_id"] for task in kept_tasks]
+        kept_angle_ids = [angle["angle_id"] for angle in candidate_input["angles"]]
+        for requirement in candidate_input["requirement_coverage_map"]:
+            requirement["covered_by_angle_ids"] = list(kept_angle_ids)
+            requirement["covered_by_task_ids"] = list(kept_task_ids)
+            requirement["coverage_status"] = "covered"
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["question_scope"], "medium")
+        self.assertNotIn("scope_downgrade", candidate)
+        self.assertFalse(
+            any(
+                item.get("materialization") == "broad_cardinality_replan_required"
+                for item in materializations
+            ),
+            materializations,
+        )
+        alignment = candidate["diagnostics"][
+            "locked_semantic_expectation_oracle_alignment"
+        ]
+        self.assertEqual(alignment["status"], "honored_locked_oracle_scope")
+        self.assertEqual(alignment["locked_question_scope"], "medium")
+        self.assertTrue(alignment["counts_fit_locked_scope"])
+        self.assertTrue(alignment["oracle_coverage_complete"])
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(validation["locked_oracle_scope_alignment_valid"], validation)
+        self.assertFalse(validation["effective_broad_question"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("broad_cardinality_replan_required", failure_codes)
+        self.assertNotIn("hidden_scope_downgrade_without_diagnostics", failure_codes)
+
+    def test_locked_medium_oracle_rejects_silent_broad_candidate(self) -> None:
+        question = (
+            "테스트라는 말이 의료 진단검사 맥락에서 쓰일 때, 국내외 공식 "
+            "가이드라인의 민감도와 특이도 보고 기준을 조사해줘."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "f" * 64,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "medium",
+                "bounded_task_range": {
+                    "min": 12,
+                    "max": 18,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            response["candidate_plan"],
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["question_scope"], "broad")
+        self.assertTrue(
+            any(
+                item.get("materialization") == "locked_oracle_scope_alignment_required"
+                for item in materializations
+            ),
+            materializations,
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("locked_oracle_scope_alignment_failed", failure_codes)
+        self.assertFalse(validation["ok"], validation)
+        self.assertFalse(validation["locked_oracle_scope_alignment_valid"], validation)
+
+    def test_locked_broad_oracle_rejects_medium_candidate_without_scope_downgrade(
+        self,
+    ) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "a" * 64,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {
+                    "min": 20,
+                    "max": 40,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = self.sanitize_city_planning_candidate_for_text_only(
+            response["candidate_plan"],
+            question=question,
+        )
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["question_scope"], "medium")
+        self.assertTrue(
+            any(
+                item.get("materialization") == "broad_cardinality_replan_required"
+                and item.get("content_added") is False
+                and item.get("target_scope_if_downgraded") == "medium"
+                for item in materializations
+            ),
+            materializations,
+        )
+        self.assertIn(
+            "broad_locked_semantic_expectation_oracle_scope",
+            candidate["diagnostics"],
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("broad_locked_oracle_scope_downgrade_missing", failure_codes)
+        self.assertFalse(validation["ok"], validation)
+        self.assertFalse(validation["broad_locked_oracle_scope_valid"], validation)
+
+    def test_locked_broad_oracle_rejects_first_attempt_candidate_forged_scope_downgrade(
+        self,
+    ) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "a" * 64,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {
+                    "min": 20,
+                    "max": 40,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = self.sanitize_city_planning_candidate_for_text_only(
+            response["candidate_plan"],
+            question=question,
+        )
+        candidate, _materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+        forged_downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        candidate["scope_downgrade"] = forged_downgrade
+        candidate.setdefault("diagnostics", {})["scope_downgrade"] = forged_downgrade
+
+        direct_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        direct_failure_codes = {
+            failure["code"] for failure in direct_validation["failures"]
+        }
+        self.assertIn(
+            "invalid_scope_downgrade_diagnostics",
+            direct_failure_codes,
+        )
+        self.assertFalse(
+            direct_validation["scope_downgrade_valid"],
+            direct_validation,
+        )
+        self.assertFalse(direct_validation["ok"], direct_validation)
+
+        validation = _codex_semantic_candidate_validation(
+            original_question=question,
+            candidate=candidate,
+            raw_request=request,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("invalid_scope_downgrade_diagnostics", failure_codes)
+        self.assertIn("broad_locked_oracle_scope_downgrade_missing", failure_codes)
+        self.assertFalse(validation["scope_downgrade_valid"], validation)
+        self.assertFalse(validation["ok"], validation)
+
+    def test_locked_broad_oracle_accepts_explicit_medium_scope_downgrade(self) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "b" * 64,
+            "retry_attempt": 2,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {
+                    "min": 20,
+                    "max": 40,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = self.sanitize_city_planning_candidate_for_text_only(
+            response["candidate_plan"],
+            question=question,
+        )
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["question_scope"], "medium")
+        self.assertEqual(candidate["scope_downgrade"]["from_scope"], "broad")
+        self.assertEqual(candidate["scope_downgrade"]["to_scope"], "medium")
+        self.assertTrue(
+            any(
+                item.get("materialization")
+                == "oracle_bounded_semantic_scope_downgrade"
+                for item in materializations
+            ),
+            materializations,
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            raw_request=request,
+            visual_preference="text_only",
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("broad_locked_oracle_scope_downgrade_missing", failure_codes)
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(validation["scope_downgrade_valid"], validation)
+        self.assertTrue(validation["broad_locked_oracle_scope_valid"], validation)
+
+    def test_scope_downgrade_requires_complete_oracle_coverage(self) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "c" * 64,
+            "retry_attempt": 2,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate_input = self.reduce_candidate_to_scope(
+            response["candidate_plan"],
+            angle_count=5,
+            tasks_per_angle=2,
+            question_scope="medium",
+            coverage_complete=False,
+        )
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertNotIn("scope_downgrade", candidate)
+        self.assertTrue(
+            any(
+                item.get("materialization") == "broad_cardinality_replan_required"
+                and item.get("oracle_coverage_complete") is False
+                for item in materializations
+            ),
+            materializations,
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("requirement_not_covered", failure_codes)
+        self.assertFalse(validation["scope_downgrade_valid"], validation)
+
+    def test_text_only_scope_downgrade_preserves_text_only_tasks(self) -> None:
+        question = (
+            "Compare official city planning implementation indicators and "
+            "responsible agencies across local government plans"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+            "retry_attempt": 2,
+            "visual_preference": "text_only",
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate = response["candidate_plan"]
+        angle_specs = [
+            {
+                "need": "primary_source",
+                "title": "Adopted Plan Metrics",
+                "question": "Which adopted plans define measurable implementation indicators?",
+                "artifact": "adopted plan metric inventory",
+            },
+            {
+                "need": "official_source",
+                "title": "Agency Responsibility Mapping",
+                "question": "Which departments or partner agencies are assigned delivery responsibility?",
+                "artifact": "agency responsibility matrix",
+            },
+            {
+                "need": "recent_change",
+                "title": "Update Cycle And Amendments",
+                "question": "What recent amendments or annual reports changed the implementation baseline?",
+                "artifact": "recent plan update timeline",
+            },
+            {
+                "need": "comparative_analysis",
+                "title": "Cross-Jurisdiction Differences",
+                "question": "How do indicator definitions and agency roles differ across jurisdictions?",
+                "artifact": "cross-jurisdiction comparison table",
+            },
+            {
+                "need": "counter_evidence",
+                "title": "Gaps And Conflicting Duties",
+                "question": "Where do official records omit owners or assign overlapping responsibilities?",
+                "artifact": "implementation gap register",
+            },
+        ]
+        for index, angle in enumerate(candidate["angles"], start=1):
+            spec = angle_specs[index - 1]
+            angle["route"] = "text_only"
+            angle["evidence_need"] = spec["need"]
+            angle["title"] = spec["title"]
+            angle["research_question"] = (
+                f"{spec['question']} Scope: {question}."
+            )
+            angle["why_this_angle_matters"] = (
+                "This preserves a distinct official planning evidence need."
+            )
+            angle["included_scope"] = [question]
+            angle["excluded_scope"] = ["Do not add image, chart, or software implementation work."]
+            angle["expected_source_types"] = ["official local government plans"]
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = [
+                spec["artifact"],
+                "official source notes",
+            ]
+            angle["search_queries"] = [
+                f"{question} {spec['need']} official local government plan"
+            ]
+            angle["success_criteria"] = [
+                "Use official local government planning records.",
+                "Record indicators, agencies, caveats, and unknowns.",
+            ]
+            angle["report_section"] = f"Planning Indicators {index}"
+            angle["risk_or_contradiction_checks"] = [
+                "Check stale plan years and conflicting responsibility assignments."
+            ]
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["query"] = f"{question} official planning records task {index}"
+            task["expected_visual_targets"] = []
+            task["expected_artifacts"] = [
+                "planning indicator source notes",
+                "responsible agency comparison table",
+            ]
+            task["success_criteria"] = [
+                "Use official local government planning records.",
+                "Record indicators, agencies, caveats, and unknowns.",
+            ]
+            task["max_images"] = 0
+            task.pop("expected_evidence", None)
+
+        downgraded, _materializations = _materialize_candidate_broad_cardinality(
+            candidate,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(downgraded["question_scope"], "medium")
+        self.assertTrue(downgraded["scope_downgrade"])
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=downgraded,
+            raw_request=request,
+            visual_preference="text_only",
+        )
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(validation["scope_downgrade_valid"], validation)
+        self.assertTrue(
+            all(task["route"] == "text_only" for task in downgraded["bounded_tasks"])
+        )
+        self.assertTrue(all(task["max_images"] == 0 for task in downgraded["bounded_tasks"]))
 
     def test_validate_semantic_candidate_plan_accepts_valid_effective_broad_candidate(self) -> None:
         question = "Compare official product screenshots and chart images for onboarding workflows"

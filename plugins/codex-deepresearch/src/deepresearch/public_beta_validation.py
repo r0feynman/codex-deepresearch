@@ -21,6 +21,8 @@ from typing import Any, Mapping, Sequence
 from .evidence_schema import VERIFIER_METHODS, VERIFIER_TYPES, VERIFIER_VOTES
 from .semantic_planner import (
     SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+    SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
+    SEMANTIC_SCOPE_TIERS,
     build_semantic_materialization_diff,
 )
 from .visual_artifacts import (
@@ -195,6 +197,17 @@ SEMANTIC_RELEASE_REQUIRED_CODEX_SOURCE_SOURCES = (
     "semantic_plan.semantic_plan",
 )
 SEMANTIC_MIN_RELEASE_ANGLES = 2
+SEMANTIC_SCOPE_DOWNGRADE_STATUS = "oracle_bounded_semantic_scope_downgrade"
+GENERIC_BROAD_CARDINALITY_TASK_SUFFIXES = (
+    "official documentation baseline",
+    "current behavior constraints",
+    "migration hazard evidence",
+    "version caveat cross-check",
+    "remediation evidence",
+    "counter-evidence review",
+    "implementation boundary check",
+    "synthesis readiness check",
+)
 SEMANTIC_MIN_ANGLE_OVERLAP_TOKENS = 2
 SEMANTIC_MIN_ANGLE_UNIQUE_TOKENS = 4
 SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD = 0.85
@@ -3470,6 +3483,10 @@ def _semantic_prepare_readiness_from_artifacts(
     validation = _read_optional_json(artifact_paths.get("semantic_planner_validation", ""))
     review = _read_optional_json(artifact_paths.get("semantic_plan_review", ""))
     plan_payload = _read_optional_json(artifact_paths.get("semantic_plan", ""))
+    oracle = _read_optional_json(artifact_paths.get("semantic_expectation_oracle", ""))
+    convergence = _read_optional_json(
+        artifact_paths.get("semantic_planner_convergence", "")
+    )
     plan = (
         plan_payload.get("semantic_plan")
         if isinstance(plan_payload, Mapping)
@@ -3498,6 +3515,28 @@ def _semantic_prepare_readiness_from_artifacts(
             else None
         )
     )
+    scope_tier = (
+        plan.get("question_scope")
+        if isinstance(plan, Mapping) and isinstance(plan.get("question_scope"), str)
+        else (
+            validation.get("scope_tier")
+            if isinstance(validation, Mapping)
+            else None
+        )
+    )
+    scope_downgrade = _semantic_release_plan_scope_downgrade_payload(
+        plan_payload if isinstance(plan_payload, Mapping) else None,
+        plan if isinstance(plan, Mapping) else None,
+    )
+    auxiliary_downgrades = _semantic_release_auxiliary_scope_downgrade_payloads(
+        validation=validation if isinstance(validation, Mapping) else None,
+        review=review if isinstance(review, Mapping) else None,
+    )
+    scope_downgrade_valid = (
+        validation.get("scope_downgrade_valid")
+        if isinstance(validation, Mapping)
+        else None
+    )
     plan_eligible = isinstance(plan, Mapping) and plan.get("semantic_release_eligible") is True
     failures: list[str] = []
     if not validation_ok:
@@ -3508,6 +3547,40 @@ def _semantic_prepare_readiness_from_artifacts(
         failures.append("planner_mode_not_codex_semantic")
     if not plan_eligible:
         failures.append("semantic_plan_not_release_eligible")
+    if not isinstance(scope_downgrade, Mapping) and (
+        auxiliary_downgrades or scope_downgrade_valid is True
+    ):
+        failures.append("scope_downgrade_missing_plan")
+    if scope_downgrade and scope_downgrade_valid is not True:
+        failures.append("scope_downgrade_invalid")
+    downgrade_artifacts = {
+        "semantic_plan": plan_payload,
+        "semantic_planner_validation": validation,
+        "semantic_plan_review": review,
+        "semantic_expectation_oracle": oracle,
+        "semantic_planner_convergence": convergence,
+    }
+    candidate_scope = _semantic_release_candidate_scope(
+        plan_payload if isinstance(plan_payload, Mapping) else None,
+        plan if isinstance(plan, Mapping) else {},
+    )
+    oracle_scope = _semantic_release_oracle_scope(
+        oracle if isinstance(oracle, Mapping) else None
+    )
+    downgrade_checks_required = isinstance(scope_downgrade, Mapping) or (
+        oracle_scope == "broad" and candidate_scope in {"medium", "narrow"}
+    )
+    downgrade_release_failures: list[dict[str, Any]] = []
+    if downgrade_checks_required:
+        downgrade_release_failures = _semantic_scope_downgrade_release_failures(
+            {
+                name: payload
+                for name, payload in downgrade_artifacts.items()
+                if isinstance(payload, Mapping)
+            }
+        )
+        if downgrade_release_failures:
+            failures.append("scope_downgrade_release_failures")
     ready = not failures
     return {
         "schema_version": "codex-deepresearch.semantic-prepare-readiness.v0",
@@ -3524,6 +3597,10 @@ def _semantic_prepare_readiness_from_artifacts(
             else None
         ),
         "plan_release_eligible": plan_eligible,
+        "scope_tier": scope_tier,
+        "scope_downgrade": dict(scope_downgrade) if scope_downgrade else None,
+        "scope_downgrade_valid": scope_downgrade_valid,
+        "scope_downgrade_release_failures": downgrade_release_failures,
         "validation_failure_codes": [
             str(failure.get("code"))
             for failure in (
@@ -3810,6 +3887,7 @@ def _artifact_paths(run_dir: Path, *, route: str) -> dict[str, Path]:
         "semantic_plan_review": run_dir / "semantic_plan_review.json",
         "semantic_planner_validation": run_dir / "semantic_planner_validation.json",
         "semantic_materialization_diff": run_dir / SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+        "semantic_planner_convergence": run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
     }
     if route in VISUAL_ROUTES:
         artifacts.update(
@@ -4224,6 +4302,12 @@ def _semantic_release_checks(
             }
         )
 
+    scope_downgrade_payloads: dict[str, Mapping[str, Any]] = dict(required_payloads)
+    convergence = loaded_artifacts.get("semantic_planner_convergence")
+    if isinstance(convergence, Mapping):
+        scope_downgrade_payloads["semantic_planner_convergence"] = convergence
+    failures.extend(_semantic_scope_downgrade_release_failures(scope_downgrade_payloads))
+
     if _claims_eligible_codex_semantic(
         planner_sources=planner_sources,
         eligible_sources=eligible_sources,
@@ -4249,6 +4333,805 @@ def _semantic_release_checks(
         "computed_materialization_diff": computed_materialization,
         "failures": failures,
     }
+
+
+def _semantic_scope_downgrade_release_failures(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    plan = artifacts.get("semantic_plan")
+    review = artifacts.get("semantic_plan_review")
+    validation = artifacts.get("semantic_planner_validation")
+    oracle = artifacts.get("semantic_expectation_oracle")
+    nested_plan = (
+        plan.get("semantic_plan")
+        if isinstance(plan, Mapping) and isinstance(plan.get("semantic_plan"), Mapping)
+        else {}
+    )
+    candidate_scope = _semantic_release_candidate_scope(plan, nested_plan)
+    oracle_scope = _semantic_release_oracle_scope(oracle)
+    plan_downgrade = _semantic_release_plan_scope_downgrade_payload(
+        plan,
+        nested_plan,
+    )
+    auxiliary_downgrades = _semantic_release_auxiliary_scope_downgrade_payloads(
+        validation=validation,
+        review=review,
+    )
+    validation_scope_downgrade_valid = (
+        validation.get("scope_downgrade_valid")
+        if isinstance(validation, Mapping)
+        else None
+    )
+    plan_angles, plan_tasks = _semantic_release_plan_angle_task_records(
+        plan,
+        nested_plan,
+    )
+    failures: list[dict[str, Any]] = []
+    if (
+        oracle_scope == "broad"
+        and candidate_scope in {"medium", "narrow"}
+        and not isinstance(plan_downgrade, Mapping)
+    ):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "semantic_plan silently downgraded a broad oracle to "
+                    f"{candidate_scope} without plan-level scope_downgrade diagnostics"
+                ),
+            }
+        )
+    if not isinstance(plan_downgrade, Mapping):
+        if auxiliary_downgrades or validation_scope_downgrade_valid is True:
+            failures.append(
+                {
+                    "check": "semantic_scope_downgrade",
+                    "detail": (
+                        "scope_downgrade metadata appears in validation/review artifacts "
+                        "but semantic_plan lacks a matching plan-level scope_downgrade"
+                    ),
+                    "metadata_sources": [source for source, _payload in auxiliary_downgrades],
+                }
+            )
+        return failures
+    downgrade = plan_downgrade
+    oracle_question_scope = (
+        str(oracle.get("question_scope") or "").strip().lower()
+        if isinstance(oracle, Mapping)
+        else ""
+    )
+    if oracle_question_scope != "broad":
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "scope_downgrade requires semantic_expectation_oracle."
+                    "question_scope to be broad"
+                ),
+            }
+        )
+    if candidate_scope not in {"medium", "narrow"}:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade is present but final scope is not medium/narrow",
+            }
+        )
+    if str(downgrade.get("to_scope") or "") != candidate_scope:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.to_scope does not match semantic_plan.question_scope",
+            }
+        )
+    if not _semantic_release_counts_fit_scope(
+        candidate_scope,
+        angles=plan_angles,
+        tasks=plan_tasks,
+    ):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "semantic_plan final angle/task counts do not fit "
+                    f"{candidate_scope} scope"
+                ),
+                "angle_count": len(plan_angles),
+                "task_count": len(plan_tasks),
+            }
+        )
+    declared_angle_count = _strict_int_count(downgrade, "angle_count")
+    if declared_angle_count is not None and declared_angle_count != len(plan_angles):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.angle_count does not match semantic_plan angles",
+                "declared_angle_count": declared_angle_count,
+                "actual_angle_count": len(plan_angles),
+            }
+        )
+    declared_task_count = _strict_int_count(downgrade, "task_count")
+    if declared_task_count is not None and declared_task_count != len(plan_tasks):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.task_count does not match semantic_plan bounded_tasks",
+                "declared_task_count": declared_task_count,
+                "actual_task_count": len(plan_tasks),
+            }
+        )
+    failures.extend(
+        _semantic_scope_downgrade_final_range_failures(
+            downgrade,
+            candidate_scope=candidate_scope,
+        )
+    )
+    if downgrade.get("status") != SEMANTIC_SCOPE_DOWNGRADE_STATUS:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.status is invalid",
+            }
+        )
+    if str(downgrade.get("from_scope") or "") != "broad":
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.from_scope must be broad",
+            }
+        )
+    if _strict_int_count(downgrade, "retry_attempt") is None or int(
+        downgrade.get("retry_attempt") or 0
+    ) < 2:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.retry_attempt must prove a retry occurred",
+            }
+        )
+    elif not _semantic_scope_downgrade_retry_evidence_valid(artifacts, downgrade):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "scope_downgrade.retry_attempt lacks persisted semantic "
+                    "planner convergence retry evidence"
+                ),
+            }
+        )
+    if downgrade.get("oracle_coverage_complete") is not True:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.oracle_coverage_complete must be true",
+            }
+        )
+    if downgrade.get("non_negotiable_coverage_complete") is not True:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.non_negotiable_coverage_complete must be true",
+            }
+        )
+    if not _semantic_release_requirement_coverage_complete(
+        nested_plan,
+        angles=plan_angles,
+        tasks=plan_tasks,
+    ):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "semantic_plan requirement_coverage_map is incomplete or "
+                    "does not match final angle/task ids"
+                ),
+            }
+        )
+    if downgrade.get("generic_padding_added") is not False:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.generic_padding_added must be false",
+            }
+        )
+    if downgrade.get("non_oracle_topics_added") is not False:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "scope_downgrade.non_oracle_topics_added must be false",
+            }
+        )
+    if not isinstance(validation, Mapping) or validation_scope_downgrade_valid is not True:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": "semantic_planner_validation.scope_downgrade_valid is not true",
+            }
+        )
+    validation_downgrade = (
+        _semantic_release_scope_downgrade_payload(validation)
+        if isinstance(validation, Mapping)
+        else None
+    )
+    if validation_scope_downgrade_valid is True and not _semantic_scope_downgrade_payloads_match(
+        downgrade,
+        validation_downgrade,
+    ):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "semantic_planner_validation.scope_downgrade is stale or "
+                    "does not match semantic_plan.scope_downgrade"
+                ),
+            }
+        )
+    review_downgrade = (
+        _semantic_release_scope_downgrade_payload(review)
+        if isinstance(review, Mapping)
+        else None
+    )
+    if isinstance(review_downgrade, Mapping) and not _semantic_scope_downgrade_payloads_match(
+        downgrade,
+        review_downgrade,
+    ):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "semantic_plan_review.scope_downgrade is stale or does not "
+                    "match semantic_plan.scope_downgrade"
+                ),
+            }
+        )
+    for hit in _semantic_scope_downgrade_generic_padding_hits(nested_plan, oracle):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "scope downgrade plan still contains generic broad-cardinality "
+                    f"padding text: {hit}"
+                ),
+            }
+        )
+    return failures
+
+
+def _semantic_release_plan_scope_downgrade_payload(
+    plan: Mapping[str, Any] | None,
+    nested_plan: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if not isinstance(nested_plan, Mapping):
+        return None
+    value = nested_plan.get("scope_downgrade")
+    return value if isinstance(value, Mapping) else None
+
+
+def _semantic_release_auxiliary_scope_downgrade_payloads(
+    *,
+    validation: Mapping[str, Any] | None,
+    review: Mapping[str, Any] | None,
+) -> list[tuple[str, Mapping[str, Any]]]:
+    payloads: list[tuple[str, Mapping[str, Any]]] = []
+    for source, payload in (
+        ("semantic_planner_validation", validation),
+        ("semantic_plan_review", review),
+    ):
+        downgrade = _semantic_release_scope_downgrade_payload(payload)
+        if isinstance(downgrade, Mapping):
+            payloads.append((source, downgrade))
+    return payloads
+
+
+def _semantic_release_plan_angle_task_records(
+    plan: Mapping[str, Any] | None,
+    nested_plan: Mapping[str, Any] | None,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    angles = _semantic_release_mapping_list(
+        nested_plan.get("angles") if isinstance(nested_plan, Mapping) else None
+    )
+    if not angles:
+        angles = _semantic_release_mapping_list(
+            plan.get("angles") if isinstance(plan, Mapping) else None
+        )
+    tasks = _semantic_release_mapping_list(
+        nested_plan.get("bounded_tasks") if isinstance(nested_plan, Mapping) else None
+    )
+    if not tasks:
+        tasks = _semantic_release_mapping_list(
+            plan.get("bounded_tasks") if isinstance(plan, Mapping) else None
+        )
+    return angles, tasks
+
+
+def _semantic_release_mapping_list(value: Any) -> list[Mapping[str, Any]]:
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _semantic_release_counts_fit_scope(
+    scope: str,
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    tier = SEMANTIC_SCOPE_TIERS.get(scope)
+    if tier is None:
+        return False
+    if not (tier["min_angles"] <= len(angles) <= tier["max_angles"]):
+        return False
+    if not (tier["min_tasks"] <= len(tasks) <= tier["max_tasks"]):
+        return False
+    tasks_per_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
+    for angle in angles:
+        angle_id = str(angle.get("angle_id") or "")
+        if tasks_per_angle[angle_id] < tier["min_tasks_per_angle"]:
+            return False
+    return True
+
+
+def _semantic_release_requirement_coverage_complete(
+    plan: Mapping[str, Any] | None,
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    if not isinstance(plan, Mapping):
+        return False
+    requirements = _semantic_release_mapping_list(plan.get("requirement_coverage_map"))
+    if not requirements:
+        return False
+    angle_ids = {str(angle.get("angle_id") or "") for angle in angles}
+    task_ids = {str(task.get("task_id") or "") for task in tasks}
+    for requirement in requirements:
+        if requirement.get("coverage_status") != "covered":
+            return False
+        covered_angle_ids = {
+            str(value)
+            for value in requirement.get("covered_by_angle_ids", [])
+            if isinstance(value, str) and value
+        }
+        covered_task_ids = {
+            str(value)
+            for value in requirement.get("covered_by_task_ids", [])
+            if isinstance(value, str) and value
+        }
+        if not covered_angle_ids or not covered_task_ids:
+            return False
+        if not covered_angle_ids <= angle_ids:
+            return False
+        if not covered_task_ids <= task_ids:
+            return False
+    return True
+
+
+def _semantic_scope_downgrade_final_range_failures(
+    downgrade: Mapping[str, Any],
+    *,
+    candidate_scope: str,
+) -> list[dict[str, Any]]:
+    tier = SEMANTIC_SCOPE_TIERS.get(candidate_scope)
+    if tier is None:
+        return []
+    expected_ranges = {
+        "final_scope_angle_range": [tier["min_angles"], tier["max_angles"]],
+        "final_scope_task_range": [tier["min_tasks"], tier["max_tasks"]],
+    }
+    failures: list[dict[str, Any]] = []
+    for field, expected in expected_ranges.items():
+        actual = _semantic_scope_downgrade_int_pair(downgrade.get(field))
+        if actual != expected:
+            failures.append(
+                {
+                    "check": "semantic_scope_downgrade",
+                    "detail": f"scope_downgrade.{field} must match {candidate_scope} scope",
+                    "expected": expected,
+                    "actual": actual,
+                }
+            )
+    min_tasks_per_angle = _strict_int_count(
+        downgrade,
+        "final_scope_min_tasks_per_angle",
+    )
+    if min_tasks_per_angle != tier["min_tasks_per_angle"]:
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "scope_downgrade.final_scope_min_tasks_per_angle must match "
+                    f"{candidate_scope} scope"
+                ),
+                "expected": tier["min_tasks_per_angle"],
+                "actual": min_tasks_per_angle,
+            }
+        )
+    return failures
+
+
+def _semantic_scope_downgrade_int_pair(value: Any) -> list[int] | None:
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    try:
+        return [int(value[0]), int(value[1])]
+    except (TypeError, ValueError):
+        return None
+
+
+def _semantic_scope_downgrade_payloads_match(
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(actual, Mapping):
+        return False
+    return json.dumps(expected, sort_keys=True, ensure_ascii=True) == json.dumps(
+        actual,
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+
+
+def _semantic_scope_downgrade_retry_evidence_valid(
+    artifacts: Mapping[str, Mapping[str, Any]],
+    downgrade: Mapping[str, Any],
+) -> bool:
+    retry_attempt = _strict_int_count(downgrade, "retry_attempt")
+    if retry_attempt is None or retry_attempt < 2:
+        return False
+    convergence = artifacts.get("semantic_planner_convergence")
+    if not isinstance(convergence, Mapping):
+        return False
+    if convergence.get("artifact_type") != "semantic_planner_convergence":
+        return False
+    if convergence.get("status") != "converged":
+        return False
+    attempt_count = _strict_int_count(convergence, "attempt_count")
+    if attempt_count is None or attempt_count < 1:
+        return False
+    attempts = convergence.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return False
+    adapter_attempts = _semantic_scope_downgrade_adapter_attempts(attempts)
+    if len(adapter_attempts) < retry_attempt:
+        return False
+    final_selection = convergence.get("final_selection")
+    final_candidate_hash = (
+        str(final_selection.get("candidate_hash") or "").strip()
+        if isinstance(final_selection, Mapping)
+        else ""
+    )
+    if not _sha256_hex_string(final_candidate_hash):
+        return False
+    attempts_by_number: dict[int, Mapping[str, Any]] = {}
+    for attempt in adapter_attempts:
+        attempt_number = _strict_int_count(attempt, "attempt")
+        if attempt_number is not None:
+            attempts_by_number[int(attempt_number)] = attempt
+    if not set(range(1, retry_attempt + 1)) <= set(attempts_by_number):
+        return False
+    first_attempt = attempts_by_number[1]
+    if "broad_cardinality_replan_required" not in _semantic_scope_downgrade_attempt_codes(
+        first_attempt
+    ):
+        return False
+    accepted_attempt = attempts_by_number[retry_attempt]
+    accepted_candidate_hashes = _semantic_scope_downgrade_attempt_candidate_hashes(
+        accepted_attempt
+    )
+    if accepted_attempt.get("final_selection") is not True:
+        return False
+    plan_candidate_hashes = _semantic_scope_downgrade_plan_candidate_hashes(artifacts)
+    if final_candidate_hash not in plan_candidate_hashes:
+        return False
+    plan_adapter_hashes = _semantic_scope_downgrade_plan_adapter_candidate_hashes(
+        artifacts
+    )
+    if not accepted_candidate_hashes:
+        return False
+    if not plan_adapter_hashes:
+        return False
+    if not plan_adapter_hashes & accepted_candidate_hashes:
+        return False
+    retry_hash = _semantic_scope_downgrade_retry_request_hash(
+        adapter_attempts,
+        retry_attempt=retry_attempt,
+    )
+    if not retry_hash:
+        return False
+    plan_request_hashes = _semantic_scope_downgrade_plan_request_hashes(artifacts)
+    if not plan_request_hashes or retry_hash not in plan_request_hashes:
+        return False
+    return _semantic_scope_downgrade_retry_attempt_successful(accepted_attempt)
+
+
+def _semantic_scope_downgrade_adapter_attempts(
+    attempts: Sequence[Any],
+) -> list[Mapping[str, Any]]:
+    adapter_attempts: list[Mapping[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        inner_attempts = attempt.get("adapter_candidate_attempts")
+        if not isinstance(inner_attempts, list):
+            continue
+        adapter_attempts.extend(
+            inner
+            for inner in inner_attempts
+            if isinstance(inner, Mapping)
+        )
+    return adapter_attempts
+
+
+def _semantic_scope_downgrade_attempt_codes(
+    attempt: Mapping[str, Any],
+) -> set[str]:
+    codes: set[str] = set()
+    for field in (
+        "deterministic_failure_codes",
+        "candidate_validation_failure_codes",
+        "previous_candidate_validation_failure_codes",
+    ):
+        value = attempt.get(field)
+        if isinstance(value, list):
+            codes.update(str(code) for code in value if str(code).strip())
+    repair_inputs = attempt.get("repair_inputs")
+    if isinstance(repair_inputs, Mapping):
+        value = repair_inputs.get("deterministic_failure_codes")
+        if isinstance(value, list):
+            codes.update(str(code) for code in value if str(code).strip())
+    candidate_validation = attempt.get("candidate_validation")
+    if isinstance(candidate_validation, Mapping):
+        failures = candidate_validation.get("failures")
+        if isinstance(failures, list):
+            codes.update(
+                str(failure.get("code"))
+                for failure in failures
+                if isinstance(failure, Mapping) and failure.get("code")
+            )
+    return codes
+
+
+def _semantic_scope_downgrade_attempt_candidate_hashes(
+    attempt: Mapping[str, Any],
+) -> set[str]:
+    hashes: set[str] = set()
+    for field in (
+        "candidate_hash",
+        "reviewed_plan_candidate_hash",
+        "semantic_plan_candidate_hash",
+    ):
+        value = str(attempt.get(field) or "").strip()
+        if _sha256_hex_string(value):
+            hashes.add(value)
+    return hashes
+
+
+def _semantic_scope_downgrade_plan_candidate_hashes(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    hashes: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    nested_plan = (
+        plan.get("semantic_plan")
+        if isinstance(plan, Mapping) and isinstance(plan.get("semantic_plan"), Mapping)
+        else None
+    )
+    if isinstance(nested_plan, Mapping):
+        hashes.add(_canonical_json_sha256(nested_plan))
+    return hashes
+
+
+def _semantic_scope_downgrade_plan_adapter_candidate_hashes(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    hashes: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    if not isinstance(plan, Mapping):
+        return hashes
+    for payload in (
+        plan,
+        plan.get("semantic_plan"),
+        plan.get("planner_provenance"),
+        plan.get("provenance"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        for field in ("parsed_response_hash", "adapter_candidate_hash"):
+            value = str(payload.get(field) or "").strip()
+            if _sha256_hex_string(value):
+                hashes.add(value)
+    nested_plan = plan.get("semantic_plan")
+    if isinstance(nested_plan, Mapping):
+        for payload in (
+            nested_plan.get("planner_provenance"),
+            nested_plan.get("provenance"),
+        ):
+            if not isinstance(payload, Mapping):
+                continue
+            for field in ("parsed_response_hash", "adapter_candidate_hash"):
+                value = str(payload.get(field) or "").strip()
+                if _sha256_hex_string(value):
+                    hashes.add(value)
+    return hashes
+
+
+def _semantic_scope_downgrade_retry_request_hash(
+    adapter_attempts: Sequence[Mapping[str, Any]],
+    *,
+    retry_attempt: int,
+) -> str | None:
+    for attempt in adapter_attempts:
+        attempt_number = _strict_int_count(attempt, "attempt")
+        if attempt_number is None or int(attempt_number) >= retry_attempt:
+            continue
+        repair_inputs = attempt.get("repair_inputs")
+        if not isinstance(repair_inputs, Mapping):
+            continue
+        next_attempt = _strict_int_count(repair_inputs, "next_attempt")
+        retry_hash = str(repair_inputs.get("retry_request_hash") or "").strip()
+        if next_attempt == retry_attempt and _sha256_hex_string(retry_hash):
+            return retry_hash
+    return None
+
+
+def _semantic_scope_downgrade_plan_request_hashes(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    hashes: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    if not isinstance(plan, Mapping):
+        return hashes
+    for payload in (
+        plan,
+        plan.get("semantic_plan"),
+        plan.get("planner_provenance"),
+        plan.get("provenance"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        for field in ("raw_request_hash", "adapter_request_hash"):
+            value = str(payload.get(field) or "").strip()
+            if _sha256_hex_string(value):
+                hashes.add(value)
+    nested_plan = plan.get("semantic_plan")
+    if isinstance(nested_plan, Mapping):
+        for payload in (
+            nested_plan.get("planner_provenance"),
+            nested_plan.get("provenance"),
+        ):
+            if not isinstance(payload, Mapping):
+                continue
+            for field in ("raw_request_hash", "adapter_request_hash"):
+                value = str(payload.get(field) or "").strip()
+                if _sha256_hex_string(value):
+                    hashes.add(value)
+    return hashes
+
+
+def _semantic_scope_downgrade_retry_attempt_successful(
+    attempt: Mapping[str, Any],
+) -> bool:
+    if attempt.get("deterministic_ok") is True:
+        return True
+    for payload in (
+        attempt,
+        attempt.get("candidate_validation"),
+        attempt.get("raw_response"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("scope_downgrade_valid") is True or payload.get("ok") is True:
+            return True
+        materializations = payload.get("candidate_plan_broad_cardinality_materializations")
+        if isinstance(materializations, list) and any(
+            isinstance(item, Mapping)
+            and item.get("materialization") == SEMANTIC_SCOPE_DOWNGRADE_STATUS
+            for item in materializations
+        ):
+            return True
+    return False
+
+
+def _semantic_scope_downgrade_generic_padding_hits(
+    plan: Mapping[str, Any] | None,
+    oracle: Mapping[str, Any] | None,
+) -> list[str]:
+    if not isinstance(plan, Mapping):
+        return []
+    allowed_text = _semantic_scope_downgrade_allowed_text(plan, oracle)
+    tasks = plan.get("bounded_tasks")
+    if not isinstance(tasks, list):
+        return []
+    hits: list[str] = []
+    for suffix in GENERIC_BROAD_CARDINALITY_TASK_SUFFIXES:
+        normalized_suffix = suffix.lower()
+        if normalized_suffix in allowed_text:
+            continue
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                continue
+            if normalized_suffix in _semantic_scope_downgrade_task_text(task):
+                hits.append(suffix)
+                break
+    return hits
+
+
+def _semantic_scope_downgrade_allowed_text(
+    plan: Mapping[str, Any],
+    oracle: Mapping[str, Any] | None,
+) -> str:
+    values: list[Any] = [plan.get("original_question")]
+    if isinstance(oracle, Mapping):
+        values.extend(
+            [
+                oracle.get("original_question"),
+                oracle.get("intent_summary"),
+                oracle.get("expected_report_shape"),
+                oracle.get("expected_entities"),
+                oracle.get("expected_constraints"),
+                oracle.get("required_angles"),
+                oracle.get("oracle_requirement_map"),
+            ]
+        )
+    return json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
+
+
+def _semantic_scope_downgrade_task_text(task: Mapping[str, Any]) -> str:
+    fields = (
+        task.get("query"),
+        task.get("expected_artifacts"),
+        task.get("success_criteria"),
+        task.get("done_condition"),
+    )
+    return json.dumps(fields, ensure_ascii=False, sort_keys=True).lower()
+
+
+def _semantic_release_candidate_scope(
+    plan: Mapping[str, Any] | None,
+    nested_plan: Mapping[str, Any] | None,
+) -> str:
+    for payload, field in (
+        (nested_plan, "question_scope"),
+        (plan, "candidate_question_scope"),
+    ):
+        if isinstance(payload, Mapping):
+            value = payload.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    return ""
+
+
+def _semantic_release_oracle_scope(oracle: Mapping[str, Any] | None) -> str:
+    if not isinstance(oracle, Mapping):
+        return ""
+    value = oracle.get("question_scope")
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    bounded = oracle.get("bounded_task_range")
+    if isinstance(bounded, Mapping):
+        minimum = bounded.get("min") or bounded.get("min_tasks")
+        try:
+            min_tasks = int(minimum)
+        except (TypeError, ValueError):
+            min_tasks = 0
+        if min_tasks >= 20:
+            return "broad"
+    return ""
+
+
+def _semantic_release_scope_downgrade_payload(
+    *payloads: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        value = payload.get("scope_downgrade")
+        if isinstance(value, Mapping):
+            return value
+        diagnostics = payload.get("diagnostics")
+        if isinstance(diagnostics, Mapping) and isinstance(
+            diagnostics.get("scope_downgrade"), Mapping
+        ):
+            return diagnostics["scope_downgrade"]
+    return None
 
 
 def _manifest_oracle_binding_failures(
