@@ -4736,42 +4736,263 @@ def _semantic_scope_downgrade_retry_evidence_valid(
     if convergence.get("status") != "converged":
         return False
     attempt_count = _strict_int_count(convergence, "attempt_count")
-    if attempt_count is None or attempt_count < retry_attempt:
+    if attempt_count is None or attempt_count < 1:
         return False
     attempts = convergence.get("attempts")
-    if not isinstance(attempts, list) or len(attempts) < retry_attempt:
+    if not isinstance(attempts, list) or not attempts:
         return False
-    observed_attempts = {
-        int(attempt.get("attempt"))
-        for attempt in attempts
-        if isinstance(attempt, Mapping)
-        and _strict_int_count(attempt, "attempt") is not None
-    }
-    if not set(range(1, retry_attempt + 1)) <= observed_attempts:
+    adapter_attempts = _semantic_scope_downgrade_adapter_attempts(attempts)
+    if len(adapter_attempts) < retry_attempt:
         return False
     final_selection = convergence.get("final_selection")
-    final_attempt = (
-        _strict_int_count(final_selection, "attempt")
+    final_candidate_hash = (
+        str(final_selection.get("candidate_hash") or "").strip()
         if isinstance(final_selection, Mapping)
-        else None
+        else ""
     )
-    if final_attempt != retry_attempt:
+    if not _sha256_hex_string(final_candidate_hash):
         return False
+    attempts_by_number: dict[int, Mapping[str, Any]] = {}
+    for attempt in adapter_attempts:
+        attempt_number = _strict_int_count(attempt, "attempt")
+        if attempt_number is not None:
+            attempts_by_number[int(attempt_number)] = attempt
+    if not set(range(1, retry_attempt + 1)) <= set(attempts_by_number):
+        return False
+    first_attempt = attempts_by_number[1]
+    if "broad_cardinality_replan_required" not in _semantic_scope_downgrade_attempt_codes(
+        first_attempt
+    ):
+        return False
+    accepted_attempt = attempts_by_number[retry_attempt]
+    accepted_candidate_hashes = _semantic_scope_downgrade_attempt_candidate_hashes(
+        accepted_attempt
+    )
+    if accepted_attempt.get("final_selection") is not True:
+        return False
+    plan_candidate_hashes = _semantic_scope_downgrade_plan_candidate_hashes(artifacts)
+    if final_candidate_hash and plan_candidate_hashes:
+        if final_candidate_hash not in plan_candidate_hashes:
+            return False
+    plan_adapter_hashes = _semantic_scope_downgrade_plan_adapter_candidate_hashes(
+        artifacts
+    )
+    if not accepted_candidate_hashes:
+        return False
+    if plan_adapter_hashes and not plan_adapter_hashes & accepted_candidate_hashes:
+        return False
+    retry_hash = _semantic_scope_downgrade_retry_request_hash(
+        adapter_attempts,
+        retry_attempt=retry_attempt,
+    )
+    if not retry_hash:
+        return False
+    plan_request_hashes = _semantic_scope_downgrade_plan_request_hashes(artifacts)
+    if plan_request_hashes and retry_hash not in plan_request_hashes:
+        return False
+    return _semantic_scope_downgrade_retry_attempt_successful(accepted_attempt)
+
+
+def _semantic_scope_downgrade_adapter_attempts(
+    attempts: Sequence[Any],
+) -> list[Mapping[str, Any]]:
+    adapter_attempts: list[Mapping[str, Any]] = []
     for attempt in attempts:
         if not isinstance(attempt, Mapping):
             continue
+        inner_attempts = attempt.get("adapter_candidate_attempts")
+        if not isinstance(inner_attempts, list):
+            continue
+        adapter_attempts.extend(
+            inner
+            for inner in inner_attempts
+            if isinstance(inner, Mapping)
+        )
+    return adapter_attempts
+
+
+def _semantic_scope_downgrade_attempt_codes(
+    attempt: Mapping[str, Any],
+) -> set[str]:
+    codes: set[str] = set()
+    for field in (
+        "deterministic_failure_codes",
+        "candidate_validation_failure_codes",
+        "previous_candidate_validation_failure_codes",
+    ):
+        value = attempt.get(field)
+        if isinstance(value, list):
+            codes.update(str(code) for code in value if str(code).strip())
+    repair_inputs = attempt.get("repair_inputs")
+    if isinstance(repair_inputs, Mapping):
+        value = repair_inputs.get("deterministic_failure_codes")
+        if isinstance(value, list):
+            codes.update(str(code) for code in value if str(code).strip())
+    candidate_validation = attempt.get("candidate_validation")
+    if isinstance(candidate_validation, Mapping):
+        failures = candidate_validation.get("failures")
+        if isinstance(failures, list):
+            codes.update(
+                str(failure.get("code"))
+                for failure in failures
+                if isinstance(failure, Mapping) and failure.get("code")
+            )
+    return codes
+
+
+def _semantic_scope_downgrade_attempt_candidate_hashes(
+    attempt: Mapping[str, Any],
+) -> set[str]:
+    hashes: set[str] = set()
+    for field in (
+        "candidate_hash",
+        "reviewed_plan_candidate_hash",
+        "semantic_plan_candidate_hash",
+    ):
+        value = str(attempt.get(field) or "").strip()
+        if _sha256_hex_string(value):
+            hashes.add(value)
+    return hashes
+
+
+def _semantic_scope_downgrade_plan_candidate_hashes(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    hashes: set[str] = set()
+    for artifact_name in (
+        "semantic_plan",
+        "semantic_planner_validation",
+        "semantic_plan_review",
+    ):
+        artifact = artifacts.get(artifact_name)
+        if not isinstance(artifact, Mapping):
+            continue
+        for field in (
+            "reviewed_candidate_hash",
+            "semantic_plan_candidate_hash",
+            "semantic_plan_candidate_artifact_hash",
+            "candidate_hash",
+        ):
+            value = str(artifact.get(field) or "").strip()
+            if _sha256_hex_string(value):
+                hashes.add(value)
+    plan = artifacts.get("semantic_plan")
+    nested_plan = (
+        plan.get("semantic_plan")
+        if isinstance(plan, Mapping) and isinstance(plan.get("semantic_plan"), Mapping)
+        else None
+    )
+    if isinstance(nested_plan, Mapping):
+        hashes.add(_canonical_json_sha256(nested_plan))
+    return hashes
+
+
+def _semantic_scope_downgrade_plan_adapter_candidate_hashes(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    hashes: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    if not isinstance(plan, Mapping):
+        return hashes
+    for payload in (
+        plan,
+        plan.get("semantic_plan"),
+        plan.get("planner_provenance"),
+        plan.get("provenance"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        for field in ("parsed_response_hash", "adapter_candidate_hash"):
+            value = str(payload.get(field) or "").strip()
+            if _sha256_hex_string(value):
+                hashes.add(value)
+    nested_plan = plan.get("semantic_plan")
+    if isinstance(nested_plan, Mapping):
+        for payload in (
+            nested_plan.get("planner_provenance"),
+            nested_plan.get("provenance"),
+        ):
+            if not isinstance(payload, Mapping):
+                continue
+            for field in ("parsed_response_hash", "adapter_candidate_hash"):
+                value = str(payload.get(field) or "").strip()
+                if _sha256_hex_string(value):
+                    hashes.add(value)
+    return hashes
+
+
+def _semantic_scope_downgrade_retry_request_hash(
+    adapter_attempts: Sequence[Mapping[str, Any]],
+    *,
+    retry_attempt: int,
+) -> str | None:
+    for attempt in adapter_attempts:
         attempt_number = _strict_int_count(attempt, "attempt")
-        if attempt_number is None or attempt_number >= retry_attempt:
+        if attempt_number is None or int(attempt_number) >= retry_attempt:
             continue
         repair_inputs = attempt.get("repair_inputs")
         if not isinstance(repair_inputs, Mapping):
             continue
         next_attempt = _strict_int_count(repair_inputs, "next_attempt")
-        retry_hash = repair_inputs.get("retry_request_hash")
-        if (
-            next_attempt == attempt_number + 1
-            and isinstance(retry_hash, str)
-            and retry_hash
+        retry_hash = str(repair_inputs.get("retry_request_hash") or "").strip()
+        if next_attempt == retry_attempt and _sha256_hex_string(retry_hash):
+            return retry_hash
+    return None
+
+
+def _semantic_scope_downgrade_plan_request_hashes(
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    hashes: set[str] = set()
+    plan = artifacts.get("semantic_plan")
+    if not isinstance(plan, Mapping):
+        return hashes
+    for payload in (
+        plan,
+        plan.get("semantic_plan"),
+        plan.get("planner_provenance"),
+        plan.get("provenance"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        for field in ("raw_request_hash", "adapter_request_hash"):
+            value = str(payload.get(field) or "").strip()
+            if _sha256_hex_string(value):
+                hashes.add(value)
+    nested_plan = plan.get("semantic_plan")
+    if isinstance(nested_plan, Mapping):
+        for payload in (
+            nested_plan.get("planner_provenance"),
+            nested_plan.get("provenance"),
+        ):
+            if not isinstance(payload, Mapping):
+                continue
+            for field in ("raw_request_hash", "adapter_request_hash"):
+                value = str(payload.get(field) or "").strip()
+                if _sha256_hex_string(value):
+                    hashes.add(value)
+    return hashes
+
+
+def _semantic_scope_downgrade_retry_attempt_successful(
+    attempt: Mapping[str, Any],
+) -> bool:
+    if attempt.get("deterministic_ok") is True:
+        return True
+    for payload in (
+        attempt,
+        attempt.get("candidate_validation"),
+        attempt.get("raw_response"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("scope_downgrade_valid") is True or payload.get("ok") is True:
+            return True
+        materializations = payload.get("candidate_plan_broad_cardinality_materializations")
+        if isinstance(materializations, list) and any(
+            isinstance(item, Mapping)
+            and item.get("materialization") == SEMANTIC_SCOPE_DOWNGRADE_STATUS
+            for item in materializations
         ):
             return True
     return False

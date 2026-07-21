@@ -85,6 +85,145 @@ class PublicBetaValidationTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def semantic_scope_downgrade_release_artifacts(
+        self,
+        *,
+        final_candidate_hash: str = "a" * 64,
+        adapter_candidate_hash: str = "d" * 64,
+        retry_request_hash: str = "b" * 64,
+    ) -> dict[str, dict[str, Any]]:
+        downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        angles = [
+            {
+                "angle_id": f"angle_{index:03d}",
+                "research_question": f"Requirement-specific agency indicator angle {index}",
+            }
+            for index in range(1, 6)
+        ]
+        tasks = [
+            {
+                "task_id": f"task_{task_index:03d}",
+                "angle_id": f"angle_{angle_index:03d}",
+                "query": f"Requirement-specific agency source query {task_index}",
+            }
+            for task_index, angle_index in enumerate(
+                [1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+                start=1,
+            )
+        ]
+        return {
+            "semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {"min": 20, "max": 40},
+                "oracle_requirement_map": [
+                    {
+                        "requirement_id": "req_001",
+                        "requirement_text": "Requirement-specific agency source query",
+                    }
+                ],
+            },
+            "semantic_plan": {
+                "reviewed_candidate_hash": final_candidate_hash,
+                "raw_request_hash": retry_request_hash,
+                "adapter_request_hash": retry_request_hash,
+                "planner_provenance": {
+                    "raw_request_hash": retry_request_hash,
+                    "adapter_request_hash": retry_request_hash,
+                    "parsed_response_hash": adapter_candidate_hash,
+                },
+                "semantic_plan": {
+                    "question_scope": "medium",
+                    "original_question": "Compare official city planning agency indicators.",
+                    "planner_provenance": {
+                        "raw_request_hash": retry_request_hash,
+                        "adapter_request_hash": retry_request_hash,
+                        "parsed_response_hash": adapter_candidate_hash,
+                    },
+                    "scope_downgrade": downgrade,
+                    "angles": angles,
+                    "bounded_tasks": tasks,
+                    "requirement_coverage_map": [
+                        {
+                            "requirement_id": "req_001",
+                            "coverage_status": "covered",
+                            "covered_by_angle_ids": [
+                                angle["angle_id"] for angle in angles
+                            ],
+                            "covered_by_task_ids": [
+                                task["task_id"] for task in tasks
+                            ],
+                        }
+                    ],
+                },
+            },
+            "semantic_planner_validation": {
+                "scope_downgrade_valid": True,
+                "scope_downgrade": downgrade,
+            },
+            "semantic_plan_review": {
+                "scope_downgrade": downgrade,
+            },
+            "semantic_planner_convergence": {
+                "artifact_type": "semantic_planner_convergence",
+                "status": "converged",
+                "attempt_count": 1,
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "adapter_candidate_attempt_count": 2,
+                        "adapter_candidate_attempts": [
+                            {
+                                "attempt": 1,
+                                "candidate_hash": "c" * 64,
+                                "deterministic_ok": False,
+                                "deterministic_failure_codes": [
+                                    "broad_cardinality_replan_required",
+                                ],
+                                "repair_inputs": {
+                                    "retry_source": "adapter_candidate_validation",
+                                    "next_attempt": 2,
+                                    "retry_request_hash": retry_request_hash,
+                                    "deterministic_failure_codes": [
+                                        "broad_cardinality_replan_required",
+                                    ],
+                                },
+                                "final_selection": False,
+                                "terminal_failure": False,
+                            },
+                            {
+                                "attempt": 2,
+                                "candidate_hash": adapter_candidate_hash,
+                                "deterministic_ok": True,
+                                "deterministic_failure_codes": [],
+                                "repair_inputs": {},
+                                "final_selection": True,
+                                "terminal_failure": False,
+                            },
+                        ],
+                        "final_selection": True,
+                    }
+                ],
+                "final_selection": {
+                    "attempt": 1,
+                    "candidate_hash": final_candidate_hash,
+                },
+            },
+        }
+
     def test_semantic_scope_downgrade_release_rejects_generic_padding_text(self) -> None:
         downgrade = {
             "status": "oracle_bounded_semantic_scope_downgrade",
@@ -334,6 +473,55 @@ class PublicBetaValidationTests(unittest.TestCase):
             ),
             failures,
         )
+
+    def test_semantic_scope_downgrade_release_rejects_forged_retry_evidence(
+        self,
+    ) -> None:
+        artifacts = self.semantic_scope_downgrade_release_artifacts()
+        artifacts["semantic_planner_convergence"] = {
+            "artifact_type": "semantic_planner_convergence",
+            "status": "converged",
+            "attempt_count": 2,
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "repair_inputs": {
+                        "next_attempt": 2,
+                        "retry_request_hash": "d" * 64,
+                    },
+                },
+                {
+                    "attempt": 2,
+                    "candidate_hash": "e" * 64,
+                    "deterministic_ok": True,
+                    "final_selection": True,
+                },
+            ],
+            "final_selection": {
+                "attempt": 2,
+                "candidate_hash": "e" * 64,
+            },
+        }
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any(
+                "lacks persisted semantic planner convergence retry evidence" in detail
+                for detail in details
+            ),
+            failures,
+        )
+
+    def test_semantic_scope_downgrade_release_accepts_adapter_candidate_retry_evidence(
+        self,
+    ) -> None:
+        artifacts = self.semantic_scope_downgrade_release_artifacts()
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+
+        self.assertEqual(failures, [])
 
     def assert_semantic_artifact_integrity_failure(
         self,
