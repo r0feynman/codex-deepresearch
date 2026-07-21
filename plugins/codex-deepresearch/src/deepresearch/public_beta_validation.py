@@ -1450,38 +1450,79 @@ def run_semantic_anti_overfit_scan(
     *,
     repo_root: str | Path | None = None,
     holdout_manifest: str | Path = DEFAULT_BLIND_HOLDOUT_MANIFEST,
+    semantic_regression_manifest: str | Path = DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+    public_beta_semantic_manifest: str | Path = DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
     scan_paths: Sequence[str | Path] | None = None,
 ) -> dict[str, Any]:
     """Scan planner-facing files for prompt-specific overfit hooks."""
 
     root = Path(repo_root) if repo_root is not None else PLUGIN_ROOT.parents[1]
-    try:
-        holdout = load_blind_holdout_manifest(holdout_manifest)
-    except PublicBetaValidationError:
-        holdout = _read_json(holdout_manifest)
-    prompt_texts = [
-        str(prompt.get("prompt") or "")
-        for prompt in holdout.get("prompts", [])
-        if isinstance(prompt, Mapping)
+    protected_manifests = [
+        ("holdout", holdout_manifest),
+        ("semantic_regression", semantic_regression_manifest),
+        ("public_beta_semantic", public_beta_semantic_manifest),
     ]
-    prompt_hashes = {_prompt_hash(prompt) for prompt in prompt_texts if prompt.strip()}
+    protected_records = _semantic_overfit_protected_records(protected_manifests)
+    prompt_texts = [
+        str(record.get("prompt") or "")
+        for record in protected_records
+        if isinstance(record.get("prompt"), str)
+    ]
+    prompt_hashes = {
+        str(record.get("prompt_hash") or "")
+        for record in protected_records
+        if isinstance(record.get("prompt_hash"), str)
+    }
+    prompt_ids = {
+        str(record.get("id") or "")
+        for record in protected_records
+        if isinstance(record.get("id"), str)
+    }
+    oracle_strings = [
+        str(value)
+        for record in protected_records
+        for value in record.get("oracle_strings", [])
+        if isinstance(value, str)
+    ]
     if scan_paths is None:
         scan_paths = [
             PLUGIN_ROOT / "src" / "deepresearch" / "semantic_planner.py",
+            PLUGIN_ROOT / "src" / "deepresearch" / "search_handoff.py",
+            PLUGIN_ROOT / ".codex-plugin" / "plugin.json",
             PLUGIN_ROOT / "skills",
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST,
+            DEFAULT_PUBLIC_BETA_SEMANTIC_MANIFEST,
+            DEFAULT_BLIND_HOLDOUT_MANIFEST,
+            DEFAULT_BLIND_HOLDOUT_MANIFEST.parent / "semantic_oracles.json",
+            root / "tests" / "test_semantic_planner.py",
+            root / "tests" / "test_public_beta_validation.py",
             root / "tests" / "fixtures",
         ]
     files = _semantic_scan_files(scan_paths)
     findings: list[dict[str, Any]] = []
-    holdout_manifest_path = Path(holdout_manifest).resolve()
+    protected_manifest_paths = {
+        Path(path).resolve()
+        for _, path in protected_manifests
+        if Path(path).exists()
+    }
+    oracle_manifest_paths = {
+        Path(path).resolve()
+        for record in protected_records
+        for path in record.get("oracle_manifest_paths", [])
+        if isinstance(path, str) and Path(path).exists()
+    }
+    explicitly_excluded_paths: list[str] = []
+    scanned_paths: list[str] = []
     for path in files:
         resolved = path.resolve()
-        if resolved == holdout_manifest_path:
+        if resolved in protected_manifest_paths or resolved in oracle_manifest_paths:
+            explicitly_excluded_paths.append(str(resolved))
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        scanned_paths.append(str(resolved))
         normalized = _normalize_prompt_text(text)
         for prompt in prompt_texts:
             if prompt and _normalize_prompt_text(prompt) in normalized:
@@ -1493,13 +1534,36 @@ def run_semantic_anti_overfit_scan(
                     }
                 )
                 break
+        for prompt_id in prompt_ids:
+            if prompt_id and re.search(
+                rf"(?<![A-Za-z0-9_-]){re.escape(prompt_id)}(?![A-Za-z0-9_-])",
+                text,
+            ):
+                findings.append(
+                    {
+                        "code": "known_registered_prompt_id",
+                        "path": str(path),
+                        "detail": "registered semantic prompt id appears in scanned planner-facing files",
+                    }
+                )
+                break
         for prompt_hash in prompt_hashes:
             if prompt_hash and prompt_hash in text:
                 findings.append(
                     {
-                        "code": "known_holdout_prompt_hash",
+                        "code": "known_registered_prompt_hash",
                         "path": str(path),
-                        "detail": "holdout prompt hash appears in scanned planner-facing files",
+                        "detail": "registered semantic prompt hash appears in scanned planner-facing files",
+                    }
+                )
+                break
+        for oracle_string in oracle_strings:
+            if oracle_string and _normalize_prompt_text(oracle_string) in normalized:
+                findings.append(
+                    {
+                        "code": "known_oracle_fragment",
+                        "path": str(path),
+                        "detail": "registered semantic oracle fragment appears in scanned planner-facing files",
                     }
                 )
                 break
@@ -1540,8 +1604,109 @@ def run_semantic_anti_overfit_scan(
         "valid": not findings,
         "status": "passed" if not findings else "failed",
         "scan_file_count": len(files),
+        "protected_prompt_count": len(protected_records),
+        "protected_prompt_id_count": len(prompt_ids),
+        "protected_prompt_hash_count": len(prompt_hashes),
+        "protected_oracle_fragment_count": len(oracle_strings),
+        "scanned_paths": sorted(scanned_paths),
+        "excluded_paths": sorted(set(explicitly_excluded_paths)),
+        "excluded_path_count": len(set(explicitly_excluded_paths)),
         "findings": findings,
     }
+
+
+def _semantic_overfit_protected_records(
+    manifests: Sequence[tuple[str, str | Path]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for manifest_kind, raw_path in manifests:
+        manifest_path = Path(raw_path)
+        try:
+            manifest = _load_semantic_overfit_manifest(manifest_kind, manifest_path)
+        except PublicBetaValidationError:
+            manifest = _read_json(manifest_path)
+        prompts = manifest.get("prompts")
+        if not isinstance(prompts, list):
+            continue
+        for prompt in prompts:
+            if not isinstance(prompt, Mapping):
+                continue
+            prompt_id = str(prompt.get("id") or "").strip()
+            prompt_text = str(prompt.get("prompt") or "").strip()
+            if not prompt_id or not prompt_text:
+                continue
+            key = (manifest_kind, prompt_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            prompt_hash = str(prompt.get("prompt_hash") or "").strip() or _prompt_hash(
+                prompt_text
+            )
+            record: dict[str, Any] = {
+                "kind": manifest_kind,
+                "id": prompt_id,
+                "prompt": prompt_text,
+                "prompt_hash": prompt_hash,
+                "oracle_strings": [],
+                "oracle_manifest_paths": [],
+            }
+            oracle_path = str(prompt.get("oracle_path") or "").strip()
+            if oracle_path:
+                try:
+                    oracle_file, oracle_fragment = _semantic_oracle_fragment(
+                        manifest_path,
+                        oracle_path,
+                        manifest_kind=manifest_kind,
+                        prompt_id=prompt_id,
+                    )
+                except PublicBetaValidationError:
+                    oracle_file, oracle_fragment = None, None
+                if oracle_file is not None:
+                    record["oracle_manifest_paths"].append(str(oracle_file.resolve()))
+                if isinstance(oracle_fragment, Mapping):
+                    record["oracle_strings"] = _semantic_oracle_overfit_strings(
+                        oracle_fragment
+                    )
+            records.append(record)
+    return records
+
+
+def _load_semantic_overfit_manifest(
+    manifest_kind: str,
+    manifest_path: Path,
+) -> dict[str, Any]:
+    if manifest_kind == "holdout":
+        return load_blind_holdout_manifest(manifest_path)
+    if manifest_kind == "semantic_regression":
+        return load_semantic_regression_manifest(manifest_path)
+    if manifest_kind == "public_beta_semantic":
+        return load_public_beta_semantic_manifest(manifest_path)
+    raise PublicBetaValidationError(
+        f"unsupported semantic overfit manifest kind: {manifest_kind}"
+    )
+
+
+def _semantic_oracle_overfit_strings(fragment: Mapping[str, Any]) -> list[str]:
+    strings: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            normalized = _normalize_prompt_text(text)
+            if len(normalized) >= 40:
+                strings.append(text)
+        elif isinstance(value, Mapping):
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(fragment.get("semantic_alignment_expectations"))
+    collect(fragment.get("expected_source_policy"))
+    collect(fragment.get("expected_modalities"))
+    return sorted(set(strings))
 
 
 def _semantic_prompt_hash_alias_routing_findings(text: str) -> list[str]:
@@ -1604,13 +1769,13 @@ def _semantic_prompt_hash_alias_routing_findings(text: str) -> list[str]:
         findings.append("prompt_hash_alias_routing")
     if re.search(
         rf"(?is)\b(?:plan|route|angle|task|bounded_tasks|semantic_plan)_by_"
-        rf"(?:hash|digest)\b.{{0,420}}(?:prompt_hash|{hash_helper}\s*\(|sha256\s*\()"
+        rf"(?:hash|digest)\b.{{0,420}}(?:prompt_hash|{hash_helper}\s*\()"
         rf".{{0,420}}{semantic_target}",
         text,
     ):
         findings.append("prompt_hash_alias_routing")
     if re.search(
-        rf"(?is)\{{.{{0,260}}(?:{hash_helper}\s*\(|sha256\s*\()"
+        rf"(?is)\{{.{{0,260}}(?:{hash_helper}\s*\()"
         rf".{{0,420}}{semantic_target}",
         text,
     ):
@@ -3135,6 +3300,9 @@ def _semantic_release_report(
         for run in evaluated_runs
         if isinstance(run, Mapping)
     ]
+    prepare_ready_count = sum(
+        1 for run in report_runs if run.get("semantic_prepare_ready") is True
+    )
     missing_entries = [
         str(run.get("id"))
         for run in evaluated_runs
@@ -3164,6 +3332,15 @@ def _semantic_release_report(
             "manual_trace_audits_required_when_claiming_semantic_readiness": True,
         },
         "manual_trace_audit_gate": manual_trace_audit_gate,
+        "semantic_prepare_summary": {
+            "ready_run_count": prepare_ready_count,
+            "failed_run_count": len(report_runs) - prepare_ready_count,
+            "release_counted_run_count": len(report_runs),
+            "all_prepare_runs_ready": bool(report_runs)
+            and prepare_ready_count == len(report_runs),
+            "full_release_readiness_is_separate": True,
+            "full_release_required_artifacts_still_enforced": True,
+        },
         "release_counted_run_count": len(report_runs),
         "ready_run_count": sum(
             1 for run in report_runs if run.get("semantic_release_ready") is True
@@ -3179,6 +3356,7 @@ def _semantic_release_report(
 def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
     status_artifacts = run.get("status_artifacts")
     artifact_paths = status_artifacts if isinstance(status_artifacts, Mapping) else {}
+    semantic_prepare = _semantic_prepare_readiness_from_artifacts(artifact_paths)
     artifact_hashes = {
         name: _artifact_file_hash(path)
         for name, path in sorted(artifact_paths.items())
@@ -3267,6 +3445,10 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
         "release_counted_status": (
             "passed" if semantic_ready else "denominator_failure"
         ),
+        "semantic_prepare_ready": semantic_prepare["ready"],
+        "semantic_prepare_status": semantic_prepare["status"],
+        "semantic_prepare_failure_reason": semantic_prepare["failure_reason"],
+        "semantic_prepare_checks": semantic_prepare,
         "semantic_release_ready": semantic_ready,
         "semantic_release_check_valid": (
             semantic_checks.get("valid") if isinstance(semantic_checks, Mapping) else None
@@ -3279,6 +3461,79 @@ def _semantic_release_report_run(run: Mapping[str, Any]) -> dict[str, Any]:
         "failure_category": run.get("failure_category"),
         "failure_reason": failure_reason,
         "semantic_failures": semantic_failures,
+    }
+
+
+def _semantic_prepare_readiness_from_artifacts(
+    artifact_paths: Mapping[str, Any],
+) -> dict[str, Any]:
+    validation = _read_optional_json(artifact_paths.get("semantic_planner_validation", ""))
+    review = _read_optional_json(artifact_paths.get("semantic_plan_review", ""))
+    plan_payload = _read_optional_json(artifact_paths.get("semantic_plan", ""))
+    plan = (
+        plan_payload.get("semantic_plan")
+        if isinstance(plan_payload, Mapping)
+        and isinstance(plan_payload.get("semantic_plan"), Mapping)
+        else plan_payload
+    )
+    validation_ok = isinstance(validation, Mapping) and validation.get("ok") is True
+    review_score = (
+        _numeric_or_none(review.get("semantic_fit_score"))
+        if isinstance(review, Mapping)
+        else None
+    )
+    review_pass = (
+        isinstance(review, Mapping)
+        and review.get("verdict") == "pass"
+        and review.get("semantic_release_eligible") is True
+        and review_score is not None
+        and review_score >= 9.0
+    )
+    planner_mode = (
+        plan.get("planner_mode")
+        if isinstance(plan, Mapping)
+        else (
+            validation.get("planner_mode")
+            if isinstance(validation, Mapping)
+            else None
+        )
+    )
+    plan_eligible = isinstance(plan, Mapping) and plan.get("semantic_release_eligible") is True
+    failures: list[str] = []
+    if not validation_ok:
+        failures.append("semantic_planner_validation_not_ok")
+    if not review_pass:
+        failures.append("semantic_plan_review_not_release_eligible")
+    if planner_mode != "codex_semantic":
+        failures.append("planner_mode_not_codex_semantic")
+    if not plan_eligible:
+        failures.append("semantic_plan_not_release_eligible")
+    ready = not failures
+    return {
+        "schema_version": "codex-deepresearch.semantic-prepare-readiness.v0",
+        "ready": ready,
+        "status": "passed" if ready else "failed",
+        "failure_reason": " | ".join(failures) if failures else None,
+        "validation_ok": validation_ok,
+        "planner_mode": planner_mode,
+        "semantic_fit_score": review_score,
+        "review_verdict": review.get("verdict") if isinstance(review, Mapping) else None,
+        "review_release_eligible": (
+            review.get("semantic_release_eligible")
+            if isinstance(review, Mapping)
+            else None
+        ),
+        "plan_release_eligible": plan_eligible,
+        "validation_failure_codes": [
+            str(failure.get("code"))
+            for failure in (
+                validation.get("failures")
+                if isinstance(validation, Mapping)
+                and isinstance(validation.get("failures"), list)
+                else []
+            )
+            if isinstance(failure, Mapping) and failure.get("code")
+        ],
     }
 
 

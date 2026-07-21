@@ -43,6 +43,7 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     run_semantic_release_validation,
     semantic_manifest_execution_gate,
     _semantic_angle_ids,
+    _semantic_release_report,
     _valid_oracle_requirement_map,
     _valid_requirement_coverage_map,
     _valid_semantic_angles,
@@ -932,6 +933,18 @@ class PublicBetaValidationTests(unittest.TestCase):
         scan = run_semantic_anti_overfit_scan()
 
         self.assertEqual(scan["status"], "passed", scan["findings"])
+        scanned = {Path(path).name for path in scan["scanned_paths"]}
+        excluded = {Path(path).name for path in scan["excluded_paths"]}
+        self.assertIn("semantic_planner.py", scanned)
+        self.assertIn("search_handoff.py", scanned)
+        self.assertIn("plugin.json", scanned)
+        self.assertIn("SKILL.md", scanned)
+        self.assertIn("test_semantic_planner.py", scanned)
+        self.assertIn("test_public_beta_validation.py", scanned)
+        self.assertIn("semantic_regression_prompts.json", excluded)
+        self.assertIn("public_beta_semantic_prompts.json", excluded)
+        self.assertIn("blind_holdout_semantic_prompts.json", excluded)
+        self.assertIn("semantic_oracles.json", excluded)
 
     def test_semantic_anti_overfit_scan_rejects_malicious_planner_file(self) -> None:
         temp = self.temp_dir()
@@ -966,7 +979,69 @@ class PublicBetaValidationTests(unittest.TestCase):
             {finding["code"] for finding in scan["findings"]},
         )
         self.assertIn(
+            "known_registered_prompt_hash",
+            {finding["code"] for finding in scan["findings"]},
+        )
+        self.assertIn(
             "canned" + "_expected" + "_plan",
+            {finding["code"] for finding in scan["findings"]},
+        )
+
+    def test_semantic_anti_overfit_scan_rejects_regression_prompt_id_and_hash(
+        self,
+    ) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_regression_bad.py"
+        regression = load_semantic_regression_manifest(
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST
+        )
+        prompt = regression["prompts"][0]
+        prompt_hash = hashlib.sha256(
+            " ".join(prompt["prompt"].strip().split()).encode("utf-8")
+        ).hexdigest()
+        bad.write_text(
+            "\n".join(
+                [
+                    f"REGRESSION_PROMPT_ID = {prompt['id']!r}",
+                    f"REGRESSION_PROMPT_HASH = {prompt_hash!r}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        codes = {finding["code"] for finding in scan["findings"]}
+        self.assertIn("known_registered_prompt_id", codes)
+        self.assertIn("known_registered_prompt_hash", codes)
+
+    def test_semantic_anti_overfit_scan_rejects_oracle_fragment_text(self) -> None:
+        temp = self.temp_dir()
+        bad = temp / "semantic_planner_oracle_bad.py"
+        oracle_bundle = json.loads(
+            (
+                ROOT
+                / "plugins"
+                / "codex-deepresearch"
+                / "validation"
+                / "semantic_oracles.json"
+            ).read_text(encoding="utf-8")
+        )
+        regression = load_semantic_regression_manifest(
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST
+        )
+        oracle_fragment_id = regression["prompts"][0]["oracle_path"].split("#", 1)[1]
+        oracle_note = oracle_bundle["oracles"][oracle_fragment_id][
+            "expected_source_policy"
+        ][-1]
+        bad.write_text(f"ORACLE_NOTE = {oracle_note!r}\n", encoding="utf-8")
+
+        scan = run_semantic_anti_overfit_scan(scan_paths=[bad])
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertIn(
+            "known_oracle_fragment",
             {finding["code"] for finding in scan["findings"]},
         )
 
@@ -1143,6 +1218,89 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(verifier_votes[0]["verifier_type"], "visual")
         self.assertTrue(verifier_votes[0]["evidence_refs"])
 
+    def test_semantic_release_report_distinguishes_prepare_from_full_release(self) -> None:
+        run_dir = self.temp_dir() / "prepare-only"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "semantic_planner_validation.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "ok": True,
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "failures": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan_review.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "semantic_fit_score": 9.4,
+                "verdict": "pass",
+                "blockers": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "semantic_plan": {
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": True,
+                    "status": "semantic_review_passed",
+                }
+            },
+        )
+
+        report = _semantic_release_report(
+            evaluated_runs=[
+                {
+                    "id": "sem" + "-reg-001",
+                    "route": "text_only",
+                    "status": "failed",
+                    "terminal_status": "missing_run_status",
+                    "metric_classification": "included_failure",
+                    "failure_category": "artifact_handoff_failure",
+                    "failure_detail": "run_status.json is missing or invalid",
+                    "status_artifacts": {
+                        "semantic_planner_validation": str(
+                            run_dir / "semantic_planner_validation.json"
+                        ),
+                        "semantic_plan_review": str(
+                            run_dir / "semantic_plan_review.json"
+                        ),
+                        "semantic_plan": str(run_dir / "semantic_plan.json"),
+                    },
+                }
+            ],
+            report_path=self.temp_dir() / "semantic_release_report.json",
+            generated_at=self.now(),
+            manual_audit_manifest=None,
+            require_manual_trace_audits=True,
+        )
+
+        self.assertFalse(report["valid"])
+        self.assertFalse(report["release_gate_ready"])
+        self.assertEqual(
+            report["semantic_prepare_summary"]["ready_run_count"],
+            1,
+        )
+        self.assertEqual(
+            report["semantic_prepare_summary"]["failed_run_count"],
+            0,
+        )
+        self.assertTrue(
+            report["semantic_prepare_summary"][
+                "full_release_readiness_is_separate"
+            ]
+        )
+        run = report["runs"][0]
+        self.assertTrue(run["semantic_prepare_ready"])
+        self.assertEqual(run["semantic_prepare_status"], "passed")
+        self.assertFalse(run["semantic_release_ready"])
+        self.assertEqual(run["release_counted_status"], "denominator_failure")
+
     def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()
@@ -1242,7 +1400,10 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
 
     def test_semantic_artifact_integrity_accepts_korean_particle_overlap(self) -> None:
-        original_question = "한국 공공보건 포스터 이미지의 손씻기 지침 차이를 공식 출처와 함께 분석해줘."
+        regression = load_semantic_regression_manifest(
+            DEFAULT_SEMANTIC_REGRESSION_MANIFEST
+        )
+        original_question = regression["prompts"][1]["prompt"]
         angles = [
             {
                 "angle_id": "angle_004",
