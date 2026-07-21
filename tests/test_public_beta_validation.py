@@ -44,6 +44,7 @@ from deepresearch.public_beta_validation import (  # noqa: E402
     semantic_manifest_execution_gate,
     _semantic_angle_ids,
     _semantic_release_report,
+    _semantic_scope_downgrade_release_failures,
     _valid_oracle_requirement_map,
     _valid_requirement_coverage_map,
     _valid_semantic_angles,
@@ -83,6 +84,59 @@ class PublicBetaValidationTests(unittest.TestCase):
     def write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def test_semantic_scope_downgrade_release_rejects_generic_padding_text(self) -> None:
+        downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+        }
+        artifacts = {
+            "semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "oracle_requirement_map": [
+                    {
+                        "requirement_id": "req_001",
+                        "requirement_text": "Compare city planning implementation indicators.",
+                    }
+                ],
+            },
+            "semantic_plan": {
+                "semantic_plan": {
+                    "question_scope": "medium",
+                    "original_question": (
+                        "Compare city planning implementation indicators and responsible agencies."
+                    ),
+                    "scope_downgrade": downgrade,
+                    "bounded_tasks": [
+                        {
+                            "task_id": "task_001",
+                            "query": (
+                                "Compare city planning implementation indicators "
+                                "migration hazard evidence"
+                            ),
+                        }
+                    ],
+                }
+            },
+            "semantic_planner_validation": {"scope_downgrade_valid": True},
+            "semantic_plan_review": {},
+        }
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+
+        self.assertTrue(
+            any(
+                failure.get("check") == "semantic_scope_downgrade"
+                and "generic broad-cardinality padding text" in failure.get("detail", "")
+                for failure in failures
+            ),
+            failures,
+        )
 
     def assert_semantic_artifact_integrity_failure(
         self,

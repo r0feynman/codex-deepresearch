@@ -243,6 +243,11 @@ def prepare_run(
             run_id=run_id,
             created_at=now,
         )
+        _attach_locked_oracle_context_to_planner_request(
+            planner_raw_request,
+            locked_oracle=locked_oracle,
+            run_dir=run_dir,
+        )
         planner_raw_dir = run_dir / "semantic_planner_raw"
         planner_raw_dir.mkdir(parents=True, exist_ok=True)
         _write_json(planner_raw_dir / "planner_request.json", planner_raw_request)
@@ -451,6 +456,11 @@ def prepare_run(
             "domain_entities": list(semantic_plan.domain_entities),
             "constraints": list(semantic_plan.constraints),
             "question_scope": semantic_plan.question_scope,
+            "scope_downgrade": (
+                dict(semantic_plan.scope_downgrade)
+                if getattr(semantic_plan, "scope_downgrade", None)
+                else None
+            ),
             "decomposition_strategy": semantic_plan.decomposition_strategy,
             "requirement_coverage_map": list(semantic_plan.requirement_coverage_map),
             "negative_scope": list(semantic_plan.negative_scope),
@@ -1060,6 +1070,12 @@ def _prepare_blocked_semantic_planner_run(
             "broad_question": semantic_plan.broad_question,
             "source": semantic_plan.source,
             "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
+            "question_scope": getattr(semantic_plan, "question_scope", ""),
+            "scope_downgrade": (
+                dict(semantic_plan.scope_downgrade)
+                if getattr(semantic_plan, "scope_downgrade", None)
+                else None
+            ),
             "planner_mode": semantic_plan.planner_mode,
             "semantic_release_eligible": semantic_plan.semantic_release_eligible,
             "status": semantic_plan.status,
@@ -1205,6 +1221,11 @@ def _finalize_blocked_semantic_run(
             "domain_entities": list(getattr(semantic_plan, "domain_entities", [])),
             "constraints": list(getattr(semantic_plan, "constraints", [])),
             "question_scope": getattr(semantic_plan, "question_scope", ""),
+            "scope_downgrade": (
+                dict(semantic_plan.scope_downgrade)
+                if getattr(semantic_plan, "scope_downgrade", None)
+                else None
+            ),
             "decomposition_strategy": getattr(semantic_plan, "decomposition_strategy", ""),
             "requirement_coverage_map": list(
                 getattr(semantic_plan, "requirement_coverage_map", [])
@@ -1452,8 +1473,51 @@ def _sync_semantic_trace_artifact_hash(
         trace_file.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
 
 
+def _attach_locked_oracle_context_to_planner_request(
+    request: dict[str, Any],
+    *,
+    locked_oracle: Mapping[str, Any],
+    run_dir: Path,
+) -> None:
+    oracle_path = run_dir / SEMANTIC_EXPECTATION_ORACLE_FILENAME
+    oracle_hash = _sha256_file(oracle_path) if oracle_path.exists() else None
+    request["semantic_expectation_oracle_path"] = SEMANTIC_EXPECTATION_ORACLE_FILENAME
+    request["semantic_expectation_oracle_hash"] = oracle_hash
+    request["locked_semantic_expectation_oracle"] = {
+        "question_scope": locked_oracle.get("question_scope"),
+        "bounded_task_range": locked_oracle.get("bounded_task_range"),
+        "oracle_requirement_map": [
+            dict(record)
+            for record in locked_oracle.get("oracle_requirement_map", [])
+            if isinstance(record, Mapping)
+        ],
+        "expected_entities": list(locked_oracle.get("expected_entities", [])),
+        "expected_constraints": list(locked_oracle.get("expected_constraints", [])),
+        "expected_modalities": list(locked_oracle.get("expected_modalities", [])),
+        "required_angles": list(locked_oracle.get("required_angles", [])),
+        "forbidden_angles": list(locked_oracle.get("forbidden_angles", [])),
+        "expected_report_shape": list(locked_oracle.get("expected_report_shape", [])),
+        "oracle_content_hash": locked_oracle.get("oracle_content_hash"),
+    }
+    instructions = request.setdefault("planner_instructions", [])
+    if isinstance(instructions, list):
+        instructions.append(
+            "Use locked_semantic_expectation_oracle as the semantic boundary for "
+            "all planning and retries. Do not add topics, workstreams, or task "
+            "suffixes outside that oracle merely to satisfy task-count thresholds."
+        )
+    request.pop("adapter_request_hash", None)
+    request["adapter_request_hash"] = _sha256_payload(request)
+
+
 def _sha256_file(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
+
+
+def _sha256_payload(payload: Mapping[str, Any]) -> str:
+    return sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def build_release_validation_identity(

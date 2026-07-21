@@ -87,6 +87,33 @@ SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES = (
     "source_quality_omission",
     "generic_task_content",
 )
+SEMANTIC_SCOPE_TIERS: dict[str, dict[str, int]] = {
+    "broad": {
+        "min_tasks": 20,
+        "max_tasks": 40,
+        "min_angles": 5,
+        "max_angles": 8,
+        "min_tasks_per_angle": 2,
+    },
+    "medium": {
+        "min_tasks": 10,
+        "max_tasks": 19,
+        "min_angles": 3,
+        "max_angles": 6,
+        "min_tasks_per_angle": 1,
+    },
+    "narrow": {
+        "min_tasks": 6,
+        "max_tasks": 12,
+        "min_angles": 2,
+        "max_angles": 4,
+        "min_tasks_per_angle": 1,
+    },
+}
+SEMANTIC_SCOPE_DOWNGRADE_STATUS = "oracle_bounded_semantic_scope_downgrade"
+LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC = (
+    "locked_semantic_expectation_oracle_alignment"
+)
 ALLOWED_PLANNER_MODES = (
     PLANNER_MODE_CODEX_SEMANTIC,
     PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
@@ -113,6 +140,7 @@ SEMANTIC_COMMON_INTEGRITY_FIELDS = (
     "manifest_oracle_hash",
     "manifest_oracle_path",
     "manifest_oracle_fragment_id",
+    "scope_downgrade",
 )
 SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
     "query",
@@ -502,6 +530,7 @@ class SemanticPlan:
     constraints: list[dict[str, Any]] = field(default_factory=list)
     runner_source_budget: dict[str, Any] = field(default_factory=dict)
     question_scope: str = "narrow"
+    scope_downgrade: dict[str, Any] | None = None
     decomposition_strategy: str = ""
     requirement_coverage_map: list[dict[str, Any]] = field(default_factory=list)
     negative_scope: list[str] = field(default_factory=list)
@@ -802,12 +831,6 @@ def codex_semantic_candidate_plan(
                 candidate, source_cap_split_materializations = (
                     _materialize_candidate_source_cap_splits(candidate)
                 )
-                candidate, broad_cardinality_materializations = (
-                    _materialize_candidate_broad_cardinality(
-                        candidate,
-                        original_question=original_question,
-                    )
-                )
                 candidate, comparison_deliverable_materializations = (
                     _materialize_candidate_req003_comparison_deliverable(
                         candidate,
@@ -817,6 +840,13 @@ def codex_semantic_candidate_plan(
                 )
             else:
                 comparison_deliverable_materializations = []
+            candidate, broad_cardinality_materializations = (
+                _materialize_candidate_broad_cardinality(
+                    candidate,
+                    original_question=original_question,
+                    raw_request=raw_request,
+                )
+            )
             candidate, source_cap_constraint_materializations = (
                 _materialize_candidate_source_cap_constraints(
                     candidate,
@@ -1038,11 +1068,32 @@ def codex_semantic_candidate_plan(
         ),
         "parsed_response_hash": parsed_response_hash,
     }
+    candidate_diagnostics = (
+        candidate.get("diagnostics") if isinstance(candidate.get("diagnostics"), Mapping) else {}
+    )
+    if isinstance(
+        candidate_diagnostics.get(LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC),
+        Mapping,
+    ):
+        diagnostics[LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC] = dict(
+            candidate_diagnostics[LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC]
+        )
+    if isinstance(candidate.get("scope_downgrade"), Mapping):
+        diagnostics["scope_downgrade"] = dict(candidate["scope_downgrade"])
+        diagnostics["user_visible_diagnostic"] = (
+            "A Codex semantic candidate plan was generated with an explicit "
+            f"{candidate['scope_downgrade'].get('to_scope')} scope downgrade; "
+            "it remains release-ineligible until independent semantic review and "
+            "E2E gates pass."
+        )
     expected_evidence_needs = _ordered_unique(angle.evidence_need for angle in angles)
-    broad_question = _effective_broad_question(
+    broad_question = _candidate_effective_broad_question(
+        plan=candidate,
+        angles=candidate["angles"],
+        tasks=candidate["bounded_tasks"],
+        requirements=candidate["requirement_coverage_map"],
         question_class=question_class,
         expected_needs=expected_evidence_needs,
-        declared_broad=candidate["question_scope"] == "broad",
     )
     return SemanticPlan(
         schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
@@ -1060,6 +1111,11 @@ def codex_semantic_candidate_plan(
             else {}
         ),
         question_scope=str(candidate["question_scope"]),
+        scope_downgrade=(
+            dict(candidate["scope_downgrade"])
+            if isinstance(candidate.get("scope_downgrade"), Mapping)
+            else None
+        ),
         decomposition_strategy=str(candidate["decomposition_strategy"]),
         requirement_coverage_map=list(candidate["requirement_coverage_map"]),
         negative_scope=list(candidate["negative_scope"]),
@@ -1771,6 +1827,7 @@ def _materialize_candidate_broad_cardinality(
     candidate: Mapping[str, Any],
     *,
     original_question: str,
+    raw_request: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     normalized = copy.deepcopy(dict(candidate))
     raw_angles = normalized.get("angles")
@@ -1805,6 +1862,21 @@ def _materialize_candidate_broad_cardinality(
         plan=normalized,
         angles=angles,
     )
+    locked_oracle_scope = _candidate_locked_oracle_scope_contract(raw_request)
+    if (
+        locked_oracle_scope is not None
+        and locked_oracle_scope["question_scope"] in {"medium", "narrow"}
+    ):
+        return _materialize_candidate_locked_oracle_scope_alignment(
+            normalized,
+            original_candidate=candidate,
+            locked_oracle_scope=locked_oracle_scope,
+            question_class=question_class,
+            expected_needs=expected_needs,
+            angles=angles,
+            tasks=tasks,
+            requirements=requirements,
+        )
     effective_broad = _effective_broad_question(
         question_class=question_class,
         expected_needs=expected_needs,
@@ -1812,7 +1884,7 @@ def _materialize_candidate_broad_cardinality(
     )
     if not effective_broad and classified_question != _CLASS_IMPLEMENTATION:
         return normalized, []
-    if len(angles) >= 5 and len(tasks) >= 20:
+    if _candidate_counts_fit_scope("broad", angles=angles, tasks=tasks):
         if str(normalized.get("question_scope") or "") != "broad":
             normalized["question_scope"] = "broad"
             normalized.setdefault("question_class", question_class)
@@ -1827,106 +1899,184 @@ def _materialize_candidate_broad_cardinality(
         return normalized, []
 
     materializations: list[dict[str, Any]] = []
-    previous_scope = normalized.get("question_scope")
-    if previous_scope != "broad":
-        normalized["question_scope"] = "broad"
-        materializations.append(
-            {
-                "field": "question_scope",
-                "materialization": "promoted_effective_broad_question_scope",
-                "previous_question_scope": previous_scope,
-                "question_class": question_class,
-            }
-        )
     normalized["question_class"] = question_class
-
-    existing_angle_ids = {
-        str(angle.get("angle_id") or "")
-        for angle in angles
-        if str(angle.get("angle_id") or "")
-    }
-    added_angle_ids: list[str] = []
-    while len(angles) < 5:
-        angle = _candidate_broad_cardinality_angle(
-            original_question=original_question,
+    retry_attempt = _candidate_retry_attempt(raw_request)
+    target_scope = _candidate_scope_tier_for_counts(
+        angles=angles,
+        tasks=tasks,
+        allowed_scopes=("medium", "narrow"),
+    )
+    coverage_complete = _candidate_requirement_coverage_complete(
+        requirements=requirements,
+        angles=angles,
+        tasks=tasks,
+    )
+    if retry_attempt >= 2 and target_scope and coverage_complete:
+        previous_scope = normalized.get("question_scope")
+        scope_downgrade = _candidate_scope_downgrade_record(
+            previous_scope=previous_scope,
+            target_scope=target_scope,
+            retry_attempt=retry_attempt,
             question_class=question_class,
-            existing_angles=angles,
-            existing_angle_ids=existing_angle_ids,
-        )
-        existing_angle_ids.add(str(angle["angle_id"]))
-        added_angle_ids.append(str(angle["angle_id"]))
-        angles.append(angle)
-
-    existing_task_ids = {
-        str(task.get("task_id") or "")
-        for task in tasks
-        if str(task.get("task_id") or "")
-    }
-    tasks_by_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
-    added_task_ids: list[str] = []
-    task_sequence = 1
-    while len(tasks) < 20 or any(
-        tasks_by_angle[str(angle.get("angle_id") or "")] < 2 for angle in angles
-    ):
-        if len(tasks) >= 40:
-            break
-        angle = _candidate_broad_cardinality_next_angle(
             angles=angles,
-            tasks_by_angle=tasks_by_angle,
-            sequence=task_sequence,
+            tasks=tasks,
+            requirements=requirements,
         )
-        task = _candidate_broad_cardinality_task(
-            original_question=original_question,
-            angle=angle,
-            existing_tasks=tasks,
-            existing_task_ids=existing_task_ids,
-            sequence=task_sequence,
+        normalized["question_scope"] = target_scope
+        normalized["scope_downgrade"] = scope_downgrade
+        diagnostics = (
+            dict(normalized.get("diagnostics"))
+            if isinstance(normalized.get("diagnostics"), Mapping)
+            else {}
         )
-        existing_task_ids.add(str(task["task_id"]))
-        added_task_ids.append(str(task["task_id"]))
-        tasks.append(task)
-        tasks_by_angle[str(task["angle_id"])] += 1
-        task_sequence += 1
-
-    normalized["angles"] = [
-        _candidate_record if isinstance(_candidate_record, Mapping) else _candidate_record
-        for _candidate_record in raw_angles
-        if not isinstance(_candidate_record, Mapping)
-    ] + angles
-    normalized["bounded_tasks"] = [
-        _candidate_record if isinstance(_candidate_record, Mapping) else _candidate_record
-        for _candidate_record in raw_tasks
-        if not isinstance(_candidate_record, Mapping)
-    ] + tasks
-    if added_angle_ids:
-        normalized["requirement_coverage_map"] = _candidate_add_angle_coverage(
-            normalized.get("requirement_coverage_map"),
-            added_angle_ids=added_angle_ids,
+        diagnostics["scope_downgrade"] = scope_downgrade
+        diagnostics["user_visible_diagnostic"] = (
+            "Broad semantic replan stayed within the locked oracle and found a "
+            f"{target_scope} executable scope; no generic padding was added."
         )
-    if added_task_ids:
-        normalized["requirement_coverage_map"] = _candidate_add_task_coverage(
-            normalized.get("requirement_coverage_map"),
-            added_task_ids=added_task_ids,
-        )
-    if added_angle_ids or added_task_ids:
+        normalized["diagnostics"] = diagnostics
         normalized["decomposition_strategy"] = (
             str(normalized.get("decomposition_strategy") or "").rstrip()
-            + " Broad-question cardinality was materialized before validation so "
-            "the candidate preserves 5-8 semantic angles and 20-40 bounded tasks."
+            + " Broad cardinality shortfall was resolved by explicit "
+            f"{target_scope} scope downgrade after oracle-bounded semantic retry; "
+            "no generic task padding was added."
         ).strip()
         materializations.append(
             {
-                "field": "angles,bounded_tasks",
-                "materialization": "expanded_effective_broad_question_cardinality",
-                "previous_angle_count": len(angles) - len(added_angle_ids),
-                "previous_task_count": len(tasks) - len(added_task_ids),
-                "materialized_angle_count": len(angles),
-                "materialized_task_count": len(tasks),
-                "added_angle_ids": added_angle_ids,
-                "added_task_ids": added_task_ids,
+                "field": "question_scope",
+                "materialization": SEMANTIC_SCOPE_DOWNGRADE_STATUS,
+                "previous_question_scope": previous_scope,
+                "final_question_scope": target_scope,
+                "content_added": False,
+                "retry_attempt": retry_attempt,
+                "angle_count": len(angles),
+                "task_count": len(tasks),
+                "oracle_coverage_complete": True,
                 "question_class": question_class,
+                "scope_downgrade": scope_downgrade,
             }
         )
+        return normalized, materializations
+
+    broad_tier = SEMANTIC_SCOPE_TIERS["broad"]
+    materializations.append(
+        {
+            "field": "angles,bounded_tasks",
+            "materialization": "broad_cardinality_replan_required",
+            "content_added": False,
+            "retryable": True,
+            "retry_attempt": retry_attempt or None,
+            "angle_count": len(angles),
+            "task_count": len(tasks),
+            "required_angle_range": [
+                broad_tier["min_angles"],
+                broad_tier["max_angles"],
+            ],
+            "required_task_range": [
+                broad_tier["min_tasks"],
+                broad_tier["max_tasks"],
+            ],
+            "target_scope_if_downgraded": target_scope,
+            "oracle_coverage_complete": coverage_complete,
+            "question_class": question_class,
+            "message": (
+                "Broad cardinality shortfall requires semantic adapter replan "
+                "inside the locked oracle; generic suffix padding is forbidden."
+            ),
+        }
+    )
+    return normalized, materializations
+
+
+def _materialize_candidate_locked_oracle_scope_alignment(
+    normalized: dict[str, Any],
+    *,
+    original_candidate: Mapping[str, Any],
+    locked_oracle_scope: Mapping[str, Any],
+    question_class: str,
+    expected_needs: Sequence[str],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    locked_scope = str(locked_oracle_scope.get("question_scope") or "")
+    coverage_complete = _candidate_requirement_coverage_complete(
+        requirements=requirements,
+        angles=angles,
+        tasks=tasks,
+    )
+    counts_fit_locked_scope = _candidate_counts_fit_locked_oracle_scope(
+        locked_oracle_scope,
+        angles=angles,
+        tasks=tasks,
+    )
+    alignment = _candidate_locked_oracle_alignment_record(
+        locked_oracle_scope,
+        status=(
+            "honored_locked_oracle_scope"
+            if counts_fit_locked_scope and coverage_complete
+            else "violates_locked_oracle_scope"
+        ),
+        question_class=question_class,
+        expected_needs=expected_needs,
+        angles=angles,
+        tasks=tasks,
+        oracle_coverage_complete=coverage_complete,
+        counts_fit_locked_scope=counts_fit_locked_scope,
+    )
+    diagnostics = (
+        dict(normalized.get("diagnostics"))
+        if isinstance(normalized.get("diagnostics"), Mapping)
+        else {}
+    )
+    diagnostics[LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC] = alignment
+    normalized["diagnostics"] = diagnostics
+
+    materializations: list[dict[str, Any]] = []
+    if counts_fit_locked_scope and coverage_complete:
+        previous_scope = normalized.get("question_scope")
+        if str(previous_scope or "") != locked_scope:
+            normalized["question_scope"] = locked_scope
+            materializations.append(
+                {
+                    "field": "question_scope",
+                    "materialization": "honored_locked_oracle_question_scope",
+                    "previous_question_scope": original_candidate.get("question_scope"),
+                    "final_question_scope": locked_scope,
+                    "content_added": False,
+                    "scope_downgrade_added": False,
+                    "angle_count": len(angles),
+                    "task_count": len(tasks),
+                    "oracle_coverage_complete": True,
+                    "question_class": question_class,
+                    "bounded_task_range": dict(
+                        alignment.get("bounded_task_range") or {}
+                    ),
+                }
+            )
+        return normalized, materializations
+
+    materializations.append(
+        {
+            "field": "question_scope,angles,bounded_tasks",
+            "materialization": "locked_oracle_scope_alignment_required",
+            "content_added": False,
+            "retryable": True,
+            "declared_question_scope": original_candidate.get("question_scope"),
+            "locked_question_scope": locked_scope,
+            "angle_count": len(angles),
+            "task_count": len(tasks),
+            "bounded_task_range": dict(alignment.get("bounded_task_range") or {}),
+            "oracle_coverage_complete": coverage_complete,
+            "counts_fit_locked_scope": counts_fit_locked_scope,
+            "question_class": question_class,
+            "message": (
+                "Candidate scope/counts must align to the locked semantic "
+                "expectation oracle; broad cardinality promotion is not allowed "
+                "when the locked oracle scope is medium or narrow."
+            ),
+        }
+    )
     return normalized, materializations
 
 
@@ -2098,103 +2248,11 @@ def _candidate_broad_cardinality_next_angle(
     return angles[(sequence - 1) % len(angles)]
 
 
-def _candidate_broad_cardinality_task(
-    *,
-    original_question: str,
-    angle: Mapping[str, Any],
-    existing_tasks: Sequence[Mapping[str, Any]],
-    existing_task_ids: set[str],
-    sequence: int,
-) -> dict[str, Any]:
-    task_id = _candidate_next_task_id(existing_task_ids)
-    angle_id = str(angle.get("angle_id") or "")
-    base_task = next(
-        (
-            task
-            for task in existing_tasks
-            if str(task.get("angle_id") or "") == angle_id
-        ),
-        {},
-    )
-    route = str(angle.get("route") or base_task.get("route") or "text_only")
-    max_sources = _semantic_task_source_cap_int(base_task.get("max_sources"))
-    if max_sources is None:
-        max_sources = 3
-    max_sources = max(
-        SEMANTIC_TASK_MIN_SOURCES,
-        min(SEMANTIC_TASK_MAX_SOURCES, max_sources),
-    )
-    max_images = _semantic_task_source_cap_int(base_task.get("max_images")) or 0
-    if route == "text_only":
-        max_images = 0
-    focus = _candidate_broad_task_focus(sequence)
-    angle_title = str(angle.get("title") or angle_id)
-    source_policy = (
-        dict(base_task.get("source_policy"))
-        if isinstance(base_task.get("source_policy"), Mapping)
-        else {"decision": "allowed", "flags": []}
-    )
-    freshness = str(
-        base_task.get("freshness_requirement")
-        or ("recent" if "current" in original_question.lower() else "any")
-    )
-    return {
-        "task_id": task_id,
-        "angle_id": angle_id,
-        "query": f"{original_question} {angle_title} {focus}",
-        "route": route,
-        "freshness_requirement": freshness,
-        "source_policy": source_policy,
-        "expected_source_types": _string_list(angle.get("expected_source_types"))
-        or _string_list(base_task.get("expected_source_types"))
-        or ["official documentation", "primary sources"],
-        "expected_visual_targets": (
-            _string_list(angle.get("expected_visual_targets"))
-            if route != "text_only"
-            else []
-        ),
-        "expected_artifacts": _ordered_unique(
-            [
-                *_string_list(angle.get("expected_artifacts")),
-                f"{angle_title} {focus} notes",
-            ]
-        ),
-        "success_criteria": _ordered_unique(
-            [
-                *_string_list(angle.get("success_criteria")),
-                f"Task findings must directly address {original_question}.",
-                "Use source-backed evidence and record caveats, conflicts, or unknowns.",
-            ]
-        ),
-        "max_results": base_task.get("max_results", 8),
-        "max_sources": max_sources,
-        "max_images": max_images,
-        "done_condition": (
-            "Stop when this bounded task has source-backed findings, evidence "
-            "metadata, caveats, and unresolved items marked unknown."
-        ),
-    }
-
-
 def _candidate_next_task_id(existing_task_ids: set[str]) -> str:
     index = 1
     while f"task_semantic_{index:03d}" in existing_task_ids:
         index += 1
     return f"task_semantic_{index:03d}"
-
-
-def _candidate_broad_task_focus(sequence: int) -> str:
-    focuses = (
-        "official documentation baseline",
-        "current behavior constraints",
-        "migration hazard evidence",
-        "version caveat cross-check",
-        "remediation evidence",
-        "counter-evidence review",
-        "implementation boundary check",
-        "synthesis readiness check",
-    )
-    return focuses[(sequence - 1) % len(focuses)]
 
 
 def _candidate_add_angle_coverage(
@@ -2580,7 +2638,10 @@ def _candidate_req003_comparison_task_score(text: str) -> int:
 
 
 def _candidate_task_count_ceiling(candidate: Mapping[str, Any]) -> int:
-    return 40 if str(candidate.get("question_scope") or "") == "broad" else 12
+    scope = str(candidate.get("question_scope") or "")
+    if scope in SEMANTIC_SCOPE_TIERS:
+        return SEMANTIC_SCOPE_TIERS[scope]["max_tasks"]
+    return SEMANTIC_SCOPE_TIERS["narrow"]["max_tasks"]
 
 
 def _candidate_req003_append_comparison_task(
@@ -5069,11 +5130,18 @@ def _codex_semantic_retry_raw_request(
         "The previous Codex semantic candidate did not pass release validation. "
         "Generate a fresh semantic decomposition that fixes these failure codes "
         f"without lowering any release gate: {', '.join(failure_codes) or 'unknown'}. "
-        "For broad questions, return 5 to 8 distinct semantic angles and 20 to 40 "
-        "bounded tasks, with at least 2 bounded_tasks assigned to every angle_id. "
+        "Stay within the locked semantic expectation oracle: do not add non-oracle "
+        "topics, do not use generic suffix padding, and decompose only meaningful "
+        "bounded tasks. For broad questions, first try to return 5 to 8 distinct "
+        "semantic angles and 20 to 40 bounded tasks, with at least 2 bounded_tasks "
+        "assigned to every angle_id. "
         "If `broad_angle_has_too_few_tasks` appears, repair the per-angle task "
         "distribution by adding or reassigning specific bounded tasks so each broad "
-        "angle has at least 2 tasks while the total remains 20 to 40. Preserve the "
+        "angle has at least 2 tasks while the total remains 20 to 40; never add "
+        "generic checklist, lens, or suffix-only tasks. If broad cardinality still "
+        "cannot be met without non-oracle topics, keep the meaningful oracle-bounded "
+        "decomposition and let validation record an explicit medium/narrow scope "
+        "downgrade after coverage is proven complete. Preserve the "
         "user's domain, modality, source-quality, "
         f"geography/time, and deliverable requirements. {visual_guidance}"
         f"{semantic_angle_guidance}"
@@ -5224,13 +5292,17 @@ def _semantic_repair_guidance_for_codes(
     if code_set & {
         "broad_question_angle_count_out_of_range",
         "broad_question_task_count_out_of_range",
+        "broad_cardinality_replan_required",
     }:
         guidance.append(
-            " If a broad-question count failure appears, repair by preserving the "
-            "question as broad and returning 5-8 prompt-specific semantic angles "
-            "and 20-40 executable bounded tasks. Do not relabel a broad software, "
-            "architecture, migration, testing, comparison, official-source, or "
-            "current-docs investigation as narrow."
+            " If a broad-question count failure appears, retry through semantic "
+            "decomposition inside the locked oracle. Add only prompt-specific, "
+            "oracle-backed angles/tasks; do not pad with generic suffixes, checklist "
+            "lenses, non-oracle topics, or copied angle titles. If meaningful "
+            "decomposition remains below broad thresholds after retry and all "
+            "oracle requirements are covered, keep the bounded decomposition for "
+            "an explicit medium/narrow scope downgrade diagnostic instead of "
+            "silently relabeling the question."
         )
     if visual_preference == "visual_optional" and not provided_images:
         guidance.append(
@@ -6393,7 +6465,9 @@ def _semantic_adapter_prompt(role_label: str) -> str:
             "req_005 exactly once, in order. Mark each coverage_status covered and cover every id "
             "with at least one angle and one task. For broad questions produce 5 to 8 angles and "
             "20 to 40 bounded_tasks; every angle must have at least two executable bounded_tasks. "
-            "For narrow questions produce 6 to 12 bounded_tasks. Every bounded_task must have "
+            "For medium questions produce 3 to 6 angles and 10 to 19 bounded_tasks. "
+            "For narrow questions produce 2 to 4 angles and 6 to 12 bounded_tasks. "
+            "Every bounded_task must have "
             "max_sources as an integer from 1 to 5. Text-only tasks must have max_images=0. "
             "Visual-required or visual-optional tasks must have max_images from 1 to 3 and "
             "non-empty expected_visual_targets. "
@@ -6422,8 +6496,8 @@ def _semantic_adapter_prompt(role_label: str) -> str:
             "include req_001 through req_005 exactly once, in order. Capture explicit and justified "
             "inferred requirements, including source-quality needs, modality needs, geography/time "
             "constraints, report shape, forbidden drift, and expected task range. For broad questions "
-            "set bounded_task_range min at least 20 and max at most 40; for narrow questions set min "
-            "at least 6 and max at most 12."
+            "set bounded_task_range min at least 20 and max at most 40; for medium questions set min "
+            "at least 10 and max at most 19; for narrow questions set min at least 6 and max at most 12."
         )
     if role_label == "semantic reviewer":
         return (
@@ -6435,6 +6509,10 @@ def _semantic_adapter_prompt(role_label: str) -> str:
             "tasks. Require all req_001 through req_005 non-negotiable requirements to be covered by "
             "valid angle ids and task ids. Require broad plans to have 5-8 angles, 20-40 bounded tasks, "
             "at least two tasks per angle, and no task query that merely copies an angle title. Require "
+            "medium plans to have 3-6 angles and 10-19 bounded tasks. Require narrow plans to have "
+            "2-4 angles and 6-12 bounded tasks. Require broad-looking plans that finish as medium or "
+            "narrow to include explicit scope_downgrade evidence proving retry, oracle coverage, and "
+            "no generic task padding. Require "
             "every bounded task to have max_sources 1-5 and visual tasks to have max_images 1-3 with "
             "concrete visual targets. Return semantic_fit_score >=9 and verdict pass only when there are "
             "no blockers and non_negotiable_coverage_complete is true."
@@ -6479,7 +6557,7 @@ def _semantic_oracle_raw_request(
         ],
         "response_schema_shape": {
             "oracle_requirement_map": "list",
-            "question_scope": "broad|narrow",
+            "question_scope": "broad|medium|narrow",
             "bounded_task_range": "object",
             "expected_entities": "list",
             "expected_constraints": "list",
@@ -6759,6 +6837,8 @@ def _bounded_task_range(scope: str, depth_preset: str) -> dict[str, Any]:
         if depth_preset == "exhaustive":
             return {"min": 80, "max": 100, "depth_preset": depth_preset}
         return {"min": 20, "max": 40, "depth_preset": depth_preset}
+    if scope == "medium":
+        return {"min": 10, "max": 19, "depth_preset": depth_preset}
     return {"min": 6, "max": 12, "depth_preset": depth_preset}
 
 
@@ -6968,6 +7048,9 @@ def _semantic_plan_review_from_raw_response(
     review["raw_response_artifact_hash"] = raw_response_hash
     review["raw_response_hash"] = raw_response_hash
     review["question_scope"] = _question_scope(question, plan)
+    review["scope_downgrade"] = (
+        dict(plan.scope_downgrade) if isinstance(plan.scope_downgrade, Mapping) else None
+    )
     review["template_use"] = _template_use(plan)
     review["parsed_response_hash"] = _sha256_text(
         json.dumps(adapter_review or deterministic, sort_keys=True, ensure_ascii=True)
@@ -8934,33 +9017,150 @@ def validate_semantic_candidate_plan(
         requirements=requirements,
     )
     expected_needs = _candidate_validation_expected_needs(plan=plan, angles=angles)
-    effective_broad_question = _effective_broad_question(
+    valid_scope_downgrade = _valid_candidate_scope_downgrade(
+        plan=plan,
+        angles=angles,
+        tasks=tasks,
+        requirements=requirements,
+    )
+    locked_oracle_alignment_payload = _candidate_locked_oracle_alignment_payload(plan)
+    valid_locked_oracle_alignment = _valid_candidate_locked_oracle_scope_alignment(
+        plan=plan,
+        angles=angles,
+        tasks=tasks,
+        requirements=requirements,
+    )
+    effective_broad_question = _candidate_effective_broad_question(
+        plan=plan,
+        angles=angles,
+        tasks=tasks,
+        requirements=requirements,
         question_class=candidate_question_class,
         expected_needs=expected_needs,
-        declared_broad=scope == "broad",
     )
-    if effective_broad_question and not (5 <= len(angles) <= 8):
+    if scope not in SEMANTIC_SCOPE_TIERS:
         failures.append(
             {
-                "code": "broad_question_angle_count_out_of_range",
+                "code": "question_scope_unknown",
+                "declared_question_scope": scope,
+                "allowed_question_scopes": sorted(SEMANTIC_SCOPE_TIERS),
+            }
+        )
+    if locked_oracle_alignment_payload and not valid_locked_oracle_alignment:
+        failures.append(
+            {
+                "code": "locked_oracle_scope_alignment_failed",
+                "declared_question_scope": scope,
+                "locked_question_scope": locked_oracle_alignment_payload.get(
+                    "locked_question_scope"
+                ),
+                "alignment_status": locked_oracle_alignment_payload.get("status"),
+                "oracle_coverage_complete": locked_oracle_alignment_payload.get(
+                    "oracle_coverage_complete"
+                ),
+                "counts_fit_locked_scope": locked_oracle_alignment_payload.get(
+                    "counts_fit_locked_scope"
+                ),
+                "message": (
+                    "Candidate scope/counts do not match the locked semantic "
+                    "expectation oracle."
+                ),
+            }
+        )
+    if (
+        scope in {"medium", "narrow"}
+        and not valid_scope_downgrade
+        and not valid_locked_oracle_alignment
+        and _effective_broad_question(
+            question_class=candidate_question_class,
+            expected_needs=expected_needs,
+            declared_broad=False,
+        )
+    ):
+        failures.append(
+            {
+                "code": "hidden_scope_downgrade_without_diagnostics",
+                "declared_question_scope": scope,
+                "question_class": candidate_question_class,
+                "message": (
+                    "Broad-looking candidates may only finish as medium/narrow "
+                    "after a retry with explicit scope_downgrade diagnostics."
+                ),
+            }
+        )
+    if effective_broad_question and not _candidate_counts_fit_scope(
+        "broad",
+        angles=angles,
+        tasks=tasks,
+    ):
+        broad_tier = SEMANTIC_SCOPE_TIERS["broad"]
+        if not (
+            broad_tier["min_angles"] <= len(angles) <= broad_tier["max_angles"]
+        ):
+            failures.append(
+                {
+                    "code": "broad_question_angle_count_out_of_range",
+                    "declared_question_scope": scope,
+                    "question_class": candidate_question_class,
+                    "angle_count": len(angles),
+                    "expected_evidence_needs": expected_needs,
+                    "retryable": True,
+                }
+            )
+        if not (
+            broad_tier["min_tasks"] <= len(tasks) <= broad_tier["max_tasks"]
+        ):
+            failures.append(
+                {
+                    "code": "broad_question_task_count_out_of_range",
+                    "declared_question_scope": scope,
+                    "question_class": candidate_question_class,
+                    "task_count": len(tasks),
+                    "expected_evidence_needs": expected_needs,
+                    "retryable": True,
+                }
+            )
+        failures.append(
+            {
+                "code": "broad_cardinality_replan_required",
                 "declared_question_scope": scope,
                 "question_class": candidate_question_class,
                 "angle_count": len(angles),
-                "expected_evidence_needs": expected_needs,
-            }
-        )
-    if effective_broad_question and not (20 <= len(tasks) <= 40):
-        failures.append(
-            {
-                "code": "broad_question_task_count_out_of_range",
-                "declared_question_scope": scope,
-                "question_class": candidate_question_class,
                 "task_count": len(tasks),
                 "expected_evidence_needs": expected_needs,
+                "message": (
+                    "Broad cardinality shortfall must be repaired by semantic "
+                    "adapter replan inside the locked oracle; generic padding is forbidden."
+                ),
+                "retryable": True,
             }
         )
-    if not effective_broad_question and scope == "narrow" and tasks and not (6 <= len(tasks) <= 12):
-        failures.append({"code": "narrow_task_count_out_of_range"})
+    if not effective_broad_question and scope in {"medium", "narrow"}:
+        tier = SEMANTIC_SCOPE_TIERS[scope]
+        if not (tier["min_angles"] <= len(angles) <= tier["max_angles"]):
+            failures.append(
+                {
+                    "code": f"{scope}_angle_count_out_of_range",
+                    "declared_question_scope": scope,
+                    "angle_count": len(angles),
+                    "required_angle_range": [
+                        tier["min_angles"],
+                        tier["max_angles"],
+                    ],
+                }
+            )
+        if tasks and not (tier["min_tasks"] <= len(tasks) <= tier["max_tasks"]):
+            failures.append(
+                {
+                    "code": f"{scope}_task_count_out_of_range",
+                    "declared_question_scope": scope,
+                    "task_count": len(tasks),
+                    "required_task_range": [
+                        tier["min_tasks"],
+                        tier["max_tasks"],
+                    ],
+                }
+            )
     angle_ids = {str(angle.get("angle_id") or "") for angle in angles}
     task_ids = {str(task.get("task_id") or "") for task in tasks}
     executable_text = _candidate_executable_text(angles=angles, tasks=tasks)
@@ -9113,6 +9313,17 @@ def validate_semantic_candidate_plan(
                     {
                         "code": "broad_angle_has_too_few_tasks",
                         "angle_id": angle_id,
+                    }
+                )
+    elif scope in {"medium", "narrow"}:
+        tier = SEMANTIC_SCOPE_TIERS[scope]
+        for angle_id in angle_ids:
+            if tasks_per_angle[angle_id] < tier["min_tasks_per_angle"]:
+                failures.append(
+                    {
+                        "code": f"{scope}_angle_has_too_few_tasks",
+                        "angle_id": angle_id,
+                        "minimum_tasks_per_angle": tier["min_tasks_per_angle"],
                     }
                 )
     required_angle_fields = (
@@ -9480,15 +9691,31 @@ def validate_semantic_candidate_plan(
         for requirement in requirements
     )
     if official_required:
+        official_source_tokens = (
+            "official",
+            "regulatory",
+            "primary",
+            "\uacf5\uc2dd",
+            "\uaddc\uc81c",
+            "\uc815\ubd80",
+            "\uc6d0\ubb38",
+            "\uc77c\ucc28",
+        )
         official_tasks = [
             task
             for task in tasks
             if any(
                 token in " ".join(_string_list(task.get("expected_source_types"))).lower()
-                for token in ("official", "regulatory", "primary")
+                for token in official_source_tokens
             )
-            or "official" in json.dumps(task.get("source_policy"), sort_keys=True).lower()
-            or "regulatory" in json.dumps(task.get("source_policy"), sort_keys=True).lower()
+            or any(
+                token in json.dumps(
+                    task.get("source_policy"),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).lower()
+                for token in official_source_tokens
+            )
         ]
         if not official_tasks:
             failures.append({"code": "official_source_requirement_missing"})
@@ -9497,7 +9724,7 @@ def validate_semantic_candidate_plan(
             for task in tasks
             if any(
                 token in " ".join(_string_list(task.get("success_criteria"))).lower()
-                for token in ("official", "regulatory", "primary", "\uacf5\uc2dd", "\uaddc\uc81c")
+                for token in official_source_tokens
             )
         ]
         if not official_success_tasks:
@@ -9507,6 +9734,19 @@ def validate_semantic_candidate_plan(
         "planner_mode": plan.get("planner_mode"),
         "semantic_release_eligible": bool(plan.get("semantic_release_eligible")),
         "declared_question_scope": scope,
+        "scope_tier": scope if scope in SEMANTIC_SCOPE_TIERS else "unknown",
+        "scope_downgrade": (
+            dict(_candidate_scope_downgrade_payload(plan) or {})
+            if _candidate_scope_downgrade_payload(plan)
+            else None
+        ),
+        "scope_downgrade_valid": valid_scope_downgrade,
+        LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC: (
+            dict(locked_oracle_alignment_payload)
+            if locked_oracle_alignment_payload
+            else None
+        ),
+        "locked_oracle_scope_alignment_valid": valid_locked_oracle_alignment,
         "effective_broad_question": effective_broad_question,
         "question_class": candidate_question_class,
         "expected_evidence_needs": expected_needs,
@@ -9928,6 +10168,379 @@ def _candidate_validation_expected_needs(
     )
 
 
+def _candidate_retry_attempt(raw_request: Mapping[str, Any] | None) -> int:
+    if not isinstance(raw_request, Mapping):
+        return 0
+    for field in ("retry_attempt", "semantic_convergence_attempt"):
+        value = raw_request.get(field)
+        if isinstance(value, bool):
+            continue
+        try:
+            attempt = int(value)
+        except (TypeError, ValueError):
+            continue
+        if attempt > 0:
+            return attempt
+    return 0
+
+
+def _candidate_counts_fit_scope(
+    scope: str,
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    tier = SEMANTIC_SCOPE_TIERS.get(scope)
+    if tier is None:
+        return False
+    angle_count = len(angles)
+    task_count = len(tasks)
+    if not (tier["min_angles"] <= angle_count <= tier["max_angles"]):
+        return False
+    if not (tier["min_tasks"] <= task_count <= tier["max_tasks"]):
+        return False
+    tasks_per_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
+    for angle in angles:
+        angle_id = str(angle.get("angle_id") or "")
+        if tasks_per_angle[angle_id] < tier["min_tasks_per_angle"]:
+            return False
+    return True
+
+
+def _candidate_scope_tier_for_counts(
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    allowed_scopes: Sequence[str] = ("broad", "medium", "narrow"),
+) -> str | None:
+    for scope in allowed_scopes:
+        if _candidate_counts_fit_scope(scope, angles=angles, tasks=tasks):
+            return scope
+    return None
+
+
+def _candidate_locked_oracle_scope_contract(
+    raw_request: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(raw_request, Mapping):
+        return None
+    locked_oracle = raw_request.get("locked_semantic_expectation_oracle")
+    if not isinstance(locked_oracle, Mapping):
+        return None
+    scope = str(locked_oracle.get("question_scope") or "").strip()
+    tier = SEMANTIC_SCOPE_TIERS.get(scope)
+    if tier is None:
+        return None
+    bounded_range = (
+        locked_oracle.get("bounded_task_range")
+        if isinstance(locked_oracle.get("bounded_task_range"), Mapping)
+        else {}
+    )
+    min_tasks = _semantic_task_source_cap_int(bounded_range.get("min"))
+    max_tasks = _semantic_task_source_cap_int(bounded_range.get("max"))
+    if min_tasks is None or min_tasks <= 0:
+        min_tasks = tier["min_tasks"]
+    if max_tasks is None or max_tasks < min_tasks:
+        max_tasks = tier["max_tasks"]
+    return {
+        "question_scope": scope,
+        "bounded_task_range": {
+            "min": min_tasks,
+            "max": max_tasks,
+            "depth_preset": bounded_range.get("depth_preset"),
+        },
+        "angle_count_range": {
+            "min": tier["min_angles"],
+            "max": tier["max_angles"],
+        },
+        "min_tasks_per_angle": tier["min_tasks_per_angle"],
+    }
+
+
+def _candidate_counts_fit_locked_oracle_scope(
+    locked_oracle_scope: Mapping[str, Any],
+    *,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    scope = str(
+        locked_oracle_scope.get("question_scope")
+        or locked_oracle_scope.get("locked_question_scope")
+        or ""
+    )
+    tier = SEMANTIC_SCOPE_TIERS.get(scope)
+    if tier is None:
+        return False
+    angle_range = (
+        locked_oracle_scope.get("angle_count_range")
+        if isinstance(locked_oracle_scope.get("angle_count_range"), Mapping)
+        else {}
+    )
+    min_angles = _semantic_task_source_cap_int(angle_range.get("min"))
+    max_angles = _semantic_task_source_cap_int(angle_range.get("max"))
+    if min_angles is None or min_angles <= 0:
+        min_angles = tier["min_angles"]
+    if max_angles is None or max_angles < min_angles:
+        max_angles = tier["max_angles"]
+    bounded_range = (
+        locked_oracle_scope.get("bounded_task_range")
+        if isinstance(locked_oracle_scope.get("bounded_task_range"), Mapping)
+        else {}
+    )
+    min_tasks = _semantic_task_source_cap_int(bounded_range.get("min"))
+    max_tasks = _semantic_task_source_cap_int(bounded_range.get("max"))
+    if min_tasks is None or min_tasks <= 0:
+        min_tasks = tier["min_tasks"]
+    if max_tasks is None or max_tasks < min_tasks:
+        max_tasks = tier["max_tasks"]
+    if not (min_angles <= len(angles) <= max_angles):
+        return False
+    if not (min_tasks <= len(tasks) <= max_tasks):
+        return False
+    min_tasks_per_angle = _semantic_task_source_cap_int(
+        locked_oracle_scope.get("min_tasks_per_angle")
+    )
+    if min_tasks_per_angle is None or min_tasks_per_angle <= 0:
+        min_tasks_per_angle = tier["min_tasks_per_angle"]
+    tasks_per_angle = Counter(str(task.get("angle_id") or "") for task in tasks)
+    for angle in angles:
+        angle_id = str(angle.get("angle_id") or "")
+        if tasks_per_angle[angle_id] < min_tasks_per_angle:
+            return False
+    return True
+
+
+def _candidate_locked_oracle_alignment_record(
+    locked_oracle_scope: Mapping[str, Any],
+    *,
+    status: str,
+    question_class: str,
+    expected_needs: Sequence[str],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    oracle_coverage_complete: bool,
+    counts_fit_locked_scope: bool,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "question_scope": str(locked_oracle_scope.get("question_scope") or ""),
+        "locked_question_scope": str(locked_oracle_scope.get("question_scope") or ""),
+        "angle_count": len(angles),
+        "task_count": len(tasks),
+        "bounded_task_range": dict(
+            locked_oracle_scope.get("bounded_task_range")
+            if isinstance(locked_oracle_scope.get("bounded_task_range"), Mapping)
+            else {}
+        ),
+        "angle_count_range": dict(
+            locked_oracle_scope.get("angle_count_range")
+            if isinstance(locked_oracle_scope.get("angle_count_range"), Mapping)
+            else {}
+        ),
+        "min_tasks_per_angle": locked_oracle_scope.get("min_tasks_per_angle"),
+        "oracle_coverage_complete": oracle_coverage_complete,
+        "counts_fit_locked_scope": counts_fit_locked_scope,
+        "question_class": question_class,
+        "expected_evidence_needs": list(expected_needs),
+        "broad_cardinality_promotion_allowed": False,
+    }
+
+
+def _candidate_locked_oracle_alignment_payload(
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    diagnostics = plan.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    payload = diagnostics.get(LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC)
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _valid_candidate_locked_oracle_scope_alignment(
+    *,
+    plan: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+) -> bool:
+    payload = _candidate_locked_oracle_alignment_payload(plan)
+    if not isinstance(payload, Mapping):
+        return False
+    locked_scope = str(payload.get("locked_question_scope") or "")
+    if locked_scope not in {"medium", "narrow"}:
+        return False
+    if str(plan.get("question_scope") or "") != locked_scope:
+        return False
+    if payload.get("status") != "honored_locked_oracle_scope":
+        return False
+    if payload.get("oracle_coverage_complete") is not True:
+        return False
+    if payload.get("counts_fit_locked_scope") is not True:
+        return False
+    if not _candidate_counts_fit_locked_oracle_scope(
+        payload,
+        angles=angles,
+        tasks=tasks,
+    ):
+        return False
+    return _candidate_requirement_coverage_complete(
+        requirements=requirements,
+        angles=angles,
+        tasks=tasks,
+    )
+
+
+def _candidate_requirement_coverage_complete(
+    *,
+    requirements: Sequence[Mapping[str, Any]],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    if not requirements:
+        return False
+    angle_ids = {str(angle.get("angle_id") or "") for angle in angles}
+    task_ids = {str(task.get("task_id") or "") for task in tasks}
+    for requirement in requirements:
+        if requirement.get("coverage_status") != "covered":
+            return False
+        covered_angles = set(_string_list(requirement.get("covered_by_angle_ids")))
+        covered_tasks = set(_string_list(requirement.get("covered_by_task_ids")))
+        if not covered_angles or not covered_tasks:
+            return False
+        if not covered_angles <= angle_ids or not covered_tasks <= task_ids:
+            return False
+    return True
+
+
+def _candidate_scope_downgrade_record(
+    *,
+    previous_scope: Any,
+    target_scope: str,
+    retry_attempt: int,
+    question_class: str,
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    broad_tier = SEMANTIC_SCOPE_TIERS["broad"]
+    target_tier = SEMANTIC_SCOPE_TIERS[target_scope]
+    return {
+        "status": SEMANTIC_SCOPE_DOWNGRADE_STATUS,
+        "diagnostic_code": "broad_cardinality_downgraded_after_semantic_retry",
+        "from_scope": "broad",
+        "previous_declared_scope": str(previous_scope or ""),
+        "to_scope": target_scope,
+        "reason": (
+            "Semantic adapter retry stayed within the locked oracle and produced "
+            "complete, meaningful decomposition below broad cardinality."
+        ),
+        "retry_attempt": retry_attempt,
+        "oracle_coverage_complete": True,
+        "non_negotiable_coverage_complete": True,
+        "generic_padding_added": False,
+        "non_oracle_topics_added": False,
+        "question_class": question_class,
+        "angle_count": len(angles),
+        "task_count": len(tasks),
+        "requirement_count": len(requirements),
+        "broad_required_angle_range": [
+            broad_tier["min_angles"],
+            broad_tier["max_angles"],
+        ],
+        "broad_required_task_range": [
+            broad_tier["min_tasks"],
+            broad_tier["max_tasks"],
+        ],
+        "final_scope_angle_range": [
+            target_tier["min_angles"],
+            target_tier["max_angles"],
+        ],
+        "final_scope_task_range": [
+            target_tier["min_tasks"],
+            target_tier["max_tasks"],
+        ],
+        "final_scope_min_tasks_per_angle": target_tier["min_tasks_per_angle"],
+    }
+
+
+def _candidate_scope_downgrade_payload(plan: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    payload = plan.get("scope_downgrade")
+    if isinstance(payload, Mapping):
+        return payload
+    diagnostics = plan.get("diagnostics")
+    if isinstance(diagnostics, Mapping) and isinstance(
+        diagnostics.get("scope_downgrade"), Mapping
+    ):
+        return diagnostics["scope_downgrade"]
+    return None
+
+
+def _valid_candidate_scope_downgrade(
+    *,
+    plan: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+) -> bool:
+    payload = _candidate_scope_downgrade_payload(plan)
+    if not isinstance(payload, Mapping):
+        return False
+    target_scope = str(payload.get("to_scope") or "")
+    if target_scope not in {"medium", "narrow"}:
+        return False
+    if str(plan.get("question_scope") or "") != target_scope:
+        return False
+    if payload.get("status") != SEMANTIC_SCOPE_DOWNGRADE_STATUS:
+        return False
+    if str(payload.get("from_scope") or "") != "broad":
+        return False
+    if payload.get("oracle_coverage_complete") is not True:
+        return False
+    if payload.get("generic_padding_added") is not False:
+        return False
+    if payload.get("non_oracle_topics_added") is not False:
+        return False
+    if _candidate_retry_attempt(payload) < 2:
+        return False
+    if not _candidate_counts_fit_scope(target_scope, angles=angles, tasks=tasks):
+        return False
+    return _candidate_requirement_coverage_complete(
+        requirements=requirements,
+        angles=angles,
+        tasks=tasks,
+    )
+
+
+def _candidate_effective_broad_question(
+    *,
+    plan: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    requirements: Sequence[Mapping[str, Any]],
+    question_class: str,
+    expected_needs: Sequence[str],
+) -> bool:
+    if _valid_candidate_scope_downgrade(
+        plan=plan,
+        angles=angles,
+        tasks=tasks,
+        requirements=requirements,
+    ):
+        return False
+    if _valid_candidate_locked_oracle_scope_alignment(
+        plan=plan,
+        angles=angles,
+        tasks=tasks,
+        requirements=requirements,
+    ):
+        return False
+    return _effective_broad_question(
+        question_class=question_class,
+        expected_needs=expected_needs,
+        declared_broad=str(plan.get("question_scope") or "") == "broad",
+    )
+
+
 def _effective_broad_question(
     *,
     question_class: str,
@@ -9988,7 +10601,7 @@ def _codex_semantic_raw_request(
             "intent_summary": "string",
             "domain_entities": "list",
             "constraints": "list",
-            "question_scope": "broad|narrow",
+            "question_scope": "broad|medium|narrow",
             "decomposition_strategy": "string",
             "requirement_coverage_map": "list",
             "negative_scope": "list",
@@ -11712,6 +12325,7 @@ def write_semantic_integrity_artifacts(
     review_payload.setdefault("planner_mode", plan.planner_mode)
     review_payload.setdefault("semantic_release_eligible", plan.semantic_release_eligible)
     review_payload.setdefault("question_scope", base["question_scope"])
+    review_payload.setdefault("scope_downgrade", base.get("scope_downgrade"))
     review_payload.setdefault(
         "raw_request_path",
         review_payload.get("reviewer_raw_request_path") or base["raw_request_path"],
@@ -12834,10 +13448,50 @@ def semantic_planner_validation(
     angles = _semantic_angles_from_evidence(evidence)
     if not expected_needs:
         expected_needs = _expected_needs_for_class(question_class, angles)
-    broad_question = _effective_broad_question(
+    scope = str(planner_metadata.get("question_scope") or "")
+    scope_task_records = [
+        dict(task)
+        for task in (
+            tasks
+            if tasks is not None
+            else (
+                planner_metadata.get("bounded_tasks")
+                if isinstance(planner_metadata.get("bounded_tasks"), list)
+                else []
+            )
+        )
+        if isinstance(task, Mapping)
+    ]
+    scope_requirements = [
+        dict(requirement)
+        for requirement in _list(planner_metadata.get("requirement_coverage_map"))
+        if isinstance(requirement, Mapping)
+    ]
+    scope_downgrade_payload = _candidate_scope_downgrade_payload(planner_metadata)
+    scope_downgrade_valid = _valid_candidate_scope_downgrade(
+        plan=planner_metadata,
+        angles=angles,
+        tasks=scope_task_records,
+        requirements=scope_requirements,
+    )
+    locked_oracle_alignment_payload = _candidate_locked_oracle_alignment_payload(
+        planner_metadata
+    )
+    locked_oracle_alignment_valid = _valid_candidate_locked_oracle_scope_alignment(
+        plan=planner_metadata,
+        angles=angles,
+        tasks=scope_task_records,
+        requirements=scope_requirements,
+    )
+    inferred_broad_question = _effective_broad_question(
         question_class=question_class,
         expected_needs=expected_needs,
         declared_broad=bool(planner_metadata.get("broad_question")),
+    )
+    broad_question = (
+        False
+        if scope_downgrade_valid or locked_oracle_alignment_valid
+        else inferred_broad_question
     )
 
     route_counts = Counter(str(angle.get("route") or "text_only") for angle in angles)
@@ -12872,6 +13526,58 @@ def semantic_planner_validation(
         visual_hits=visual_hits,
         report_angle_claim_counts=report_angle_claim_counts,
     )
+    if scope_downgrade_payload and not scope_downgrade_valid:
+        failures.append(
+            {
+                "code": "invalid_scope_downgrade_diagnostics",
+                "declared_question_scope": scope,
+                "message": (
+                    "scope_downgrade diagnostics must prove retry, complete oracle "
+                    "coverage, valid medium/narrow counts, and no generic padding."
+                ),
+            }
+        )
+    if locked_oracle_alignment_payload and not locked_oracle_alignment_valid:
+        failures.append(
+            {
+                "code": "locked_oracle_scope_alignment_failed",
+                "declared_question_scope": scope,
+                "locked_question_scope": locked_oracle_alignment_payload.get(
+                    "locked_question_scope"
+                ),
+                "alignment_status": locked_oracle_alignment_payload.get("status"),
+                "oracle_coverage_complete": locked_oracle_alignment_payload.get(
+                    "oracle_coverage_complete"
+                ),
+                "counts_fit_locked_scope": locked_oracle_alignment_payload.get(
+                    "counts_fit_locked_scope"
+                ),
+                "message": (
+                    "Semantic plan does not match the locked semantic expectation "
+                    "oracle scope."
+                ),
+            }
+        )
+    if (
+        scope in {"medium", "narrow"}
+        and not scope_downgrade_valid
+        and not locked_oracle_alignment_valid
+        and _effective_broad_question(
+            question_class=question_class,
+            expected_needs=expected_needs,
+            declared_broad=False,
+        )
+    ):
+        failures.append(
+            {
+                "code": "hidden_scope_downgrade_without_diagnostics",
+                "declared_question_scope": scope,
+                "message": (
+                    "Medium/narrow release artifacts cannot hide a broad semantic "
+                    "cardinality downgrade."
+                ),
+            }
+        )
     task_count = len(task_records)
     near_duplicate_ratio = _ratio(len(near_duplicate_records), task_count)
     generic_lens_ratio = _ratio(len(generic_lens_records), task_count)
@@ -12921,6 +13627,17 @@ def semantic_planner_validation(
         "semantic_status": semantic_status,
         "question_class": question_class,
         "broad_question": broad_question,
+        "scope_tier": scope if scope in SEMANTIC_SCOPE_TIERS else "unknown",
+        "scope_downgrade": (
+            dict(scope_downgrade_payload) if scope_downgrade_payload else None
+        ),
+        "scope_downgrade_valid": scope_downgrade_valid,
+        LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC: (
+            dict(locked_oracle_alignment_payload)
+            if locked_oracle_alignment_payload
+            else None
+        ),
+        "locked_oracle_scope_alignment_valid": locked_oracle_alignment_valid,
         "angle_count": len(angles),
         "route_counts": dict(sorted(route_counts.items())),
         "evidence_need_counts": dict(sorted(evidence_need_counts.items())),
@@ -13972,6 +14689,7 @@ def _question_scope(question: str, plan: SemanticPlan) -> dict[str, Any]:
         "question_class": plan.question_class,
         "planner_mode": plan.planner_mode,
         "angle_count": len(plan.angles),
+        "scope_tier": plan.question_scope,
     }
 
 
@@ -14030,6 +14748,9 @@ def _integrity_base_payload(
         "semantic_release_eligible": plan.semantic_release_eligible,
         "status": plan.status,
         "question_scope": _question_scope(question, plan),
+        "scope_downgrade": (
+            dict(plan.scope_downgrade) if isinstance(plan.scope_downgrade, Mapping) else None
+        ),
         "raw_request_path": str(raw_request_path),
         "raw_response_path": str(raw_response_path),
         "raw_request_hash": raw_request_hash,
