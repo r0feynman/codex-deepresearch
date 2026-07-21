@@ -88,7 +88,7 @@ class PublicBetaValidationTests(unittest.TestCase):
     def semantic_scope_downgrade_release_artifacts(
         self,
         *,
-        final_candidate_hash: str = "a" * 64,
+        final_candidate_hash: str | None = None,
         adapter_candidate_hash: str = "d" * 64,
         retry_request_hash: str = "b" * 64,
     ) -> dict[str, dict[str, Any]]:
@@ -125,6 +125,38 @@ class PublicBetaValidationTests(unittest.TestCase):
                 start=1,
             )
         ]
+        semantic_plan_payload = {
+            "question_scope": "medium",
+            "original_question": "Compare official city planning agency indicators.",
+            "planner_provenance": {
+                "raw_request_hash": retry_request_hash,
+                "adapter_request_hash": retry_request_hash,
+                "parsed_response_hash": adapter_candidate_hash,
+            },
+            "scope_downgrade": downgrade,
+            "angles": angles,
+            "bounded_tasks": tasks,
+            "requirement_coverage_map": [
+                {
+                    "requirement_id": "req_001",
+                    "coverage_status": "covered",
+                    "covered_by_angle_ids": [
+                        angle["angle_id"] for angle in angles
+                    ],
+                    "covered_by_task_ids": [
+                        task["task_id"] for task in tasks
+                    ],
+                }
+            ],
+        }
+        if final_candidate_hash is None:
+            final_candidate_hash = hashlib.sha256(
+                json.dumps(
+                    semantic_plan_payload,
+                    sort_keys=True,
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()
         return {
             "semantic_expectation_oracle": {
                 "question_scope": "broad",
@@ -145,30 +177,7 @@ class PublicBetaValidationTests(unittest.TestCase):
                     "adapter_request_hash": retry_request_hash,
                     "parsed_response_hash": adapter_candidate_hash,
                 },
-                "semantic_plan": {
-                    "question_scope": "medium",
-                    "original_question": "Compare official city planning agency indicators.",
-                    "planner_provenance": {
-                        "raw_request_hash": retry_request_hash,
-                        "adapter_request_hash": retry_request_hash,
-                        "parsed_response_hash": adapter_candidate_hash,
-                    },
-                    "scope_downgrade": downgrade,
-                    "angles": angles,
-                    "bounded_tasks": tasks,
-                    "requirement_coverage_map": [
-                        {
-                            "requirement_id": "req_001",
-                            "coverage_status": "covered",
-                            "covered_by_angle_ids": [
-                                angle["angle_id"] for angle in angles
-                            ],
-                            "covered_by_task_ids": [
-                                task["task_id"] for task in tasks
-                            ],
-                        }
-                    ],
-                },
+                "semantic_plan": semantic_plan_payload,
             },
             "semantic_planner_validation": {
                 "scope_downgrade_valid": True,
@@ -524,6 +533,51 @@ class PublicBetaValidationTests(unittest.TestCase):
         nested_plan = semantic_plan["semantic_plan"]
         nested_plan.pop("adapter_candidate_hash", None)
         nested_plan["planner_provenance"].pop("parsed_response_hash", None)
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any(
+                "lacks persisted semantic planner convergence retry evidence" in detail
+                for detail in details
+            ),
+            failures,
+        )
+
+    def test_semantic_scope_downgrade_release_requires_plan_retry_request_hash(
+        self,
+    ) -> None:
+        artifacts = self.semantic_scope_downgrade_release_artifacts()
+        semantic_plan = artifacts["semantic_plan"]
+        semantic_plan.pop("raw_request_hash", None)
+        semantic_plan.pop("adapter_request_hash", None)
+        semantic_plan["planner_provenance"].pop("raw_request_hash", None)
+        semantic_plan["planner_provenance"].pop("adapter_request_hash", None)
+        nested_plan = semantic_plan["semantic_plan"]
+        nested_plan["planner_provenance"].pop("raw_request_hash", None)
+        nested_plan["planner_provenance"].pop("adapter_request_hash", None)
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any(
+                "lacks persisted semantic planner convergence retry evidence" in detail
+                for detail in details
+            ),
+            failures,
+        )
+
+    def test_semantic_scope_downgrade_release_rejects_summary_only_final_hash(
+        self,
+    ) -> None:
+        artifacts = self.semantic_scope_downgrade_release_artifacts()
+        forged_hash = "e" * 64
+        artifacts["semantic_plan"]["reviewed_candidate_hash"] = forged_hash
+        artifacts["semantic_planner_convergence"]["final_selection"][
+            "candidate_hash"
+        ] = forged_hash
 
         failures = _semantic_scope_downgrade_release_failures(artifacts)
         details = [str(failure.get("detail") or "") for failure in failures]

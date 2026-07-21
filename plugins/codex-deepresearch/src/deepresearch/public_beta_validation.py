@@ -4771,9 +4771,8 @@ def _semantic_scope_downgrade_retry_evidence_valid(
     if accepted_attempt.get("final_selection") is not True:
         return False
     plan_candidate_hashes = _semantic_scope_downgrade_plan_candidate_hashes(artifacts)
-    if final_candidate_hash and plan_candidate_hashes:
-        if final_candidate_hash not in plan_candidate_hashes:
-            return False
+    if final_candidate_hash not in plan_candidate_hashes:
+        return False
     plan_adapter_hashes = _semantic_scope_downgrade_plan_adapter_candidate_hashes(
         artifacts
     )
@@ -4790,7 +4789,7 @@ def _semantic_scope_downgrade_retry_evidence_valid(
     if not retry_hash:
         return False
     plan_request_hashes = _semantic_scope_downgrade_plan_request_hashes(artifacts)
-    if plan_request_hashes and retry_hash not in plan_request_hashes:
+    if not plan_request_hashes or retry_hash not in plan_request_hashes:
         return False
     return _semantic_scope_downgrade_retry_attempt_successful(accepted_attempt)
 
@@ -4861,23 +4860,6 @@ def _semantic_scope_downgrade_plan_candidate_hashes(
     artifacts: Mapping[str, Mapping[str, Any]],
 ) -> set[str]:
     hashes: set[str] = set()
-    for artifact_name in (
-        "semantic_plan",
-        "semantic_planner_validation",
-        "semantic_plan_review",
-    ):
-        artifact = artifacts.get(artifact_name)
-        if not isinstance(artifact, Mapping):
-            continue
-        for field in (
-            "reviewed_candidate_hash",
-            "semantic_plan_candidate_hash",
-            "semantic_plan_candidate_artifact_hash",
-            "candidate_hash",
-        ):
-            value = str(artifact.get(field) or "").strip()
-            if _sha256_hex_string(value):
-                hashes.add(value)
     plan = artifacts.get("semantic_plan")
     nested_plan = (
         plan.get("semantic_plan")
