@@ -138,6 +138,114 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
+    def test_semantic_scope_downgrade_release_rejects_forged_validation_metadata(
+        self,
+    ) -> None:
+        forged_downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        artifacts = {
+            "semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {"min": 20, "max": 40},
+            },
+            "semantic_plan": {
+                "semantic_plan": {
+                    "question_scope": "medium",
+                    "angles": [],
+                    "bounded_tasks": [],
+                    "requirement_coverage_map": [],
+                }
+            },
+            "semantic_planner_validation": {
+                "scope_downgrade_valid": True,
+                "scope_downgrade": forged_downgrade,
+            },
+            "semantic_plan_review": {
+                "scope_downgrade": forged_downgrade,
+            },
+        }
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any("lacks a matching plan-level scope_downgrade" in detail for detail in details),
+            failures,
+        )
+
+    def test_semantic_scope_downgrade_release_recomputes_plan_counts_and_coverage(
+        self,
+    ) -> None:
+        downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        artifacts = {
+            "semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {"min": 20, "max": 40},
+            },
+            "semantic_plan": {
+                "semantic_plan": {
+                    "question_scope": "medium",
+                    "scope_downgrade": downgrade,
+                    "angles": [{"angle_id": "angle_001"}],
+                    "bounded_tasks": [],
+                    "requirement_coverage_map": [
+                        {
+                            "requirement_id": "req_001",
+                            "coverage_status": "covered",
+                            "covered_by_angle_ids": ["angle_001"],
+                            "covered_by_task_ids": ["task_missing"],
+                        }
+                    ],
+                }
+            },
+            "semantic_planner_validation": {
+                "scope_downgrade_valid": True,
+                "scope_downgrade": downgrade,
+            },
+            "semantic_plan_review": {
+                "scope_downgrade": downgrade,
+            },
+        }
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any("final angle/task counts do not fit medium scope" in detail for detail in details),
+            failures,
+        )
+        self.assertTrue(
+            any("requirement_coverage_map is incomplete" in detail for detail in details),
+            failures,
+        )
+
     def assert_semantic_artifact_integrity_failure(
         self,
         result: dict[str, Any],

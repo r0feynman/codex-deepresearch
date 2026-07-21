@@ -114,6 +114,7 @@ SEMANTIC_SCOPE_DOWNGRADE_STATUS = "oracle_bounded_semantic_scope_downgrade"
 LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC = (
     "locked_semantic_expectation_oracle_alignment"
 )
+BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC = "broad_locked_semantic_expectation_oracle_scope"
 ALLOWED_PLANNER_MODES = (
     PLANNER_MODE_CODEX_SEMANTIC,
     PLANNER_MODE_HEURISTIC_TEMPLATE_FALLBACK,
@@ -1078,6 +1079,13 @@ def codex_semantic_candidate_plan(
         diagnostics[LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC] = dict(
             candidate_diagnostics[LOCKED_ORACLE_SCOPE_ALIGNMENT_DIAGNOSTIC]
         )
+    if isinstance(
+        candidate_diagnostics.get(BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC),
+        Mapping,
+    ):
+        diagnostics[BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC] = dict(
+            candidate_diagnostics[BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC]
+        )
     if isinstance(candidate.get("scope_downgrade"), Mapping):
         diagnostics["scope_downgrade"] = dict(candidate["scope_downgrade"])
         diagnostics["user_visible_diagnostic"] = (
@@ -1863,6 +1871,19 @@ def _materialize_candidate_broad_cardinality(
         angles=angles,
     )
     locked_oracle_scope = _candidate_locked_oracle_scope_contract(raw_request)
+    if (
+        locked_oracle_scope is not None
+        and locked_oracle_scope["question_scope"] == "broad"
+    ):
+        diagnostics = (
+            dict(normalized.get("diagnostics"))
+            if isinstance(normalized.get("diagnostics"), Mapping)
+            else {}
+        )
+        diagnostics[BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC] = (
+            _candidate_locked_oracle_scope_record(locked_oracle_scope)
+        )
+        normalized["diagnostics"] = diagnostics
     if (
         locked_oracle_scope is not None
         and locked_oracle_scope["question_scope"] in {"medium", "narrow"}
@@ -9067,6 +9088,15 @@ def validate_semantic_candidate_plan(
                 ),
             }
         )
+    broad_locked_oracle_scope_payload = _candidate_broad_locked_oracle_scope_payload(plan)
+    broad_locked_oracle_violation = _candidate_broad_locked_oracle_scope_violation(
+        plan=plan,
+        angles=angles,
+        tasks=tasks,
+        valid_scope_downgrade=valid_scope_downgrade,
+    )
+    if broad_locked_oracle_violation:
+        failures.append(dict(broad_locked_oracle_violation))
     if (
         scope in {"medium", "narrow"}
         and not valid_scope_downgrade
@@ -9747,6 +9777,12 @@ def validate_semantic_candidate_plan(
             else None
         ),
         "locked_oracle_scope_alignment_valid": valid_locked_oracle_alignment,
+        BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC: (
+            dict(broad_locked_oracle_scope_payload)
+            if broad_locked_oracle_scope_payload
+            else None
+        ),
+        "broad_locked_oracle_scope_valid": not bool(broad_locked_oracle_violation),
         "effective_broad_question": effective_broad_question,
         "question_class": candidate_question_class,
         "expected_evidence_needs": expected_needs,
@@ -10356,6 +10392,38 @@ def _candidate_locked_oracle_alignment_payload(
     return payload if isinstance(payload, Mapping) else None
 
 
+def _candidate_broad_locked_oracle_scope_payload(
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    diagnostics = plan.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    payload = diagnostics.get(BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC)
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _candidate_locked_oracle_scope_record(
+    locked_oracle_scope: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": "broad_locked_oracle_scope_required",
+        "question_scope": str(locked_oracle_scope.get("question_scope") or ""),
+        "locked_question_scope": str(locked_oracle_scope.get("question_scope") or ""),
+        "bounded_task_range": dict(
+            locked_oracle_scope.get("bounded_task_range")
+            if isinstance(locked_oracle_scope.get("bounded_task_range"), Mapping)
+            else {}
+        ),
+        "angle_count_range": dict(
+            locked_oracle_scope.get("angle_count_range")
+            if isinstance(locked_oracle_scope.get("angle_count_range"), Mapping)
+            else {}
+        ),
+        "min_tasks_per_angle": locked_oracle_scope.get("min_tasks_per_angle"),
+        "broad_cardinality_promotion_allowed": False,
+    }
+
+
 def _valid_candidate_locked_oracle_scope_alignment(
     *,
     plan: Mapping[str, Any],
@@ -10388,6 +10456,45 @@ def _valid_candidate_locked_oracle_scope_alignment(
         angles=angles,
         tasks=tasks,
     )
+
+
+def _candidate_broad_locked_oracle_scope_violation(
+    *,
+    plan: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    valid_scope_downgrade: bool,
+) -> Mapping[str, Any] | None:
+    payload = _candidate_broad_locked_oracle_scope_payload(plan)
+    if not isinstance(payload, Mapping):
+        return None
+    locked_scope = str(
+        payload.get("locked_question_scope") or payload.get("question_scope") or ""
+    )
+    if locked_scope != "broad":
+        return None
+    declared_scope = str(plan.get("question_scope") or "")
+    count_scope = _candidate_scope_tier_for_counts(
+        angles=angles,
+        tasks=tasks,
+        allowed_scopes=("medium", "narrow"),
+    )
+    if declared_scope not in {"medium", "narrow"} and count_scope not in {"medium", "narrow"}:
+        return None
+    if valid_scope_downgrade:
+        return None
+    return {
+        "code": "broad_locked_oracle_scope_downgrade_missing",
+        "declared_question_scope": declared_scope,
+        "locked_question_scope": locked_scope,
+        "count_scope": count_scope,
+        "angle_count": len(angles),
+        "task_count": len(tasks),
+        "message": (
+            "A broad locked semantic expectation oracle cannot be satisfied by "
+            "medium/narrow final cardinality without valid scope_downgrade diagnostics."
+        ),
+    }
 
 
 def _candidate_requirement_coverage_complete(
@@ -13483,6 +13590,15 @@ def semantic_planner_validation(
         tasks=scope_task_records,
         requirements=scope_requirements,
     )
+    broad_locked_oracle_scope_payload = _candidate_broad_locked_oracle_scope_payload(
+        planner_metadata
+    )
+    broad_locked_oracle_violation = _candidate_broad_locked_oracle_scope_violation(
+        plan=planner_metadata,
+        angles=angles,
+        tasks=scope_task_records,
+        valid_scope_downgrade=scope_downgrade_valid,
+    )
     inferred_broad_question = _effective_broad_question(
         question_class=question_class,
         expected_needs=expected_needs,
@@ -13558,6 +13674,8 @@ def semantic_planner_validation(
                 ),
             }
         )
+    if broad_locked_oracle_violation:
+        failures.append(dict(broad_locked_oracle_violation))
     if (
         scope in {"medium", "narrow"}
         and not scope_downgrade_valid
@@ -13638,6 +13756,12 @@ def semantic_planner_validation(
             else None
         ),
         "locked_oracle_scope_alignment_valid": locked_oracle_alignment_valid,
+        BROAD_LOCKED_ORACLE_SCOPE_DIAGNOSTIC: (
+            dict(broad_locked_oracle_scope_payload)
+            if broad_locked_oracle_scope_payload
+            else None
+        ),
+        "broad_locked_oracle_scope_valid": not bool(broad_locked_oracle_violation),
         "angle_count": len(angles),
         "route_counts": dict(sorted(route_counts.items())),
         "evidence_need_counts": dict(sorted(evidence_need_counts.items())),

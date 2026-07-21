@@ -1861,6 +1861,76 @@ class SemanticPlannerTests(unittest.TestCase):
             requirement["coverage_status"] = "covered" if coverage_complete else "not_covered"
         return candidate
 
+    def sanitize_city_planning_candidate_for_text_only(
+        self, candidate: dict, *, question: str
+    ) -> dict:
+        angle_specs = (
+            (
+                "primary_source",
+                "Adopted Plan Metrics",
+                "Which adopted plans define measurable implementation indicators?",
+                "adopted plan metric inventory",
+            ),
+            (
+                "official_source",
+                "Agency Responsibility Mapping",
+                "Which departments or partner agencies are assigned delivery responsibility?",
+                "agency responsibility matrix",
+            ),
+            (
+                "recent_change",
+                "Update Cycle And Amendments",
+                "What recent amendments or annual reports changed the implementation baseline?",
+                "recent plan update timeline",
+            ),
+            (
+                "comparative_analysis",
+                "Cross-Jurisdiction Differences",
+                "How do indicator definitions and agency roles differ across jurisdictions?",
+                "cross-jurisdiction comparison table",
+            ),
+            (
+                "counter_evidence",
+                "Gaps And Conflicting Duties",
+                "Where do official records omit owners or assign overlapping responsibilities?",
+                "implementation gap register",
+            ),
+        )
+        for index, angle in enumerate(candidate["angles"], start=1):
+            need, title, research_question, artifact = angle_specs[
+                (index - 1) % len(angle_specs)
+            ]
+            angle["route"] = "text_only"
+            angle["evidence_need"] = need
+            angle["title"] = title
+            angle["research_question"] = f"{research_question} Scope: {question}."
+            angle["expected_source_types"] = ["official local government plans"]
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = [artifact, "official source notes"]
+            angle["search_queries"] = [
+                f"{question} {need} official local government plan"
+            ]
+            angle["success_criteria"] = [
+                "Use official local government planning records.",
+                "Record indicators, agencies, caveats, and unknowns.",
+            ]
+            angle["report_section"] = f"Planning Indicators {index}"
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["query"] = f"{question} official planning records task {index}"
+            task["expected_visual_targets"] = []
+            task["expected_artifacts"] = [
+                "planning indicator source notes",
+                "responsible agency comparison table",
+            ]
+            task["success_criteria"] = [
+                "Use official local government planning records.",
+                "Record indicators, agencies, caveats, and unknowns.",
+            ]
+            task["max_images"] = 0
+            task.pop("expected_evidence", None)
+        return candidate
+
     def prepare_fixture(self, fixture: dict) -> Path:
         fallback_plan = heuristic_template_planner(question=fixture["question"])
         result = prepare_run(
@@ -6254,6 +6324,125 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("locked_oracle_scope_alignment_failed", failure_codes)
         self.assertFalse(validation["ok"], validation)
         self.assertFalse(validation["locked_oracle_scope_alignment_valid"], validation)
+
+    def test_locked_broad_oracle_rejects_medium_candidate_without_scope_downgrade(
+        self,
+    ) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "a" * 64,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {
+                    "min": 20,
+                    "max": 40,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = self.sanitize_city_planning_candidate_for_text_only(
+            response["candidate_plan"],
+            question=question,
+        )
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["question_scope"], "medium")
+        self.assertTrue(
+            any(
+                item.get("materialization") == "broad_cardinality_replan_required"
+                and item.get("content_added") is False
+                and item.get("target_scope_if_downgraded") == "medium"
+                for item in materializations
+            ),
+            materializations,
+        )
+        self.assertIn(
+            "broad_locked_semantic_expectation_oracle_scope",
+            candidate["diagnostics"],
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("broad_locked_oracle_scope_downgrade_missing", failure_codes)
+        self.assertFalse(validation["ok"], validation)
+        self.assertFalse(validation["broad_locked_oracle_scope_valid"], validation)
+
+    def test_locked_broad_oracle_accepts_explicit_medium_scope_downgrade(self) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "b" * 64,
+            "retry_attempt": 2,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {
+                    "min": 20,
+                    "max": 40,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = self.sanitize_city_planning_candidate_for_text_only(
+            response["candidate_plan"],
+            question=question,
+        )
+
+        candidate, materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+
+        self.assertEqual(candidate["question_scope"], "medium")
+        self.assertEqual(candidate["scope_downgrade"]["from_scope"], "broad")
+        self.assertEqual(candidate["scope_downgrade"]["to_scope"], "medium")
+        self.assertTrue(
+            any(
+                item.get("materialization")
+                == "oracle_bounded_semantic_scope_downgrade"
+                for item in materializations
+            ),
+            materializations,
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("broad_locked_oracle_scope_downgrade_missing", failure_codes)
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(validation["scope_downgrade_valid"], validation)
+        self.assertTrue(validation["broad_locked_oracle_scope_valid"], validation)
 
     def test_scope_downgrade_requires_complete_oracle_coverage(self) -> None:
         question = "Compare official city planning implementation indicators across local plans"
