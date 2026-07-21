@@ -21,6 +21,7 @@ from typing import Any, Mapping, Sequence
 from .evidence_schema import VERIFIER_METHODS, VERIFIER_TYPES, VERIFIER_VOTES
 from .semantic_planner import (
     SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+    SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
     SEMANTIC_SCOPE_TIERS,
     build_semantic_materialization_diff,
 )
@@ -3519,10 +3520,13 @@ def _semantic_prepare_readiness_from_artifacts(
             else None
         )
     )
-    scope_downgrade = _semantic_release_scope_downgrade_payload(
+    scope_downgrade = _semantic_release_plan_scope_downgrade_payload(
+        plan_payload if isinstance(plan_payload, Mapping) else None,
         plan if isinstance(plan, Mapping) else None,
-        validation if isinstance(validation, Mapping) else None,
-        review if isinstance(review, Mapping) else None,
+    )
+    auxiliary_downgrades = _semantic_release_auxiliary_scope_downgrade_payloads(
+        validation=validation if isinstance(validation, Mapping) else None,
+        review=review if isinstance(review, Mapping) else None,
     )
     scope_downgrade_valid = (
         validation.get("scope_downgrade_valid")
@@ -3539,6 +3543,10 @@ def _semantic_prepare_readiness_from_artifacts(
         failures.append("planner_mode_not_codex_semantic")
     if not plan_eligible:
         failures.append("semantic_plan_not_release_eligible")
+    if not isinstance(scope_downgrade, Mapping) and (
+        auxiliary_downgrades or scope_downgrade_valid is True
+    ):
+        failures.append("scope_downgrade_missing_plan")
     if scope_downgrade and scope_downgrade_valid is not True:
         failures.append("scope_downgrade_invalid")
     ready = not failures
@@ -3846,6 +3854,7 @@ def _artifact_paths(run_dir: Path, *, route: str) -> dict[str, Path]:
         "semantic_plan_review": run_dir / "semantic_plan_review.json",
         "semantic_planner_validation": run_dir / "semantic_planner_validation.json",
         "semantic_materialization_diff": run_dir / SEMANTIC_MATERIALIZATION_DIFF_FILENAME,
+        "semantic_planner_convergence": run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
     }
     if route in VISUAL_ROUTES:
         artifacts.update(
@@ -4260,7 +4269,11 @@ def _semantic_release_checks(
             }
         )
 
-    failures.extend(_semantic_scope_downgrade_release_failures(required_payloads))
+    scope_downgrade_payloads: dict[str, Mapping[str, Any]] = dict(required_payloads)
+    convergence = loaded_artifacts.get("semantic_planner_convergence")
+    if isinstance(convergence, Mapping):
+        scope_downgrade_payloads["semantic_planner_convergence"] = convergence
+    failures.extend(_semantic_scope_downgrade_release_failures(scope_downgrade_payloads))
 
     if _claims_eligible_codex_semantic(
         planner_sources=planner_sources,
@@ -4426,6 +4439,16 @@ def _semantic_scope_downgrade_release_failures(
             {
                 "check": "semantic_scope_downgrade",
                 "detail": "scope_downgrade.retry_attempt must prove a retry occurred",
+            }
+        )
+    elif not _semantic_scope_downgrade_retry_evidence_valid(artifacts, downgrade):
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "scope_downgrade.retry_attempt lacks persisted semantic "
+                    "planner convergence retry evidence"
+                ),
             }
         )
     if downgrade.get("oracle_coverage_complete") is not True:
@@ -4696,6 +4719,62 @@ def _semantic_scope_downgrade_payloads_match(
         sort_keys=True,
         ensure_ascii=True,
     )
+
+
+def _semantic_scope_downgrade_retry_evidence_valid(
+    artifacts: Mapping[str, Mapping[str, Any]],
+    downgrade: Mapping[str, Any],
+) -> bool:
+    retry_attempt = _strict_int_count(downgrade, "retry_attempt")
+    if retry_attempt is None or retry_attempt < 2:
+        return False
+    convergence = artifacts.get("semantic_planner_convergence")
+    if not isinstance(convergence, Mapping):
+        return False
+    if convergence.get("artifact_type") != "semantic_planner_convergence":
+        return False
+    if convergence.get("status") != "converged":
+        return False
+    attempt_count = _strict_int_count(convergence, "attempt_count")
+    if attempt_count is None or attempt_count < retry_attempt:
+        return False
+    attempts = convergence.get("attempts")
+    if not isinstance(attempts, list) or len(attempts) < retry_attempt:
+        return False
+    observed_attempts = {
+        int(attempt.get("attempt"))
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and _strict_int_count(attempt, "attempt") is not None
+    }
+    if not set(range(1, retry_attempt + 1)) <= observed_attempts:
+        return False
+    final_selection = convergence.get("final_selection")
+    final_attempt = (
+        _strict_int_count(final_selection, "attempt")
+        if isinstance(final_selection, Mapping)
+        else None
+    )
+    if final_attempt != retry_attempt:
+        return False
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        attempt_number = _strict_int_count(attempt, "attempt")
+        if attempt_number is None or attempt_number >= retry_attempt:
+            continue
+        repair_inputs = attempt.get("repair_inputs")
+        if not isinstance(repair_inputs, Mapping):
+            continue
+        next_attempt = _strict_int_count(repair_inputs, "next_attempt")
+        retry_hash = repair_inputs.get("retry_request_hash")
+        if (
+            next_attempt == attempt_number + 1
+            and isinstance(retry_hash, str)
+            and retry_hash
+        ):
+            return True
+    return False
 
 
 def _semantic_scope_downgrade_generic_padding_hits(

@@ -246,6 +246,95 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
+    def test_semantic_scope_downgrade_release_requires_persisted_retry_evidence(
+        self,
+    ) -> None:
+        downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        angles = [
+            {
+                "angle_id": f"angle_{index:03d}",
+                "research_question": f"Requirement angle {index}",
+            }
+            for index in range(1, 6)
+        ]
+        tasks = [
+            {
+                "task_id": f"task_{task_index:03d}",
+                "angle_id": f"angle_{angle_index:03d}",
+                "query": f"Requirement-specific source query {task_index}",
+            }
+            for task_index, angle_index in enumerate(
+                [1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+                start=1,
+            )
+        ]
+        artifacts = {
+            "semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {"min": 20, "max": 40},
+                "oracle_requirement_map": [
+                    {
+                        "requirement_id": "req_001",
+                        "requirement_text": (
+                            "Requirement-specific source query"
+                        ),
+                    }
+                ],
+            },
+            "semantic_plan": {
+                "semantic_plan": {
+                    "question_scope": "medium",
+                    "scope_downgrade": downgrade,
+                    "angles": angles,
+                    "bounded_tasks": tasks,
+                    "requirement_coverage_map": [
+                        {
+                            "requirement_id": "req_001",
+                            "coverage_status": "covered",
+                            "covered_by_angle_ids": [
+                                angle["angle_id"] for angle in angles
+                            ],
+                            "covered_by_task_ids": [
+                                task["task_id"] for task in tasks
+                            ],
+                        }
+                    ],
+                }
+            },
+            "semantic_planner_validation": {
+                "scope_downgrade_valid": True,
+                "scope_downgrade": downgrade,
+            },
+            "semantic_plan_review": {
+                "scope_downgrade": downgrade,
+            },
+        }
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any(
+                "lacks persisted semantic planner convergence retry evidence" in detail
+                for detail in details
+            ),
+            failures,
+        )
+
     def assert_semantic_artifact_integrity_failure(
         self,
         result: dict[str, Any],
@@ -1462,6 +1551,100 @@ class PublicBetaValidationTests(unittest.TestCase):
         self.assertEqual(run["semantic_prepare_status"], "passed")
         self.assertFalse(run["semantic_release_ready"])
         self.assertEqual(run["release_counted_status"], "denominator_failure")
+
+    def test_semantic_release_report_rejects_auxiliary_only_scope_downgrade_prepare(
+        self,
+    ) -> None:
+        forged_downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        run_dir = self.temp_dir() / "prepare-forged-downgrade"
+        run_dir.mkdir()
+        self.write_json(
+            run_dir / "semantic_planner_validation.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "ok": True,
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "scope_tier": "medium",
+                "scope_downgrade_valid": True,
+                "scope_downgrade": forged_downgrade,
+                "failures": [],
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan_review.json",
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "semantic_fit_score": 9.4,
+                "verdict": "pass",
+                "blockers": [],
+                "scope_downgrade": forged_downgrade,
+            },
+        )
+        self.write_json(
+            run_dir / "semantic_plan.json",
+            {
+                "semantic_plan": {
+                    "planner_mode": "codex_semantic",
+                    "semantic_release_eligible": True,
+                    "question_scope": "medium",
+                    "status": "semantic_review_passed",
+                }
+            },
+        )
+
+        report = _semantic_release_report(
+            evaluated_runs=[
+                {
+                    "id": "sem-reg-aux-forged",
+                    "route": "text_only",
+                    "status": "failed",
+                    "terminal_status": "missing_run_status",
+                    "metric_classification": "included_failure",
+                    "failure_category": "artifact_handoff_failure",
+                    "failure_detail": "run_status.json is missing or invalid",
+                    "status_artifacts": {
+                        "semantic_planner_validation": str(
+                            run_dir / "semantic_planner_validation.json"
+                        ),
+                        "semantic_plan_review": str(
+                            run_dir / "semantic_plan_review.json"
+                        ),
+                        "semantic_plan": str(run_dir / "semantic_plan.json"),
+                    },
+                }
+            ],
+            report_path=self.temp_dir() / "semantic_release_report.json",
+            generated_at=self.now(),
+            manual_audit_manifest=None,
+            require_manual_trace_audits=True,
+        )
+
+        run = report["runs"][0]
+        self.assertFalse(run["semantic_prepare_ready"], run)
+        self.assertEqual(report["semantic_prepare_summary"]["ready_run_count"], 0)
+        self.assertEqual(report["semantic_prepare_summary"]["failed_run_count"], 1)
+        self.assertIn(
+            "scope_downgrade_missing_plan",
+            run["semantic_prepare_failure_reason"],
+        )
+        self.assertIsNone(run["semantic_prepare_checks"]["scope_downgrade"])
 
     def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
