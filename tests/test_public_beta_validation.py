@@ -514,6 +514,28 @@ class PublicBetaValidationTests(unittest.TestCase):
             failures,
         )
 
+    def test_semantic_scope_downgrade_release_requires_plan_adapter_candidate_hash(
+        self,
+    ) -> None:
+        artifacts = self.semantic_scope_downgrade_release_artifacts()
+        semantic_plan = artifacts["semantic_plan"]
+        semantic_plan.pop("adapter_candidate_hash", None)
+        semantic_plan["planner_provenance"].pop("parsed_response_hash", None)
+        nested_plan = semantic_plan["semantic_plan"]
+        nested_plan.pop("adapter_candidate_hash", None)
+        nested_plan["planner_provenance"].pop("parsed_response_hash", None)
+
+        failures = _semantic_scope_downgrade_release_failures(artifacts)
+        details = [str(failure.get("detail") or "") for failure in failures]
+
+        self.assertTrue(
+            any(
+                "lacks persisted semantic planner convergence retry evidence" in detail
+                for detail in details
+            ),
+            failures,
+        )
+
     def test_semantic_scope_downgrade_release_accepts_adapter_candidate_retry_evidence(
         self,
     ) -> None:

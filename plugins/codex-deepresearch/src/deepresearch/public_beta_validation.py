@@ -4779,7 +4779,9 @@ def _semantic_scope_downgrade_retry_evidence_valid(
     )
     if not accepted_candidate_hashes:
         return False
-    if plan_adapter_hashes and not plan_adapter_hashes & accepted_candidate_hashes:
+    if not plan_adapter_hashes:
+        return False
+    if not plan_adapter_hashes & accepted_candidate_hashes:
         return False
     retry_hash = _semantic_scope_downgrade_retry_request_hash(
         adapter_attempts,
