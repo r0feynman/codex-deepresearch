@@ -4147,7 +4147,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
 
     def test_korean_cross_modal_req003_reviewer_retry_materializes_schema(self) -> None:
-        question = "한국 학교 급식 알레르기 라벨 이미지와 공식 표시 규정을 비교해줘."
+        question = "학교 급식 알레르기 표시 사진과 교육청 공식 안내 기준을 대조해줘."
 
         def planner_mutator(response: dict, _request: dict) -> dict:
             response = json.loads(json.dumps(response))
