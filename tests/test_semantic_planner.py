@@ -4994,7 +4994,7 @@ class SemanticPlannerTests(unittest.TestCase):
                 review["verdict"] = "release_ineligible"
             return response
 
-        result, _adapter_request = self.prepare_with_codex_adapter(
+        result, adapter_request = self.prepare_with_codex_adapter(
             question,
             route="text_only",
             requirement_types=("subject", "source_quality", "time_range"),
@@ -5047,6 +5047,7 @@ class SemanticPlannerTests(unittest.TestCase):
         validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=semantic_plan,
+            raw_request=adapter_request["_planner_requests"][-1],
             visual_preference="text_only",
         )
         self.assertTrue(validation["ok"], validation)
@@ -6439,6 +6440,24 @@ class SemanticPlannerTests(unittest.TestCase):
         }
         candidate["scope_downgrade"] = forged_downgrade
         candidate.setdefault("diagnostics", {})["scope_downgrade"] = forged_downgrade
+
+        direct_validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+        direct_failure_codes = {
+            failure["code"] for failure in direct_validation["failures"]
+        }
+        self.assertIn(
+            "invalid_scope_downgrade_diagnostics",
+            direct_failure_codes,
+        )
+        self.assertFalse(
+            direct_validation["scope_downgrade_valid"],
+            direct_validation,
+        )
+        self.assertFalse(direct_validation["ok"], direct_validation)
 
         validation = _codex_semantic_candidate_validation(
             original_question=question,

@@ -10636,10 +10636,9 @@ def _valid_candidate_scope_downgrade(
     payload_retry_attempt = _candidate_retry_attempt(payload)
     if payload_retry_attempt < 2:
         return False
-    if (
-        raw_request is not None
-        and _candidate_retry_attempt(raw_request) < payload_retry_attempt
-    ):
+    if raw_request is None:
+        return False
+    if _candidate_retry_attempt(raw_request) < payload_retry_attempt:
         return False
     if not _candidate_counts_fit_scope(target_scope, angles=angles, tasks=tasks):
         return False
