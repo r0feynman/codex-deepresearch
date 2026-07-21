@@ -4395,6 +4395,21 @@ def _semantic_scope_downgrade_release_failures(
             )
         return failures
     downgrade = plan_downgrade
+    oracle_question_scope = (
+        str(oracle.get("question_scope") or "").strip().lower()
+        if isinstance(oracle, Mapping)
+        else ""
+    )
+    if oracle_question_scope != "broad":
+        failures.append(
+            {
+                "check": "semantic_scope_downgrade",
+                "detail": (
+                    "scope_downgrade requires semantic_expectation_oracle."
+                    "question_scope to be broad"
+                ),
+            }
+        )
     if candidate_scope not in {"medium", "narrow"}:
         failures.append(
             {
