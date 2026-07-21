@@ -948,6 +948,7 @@ def codex_semantic_candidate_plan(
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
                 candidate=candidate,
+                raw_request=raw_request,
                 visual_preference=str(raw_request.get("visual_preference") or "auto"),
                 provided_images=_list(raw_request.get("provided_images")),
             )
@@ -1102,6 +1103,7 @@ def codex_semantic_candidate_plan(
         requirements=candidate["requirement_coverage_map"],
         question_class=question_class,
         expected_needs=expected_evidence_needs,
+        raw_request=raw_request,
     )
     return SemanticPlan(
         schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
@@ -4959,6 +4961,7 @@ def _codex_semantic_candidate_validation(
     *,
     original_question: str,
     candidate: Mapping[str, Any],
+    raw_request: Mapping[str, Any] | None = None,
     visual_preference: str | None = None,
     provided_images: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
@@ -4966,6 +4969,7 @@ def _codex_semantic_candidate_validation(
         validation = validate_semantic_candidate_plan(
             original_question=original_question,
             plan=candidate,
+            raw_request=raw_request,
             visual_preference=visual_preference,
             provided_images=provided_images,
         )
@@ -7245,6 +7249,11 @@ def _deterministic_semantic_review(
     candidate_validation = validate_semantic_candidate_plan(
         original_question=question,
         plan=plan_payload,
+        raw_request=(
+            plan.raw_request_payload
+            if isinstance(plan.raw_request_payload, Mapping)
+            else None
+        ),
         visual_preference=_normalized_visual_preference(
             plan.raw_request_payload.get("visual_preference")
             if isinstance(plan.raw_request_payload, Mapping)
@@ -8982,6 +8991,7 @@ def validate_semantic_candidate_plan(
     *,
     original_question: str,
     plan: Mapping[str, Any],
+    raw_request: Mapping[str, Any] | None = None,
     visual_preference: str | None = None,
     provided_images: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
@@ -9038,11 +9048,13 @@ def validate_semantic_candidate_plan(
         requirements=requirements,
     )
     expected_needs = _candidate_validation_expected_needs(plan=plan, angles=angles)
+    scope_downgrade_payload = _candidate_scope_downgrade_payload(plan)
     valid_scope_downgrade = _valid_candidate_scope_downgrade(
         plan=plan,
         angles=angles,
         tasks=tasks,
         requirements=requirements,
+        raw_request=raw_request,
     )
     locked_oracle_alignment_payload = _candidate_locked_oracle_alignment_payload(plan)
     valid_locked_oracle_alignment = _valid_candidate_locked_oracle_scope_alignment(
@@ -9058,6 +9070,7 @@ def validate_semantic_candidate_plan(
         requirements=requirements,
         question_class=candidate_question_class,
         expected_needs=expected_needs,
+        raw_request=raw_request,
     )
     if scope not in SEMANTIC_SCOPE_TIERS:
         failures.append(
@@ -9097,6 +9110,18 @@ def validate_semantic_candidate_plan(
     )
     if broad_locked_oracle_violation:
         failures.append(dict(broad_locked_oracle_violation))
+    if scope_downgrade_payload and not valid_scope_downgrade:
+        failures.append(
+            {
+                "code": "invalid_scope_downgrade_diagnostics",
+                "declared_question_scope": scope,
+                "question_class": candidate_question_class,
+                "message": (
+                    "scope_downgrade diagnostics must be backed by runner retry "
+                    "context and complete oracle coverage."
+                ),
+            }
+        )
     if (
         scope in {"medium", "narrow"}
         and not valid_scope_downgrade
@@ -9766,8 +9791,8 @@ def validate_semantic_candidate_plan(
         "declared_question_scope": scope,
         "scope_tier": scope if scope in SEMANTIC_SCOPE_TIERS else "unknown",
         "scope_downgrade": (
-            dict(_candidate_scope_downgrade_payload(plan) or {})
-            if _candidate_scope_downgrade_payload(plan)
+            dict(scope_downgrade_payload or {})
+            if scope_downgrade_payload
             else None
         ),
         "scope_downgrade_valid": valid_scope_downgrade,
@@ -10588,6 +10613,7 @@ def _valid_candidate_scope_downgrade(
     angles: Sequence[Mapping[str, Any]],
     tasks: Sequence[Mapping[str, Any]],
     requirements: Sequence[Mapping[str, Any]],
+    raw_request: Mapping[str, Any] | None = None,
 ) -> bool:
     payload = _candidate_scope_downgrade_payload(plan)
     if not isinstance(payload, Mapping):
@@ -10607,7 +10633,13 @@ def _valid_candidate_scope_downgrade(
         return False
     if payload.get("non_oracle_topics_added") is not False:
         return False
-    if _candidate_retry_attempt(payload) < 2:
+    payload_retry_attempt = _candidate_retry_attempt(payload)
+    if payload_retry_attempt < 2:
+        return False
+    if (
+        raw_request is not None
+        and _candidate_retry_attempt(raw_request) < payload_retry_attempt
+    ):
         return False
     if not _candidate_counts_fit_scope(target_scope, angles=angles, tasks=tasks):
         return False
@@ -10626,12 +10658,14 @@ def _candidate_effective_broad_question(
     requirements: Sequence[Mapping[str, Any]],
     question_class: str,
     expected_needs: Sequence[str],
+    raw_request: Mapping[str, Any] | None = None,
 ) -> bool:
     if _valid_candidate_scope_downgrade(
         plan=plan,
         angles=angles,
         tasks=tasks,
         requirements=requirements,
+        raw_request=raw_request,
     ):
         return False
     if _valid_candidate_locked_oracle_scope_alignment(
@@ -13547,6 +13581,12 @@ def semantic_planner_validation(
     report_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_path = Path(run_dir)
+    raw_request_payload = _read_optional_json(
+        run_path / SEMANTIC_RAW_DIRNAME / SEMANTIC_RAW_REQUEST_FILENAME
+    )
+    trusted_raw_request = (
+        raw_request_payload if isinstance(raw_request_payload, Mapping) else None
+    )
     planner = evidence.get("semantic_planner")
     planner_metadata = planner if isinstance(planner, Mapping) else {}
     question = str(evidence.get("question") or "")
@@ -13580,6 +13620,7 @@ def semantic_planner_validation(
         angles=angles,
         tasks=scope_task_records,
         requirements=scope_requirements,
+        raw_request=trusted_raw_request,
     )
     locked_oracle_alignment_payload = _candidate_locked_oracle_alignment_payload(
         planner_metadata

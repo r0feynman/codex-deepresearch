@@ -3483,6 +3483,10 @@ def _semantic_prepare_readiness_from_artifacts(
     validation = _read_optional_json(artifact_paths.get("semantic_planner_validation", ""))
     review = _read_optional_json(artifact_paths.get("semantic_plan_review", ""))
     plan_payload = _read_optional_json(artifact_paths.get("semantic_plan", ""))
+    oracle = _read_optional_json(artifact_paths.get("semantic_expectation_oracle", ""))
+    convergence = _read_optional_json(
+        artifact_paths.get("semantic_planner_convergence", "")
+    )
     plan = (
         plan_payload.get("semantic_plan")
         if isinstance(plan_payload, Mapping)
@@ -3549,6 +3553,34 @@ def _semantic_prepare_readiness_from_artifacts(
         failures.append("scope_downgrade_missing_plan")
     if scope_downgrade and scope_downgrade_valid is not True:
         failures.append("scope_downgrade_invalid")
+    downgrade_artifacts = {
+        "semantic_plan": plan_payload,
+        "semantic_planner_validation": validation,
+        "semantic_plan_review": review,
+        "semantic_expectation_oracle": oracle,
+        "semantic_planner_convergence": convergence,
+    }
+    candidate_scope = _semantic_release_candidate_scope(
+        plan_payload if isinstance(plan_payload, Mapping) else None,
+        plan if isinstance(plan, Mapping) else {},
+    )
+    oracle_scope = _semantic_release_oracle_scope(
+        oracle if isinstance(oracle, Mapping) else None
+    )
+    downgrade_checks_required = isinstance(scope_downgrade, Mapping) or (
+        oracle_scope == "broad" and candidate_scope in {"medium", "narrow"}
+    )
+    downgrade_release_failures: list[dict[str, Any]] = []
+    if downgrade_checks_required:
+        downgrade_release_failures = _semantic_scope_downgrade_release_failures(
+            {
+                name: payload
+                for name, payload in downgrade_artifacts.items()
+                if isinstance(payload, Mapping)
+            }
+        )
+        if downgrade_release_failures:
+            failures.append("scope_downgrade_release_failures")
     ready = not failures
     return {
         "schema_version": "codex-deepresearch.semantic-prepare-readiness.v0",
@@ -3568,6 +3600,7 @@ def _semantic_prepare_readiness_from_artifacts(
         "scope_tier": scope_tier,
         "scope_downgrade": dict(scope_downgrade) if scope_downgrade else None,
         "scope_downgrade_valid": scope_downgrade_valid,
+        "scope_downgrade_release_failures": downgrade_release_failures,
         "validation_failure_codes": [
             str(failure.get("code"))
             for failure in (

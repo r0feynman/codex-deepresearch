@@ -1910,6 +1910,97 @@ class PublicBetaValidationTests(unittest.TestCase):
         )
         self.assertIsNone(run["semantic_prepare_checks"]["scope_downgrade"])
 
+    def test_semantic_release_report_rejects_plan_scope_downgrade_without_convergence_prepare(
+        self,
+    ) -> None:
+        artifacts = self.semantic_scope_downgrade_release_artifacts()
+        artifacts.pop("semantic_planner_convergence")
+        semantic_plan = artifacts["semantic_plan"]["semantic_plan"]
+        semantic_plan.update(
+            {
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "status": "semantic_review_passed",
+            }
+        )
+        artifacts["semantic_planner_validation"].update(
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "ok": True,
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "scope_tier": "medium",
+                "failures": [],
+            }
+        )
+        artifacts["semantic_plan_review"].update(
+            {
+                "schema_version": "codex-deepresearch.semantic-planner.v0",
+                "planner_mode": "codex_semantic",
+                "semantic_release_eligible": True,
+                "semantic_fit_score": 9.4,
+                "verdict": "pass",
+                "blockers": [],
+            }
+        )
+
+        run_dir = self.temp_dir() / "prepare-plan-downgrade-no-convergence"
+        run_dir.mkdir()
+        for artifact_name, payload in artifacts.items():
+            self.write_json(run_dir / f"{artifact_name}.json", payload)
+
+        report = _semantic_release_report(
+            evaluated_runs=[
+                {
+                    "id": "sem-reg-plan-forged-no-convergence",
+                    "route": "text_only",
+                    "status": "failed",
+                    "terminal_status": "missing_run_status",
+                    "metric_classification": "included_failure",
+                    "failure_category": "artifact_handoff_failure",
+                    "failure_detail": "run_status.json is missing or invalid",
+                    "status_artifacts": {
+                        "semantic_expectation_oracle": str(
+                            run_dir / "semantic_expectation_oracle.json"
+                        ),
+                        "semantic_planner_validation": str(
+                            run_dir / "semantic_planner_validation.json"
+                        ),
+                        "semantic_plan_review": str(
+                            run_dir / "semantic_plan_review.json"
+                        ),
+                        "semantic_plan": str(run_dir / "semantic_plan.json"),
+                    },
+                }
+            ],
+            report_path=self.temp_dir() / "semantic_release_report.json",
+            generated_at=self.now(),
+            manual_audit_manifest=None,
+            require_manual_trace_audits=True,
+        )
+
+        run = report["runs"][0]
+        self.assertFalse(run["semantic_prepare_ready"], run)
+        self.assertEqual(report["semantic_prepare_summary"]["ready_run_count"], 0)
+        self.assertEqual(report["semantic_prepare_summary"]["failed_run_count"], 1)
+        self.assertIn(
+            "scope_downgrade_release_failures",
+            run["semantic_prepare_failure_reason"],
+        )
+        details = [
+            str(failure.get("detail") or "")
+            for failure in run["semantic_prepare_checks"][
+                "scope_downgrade_release_failures"
+            ]
+        ]
+        self.assertTrue(
+            any(
+                "lacks persisted semantic planner convergence retry evidence" in detail
+                for detail in details
+            ),
+            details,
+        )
+
     def test_semantic_release_report_requires_manual_trace_audits_by_default(self) -> None:
         manifest = load_public_beta_prompt_manifest(DEFAULT_PUBLIC_BETA_PROMPT_MANIFEST)
         runs_dir = self.temp_dir()

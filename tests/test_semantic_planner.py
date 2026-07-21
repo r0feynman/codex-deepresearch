@@ -58,6 +58,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     validate_codex_semantic_adapter_provenance,
     write_semantic_materialization_diff,
     write_semantic_planner_validation,
+    _codex_semantic_candidate_validation,
     _codex_semantic_planner_validation_max_attempts,
     _has_forbidden_internal_leakage,
     _materialize_candidate_budget_caps,
@@ -6386,6 +6387,72 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertFalse(validation["ok"], validation)
         self.assertFalse(validation["broad_locked_oracle_scope_valid"], validation)
 
+    def test_locked_broad_oracle_rejects_first_attempt_candidate_forged_scope_downgrade(
+        self,
+    ) -> None:
+        question = "Compare official city planning implementation indicators across local plans"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "a" * 64,
+            "locked_semantic_expectation_oracle": {
+                "question_scope": "broad",
+                "bounded_task_range": {
+                    "min": 20,
+                    "max": 40,
+                    "depth_preset": "standard",
+                },
+            },
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+        )
+        candidate_input = self.sanitize_city_planning_candidate_for_text_only(
+            response["candidate_plan"],
+            question=question,
+        )
+        candidate, _materializations = _materialize_candidate_broad_cardinality(
+            candidate_input,
+            original_question=question,
+            raw_request=request,
+        )
+        forged_downgrade = {
+            "status": "oracle_bounded_semantic_scope_downgrade",
+            "from_scope": "broad",
+            "to_scope": "medium",
+            "retry_attempt": 2,
+            "oracle_coverage_complete": True,
+            "non_negotiable_coverage_complete": True,
+            "generic_padding_added": False,
+            "non_oracle_topics_added": False,
+            "angle_count": 5,
+            "task_count": 10,
+            "final_scope_angle_range": [3, 6],
+            "final_scope_task_range": [10, 19],
+            "final_scope_min_tasks_per_angle": 1,
+        }
+        candidate["scope_downgrade"] = forged_downgrade
+        candidate.setdefault("diagnostics", {})["scope_downgrade"] = forged_downgrade
+
+        validation = _codex_semantic_candidate_validation(
+            original_question=question,
+            candidate=candidate,
+            raw_request=request,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("invalid_scope_downgrade_diagnostics", failure_codes)
+        self.assertIn("broad_locked_oracle_scope_downgrade_missing", failure_codes)
+        self.assertFalse(validation["scope_downgrade_valid"], validation)
+        self.assertFalse(validation["ok"], validation)
+
     def test_locked_broad_oracle_accepts_explicit_medium_scope_downgrade(self) -> None:
         question = "Compare official city planning implementation indicators across local plans"
         request = {
@@ -6436,6 +6503,7 @@ class SemanticPlannerTests(unittest.TestCase):
         validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=candidate,
+            raw_request=request,
             visual_preference="text_only",
         )
         failure_codes = {failure["code"] for failure in validation["failures"]}
@@ -6602,6 +6670,7 @@ class SemanticPlannerTests(unittest.TestCase):
         validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=downgraded,
+            raw_request=request,
             visual_preference="text_only",
         )
         self.assertTrue(validation["ok"], validation)
