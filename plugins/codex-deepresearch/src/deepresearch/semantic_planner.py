@@ -7829,6 +7829,11 @@ def _forbidden_angle_reference_is_negative_scope(
         rf"(?:excluded|out of scope|not in scope|not part of scope)\b",
         rf"\bdo\s+not\b(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
         rf"\b(?:rather\s+than|instead\s+of)\b(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"\b(?:prevent|prevents|preventing|prevented)\b(?:\s+\w+){{0,6}}\s+"
+        rf"(?:drift\s+)?(?:into|to|toward|towards)\b"
+        rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"\b(?:exclusion|exclusions)\s+of\b"
+        rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
     )
     return any(re.search(pattern, normalized_value) for pattern in negative_patterns)
 
@@ -7858,9 +7863,15 @@ def _forbidden_internal_term_matches(
     if not normalized_term:
         return False
     compact_term = normalized_term.replace(" ", "_")
-    for _field_name, value in records:
+    for field_name, value in records:
         normalized_value = _normalize_text(value)
         if not _contains_normalized_phrase(normalized_value, normalized_term):
+            continue
+        if _forbidden_angle_reference_is_negative_scope(
+            field_name=field_name,
+            normalized_term=normalized_term,
+            normalized_value=normalized_value,
+        ):
             continue
         if compact_term == "schema":
             if _schema_term_is_internal_leakage(normalized_value):

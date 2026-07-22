@@ -2158,12 +2158,14 @@ class SemanticPlannerTests(unittest.TestCase):
                     "and patient-flow evidence."
                 ),
                 "Exclude software architecture material from the hospital facility review.",
+                "Prevent drift into software architecture.",
             ],
             done_condition=(
-                "Stop when hospital facility architecture evidence is source-backed "
-                "and no software-architecture content remains."
+                "Stop when hospital facility architecture evidence supports an "
+                "explicit exclusion of software architecture."
             ),
         )
+        plan.angles[0].excluded_scope.append("software and IT architecture")
 
         substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
 
