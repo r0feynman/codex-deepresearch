@@ -879,6 +879,12 @@ def codex_semantic_candidate_plan(
                     original_question=original_question,
                 )
             )
+            candidate, report_section_materializations = (
+                _materialize_candidate_report_sections(
+                    candidate,
+                    original_question=original_question,
+                )
+            )
             candidate, requirement_coverage_repairs = (
                 _repair_candidate_requirement_coverage(candidate)
             )
@@ -934,6 +940,11 @@ def codex_semantic_candidate_plan(
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_angle_title_materializations"] = (
                     angle_title_materializations
+                )
+            if report_section_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_report_section_materializations"] = (
+                    report_section_materializations
                 )
             if requirement_coverage_repairs:
                 raw_response["candidate_plan"] = candidate
@@ -4247,6 +4258,153 @@ def _materialize_candidate_angle_title_prompt_anchors(
         normalized_angles.append(normalized_angle)
     normalized["angles"] = normalized_angles
     return normalized, materializations
+
+
+def _materialize_candidate_report_sections(
+    candidate: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Derive unique report sections when only the section label collided."""
+
+    normalized = copy.deepcopy(dict(candidate))
+    raw_angles = normalized.get("angles")
+    if not isinstance(raw_angles, list):
+        return normalized, []
+    angles = [angle for angle in raw_angles if isinstance(angle, Mapping)]
+    if len(angles) < 2:
+        return normalized, []
+
+    section_counts = Counter(
+        str(angle.get("report_section") or "").strip() for angle in angles
+    )
+    duplicate_sections = {
+        section for section, count in section_counts.items() if section and count > 1
+    }
+    if not duplicate_sections:
+        return normalized, []
+
+    materializations: list[dict[str, Any]] = []
+    used_sections = {
+        section for section, count in section_counts.items() if section and count == 1
+    }
+    normalized_angles: list[Any] = []
+    duplicate_groups = {
+        section: [
+            angle
+            for angle in angles
+            if str(angle.get("report_section") or "").strip() == section
+        ]
+        for section in duplicate_sections
+    }
+    repairable_sections = {
+        section
+        for section, group in duplicate_groups.items()
+        if _candidate_duplicate_report_section_repairable(
+            original_question=original_question,
+            angles=group,
+        )
+    }
+
+    for index, angle in enumerate(raw_angles, start=1):
+        if not isinstance(angle, Mapping):
+            normalized_angles.append(angle)
+            continue
+        normalized_angle = dict(angle)
+        previous_section = str(normalized_angle.get("report_section") or "").strip()
+        if previous_section not in repairable_sections:
+            normalized_angles.append(normalized_angle)
+            if previous_section:
+                used_sections.add(previous_section)
+            continue
+
+        materialized_section = _candidate_report_section_from_angle(
+            normalized_angle,
+            used_sections=used_sections,
+        )
+        if not materialized_section:
+            normalized_angles.append(normalized_angle)
+            used_sections.add(previous_section)
+            continue
+        normalized_angle["report_section"] = materialized_section
+        used_sections.add(materialized_section)
+        if materialized_section != previous_section:
+            materializations.append(
+                {
+                    "angle_id": normalized_angle.get("angle_id"),
+                    "angle_index": index,
+                    "field": "angles.report_section",
+                    "previous_report_section": previous_section,
+                    "materialized_report_section": materialized_section,
+                    "materialization": "derived_unique_report_section_from_angle_title",
+                    "repair_scope": "duplicate_report_section_only",
+                }
+            )
+        normalized_angles.append(normalized_angle)
+
+    if not materializations:
+        return normalized, []
+    normalized["angles"] = normalized_angles
+    return normalized, materializations
+
+
+def _candidate_duplicate_report_section_repairable(
+    *,
+    original_question: str,
+    angles: Sequence[Mapping[str, Any]],
+) -> bool:
+    if len(angles) < 2:
+        return False
+    if _candidate_semantic_angle_release_depth_failures(
+        question=original_question,
+        angles=angles,
+    ):
+        return False
+    if _candidate_semantic_angle_release_duplicate_failures(
+        question=original_question,
+        angles=angles,
+    ):
+        return False
+    signatures = {
+        (
+            _normalize_text(str(angle.get("title") or "")),
+            _normalize_text(str(angle.get("research_question") or "")),
+            _normalize_text(str(angle.get("evidence_need") or "")),
+            tuple(_string_list(angle.get("expected_artifacts"))),
+        )
+        for angle in angles
+    }
+    return len(signatures) == len(angles)
+
+
+def _candidate_report_section_from_angle(
+    angle: Mapping[str, Any],
+    *,
+    used_sections: set[str],
+) -> str:
+    title_section = _report_section_from_title(str(angle.get("title") or ""))
+    research_section = _report_section_from_title(
+        str(angle.get("research_question") or "")
+    )
+    evidence_need = str(angle.get("evidence_need") or "").strip()
+    evidence_label = (
+        _candidate_evidence_need_label(evidence_need) if evidence_need else ""
+    )
+    candidates = [
+        title_section,
+        f"{title_section} {evidence_label}".strip(),
+        research_section,
+        f"{research_section} {evidence_label}".strip(),
+    ]
+    seen: set[str] = set()
+    for candidate_section in candidates:
+        section = " ".join(str(candidate_section or "").split())
+        if not section or section in seen:
+            continue
+        seen.add(section)
+        if section not in used_sections:
+            return section
+    return ""
 
 
 def _repair_candidate_requirement_coverage(

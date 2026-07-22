@@ -64,6 +64,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _materialize_candidate_budget_caps,
     _materialize_candidate_broad_cardinality,
     _materialize_candidate_placeholder_selection_workflow,
+    _materialize_candidate_report_sections,
     _materialize_candidate_req003_comparison_deliverable,
     _materialize_candidate_source_cap_splits,
     _materialize_candidate_source_cap_constraints,
@@ -7358,6 +7359,148 @@ class SemanticPlannerTests(unittest.TestCase):
             failure["code"] for failure in repaired_validation["failures"]
         }
         self.assertNotIn("semantic_angle_release_depth_failed", failure_codes)
+
+    def test_codex_semantic_materializes_distinct_duplicate_report_sections(self) -> None:
+        question = self.semantic_regression_prompt(16)
+        duplicated_section = "Comparison of methods, metrics, and model purposes"
+
+        def sem_reg_017_style_duplicate_sections(response: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            candidate = response["candidate_plan"]
+            angle_specs = [
+                (
+                    "Epidemiological Model Validation Terminology in Public Reports",
+                    "Which official methodological sources define model validation terminology in public epidemiology reports?",
+                    "official_source",
+                    ["terminology source notes", "definition caveats"],
+                    "Scope and terminology",
+                ),
+                (
+                    "Validation Designs Used in Public Epidemiological Models",
+                    "Which public epidemiology reports document validation splits, holdout data, or external validation datasets?",
+                    "primary_source",
+                    ["validation design inventory", "dataset independence notes"],
+                    "Taxonomy of epidemiological validation approaches",
+                ),
+                (
+                    "Calibration, Discrimination, Sensitivity, and Uncertainty in Epidemiology Reports",
+                    "Which public epidemiology reports use calibration, discrimination, sensitivity, or uncertainty metrics for validation?",
+                    "comparative_analysis",
+                    ["metric comparison matrix", "method limitation notes"],
+                    duplicated_section,
+                ),
+                (
+                    "Validation Expectations Across Epidemiological Model Purposes",
+                    "How do validation expectations differ for forecasting, burden estimation, policy simulation, and risk stratification reports?",
+                    "risk_or_guardrail",
+                    ["purpose-specific validation matrix", "decision caveat register"],
+                    duplicated_section,
+                ),
+                (
+                    "Scientific Epidemiological Model Validation Versus Software Deployment",
+                    "Which authoritative sources separate scientific model validation claims from software deployment or runtime validation?",
+                    "counter_evidence",
+                    ["scope distinction notes", "software-deployment exclusion caveats"],
+                    "Distinction from software deployment",
+                ),
+            ]
+            for angle, (
+                title,
+                research_question,
+                evidence_need,
+                expected_artifacts,
+                report_section,
+            ) in zip(candidate["angles"], angle_specs):
+                angle["route"] = "text_only"
+                angle["expected_visual_targets"] = []
+                angle["title"] = title
+                angle["research_question"] = research_question
+                angle["evidence_need"] = evidence_need
+                angle["expected_artifacts"] = expected_artifacts
+                angle["report_section"] = report_section
+                angle["success_criteria"] = [
+                    "Findings must preserve public epidemiology model-validation scope.",
+                    "Do not treat software deployment validation as the requested subject.",
+                ]
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            response_mutator=sem_reg_017_style_duplicate_sections,
+            requirement_types=("subject", "source_quality"),
+        )
+        run_dir = Path(result["run_dir"])
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+        planner_validation = self.load_json(run_dir / "semantic_planner_validation.json")
+
+        self.assertTrue(result["semantic_release_eligible"], result)
+        self.assertTrue(planner_validation["ok"], planner_validation)
+        materializations = raw_response[
+            "candidate_plan_report_section_materializations"
+        ]
+        self.assertEqual(
+            [item["angle_id"] for item in materializations],
+            ["angle_003", "angle_004"],
+        )
+        sections = [angle["report_section"] for angle in semantic_plan["angles"]]
+        self.assertEqual(len(sections), len(set(sections)))
+        self.assertIn(
+            "Calibration Discrimination Sensitivity And Uncertainty",
+            sections,
+        )
+        self.assertIn(
+            "Validation Expectations Across Epidemiological Model",
+            sections,
+        )
+        failed_material_checks = [
+            check
+            for check in planner_validation["material_difference_checks"]
+            if not check["valid"]
+        ]
+        self.assertEqual(failed_material_checks, [])
+
+    def test_duplicate_report_section_materializer_preserves_true_duplicate_failure(self) -> None:
+        question = self.semantic_regression_prompt(16)
+        response = self.codex_adapter_response(
+            build_codex_semantic_raw_request(question=question),
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        source_angle = candidate["angles"][2]
+        target_angle = candidate["angles"][3]
+        for field_name in (
+            "title",
+            "research_question",
+            "evidence_need",
+            "expected_artifacts",
+            "report_section",
+        ):
+            target_angle[field_name] = json.loads(json.dumps(source_angle[field_name]))
+
+        repaired, materializations = _materialize_candidate_report_sections(
+            candidate,
+            original_question=question,
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+
+        self.assertEqual(materializations, [])
+        self.assertEqual(
+            repaired["angles"][2]["report_section"],
+            repaired["angles"][3]["report_section"],
+        )
+        self.assertIn(
+            "semantic_angle_release_duplicate_failed",
+            {failure["code"] for failure in validation["failures"]},
+        )
 
     def test_codex_semantic_retry_instructions_include_duplicate_angle_repair_hint(self) -> None:
         question = (
