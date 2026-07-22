@@ -2383,16 +2383,31 @@ def _materialize_candidate_req003_comparison_deliverable(
     if not task_records:
         return normalized, []
 
-    remediation_required = prioritized_requested_by_reviewer or any(
+    prioritized_remediation_required = prioritized_requested_by_reviewer or any(
         _candidate_requirement_needs_prioritized_remediation(requirement)
         for requirement in comparison_requirements
     )
+    initial_row_terms = _candidate_req003_comparison_row_terms(
+        task={},
+        angle={},
+        requirements=comparison_requirements,
+        original_question=original_question,
+        prioritized_remediation=prioritized_remediation_required,
+    )
+    remediation_required = bool(initial_row_terms.get("remediation_required"))
     if reviewer_requested_schema:
         if any(
             _candidate_has_req003_comparison_field_schema_task(task)
+            and not _candidate_req003_has_unasked_template_leakage(
+                task,
+                row_terms=initial_row_terms,
+            )
             for task in task_records
         ) and (
             not remediation_required
+            or _candidate_has_req003_remediation_action_task(tasks=task_records)
+        ) and (
+            not prioritized_remediation_required
             or _candidate_has_prioritized_remediation_task(tasks=task_records)
         ):
             return normalized, []
@@ -2400,8 +2415,15 @@ def _materialize_candidate_req003_comparison_deliverable(
         _candidate_has_comparison_deliverable_task(
             tasks=task_records,
             requirement=requirement,
+            row_terms=initial_row_terms,
         )
         for requirement in comparison_requirements
+    ) and (
+        not remediation_required
+        or _candidate_has_req003_remediation_action_task(tasks=task_records)
+    ) and (
+        not prioritized_remediation_required
+        or _candidate_has_prioritized_remediation_task(tasks=task_records)
     ):
         return normalized, []
 
@@ -2461,16 +2483,24 @@ def _materialize_candidate_req003_comparison_deliverable(
                 added_task_ids=[task_id],
             )
         )
+    row_terms = _candidate_req003_comparison_row_terms(
+        task=repaired_task,
+        angle=task_angle,
+        requirements=comparison_requirements,
+        original_question=original_question,
+        prioritized_remediation=remediation_required,
+    )
     normalized["constraints"] = _candidate_append_req003_comparison_constraint(
         normalized.get("constraints"),
         task_id=task_id,
         reviewer_requested_schema=reviewer_requested_schema,
-        prioritized_remediation=remediation_required,
+        prioritized_remediation=prioritized_remediation_required,
+        row_terms=row_terms,
     )
     normalized["decomposition_strategy"] = (
         str(normalized.get("decomposition_strategy") or "").rstrip()
         + " The requested comparison deliverable is represented by a bounded "
-        "task with status, evidence, caveat, and remediation or next-action fields."
+        f"task with {row_terms['field_list_text']} fields."
     ).strip()
     return normalized, [
         {
@@ -2491,7 +2521,10 @@ def _materialize_candidate_req003_comparison_deliverable(
             "reviewer_failure_codes": sorted(
                 repair_codes & REQ003_COMPARISON_DELIVERABLE_REPAIR_CODES
             ),
-            "prioritized_remediation": remediation_required,
+            "prioritized_remediation": prioritized_remediation_required,
+            "remediation_required": remediation_required,
+            "comparison_context": row_terms["context"],
+            "row_action_field": row_terms["row_action_field"],
             "route": repaired_task.get("route"),
             "max_images": repaired_task.get("max_images"),
         }
@@ -2783,6 +2816,13 @@ def _candidate_req003_repaired_comparison_task(
         requirements=requirements,
         text_only_contract=text_only_contract,
     )
+    row_terms = _candidate_req003_comparison_row_terms(
+        task=task,
+        angle=angle,
+        requirements=requirements,
+        original_question=original_question,
+        prioritized_remediation=prioritized_remediation,
+    )
     expected_evidence = [
         value
         for value in _string_list(repaired.get("expected_evidence"))
@@ -2795,6 +2835,7 @@ def _candidate_req003_repaired_comparison_task(
     repaired["query"] = _candidate_req003_repaired_query(
         query_base,
         korean=bool(re.search(r"[\uac00-\ud7a3]", original_query or query_base)),
+        row_terms=row_terms,
     )
     source_policy = (
         dict(repaired.get("source_policy"))
@@ -2805,8 +2846,6 @@ def _candidate_req003_repaired_comparison_task(
     quality = _ordered_unique(
         [
             *_string_list(source_policy.get("quality_requirements")),
-            "official",
-            "primary",
             "source-backed",
         ]
     )
@@ -2819,50 +2858,45 @@ def _candidate_req003_repaired_comparison_task(
     repaired["source_policy"] = source_policy
     source_types = _ordered_unique(
         [
-            *_candidate_req003_sanitize_text_only_values(
+            *_candidate_req003_sanitize_comparison_values(
                 _string_list(repaired.get("expected_source_types")),
                 text_only_contract=text_only_contract,
+                row_terms=row_terms,
             ),
-            "official regulations or standards",
-            "primary source evidence",
+            *row_terms["source_types"],
         ]
     )
     repaired["expected_source_types"] = source_types
     repaired["expected_artifacts"] = _ordered_unique(
         [
-            *_candidate_req003_sanitize_text_only_values(
+            *_candidate_req003_sanitize_comparison_values(
                 _string_list(repaired.get("expected_artifacts")),
                 text_only_contract=text_only_contract,
+                row_terms=row_terms,
             ),
             "bounded side-by-side comparison deliverable",
-            "comparison row structure: compared item, official standard, status, evidence, caveat, remediation or next action",
+            row_terms["row_artifact"],
         ]
     )
-    remediation_text = (
-        "Rank remediation recommendations by severity, impact, evidence confidence, and next action."
-        if prioritized_remediation
-        else "Include a remediation or next-action field for each mismatch, gap, or unverifiable row."
-    )
-    repaired["success_criteria"] = _ordered_unique(
-        [
-            *_candidate_req003_sanitize_text_only_values(
-                _string_list(repaired.get("success_criteria")),
-                text_only_contract=text_only_contract,
-            ),
-            (
-                "The side-by-side comparison has fields for compared item or "
-                "requirement, source item or label/artifact, official standard "
-                "or regulation, status (match, partial, mismatch, unverifiable), "
-                "evidence citation, caveat or unknown, and remediation or next action."
-            ),
-            "Every status judgment is tied to source-backed evidence and an explicit caveat when evidence is incomplete.",
-            remediation_text,
-        ]
-    )
+    success_criteria = [
+        *_candidate_req003_sanitize_comparison_values(
+            _string_list(repaired.get("success_criteria")),
+            text_only_contract=text_only_contract,
+            row_terms=row_terms,
+        ),
+        row_terms["schema_success_criterion"],
+        (
+            "Every mapping, difference, or status judgment is tied to "
+            "source-backed evidence and an explicit caveat when evidence is incomplete."
+        ),
+    ]
+    if row_terms["action_success_criterion"]:
+        success_criteria.append(str(row_terms["action_success_criterion"]))
+    repaired["success_criteria"] = _ordered_unique(success_criteria)
     repaired["done_condition"] = (
         "Stop when the bounded side-by-side comparison deliverable has one row "
-        "per compared requirement or criterion, with status, evidence, caveat, "
-        "and remediation fields completed or marked unverifiable."
+        "per compared item or criterion, with "
+        f"{row_terms['field_list_text']} fields completed or marked unverifiable."
     )
     current_max_sources = _semantic_task_source_cap_int(repaired.get("max_sources"))
     required_sources, _source_reasons, _source_counts = (
@@ -2948,21 +2982,37 @@ def _candidate_query_is_original_plus_schema(
     )
 
 
-def _candidate_req003_repaired_query(query_base: str, *, korean: bool) -> str:
+def _candidate_req003_repaired_query(
+    query_base: str,
+    *,
+    korean: bool,
+    row_terms: Mapping[str, Any],
+) -> str:
     base = " ".join(str(query_base or "").split()).rstrip(".")
     if not base:
         base = "Prepare the comparison angle rows"
+    base = _candidate_req003_sanitize_query_base(base, row_terms=row_terms)
+    if not row_terms.get("remediation_required"):
+        base = re.sub(
+            r"\s+and include row-level status, evidence, caveat, and remediation fields\.?$",
+            "",
+            base,
+            flags=re.IGNORECASE,
+        ).rstrip(".")
     if korean:
-        suffix = (
-            "행별 판정 상태, 근거, 주의사항, 개선 조치 열을 포함하라"
-        )
+        suffix = str(row_terms["query_suffix_ko"])
     else:
-        suffix = (
-            "include row-level status, evidence, caveat, and remediation fields"
-        )
-    if _contains_any(base.lower(), ("status", "판정 상태")) and _contains_any(
-        base.lower(),
-        ("remediation", "개선 조치"),
+        suffix = str(row_terms["query_suffix_en"])
+    action_needles = row_terms["action_needles"]
+    lowered_base = base.lower()
+    has_neutral_fields = (
+        _contains_any(lowered_base, ("status", "판정 상태"))
+        and _contains_any(lowered_base, ("evidence", "근거"))
+        and _contains_any(lowered_base, ("caveat", "unknown", "주의사항", "확인불가"))
+    )
+    if has_neutral_fields and (
+        not action_needles
+        or _contains_any(lowered_base, action_needles)
     ):
         return base
     separator = "하고 " if korean else " and "
@@ -2976,6 +3026,334 @@ def _candidate_req003_requirement_text(
         _candidate_requirement_text(requirement)
         for requirement in requirements
     )
+
+
+def _candidate_req003_comparison_row_terms(
+    *,
+    task: Mapping[str, Any],
+    angle: Mapping[str, Any],
+    requirements: Sequence[Mapping[str, Any]],
+    original_question: str,
+    prioritized_remediation: bool,
+) -> dict[str, Any]:
+    request_text = json.dumps(
+        [
+            original_question,
+            [
+                {
+                    "prompt_text": requirement.get("prompt_text"),
+                    "requirement_text": requirement.get("requirement_text"),
+                    "output_shape_constraints": requirement.get(
+                        "output_shape_constraints"
+                    ),
+                    "expected_modalities": requirement.get("expected_modalities"),
+                }
+                for requirement in requirements
+                if isinstance(requirement, Mapping)
+            ],
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+    remediation_required = prioritized_remediation or any(
+        _candidate_requirement_needs_remediation_action(requirement)
+        for requirement in requirements
+    )
+    base_fields = [
+        "compared item",
+        "source-backed reference",
+        "status",
+        "evidence",
+        "caveat or unknown",
+    ]
+    if remediation_required:
+        fields = [*base_fields, "remediation or next action"]
+        extra_success_criteria = [
+            (
+                "Include a remediation or next-action field only when a "
+                "mismatch, gap, or unverifiable row requires one."
+            )
+        ]
+        query_suffix_en = (
+            "include row-level status, evidence, caveat/unknown, and remediation fields"
+        )
+        query_suffix_ko = (
+            "행별 판정 상태, 근거, 주의사항 또는 미확인 사항, 개선 조치 열을 포함하라"
+        )
+        action_needles = (
+            "remediation",
+            "next action",
+            "\uac1c\uc120",
+            "\uc870\uce58",
+            "\uc2dc\uc815",
+        )
+    else:
+        fields = base_fields
+        extra_success_criteria = []
+        query_suffix_en = (
+            "include compared item, source-backed reference, status, evidence, "
+            "and caveat/unknown fields"
+        )
+        query_suffix_ko = (
+            "비교 항목, 근거 기반 참조, 판정 상태, 근거, 주의사항 또는 미확인 사항 "
+            "열을 포함하라"
+        )
+        action_needles = ()
+    field_list_text = (
+        fields[0]
+        if len(fields) == 1
+        else f"{', '.join(fields[:-1])}, and {fields[-1]}"
+    )
+    return {
+        "context": "neutral_comparison_contract",
+        "source_types": ("source-backed reference evidence",),
+        "reference_field": "source-backed reference",
+        "row_artifact": f"comparison row structure: {field_list_text}",
+        "schema_success_criterion": (
+            "The side-by-side comparison has fields for compared item, "
+            "source-backed reference, status (match, partial, mismatch, "
+            "unverifiable), evidence citation, and caveat or unknown."
+            if not remediation_required
+            else (
+                "The side-by-side comparison has fields for compared item, "
+                "source-backed reference, status (match, partial, mismatch, "
+                "unverifiable), evidence citation, caveat or unknown, and "
+                "remediation or next action."
+            )
+        ),
+        "extra_success_criteria": extra_success_criteria,
+        "action_success_criterion": (
+            extra_success_criteria[0] if extra_success_criteria else None
+        ),
+        "field_list_text": field_list_text,
+        "action_field": (
+            "remediation or next action" if remediation_required else None
+        ),
+        "row_action_field": (
+            "remediation or next action" if remediation_required else None
+        ),
+        "query_suffix_en": query_suffix_en,
+        "query_suffix_ko": query_suffix_ko,
+        "action_needles": action_needles,
+        "remediation_required": remediation_required,
+        "api_requested": _contains_any(
+            request_text,
+            (
+                "api",
+                "sdk",
+                "endpoint",
+                "rate limit",
+                "rate-limit",
+                "implementation documentation",
+                "client implication",
+            ),
+        ),
+        "screenshot_requested": _contains_any(
+            request_text,
+            (
+                "screenshot",
+                "dashboard",
+                "screen capture",
+                "visual",
+                "image",
+                "\uc774\ubbf8\uc9c0",
+                "\uc0ac\uc9c4",
+                "\uc2a4\ud06c\ub9b0\uc0f7",
+            ),
+        ),
+        "followup_requested": _contains_any(
+            request_text,
+            (
+                "follow-up",
+                "follow up",
+                "next action",
+                "next step",
+                "implication",
+                "\ud6c4\uc18d",
+                "\uc758\ubbf8",
+            ),
+        ),
+        "regulatory_requested": _contains_any(
+            request_text,
+            (
+                "regulation",
+                "regulatory",
+                "compliance",
+                "standard",
+                "law",
+                "legal",
+                "\uaddc\uc815",
+                "\uc900\uc218",
+                "\ubc95\uc801",
+                "\uae30\uc900",
+            ),
+        ),
+    }
+
+
+def _candidate_req003_sanitize_comparison_values(
+    values: Sequence[str],
+    *,
+    text_only_contract: bool,
+    row_terms: Mapping[str, Any],
+) -> list[str]:
+    sanitized = _candidate_req003_sanitize_text_only_values(
+        values,
+        text_only_contract=text_only_contract,
+    )
+    output: list[str] = []
+    remediation_required = bool(row_terms.get("remediation_required"))
+    for value in sanitized:
+        lowered = value.lower()
+        if _candidate_req003_has_unasked_template_leakage_text(
+            lowered,
+            row_terms=row_terms,
+        ):
+            continue
+        if _contains_any(
+            lowered,
+            (
+                "official regulations or standards",
+                "official standard or regulation",
+                "comparison row structure: compared item, official standard",
+                "comparison row structure: compared documentation item",
+                "comparison row structure: screenshot label/value/unit/window/scope/state",
+                "documented semantic or implementation documentation",
+                "official implementation requirement or documented behavior",
+                "follow-up or implication",
+                "follow-up or implementation implication",
+            ),
+        ):
+            continue
+        if not remediation_required and _contains_any(
+            lowered,
+            (
+                "remediation or next action",
+                "remediation or next-action",
+                "remediation fields",
+                "remediation recommendations",
+            ),
+        ) and _contains_any(
+            lowered,
+            ("comparison", "row", "mismatch", "gap", "unverifiable"),
+        ):
+            continue
+        output.append(value)
+    return output
+
+
+def _candidate_req003_sanitize_query_base(
+    query_base: str,
+    *,
+    row_terms: Mapping[str, Any],
+) -> str:
+    if not _candidate_req003_has_unasked_template_leakage_text(
+        query_base,
+        row_terms=row_terms,
+    ):
+        return query_base
+    return "Prepare the requested side-by-side comparison deliverable"
+
+
+def _candidate_req003_has_unasked_template_leakage(
+    task: Mapping[str, Any],
+    *,
+    row_terms: Mapping[str, Any],
+) -> bool:
+    return _candidate_req003_has_unasked_template_leakage_text(
+        _candidate_task_deliverable_text(task),
+        row_terms=row_terms,
+    )
+
+
+def _candidate_req003_has_unasked_template_leakage_text(
+    text: str,
+    *,
+    row_terms: Mapping[str, Any],
+) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    if _contains_any(
+        lowered,
+        (
+            "official regulations or standards",
+            "official standard or regulation",
+            "comparison row structure: compared item, official standard",
+            "comparison row structure: compared documentation item",
+            "comparison row structure: screenshot label/value/unit/window/scope/state",
+            "screenshot label/value/unit/window/scope/state",
+            "documented semantic or implementation documentation",
+            "documented semantics or api reference evidence",
+            "official implementation requirement or documented behavior",
+            "official implementation requirement evidence",
+            "follow-up or implication",
+            "follow-up or implementation implication",
+        ),
+    ):
+        return True
+    if not row_terms.get("remediation_required") and _contains_any(
+        lowered,
+        (
+            "remediation",
+            "remediate",
+            "corrective action",
+            "corrective actions",
+            "remediation next-action",
+            "remediation next action",
+            "\uac1c\uc120 \uc870\uce58",
+            "\uc2dc\uc815 \uc870\uce58",
+        ),
+    ):
+        return True
+    if not row_terms.get("followup_requested"):
+        followup_terms = [
+            "follow-up",
+            "follow up",
+            "client implication",
+            "implementation implication",
+            "\ud6c4\uc18d \ud655\uc778",
+        ]
+        if not row_terms.get("remediation_required"):
+            followup_terms.extend(["next action", "next-action"])
+        if _contains_any(lowered, tuple(followup_terms)):
+            return True
+    if not row_terms.get("api_requested") and _contains_any(
+        lowered,
+        (
+            "api",
+            "sdk",
+            "endpoint",
+            "rate limit",
+            "rate-limit",
+        ),
+    ):
+        return True
+    if not row_terms.get("screenshot_requested") and _contains_any(
+        lowered,
+        (
+            "screenshot",
+            "dashboard",
+            "screen capture",
+            "\uc2a4\ud06c\ub9b0\uc0f7",
+        ),
+    ):
+        return True
+    if not row_terms.get("regulatory_requested") and _contains_any(
+        lowered,
+        (
+            "official regulations or standards",
+            "official standard or regulation",
+            "compliance",
+            "non-compliant",
+            "noncompliant",
+            "regulatory compliance",
+            "compliance wrapper",
+            "\uc900\uc218",
+        ),
+    ):
+        return True
+    return False
 
 
 def _candidate_req003_sanitize_text_only_values(
@@ -3030,21 +3408,26 @@ def _candidate_append_req003_comparison_constraint(
     task_id: str,
     reviewer_requested_schema: bool,
     prioritized_remediation: bool,
+    row_terms: Mapping[str, Any],
 ) -> Any:
     if not isinstance(raw_constraints, list):
         return raw_constraints
-    remediation = (
-        "prioritized remediation recommendations are required"
+    action_clause = (
+        "; prioritized remediation recommendations are required"
         if prioritized_remediation
-        else "row-level remediation or next action is required"
+        else (
+            "; remediation or next action is required only when a mismatch, gap, "
+            "or unverifiable row needs one"
+            if row_terms["remediation_required"]
+            else ""
+        )
     )
     return [
         *raw_constraints,
         (
             f"Bounded task {task_id} carries the requested side-by-side comparison "
             "deliverable. "
-            "Rows must include compared item, official standard, status, evidence, "
-            f"caveat, and remediation fields; {remediation}."
+            f"Rows must include {row_terms['field_list_text']} fields{action_clause}."
         ),
     ]
 
@@ -7672,10 +8055,21 @@ def _semantic_review_oracle_semantic_blockers(
             for req in requirements
             if _candidate_requirement_is_req003_comparison(req)
         ]
+        row_terms = _candidate_req003_comparison_row_terms(
+            task={},
+            angle={},
+            requirements=comparison_requirements,
+            original_question=question,
+            prioritized_remediation=any(
+                _candidate_requirement_needs_prioritized_remediation(req)
+                for req in comparison_requirements
+            ),
+        )
         if not any(
             _candidate_has_comparison_deliverable_task(
                 tasks=tasks,
                 requirement=req,
+                row_terms=row_terms,
             )
             for req in comparison_requirements
         ):
@@ -7685,7 +8079,7 @@ def _semantic_review_oracle_semantic_blockers(
                     "message": (
                         "Req_003 comparison/output-shape oracle requirements need a "
                         "bounded side-by-side comparison deliverable with status, "
-                        "evidence, caveat, and remediation fields."
+                        "evidence, and caveat/unknown fields."
                     ),
                 }
             )
@@ -8854,6 +9248,7 @@ def _candidate_has_comparison_deliverable_task(
     *,
     tasks: Sequence[Mapping[str, Any]],
     requirement: Mapping[str, Any],
+    row_terms: Mapping[str, Any] | None = None,
 ) -> bool:
     strict_status_fields = _candidate_requirement_needs_compliance_status_fields(
         requirement
@@ -8935,31 +9330,16 @@ def _candidate_has_comparison_deliverable_task(
         ):
             continue
         has_reviewer_schema = _candidate_has_req003_comparison_field_schema_task(task)
+        if not has_reviewer_schema:
+            continue
+        if row_terms is not None and _candidate_req003_has_unasked_template_leakage(
+            task,
+            row_terms=row_terms,
+        ):
+            continue
         if strict_status_fields:
-            if not all(_contains_any(text, group) for group in status_groups) and not has_reviewer_schema:
+            if not all(_contains_any(text, group) for group in status_groups):
                 continue
-        elif not _contains_any(
-            text,
-            (
-                "difference",
-                "differences",
-                "alignment",
-                "mapping",
-                "maps",
-                "gap",
-                "omission",
-                "ambiguity",
-                "\ucc28\uc774",
-                "\ub300\uc870",
-                "\ub300\uc751",
-                "\uc77c\uce58",
-                "\ub204\ub77d",
-                "\ubaa8\ud638",
-            ),
-        ) and not has_reviewer_schema:
-            continue
-        if not _contains_any(text, ("evidence", "citation", "source", "\uadfc\uac70", "\uc778\uc6a9")):
-            continue
         return True
     return False
 
@@ -8994,12 +9374,21 @@ def _candidate_has_req003_comparison_field_schema_task(
             "unverifiable",
             "judgment",
             "compliance",
+            "difference",
+            "differences",
+            "alignment",
+            "gap",
+            "omission",
+            "ambiguity",
             "\uc0c1\ud0dc",
             "\ud310\uc815",
             "\uc77c\uce58",
             "\ubd80\ubd84",
             "\ubd88\uc77c\uce58",
             "\ud655\uc778 \ubd88\uac00",
+            "\ucc28\uc774",
+            "\ub204\ub77d",
+            "\ubaa8\ud638",
         ),
         (
             "evidence",
@@ -9021,20 +9410,6 @@ def _candidate_has_req003_comparison_field_schema_task(
             "\ubbf8\ud655\uc778",
             "\uc608\uc678",
             "\uc870\uac74",
-        ),
-        (
-            "remediation",
-            "next action",
-            "recommendation",
-            "fix",
-            "correction",
-            "follow-up",
-            "improvement",
-            "\ubcf4\uc644",
-            "\uac1c\uc120",
-            "\uc870\uce58",
-            "\uad8c\uace0",
-            "\uc2dc\uc815",
         ),
     )
     return all(_contains_any(text, group) for group in required_field_groups)
@@ -9096,6 +9471,53 @@ def _candidate_requirement_needs_prioritized_remediation(
     return action_requested and priority_requested
 
 
+def _candidate_requirement_needs_remediation_action(
+    requirement: Mapping[str, Any],
+) -> bool:
+    text = _candidate_requirement_text(requirement).lower()
+    if _contains_any(
+        text,
+        (
+            "remediation",
+            "remediate",
+            "corrective action",
+            "corrective actions",
+            "correction",
+            "corrections",
+            "correct non-compliance",
+            "correct noncompliance",
+            "fix",
+            "fixes",
+            "\uc2dc\uc815",
+        ),
+    ):
+        return True
+    compliance_requested = _contains_any(
+        text,
+        (
+            "compliance",
+            "non-compliant",
+            "noncompliant",
+            "\uc900\uc218",
+            "\ubbf8\ucda9\uc871",
+        ),
+    )
+    correction_requested = _contains_any(
+        text,
+        (
+            "correct",
+            "correction",
+            "corrective",
+            "fix",
+            "repair",
+            "\uc2dc\uc815",
+            "\ubcf4\uc644",
+            "\uac1c\uc120",
+        ),
+    )
+    return compliance_requested and correction_requested
+
+
 def _candidate_has_prioritized_remediation_task(
     *,
     tasks: Sequence[Mapping[str, Any]],
@@ -9120,6 +9542,30 @@ def _candidate_has_prioritized_remediation_task(
         if not _contains_any(text, ("impact", "effort", "confidence", "evidence", "\uc601\ud5a5", "\ub178\ub825", "\uc2e0\ub8b0", "\uadfc\uac70")):
             continue
         return True
+    return False
+
+
+def _candidate_has_req003_remediation_action_task(
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    for task in tasks:
+        text = _candidate_task_deliverable_text(task)
+        if _contains_any(
+            text,
+            (
+                "remediation",
+                "remediate",
+                "next action",
+                "corrective action",
+                "correction",
+                "fix",
+                "\uac1c\uc120",
+                "\uc870\uce58",
+                "\uc2dc\uc815",
+            ),
+        ):
+            return True
     return False
 
 
@@ -9527,9 +9973,19 @@ def validate_semantic_candidate_plan(
             requirement.get("non_negotiable") is True
             and _candidate_requirement_is_req003_comparison(requirement)
         ):
+            row_terms = _candidate_req003_comparison_row_terms(
+                task={},
+                angle={},
+                requirements=[requirement],
+                original_question=question,
+                prioritized_remediation=_candidate_requirement_needs_prioritized_remediation(
+                    requirement
+                ),
+            )
             if not _candidate_has_comparison_deliverable_task(
                 tasks=tasks,
                 requirement=requirement,
+                row_terms=row_terms,
             ):
                 failures.append(
                     {
@@ -9538,8 +9994,8 @@ def validate_semantic_candidate_plan(
                         "message": (
                             "Canonical req_003 comparison/output-shape requirements "
                             "need a bounded side-by-side comparison deliverable with "
-                            "match/partial/mismatch/unverifiable, evidence, caveat, "
-                            "and remediation fields."
+                            "match/partial/mismatch/unverifiable status, evidence, "
+                            "and caveat/unknown fields."
                         ),
                     }
                 )
