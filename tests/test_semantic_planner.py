@@ -3676,6 +3676,89 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
         self.assertNotIn("REQ_003_PRIORITIZED_REMEDIATION_MISSING", failure_codes)
 
+    def test_req003_three_part_evidence_analysis_does_not_materialize_compliance_schema(self) -> None:
+        question = (
+            "Using public official sources and publicly viewable match footage "
+            "stills or diagrams where available, analyze a disputed soccer "
+            "offside explanation: separate what can be resolved from the Laws "
+            "of the Game text, what depends on camera frame or line-drawing "
+            "evidence, and what remains uncertain without authenticated footage."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "h" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=4,
+            tasks_per_angle=3,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(3,),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        req_003 = candidate["requirement_coverage_map"][0]
+        req_003.update(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "analysis_comparison_output_shape",
+                "requirement_text": (
+                    "Produce a three-part evidence-aware analysis: conclusions "
+                    "resolvable from the Laws of the Game text, incident facts "
+                    "that require camera-frame or line-drawing evidence, and "
+                    "matters that remain uncertain without authenticated footage."
+                ),
+                "prompt_text": "separate what can be resolved from law, visuals, and uncertainty",
+                "expected_modalities": [
+                    "comparative textual analysis",
+                    "visual-evidence analysis",
+                ],
+                "output_shape_constraints": [
+                    "Organize the answer into three clearly separated categories.",
+                    "For each disputed point, state the rule, required evidence, supported conclusion, and confidence or uncertainty.",
+                    "Include a concise synthesis explaining which parts are legally sound, evidentially dependent, or presently unresolvable.",
+                ],
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": [
+                    angle["angle_id"] for angle in candidate["angles"]
+                ],
+                "covered_by_task_ids": [
+                    task["task_id"] for task in candidate["bounded_tasks"]
+                ],
+                "coverage_status": "covered",
+            }
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+        )
+        repaired, materializations = _materialize_candidate_req003_comparison_deliverable(
+            candidate,
+            raw_request={
+                "visual_preference": "visual_optional",
+                "semantic_convergence_attempt": 2,
+                "previous_candidate_validation_failure_codes": [],
+            },
+            original_question=question,
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+        self.assertEqual(materializations, [])
+        self.assertNotIn(
+            "comparison row schema",
+            json.dumps(repaired, ensure_ascii=False).lower(),
+        )
+        self.assertNotIn(
+            "candidate-validation repair",
+            json.dumps(repaired, ensure_ascii=False).lower(),
+        )
+
     def test_visual_difference_table_does_not_require_prioritized_remediation(self) -> None:
         question = "".join(
             [
@@ -4427,7 +4510,7 @@ class SemanticPlannerTests(unittest.TestCase):
         comparison_tasks = [
             task
             for task in semantic_plan["bounded_tasks"]
-            if "comparison row schema" in json.dumps(task).lower()
+            if "comparison row structure" in json.dumps(task).lower()
         ]
         self.assertTrue(comparison_tasks, semantic_plan)
         comparison_task = next(

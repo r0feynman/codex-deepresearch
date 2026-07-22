@@ -2469,9 +2469,8 @@ def _materialize_candidate_req003_comparison_deliverable(
     )
     normalized["decomposition_strategy"] = (
         str(normalized.get("decomposition_strategy") or "").rstrip()
-        + " Req_003 comparison/output-shape repair materialized an explicit "
-        "bounded side-by-side comparison deliverable with status, evidence, "
-        "caveat, and remediation fields."
+        + " The requested comparison deliverable is represented by a bounded "
+        "task with status, evidence, caveat, and remediation or next-action fields."
     ).strip()
     return normalized, [
         {
@@ -2836,7 +2835,7 @@ def _candidate_req003_repaired_comparison_task(
                 text_only_contract=text_only_contract,
             ),
             "bounded side-by-side comparison deliverable",
-            "comparison row schema: compared item, official standard, status, evidence, caveat, remediation",
+            "comparison row structure: compared item, official standard, status, evidence, caveat, remediation or next action",
         ]
     )
     remediation_text = (
@@ -3034,11 +3033,6 @@ def _candidate_append_req003_comparison_constraint(
 ) -> Any:
     if not isinstance(raw_constraints, list):
         return raw_constraints
-    reason = (
-        "reviewer-blocker repair"
-        if reviewer_requested_schema
-        else "candidate-validation repair"
-    )
     remediation = (
         "prioritized remediation recommendations are required"
         if prioritized_remediation
@@ -3047,8 +3041,8 @@ def _candidate_append_req003_comparison_constraint(
     return [
         *raw_constraints,
         (
-            f"Req_003 comparison/output-shape {reason}: bounded task {task_id} "
-            "is authoritative for the side-by-side comparison deliverable schema. "
+            f"Bounded task {task_id} carries the requested side-by-side comparison "
+            "deliverable. "
             "Rows must include compared item, official standard, status, evidence, "
             f"caveat, and remediation fields; {remediation}."
         ),
@@ -8720,9 +8714,19 @@ def _candidate_requirement_is_req003_comparison(
 ) -> bool:
     requirement_id = str(requirement.get("requirement_id") or "").lower()
     requirement_type = str(requirement.get("requirement_type") or "").lower()
-    text = _candidate_requirement_text(requirement).lower()
     if requirement_id != "req_003" and requirement_type != "analysis_comparison_output_shape":
         return False
+    text = _candidate_requirement_text(requirement).lower()
+    user_facing_text = json.dumps(
+        [
+            requirement.get("prompt_text"),
+            requirement.get("requirement_text"),
+            requirement.get("expected_modalities"),
+            requirement.get("output_shape_constraints"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
     normalized_modalities = {
         _normalize_text(item).replace(" ", "_")
         for item in _string_list(requirement.get("expected_modalities"))
@@ -8744,7 +8748,6 @@ def _candidate_requirement_is_req003_comparison(
             "comparison table",
             "comparison matrix",
             "comparison deliverable",
-            "matrix",
             "requirements matrix",
             "\uc694\uad6c\uc0ac\ud56d\ubcc4 \ube44\uad50",
             "\ube44\uad50\ud45c",
@@ -8756,6 +8759,37 @@ def _candidate_requirement_is_req003_comparison(
         ),
     ):
         return True
+    field_terms = (
+        "status",
+        "match",
+        "partial",
+        "mismatch",
+        "unverifiable",
+        "compliance",
+        "non-compliant",
+        "\uc0c1\ud0dc",
+        "\uc77c\uce58",
+        "\ubd80\ubd84",
+        "\ubd88\uc77c\uce58",
+        "\ud310\ub2e8 \ubd88\uac00",
+        "\uc900\uc218",
+        "\ucda9\uc871\ub3c4",
+    )
+    comparison_terms = (
+        "compare",
+        "comparison",
+        "side-by-side",
+        "side by side",
+        "against",
+        "\ube44\uad50",
+        "\ub300\uc870",
+        "\uc88c\uc6b0",
+    )
+    if _contains_any(user_facing_text, field_terms) and _contains_any(
+        user_facing_text,
+        comparison_terms,
+    ):
+        return True
     if requirement_id == "req_003" and _contains_any(
         text,
         (
@@ -8765,8 +8799,6 @@ def _candidate_requirement_is_req003_comparison(
             "mismatch",
             "unverifiable",
             "compliance",
-            "evidence",
-            "caveat",
             "remediation",
             "next action",
             "\uc0c1\ud0dc",
@@ -8778,19 +8810,32 @@ def _candidate_requirement_is_req003_comparison(
             "\ucda9\uc871\ub3c4",
         ),
     ) and _contains_any(
-        text,
+        user_facing_text,
         ("compare", "comparison", "\ube44\uad50", "\ub300\uc870", "\uc88c\uc6b0"),
     ):
         return True
-    if not _contains_any(text, ("compare", "comparison", "\ube44\uad50")):
+    if not _contains_any(
+        user_facing_text,
+        (
+            "compare",
+            "comparison",
+            "side-by-side",
+            "side by side",
+            "\ube44\uad50",
+            "\ub300\uc870",
+            "\uc88c\uc6b0",
+        ),
+    ):
         return False
     return _contains_any(
-        text,
+        user_facing_text,
         (
             "side-by-side",
             "side by side",
-            "matrix",
-            "table",
+            "comparison matrix",
+            "comparison table",
+            "comparison deliverable",
+            "requirements matrix",
             "\ub300\uc751\ud45c",
             "\ube44\uad50\ud45c",
             "\uc88c\uc6b0",
@@ -8801,11 +8846,6 @@ def _candidate_requirement_is_req003_comparison(
             "\uc77c\uce58",
             "\ubd88\uc77c\uce58",
             "\ud310\ub2e8 \ubd88\uac00",
-            "\uaca9\ucc28",
-            "\uc99d\uac70",
-            "\uc8fc\uc758\uc0ac\ud56d",
-            "\uac1c\uc120",
-            "\ubcf4\uc644 \uc870\uce58",
         ),
     )
 
