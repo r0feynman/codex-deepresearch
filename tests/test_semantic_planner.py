@@ -2181,6 +2181,77 @@ class SemanticPlannerTests(unittest.TestCase):
             substitute["forbidden_angle_terms_found"],
         )
 
+    def test_semantic_substitute_check_allows_domain_disambiguation_from_forbidden_angle(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        oracle["forbidden_internal_implementation_terms"].append("architecture")
+        oracle["forbidden_angles"].append("software architecture")
+        plan = self.semantic_internal_leakage_review_plan(
+            query=(
+                "Research architecture review in hospital facility planning, "
+                "using official planning guidance, and distinguish it from "
+                "clinical service planning, statutory inspection, technical "
+                "commissioning, and software architecture."
+            ),
+            expected_artifacts=[
+                "hospital facility planning guidance matrix",
+                "domain boundary notes separating facility planning from software architecture",
+            ],
+            success_criteria=[
+                (
+                    "Extract hospital facility planning requirements from official "
+                    "physical planning guidance."
+                ),
+                (
+                    "Separate the hospital facility planning review from software "
+                    "architecture, clinical service planning, and commissioning."
+                ),
+            ],
+            done_condition=(
+                "Stop when the facility-planning review distinguishes the physical "
+                "hospital domain from software architecture."
+            ),
+        )
+
+        substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+
+        self.assertFalse(_has_forbidden_internal_leakage(plan=plan, oracle=oracle))
+        self.assertTrue(substitute["passed"], substitute)
+        self.assertNotIn(
+            "software architecture",
+            substitute["forbidden_angle_terms_found"],
+        )
+
+    def test_semantic_substitute_check_blocks_positive_forbidden_angle_despite_facility_context(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        oracle["forbidden_internal_implementation_terms"].append("architecture")
+        oracle["forbidden_angles"].append("software architecture")
+        plan = self.semantic_internal_leakage_review_plan(
+            query=(
+                "Research hospital facility planning and software architecture "
+                "integration requirements using official guidance."
+            ),
+            expected_artifacts=[
+                "facility planning and software architecture comparison notes",
+            ],
+            success_criteria=[
+                (
+                    "Compare physical facility planning and software architecture "
+                    "as in-scope implementation domains."
+                ),
+            ],
+            done_condition=(
+                "Stop when software architecture implications are documented."
+            ),
+        )
+
+        substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+
+        self.assertFalse(substitute["passed"], substitute)
+        self.assertIn(
+            "software architecture",
+            substitute["forbidden_angle_terms_found"],
+        )
+
     def test_semantic_substitute_check_allows_forbidden_phrase_in_prohibitive_constraints(self) -> None:
         oracle = self.semantic_internal_leakage_oracle()
         oracle["forbidden_angles"].append("legal, insurance, or financial advice")

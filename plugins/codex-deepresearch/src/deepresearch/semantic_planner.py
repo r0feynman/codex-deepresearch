@@ -8223,6 +8223,12 @@ def _forbidden_angle_reference_is_negative_scope(
         rf"(?:\s+\w+){{0,14}}\s+{re.escape(normalized_term)}\b",
         rf"\b(?:exclusion|exclusions)\s+of\b"
         rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"\b(?:distinguish|distinguishes|distinguishing|distinguished|differentiate|"
+        rf"differentiates|differentiating|differentiated|separate|separates|"
+        rf"separating|separated|disambiguate|disambiguates|disambiguating|"
+        rf"disambiguated)\b(?:\s+\w+){{0,18}}\s+"
+        rf"(?:from|against|versus|vs|rather\s+than|instead\s+of)\b"
+        rf"(?:\s+\w+){{0,18}}\s+{re.escape(normalized_term)}\b",
     )
     return any(re.search(pattern, normalized_value) for pattern in negative_patterns)
 
