@@ -830,7 +830,10 @@ def codex_semantic_candidate_plan(
             )
             if repair_materialization_allowed:
                 candidate, source_cap_split_materializations = (
-                    _materialize_candidate_source_cap_splits(candidate)
+                    _materialize_candidate_source_cap_splits(
+                        candidate,
+                        budget_cap=raw_request.get("budget_cap"),
+                    )
                 )
                 candidate, comparison_deliverable_materializations = (
                     _materialize_candidate_req003_comparison_deliverable(
@@ -852,6 +855,7 @@ def codex_semantic_candidate_plan(
                 _materialize_candidate_source_cap_constraints(
                     candidate,
                     source_cap_normalizations=source_cap_normalizations,
+                    budget_cap=raw_request.get("budget_cap"),
                 )
             )
             if repair_materialization_allowed:
@@ -1498,6 +1502,8 @@ def _semantic_repair_materialization_allowed(raw_request: Mapping[str, Any]) -> 
 
 def _materialize_candidate_source_cap_splits(
     candidate: Mapping[str, Any],
+    *,
+    budget_cap: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     normalized = copy.deepcopy(dict(candidate))
     raw_tasks = normalized.get("bounded_tasks")
@@ -1513,6 +1519,10 @@ def _materialize_candidate_source_cap_splits(
     materializations: list[dict[str, Any]] = []
     normalized_tasks: list[Any] = []
     mapping_task_count = sum(1 for task in raw_tasks if isinstance(task, Mapping))
+    shared_source_budget_available = _candidate_shared_source_budget_available(
+        normalized,
+        budget_cap=budget_cap,
+    )
     for index, task in enumerate(raw_tasks, start=1):
         if not isinstance(task, Mapping):
             normalized_tasks.append(task)
@@ -1534,7 +1544,78 @@ def _materialize_candidate_source_cap_splits(
         if split_count <= 1:
             normalized_tasks.append(dict(task))
             continue
-        projected_task_count = mapping_task_count + split_count - 1
+        semantic_partitions = _candidate_source_cap_semantic_partitions(
+            task,
+            minimum_partition_count=split_count,
+            required_sources=required_sources,
+        )
+        if not semantic_partitions:
+            original_task_id = str(task.get("task_id") or f"task_{index:03d}")
+            if shared_source_budget_available:
+                normalized_task = _candidate_source_pool_reuse_task(
+                    task,
+                    original_task_id=original_task_id,
+                    required_sources=required_sources,
+                    source_reasons=source_reasons,
+                )
+                normalized_tasks.append(normalized_task)
+                materializations.append(
+                    {
+                        "field": "bounded_tasks",
+                        "materialization": (
+                            "source_cap_split_deferred_to_shared_source_pool"
+                        ),
+                        "repair_status": "repaired",
+                        "original_task_id": original_task_id,
+                        "original_task_index": index,
+                        "required_count": required_sources,
+                        "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
+                        "required_split_task_count": split_count,
+                        "replacement_task_id": normalized_task.get("task_id"),
+                        "requirement_kind": _dominant_cap_requirement_kind(
+                            source_counts,
+                            fallback="source",
+                            source_reasons=source_reasons,
+                        ),
+                        "explicit_requirement_counts": source_counts,
+                        "source_cap_reasons": source_reasons,
+                        "reuse_strategy": "shared_source_pool",
+                    }
+                )
+                continue
+            normalized_tasks.append(dict(task))
+            materializations.append(
+                {
+                    "field": "bounded_tasks",
+                    "materialization": (
+                        "source_cap_split_requires_semantic_partitions"
+                    ),
+                    "repair_status": "blocked",
+                    "blocked_feasibility_code": (
+                        "bounded_task_requirement_exceeds_max_sources"
+                    ),
+                    "original_task_id": original_task_id,
+                    "original_task_index": index,
+                    "required_count": required_sources,
+                    "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
+                    "required_split_task_count": split_count,
+                    "requirement_kind": _dominant_cap_requirement_kind(
+                        source_counts,
+                        fallback="source",
+                        source_reasons=source_reasons,
+                    ),
+                    "explicit_requirement_counts": source_counts,
+                    "source_cap_reasons": source_reasons,
+                    "message": (
+                        "Over-cap source requirements need deterministic typed "
+                        "provider, document, entity, or dimension partitions before "
+                        "the planner can split them into separate executable tasks."
+                    ),
+                }
+            )
+            continue
+
+        projected_task_count = mapping_task_count + len(semantic_partitions) - 1
         if projected_task_count > 40:
             normalized_tasks.append(dict(task))
             materializations.append(
@@ -1551,7 +1632,7 @@ def _materialize_candidate_source_cap_splits(
                     "original_task_index": index,
                     "required_count": required_sources,
                     "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
-                    "required_split_task_count": split_count,
+                    "required_split_task_count": len(semantic_partitions),
                     "current_task_count": mapping_task_count,
                     "projected_task_count": projected_task_count,
                     "max_task_count": 40,
@@ -1568,14 +1649,15 @@ def _materialize_candidate_source_cap_splits(
 
         original_task_id = str(task.get("task_id") or f"task_{index:03d}")
         split_tasks: list[dict[str, Any]] = []
-        for split_index in range(1, split_count + 1):
+        for split_index, partition in enumerate(semantic_partitions, start=1):
             split_task = _candidate_source_cap_split_task(
                 task,
                 original_task_id=original_task_id,
                 split_index=split_index,
-                split_count=split_count,
+                split_count=len(semantic_partitions),
                 required_sources=required_sources,
                 existing_task_ids=existing_task_ids,
+                partition=partition,
             )
             existing_task_ids.add(str(split_task["task_id"]))
             split_tasks.append(split_task)
@@ -1589,7 +1671,7 @@ def _materialize_candidate_source_cap_splits(
                 "original_task_id": original_task_id,
                 "original_task_index": index,
                 "split_task_ids": split_task_ids,
-                "split_task_count": split_count,
+                "split_task_count": len(semantic_partitions),
                 "required_count": required_sources,
                 "per_task_max_sources": SEMANTIC_TASK_MAX_SOURCES,
                 "original_max_sources": _semantic_task_source_cap_int(
@@ -1602,6 +1684,7 @@ def _materialize_candidate_source_cap_splits(
                 ),
                 "explicit_requirement_counts": source_counts,
                 "source_cap_reasons": source_reasons,
+                "semantic_partitions": copy.deepcopy(semantic_partitions),
             }
         )
 
@@ -1629,19 +1712,33 @@ def _candidate_source_cap_split_task(
     split_count: int,
     required_sources: int,
     existing_task_ids: set[str],
+    partition: Mapping[str, Any],
 ) -> dict[str, Any]:
     split_task = dict(task)
+    partition_label = str(
+        partition.get("label")
+        or partition.get("assignment_value")
+        or f"semantic partition {split_index}"
+    ).strip()
+    assignment_type = str(partition.get("assignment_type") or "semantic").strip()
+    assignment_value = str(partition.get("assignment_value") or partition_label).strip()
     split_task["task_id"] = _candidate_split_task_id(
         original_task_id,
         split_index=split_index,
         existing_task_ids=existing_task_ids,
+        partition=partition,
     )
     subject = _candidate_source_split_subject(task)
     focus = _candidate_source_split_focus(task)
-    split_task["query"] = (
-        f"{subject} {focus} source group {split_index} of {split_count}"
+    split_task["query"] = f"{subject} {focus} for {partition_label}"
+    split_task["max_sources"] = min(
+        SEMANTIC_TASK_MAX_SOURCES,
+        max(
+            SEMANTIC_TASK_MIN_SOURCES,
+            _semantic_task_source_cap_int(partition.get("max_sources"))
+            or SEMANTIC_TASK_MAX_SOURCES,
+        ),
     )
-    split_task["max_sources"] = SEMANTIC_TASK_MAX_SOURCES
     if str(split_task.get("route") or "text_only") == "text_only":
         split_task["max_images"] = 0
         split_task["expected_visual_targets"] = []
@@ -1650,19 +1747,28 @@ def _candidate_source_cap_split_task(
         split_policy = dict(source_policy)
     else:
         split_policy = {"decision": "allowed", "flags": []}
-    split_policy["source_group"] = {
+    split_policy["source_partition"] = {
+        "partition_id": partition.get("partition_id"),
         "index": split_index,
         "count": split_count,
         "original_task_id": original_task_id,
         "original_required_sources": required_sources,
+        "assignment_type": assignment_type,
+        "assignment_value": assignment_value,
     }
     split_task["source_policy"] = split_policy
+    split_task["source_partition_assignment"] = {
+        "partition_id": partition.get("partition_id"),
+        "assignment_type": assignment_type,
+        "assignment_value": assignment_value,
+        "label": partition_label,
+    }
     split_task["expected_artifacts"] = _ordered_unique(
         [
             *_candidate_source_split_scrub_list(
                 _string_list(task.get("expected_artifacts"))
             ),
-            f"source group {split_index} evidence notes",
+            f"{partition_label} evidence notes",
         ]
     )
     split_task["success_criteria"] = _ordered_unique(
@@ -1671,19 +1777,19 @@ def _candidate_source_cap_split_task(
                 _string_list(task.get("success_criteria"))
             ),
             (
-                f"Collect no more than {SEMANTIC_TASK_MAX_SOURCES} official or "
-                "primary source records for this source group."
+                f"Collect no more than {split_task['max_sources']} official or "
+                f"primary source records assigned to {partition_label}."
             ),
             (
                 "Record source metadata, caveats, and unresolved contradictions "
-                "without requiring cross-group synthesis inside this bounded task."
+                "without requiring cross-partition synthesis inside this bounded task."
             ),
         ]
     )
     split_task["done_condition"] = (
-        f"Stop when source group {split_index} has no more than "
-        f"{SEMANTIC_TASK_MAX_SOURCES} source-backed findings, source metadata, "
-        "and caveats; defer cross-group synthesis to the comparison deliverable."
+        f"Stop when {partition_label} has no more than "
+        f"{split_task['max_sources']} source-backed findings, source metadata, "
+        "and caveats; defer cross-partition synthesis to the comparison deliverable."
     )
     return split_task
 
@@ -1693,11 +1799,28 @@ def _candidate_split_task_id(
     *,
     split_index: int,
     existing_task_ids: set[str],
+    partition: Mapping[str, Any] | None = None,
 ) -> str:
     base = re.sub(r"[^A-Za-z0-9_]+", "_", original_task_id).strip("_")
     if not base:
         base = "task"
-    candidate = f"{base}_srcgrp_{split_index:02d}"
+    partition_token = ""
+    if isinstance(partition, Mapping):
+        for value in (
+            partition.get("partition_id"),
+            partition.get("assignment_value"),
+            partition.get("label"),
+        ):
+            partition_token = re.sub(
+                r"[^A-Za-z0-9_]+",
+                "_",
+                str(value or "").lower(),
+            ).strip("_")
+            if partition_token:
+                break
+    if not partition_token:
+        partition_token = f"part_{split_index:02d}"
+    candidate = f"{base}_{partition_token}"
     if candidate not in existing_task_ids:
         return candidate
     suffix = 2
@@ -1746,6 +1869,33 @@ def _candidate_source_split_scrub_list(values: Sequence[str]) -> list[str]:
 
 
 def _candidate_source_split_scrub_text(value: str) -> str:
+    return _candidate_counted_source_obligation_scrub_text(
+        value,
+        replacement="partition evidence",
+    )
+
+
+def _candidate_source_pool_reuse_scrub_list(values: Sequence[str]) -> list[str]:
+    return [
+        scrubbed
+        for value in values
+        for scrubbed in [_candidate_source_pool_reuse_scrub_text(value)]
+        if scrubbed
+    ]
+
+
+def _candidate_source_pool_reuse_scrub_text(value: str) -> str:
+    return _candidate_counted_source_obligation_scrub_text(
+        value,
+        replacement="shared source-pool evidence",
+    )
+
+
+def _candidate_counted_source_obligation_scrub_text(
+    value: str,
+    *,
+    replacement: str,
+) -> str:
     text = " ".join(str(value or "").split())
     if not text:
         return ""
@@ -1777,9 +1927,9 @@ def _candidate_source_split_scrub_text(value: str) -> str:
         re.escape(noun) for noun in sorted(counted_nouns, key=len, reverse=True)
     )
     text = re.sub(
-        rf"\b(?:at least|minimum of|no fewer than|compare|across|from|cover|collect|inspect|analyze|review|use|include)?\s*"
+        rf"\b(?:at least|minimum of|no fewer than|at most|no more than|up to|compare|across|from|cover|collect|inspect|analyze|review|use|include)?\s*"
         rf"{count_pattern}\s+(?:distinct\s+|different\s+|representative\s+|official\s+|primary\s+|regulatory\s+)?(?:{noun_pattern})\b",
-        "source group evidence",
+        replacement,
         text,
         flags=re.IGNORECASE,
     )
@@ -1836,12 +1986,266 @@ def _candidate_append_source_split_constraint(
     return [
         *raw_constraints,
         (
-            "Over-broad source obligations were split before fan-out: "
+            "Typed source obligations were partitioned before fan-out: "
             f"{', '.join(original_ids)} now materialize as {split_count} "
-            f"bounded source-group tasks, each with max_sources<={SEMANTIC_TASK_MAX_SOURCES}. "
-            "Synthesis must combine the source groups without raising any per-task cap."
+            f"bounded semantic-partition tasks, each with max_sources<={SEMANTIC_TASK_MAX_SOURCES}. "
+            "Synthesis must combine the partitions without raising any per-task cap."
         ),
     ]
+
+
+def _candidate_shared_source_budget_available(
+    candidate: Mapping[str, Any],
+    *,
+    budget_cap: Any = None,
+) -> bool:
+    runner_source_budget = candidate.get("runner_source_budget")
+    runner_cap = _candidate_runner_source_budget_cap(runner_source_budget)
+    if runner_cap is not None and runner_cap > 0:
+        if not isinstance(runner_source_budget, Mapping):
+            return True
+        allocation_strategy = str(
+            runner_source_budget.get("allocation_strategy") or ""
+        ).lower()
+        budget_type = str(runner_source_budget.get("budget_type") or "").lower()
+        if (
+            "shared_source_pool" in allocation_strategy
+            or "shared source pool" in allocation_strategy
+            or "reuse" in allocation_strategy
+            or "reuse" in budget_type
+            or runner_source_budget.get("reuse_required") is True
+        ):
+            return True
+    request_max_sources = (
+        _semantic_task_source_cap_int(budget_cap.get("max_sources"))
+        if isinstance(budget_cap, Mapping)
+        else None
+    )
+    return request_max_sources is not None and request_max_sources > 0
+
+
+def _candidate_source_cap_semantic_partitions(
+    task: Mapping[str, Any],
+    *,
+    minimum_partition_count: int,
+    required_sources: int,
+) -> list[dict[str, Any]]:
+    raw_partitions = _candidate_raw_source_cap_partitions(task)
+    if len(raw_partitions) < minimum_partition_count:
+        return []
+    partitions: list[dict[str, Any]] = []
+    for index, raw_partition in enumerate(raw_partitions, start=1):
+        partition = _candidate_normalized_source_cap_partition(
+            raw_partition,
+            partition_index=index,
+        )
+        if partition is None:
+            return []
+        partitions.append(partition)
+    total_partition_cap = sum(
+        _semantic_task_source_cap_int(partition.get("max_sources"))
+        or SEMANTIC_TASK_MAX_SOURCES
+        for partition in partitions
+    )
+    if total_partition_cap < required_sources:
+        return []
+    return partitions
+
+
+def _candidate_raw_source_cap_partitions(task: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    containers: list[Any] = [
+        task.get("source_partitions"),
+        task.get("semantic_partitions"),
+        task.get("evidence_partitions"),
+        task.get("source_assignments"),
+    ]
+    source_policy = task.get("source_policy")
+    if isinstance(source_policy, Mapping):
+        containers.extend(
+            [
+                source_policy.get("source_partitions"),
+                source_policy.get("semantic_partitions"),
+                source_policy.get("evidence_partitions"),
+                source_policy.get("source_assignments"),
+            ]
+        )
+        source_allocation = source_policy.get("source_allocation")
+        if isinstance(source_allocation, Mapping):
+            containers.extend(
+                [
+                    source_allocation.get("partitions"),
+                    source_allocation.get("source_partitions"),
+                ]
+            )
+    partitions: list[Mapping[str, Any]] = []
+    for container in containers:
+        if not isinstance(container, list):
+            continue
+        for item in container:
+            if isinstance(item, Mapping):
+                partitions.append(item)
+    return partitions
+
+
+def _candidate_normalized_source_cap_partition(
+    raw_partition: Mapping[str, Any],
+    *,
+    partition_index: int,
+) -> dict[str, Any] | None:
+    assignment = _candidate_source_partition_assignment(raw_partition)
+    if assignment is None:
+        return None
+    assignment_type, assignment_value = assignment
+    label = str(
+        raw_partition.get("label")
+        or raw_partition.get("name")
+        or raw_partition.get("title")
+        or assignment_value
+    ).strip()
+    if _candidate_source_partition_label_is_generic(label):
+        return None
+    max_sources = _semantic_task_source_cap_int(
+        raw_partition.get("max_sources")
+        or raw_partition.get("source_cap")
+        or raw_partition.get("max_unique_sources")
+    )
+    if max_sources is None or max_sources <= 0:
+        max_sources = SEMANTIC_TASK_MAX_SOURCES
+    partition_id = str(
+        raw_partition.get("partition_id")
+        or raw_partition.get("id")
+        or f"{assignment_type}_{assignment_value}"
+    ).strip()
+    partition_id = re.sub(r"[^A-Za-z0-9_]+", "_", partition_id.lower()).strip("_")
+    if not partition_id:
+        partition_id = f"partition_{partition_index:02d}"
+    return {
+        "partition_id": partition_id,
+        "label": label,
+        "assignment_type": assignment_type,
+        "assignment_value": assignment_value,
+        "max_sources": min(SEMANTIC_TASK_MAX_SOURCES, max_sources),
+    }
+
+
+def _candidate_source_partition_assignment(
+    raw_partition: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    explicit_type = str(raw_partition.get("assignment_type") or "").strip().lower()
+    explicit_value = str(raw_partition.get("assignment_value") or "").strip()
+    allowed_types = {
+        "provider",
+        "vendor",
+        "document",
+        "document_set",
+        "entity",
+        "domain",
+        "dimension",
+        "topic",
+        "jurisdiction",
+        "standard",
+    }
+    if explicit_type in allowed_types and explicit_value:
+        return explicit_type, explicit_value
+    for field_name in (
+        "provider",
+        "vendor",
+        "document",
+        "document_set",
+        "entity",
+        "domain",
+        "dimension",
+        "topic",
+        "jurisdiction",
+        "standard",
+    ):
+        value = raw_partition.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return field_name, value.strip()
+    return None
+
+
+def _candidate_source_partition_label_is_generic(label: str) -> bool:
+    lowered = str(label or "").strip().lower()
+    if not lowered:
+        return True
+    generic_patterns = (
+        r"\bsource[- ]?group\b",
+        r"\bsrcgrp\b",
+        r"\b(?:group|partition)\s*\d+\b",
+        r"^\d+$",
+    )
+    return any(re.search(pattern, lowered) for pattern in generic_patterns)
+
+
+def _candidate_source_pool_reuse_task(
+    task: Mapping[str, Any],
+    *,
+    original_task_id: str,
+    required_sources: int,
+    source_reasons: Sequence[str],
+) -> dict[str, Any]:
+    repaired = dict(task)
+    repaired["task_id"] = original_task_id
+    current_max_sources = _semantic_task_source_cap_int(repaired.get("max_sources"))
+    repaired["max_sources"] = min(
+        SEMANTIC_TASK_MAX_SOURCES,
+        max(SEMANTIC_TASK_MIN_SOURCES, current_max_sources or SEMANTIC_TASK_MAX_SOURCES),
+    )
+    if str(repaired.get("route") or "text_only") == "text_only":
+        repaired["max_images"] = 0
+        repaired["expected_visual_targets"] = []
+    repaired["query"] = _candidate_source_pool_reuse_scrub_text(
+        str(repaired.get("query") or "")
+    )
+    source_policy = repaired.get("source_policy")
+    if isinstance(source_policy, Mapping):
+        repaired_policy = dict(source_policy)
+    else:
+        repaired_policy = {"decision": "allowed", "flags": []}
+    repaired_policy["shared_source_pool"] = {
+        "reuse_required": True,
+        "original_required_sources": required_sources,
+        "per_task_max_sources": repaired["max_sources"],
+        "source_cap_reasons": list(source_reasons),
+    }
+    repaired["source_policy"] = repaired_policy
+    repaired["expected_artifacts"] = _ordered_unique(
+        [
+            *_candidate_source_pool_reuse_scrub_list(
+                _string_list(repaired.get("expected_artifacts"))
+            ),
+            "shared source-pool evidence map",
+        ]
+    )
+    repaired["success_criteria"] = _ordered_unique(
+        [
+            *_candidate_source_pool_reuse_scrub_list(
+                _string_list(repaired.get("success_criteria"))
+            ),
+            (
+                f"Use no more than {repaired['max_sources']} new source records "
+                "inside this bounded task."
+            ),
+            (
+                "Reuse source-backed findings from the shared source pool for "
+                "wider synthesis, and mark unresolved gaps as caveats instead of "
+                "creating generic source partitions."
+            ),
+        ]
+    )
+    repaired["done_condition"] = (
+        "Stop when the substantive task has mapped shared source-pool evidence, "
+        "caveats, and unknowns into its deliverable without requiring additional "
+        "unique source retrievals beyond its bounded task cap."
+    )
+    repaired["source_pool_reuse_required"] = True
+    repaired["source_pool_reuse_note"] = (
+        "The original source obligation exceeded the per-task source schema cap. "
+        "The task now remains substantive and reuses run-level evidence rather "
+        "than being split into generic wrappers."
+    )
+    return repaired
 
 
 def _materialize_candidate_broad_cardinality(
@@ -3436,6 +3840,7 @@ def _materialize_candidate_source_cap_constraints(
     candidate: Mapping[str, Any],
     *,
     source_cap_normalizations: Sequence[Mapping[str, Any]],
+    budget_cap: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     normalized = copy.deepcopy(dict(candidate))
     raw_constraints = normalized.get("constraints")
@@ -3478,12 +3883,19 @@ def _materialize_candidate_source_cap_constraints(
     min_cap = min(caps)
     max_cap = max(caps)
     total_cap = sum(caps)
-    declared_global_budgets = [
-        int(conflict["declared_source_budget"])
-        for conflict in conflict_records
-        if _semantic_task_source_cap_int(conflict.get("declared_source_budget")) is not None
-    ]
-    declared_global_budget = min(declared_global_budgets) if declared_global_budgets else None
+    request_max_sources = (
+        _semantic_task_source_cap_int(budget_cap.get("max_sources"))
+        if isinstance(budget_cap, Mapping)
+        else None
+    )
+    budget_interpretation = _candidate_source_budget_interpretation(
+        raw_constraints,
+        request_max_sources=request_max_sources,
+        existing_runner_budget=normalized.get("runner_source_budget"),
+    )
+    declared_global_budget = _candidate_source_budget_interpretation_selected_cap(
+        budget_interpretation
+    )
     runner_source_budget: dict[str, Any] | None = None
     if declared_global_budget is not None:
         runner_source_budget = _candidate_runner_source_budget_record(
@@ -3491,6 +3903,8 @@ def _materialize_candidate_source_cap_constraints(
             task_max_sources_sum=total_cap,
             bounded_task_count=len(caps),
             removed_constraints=removed_constraints,
+            request_max_sources=request_max_sources,
+            budget_interpretation=budget_interpretation,
         )
         existing_runner_budget = normalized.get("runner_source_budget")
         if isinstance(existing_runner_budget, Mapping):
@@ -3530,6 +3944,7 @@ def _materialize_candidate_source_cap_constraints(
         "bounded_task_count": len(caps),
         "conflicts": conflict_records,
         "replacement_constraint": replacement,
+        "budget_interpretation": budget_interpretation,
     }
     if declared_global_budget is not None:
         materialization.update(
@@ -3594,8 +4009,10 @@ def _candidate_runner_source_budget_record(
     task_max_sources_sum: int,
     bounded_task_count: int,
     removed_constraints: Sequence[str],
+    request_max_sources: int | None = None,
+    budget_interpretation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "budget_type": "runner_level_unique_source_reuse",
         "max_unique_sources": declared_source_budget,
         "declared_source_budget": declared_source_budget,
@@ -3606,6 +4023,16 @@ def _candidate_runner_source_budget_record(
         "enforcement_scope": "run",
         "materialized_constraint_count": len(removed_constraints),
     }
+    if request_max_sources is not None:
+        record["request_max_sources"] = request_max_sources
+    if isinstance(budget_interpretation, Mapping) and budget_interpretation:
+        selected_source = str(budget_interpretation.get("selected_source") or "")
+        if selected_source:
+            record["budget_origin"] = selected_source
+        if selected_source == "natural_language_global_total":
+            record["materialized_from_natural_language_constraints"] = True
+        record["budget_interpretation"] = copy.deepcopy(dict(budget_interpretation))
+    return record
 
 
 def _candidate_constraint_preserves_executable_source_budget(
@@ -3831,42 +4258,352 @@ def _candidate_task_subject_anchor(
 
 
 def _candidate_declared_global_source_budget(constraint: Any) -> int | None:
+    return _candidate_select_natural_language_global_source_budget(
+        _candidate_declared_source_budget_candidates(constraint)
+    )
+
+
+def _candidate_source_budget_interpretation(
+    constraints: Sequence[Any],
+    *,
+    request_max_sources: int | None = None,
+    existing_runner_budget: Any = None,
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for index, constraint in enumerate(constraints, start=1):
+        candidates.extend(
+            _candidate_declared_source_budget_candidates(
+                constraint,
+                constraint_index=index,
+            )
+        )
+
+    global_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("candidate_type") == "global_total_budget"
+    ]
+    allocation_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("candidate_type") == "allocation_sub_budget"
+    ]
+    ambiguous_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("candidate_type") == "ambiguous_source_budget"
+    ]
+    natural_language_global = (
+        _candidate_select_natural_language_global_source_budget(candidates)
+    )
+    typed_runner_cap = _candidate_runner_source_budget_explicit_typed_cap(
+        existing_runner_budget
+    )
+    typed_runner_compatible = (
+        typed_runner_cap is not None
+        and (
+            request_max_sources is None
+            or typed_runner_cap <= request_max_sources
+        )
+    )
+    if typed_runner_compatible:
+        selected_cap = typed_runner_cap
+        selected_source = "typed_runner_limit"
+    elif request_max_sources is not None and request_max_sources > 0:
+        selected_cap = request_max_sources
+        selected_source = "request_max_sources"
+    elif natural_language_global is not None:
+        selected_cap = natural_language_global
+        selected_source = "natural_language_global_total"
+    else:
+        selected_cap = None
+        selected_source = "none"
+
+    interpretation: dict[str, Any] = {
+        "selected_max_unique_sources": selected_cap,
+        "selected_source": selected_source,
+        "request_max_sources": request_max_sources,
+        "typed_runner_max_unique_sources": typed_runner_cap,
+        "typed_runner_limit_compatible": typed_runner_compatible,
+        "selected_natural_language_global_total": natural_language_global,
+        "global_total_budget_candidates": global_candidates,
+        "allocation_sub_budget_candidates": allocation_candidates,
+        "ambiguous_source_budget_candidates": ambiguous_candidates,
+    }
+    if (
+        typed_runner_cap is not None
+        and request_max_sources is not None
+        and typed_runner_cap > request_max_sources
+    ):
+        interpretation["typed_runner_limit_conflict"] = (
+            "typed_runner_limit_exceeds_request_max_sources"
+        )
+    if allocation_candidates and selected_source in {
+        "request_max_sources",
+        "typed_runner_limit",
+        "natural_language_global_total",
+    }:
+        interpretation["allocation_candidates_used_as_global_limit"] = False
+    return interpretation
+
+
+def _candidate_source_budget_interpretation_selected_cap(
+    interpretation: Mapping[str, Any],
+) -> int | None:
+    return _semantic_task_source_cap_int(
+        interpretation.get("selected_max_unique_sources")
+    )
+
+
+def _candidate_select_natural_language_global_source_budget(
+    candidates: Sequence[Mapping[str, Any]],
+) -> int | None:
+    global_values = [
+        int(candidate["value"])
+        for candidate in candidates
+        if (
+            candidate.get("candidate_type") == "global_total_budget"
+            and _semantic_task_source_cap_int(candidate.get("value")) is not None
+        )
+    ]
+    if global_values:
+        return min(global_values)
+    ambiguous_values = [
+        int(candidate["value"])
+        for candidate in candidates
+        if (
+            candidate.get("candidate_type") == "ambiguous_source_budget"
+            and _semantic_task_source_cap_int(candidate.get("value")) is not None
+        )
+    ]
+    allocation_values = [
+        int(candidate["value"])
+        for candidate in candidates
+        if (
+            candidate.get("candidate_type") == "allocation_sub_budget"
+            and _semantic_task_source_cap_int(candidate.get("value")) is not None
+        )
+    ]
+    if len(ambiguous_values) == 1 and not allocation_values:
+        return ambiguous_values[0]
+    return None
+
+
+def _candidate_declared_source_budget_candidates(
+    constraint: Any,
+    *,
+    constraint_index: int | None = None,
+) -> list[dict[str, Any]]:
     if not isinstance(constraint, str):
-        return None
+        return []
     text = str(constraint)
     lowered = text.lower()
     if not (
         "source" in lowered
         or "retrieval" in lowered
         or "max_sources" in lowered
+        or "page" in lowered
         or "출처" in text
     ):
-        return None
-    if "per-task" in lowered or "per task" in lowered or "each bounded task" in lowered:
-        if not any(
-            marker in lowered
-            for marker in ("overall", "global", "total", "aggregate", "sum", "budget")
-        ):
-            return None
-    patterns = (
-        r"\b(?:overall|global|total|aggregate|cumulative)\s+source\s+budget\s*(?:is|=|:)?\s*(?P<cap>\d{1,4})\b",
-        r"\bmax_unique_sources\b\s*(?:=|:|is|must be|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
-        r"\b(?:overall|global|total|aggregate|cumulative)\b[^.\n;]{0,120}\b(?:source|sources|retrievals?|max_sources)\b[^0-9]{0,40}\b(?P<cap>\d{1,4})\b",
-        r"\b(?:source|sources|retrievals?|max_sources)\b[^.\n;]{0,120}\b(?:overall|global|total|aggregate|cumulative|budget|cap|limit|sum)\b[^0-9]{0,40}\b(?P<cap>\d{1,4})\b",
-        r"\bsum\s*(?:of\s*)?(?:bounded_tasks\.)?max_sources\s*(?:<=|≤|=|is|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
-        r"\b(?:budget|cap|limit|max(?:imum)?|at most|no more than)\b[^.\n;]{0,80}\b(?P<cap>\d{1,4})\b[^.\n;]{0,80}\b(?:source|sources|source retrievals|retrievals?)\b",
-        r"\b(?P<cap>\d{1,4})\b\s*(?:source|sources|source retrievals|retrievals?)\b[^.\n;]{0,100}\b(?:budget|cap|limit|max(?:imum)?|overall|total|aggregate|sum)\b",
+        return []
+    candidate_specs = (
+        (
+            "explicit_runner_max_unique_sources",
+            "global_total_budget",
+            r"\bmax_unique_sources\b\s*(?:=|:|is|must be|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
+        ),
+        (
+            "named_global_source_budget",
+            "global_total_budget",
+            r"\b(?:overall|global|total|aggregate|cumulative|standard|run[- ]level|runner[- ]level)\s+(?:unique[- ]source\s+|source\s+)?budget(?:\s+of)?\s*(?:is|=|:)?\s*(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)?\s*(?P<cap>\d{1,4})\b",
+        ),
+        (
+            "global_sources_cap_phrase",
+            "global_total_budget",
+            r"\b(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)\s*(?P<cap>\d{1,4})\b\s*(?:unique[- ])?(?:source|sources|source retrievals|retrievals?)\b",
+        ),
+        (
+            "global_totaling_phrase",
+            "global_total_budget",
+            r"\b(?:totaling|totalling|total(?:ly)? remains|final(?: unique[- ]source)? count is|unique[- ]source total is|unique source total is|complete ledger(?: remains)?(?: at)?)\b[^.\n;]{0,80}\b(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)?\s*(?P<cap>\d{1,4})\b\s*(?:unique[- ])?(?:source|sources|retrievals?)\b",
+        ),
+        (
+            "complete_ledger_cap",
+            "global_total_budget",
+            r"\b(?:cap|capped|limit|limited)\b[^.\n;]{0,80}\b(?:complete|final|overall|global|total|aggregate|cumulative)?\s*(?:source\s+)?(?:ledger|source set|source pool|unique[- ]source total)\b[^.\n;]{0,80}\b(?:at|to)?\s*(?P<cap>\d{1,4})\b\s*(?:unique[- ])?(?:source|sources|retrievals?)\b",
+        ),
+        (
+            "sum_max_sources",
+            "global_total_budget",
+            r"\bsum\s*(?:of\s*)?(?:bounded_tasks\.)?max_sources\s*(?:<=|=|is|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
+        ),
+        (
+            "task_max_sources_sum",
+            "global_total_budget",
+            r"\btask\s+max_sources\s+sum\s*(?:<=|=|is|must not exceed|not exceed|at most|no more than)\s*(?P<cap>\d{1,4})\b",
+        ),
+        (
+            "allocation_cap_phrase",
+            "allocation_sub_budget",
+            r"\b(?:up to|at most|no more than|maximum of|max(?:imum)?|reserve no more than|reserve up to)\s*(?P<cap>\d{1,4})\b[^,.\n;]{0,80}\b(?:per\s+(?:provider|vendor|task|angle)|each\s+(?:provider|vendor|task|angle)|additional|standards?\b[^,.\n;]{0,30}\b(?:source|sources|page|pages)|official\b[^,.\n;]{0,30}\b(?:page|pages)|core\b[^,.\n;]{0,30}\bofficial\b[^,.\n;]{0,30}\b(?:source|sources|page|pages))",
+        ),
+        (
+            "allocation_sub_budget",
+            "allocation_sub_budget",
+            r"\b(?:allocate|assign|reserve|use|permit|allow|add)?[^,.\n;]{0,40}\b(?:up to|at most|no more than|maximum of|max(?:imum)?|reserve no more than|reserve up to)\s*(?P<cap>\d{1,4})\b[^,.\n;]{0,120}\b(?:per\s+(?:provider|vendor|task|angle)|each\s+(?:provider|vendor|task|angle)|additional|standards?\b[^,.\n;]{0,30}\b(?:source|sources|page|pages)|official\b[^,.\n;]{0,30}\b(?:page|pages)|core\b[^,.\n;]{0,30}\bofficial\b[^,.\n;]{0,30}\b(?:source|sources|page|pages))",
+        ),
+        (
+            "per_entity_source_allocation",
+            "allocation_sub_budget",
+            r"\b(?P<cap>\d{1,4})\b\s*(?:core\s+)?(?:official\s+)?(?:source|sources|page|pages)\s+per\s+(?:provider|vendor|task|angle)\b",
+        ),
     )
-    budgets: list[int] = []
-    for pattern in patterns:
+    candidates: list[dict[str, Any]] = []
+    for pattern_name, default_type, pattern in candidate_specs:
         for match in re.finditer(pattern, lowered):
-            try:
-                budgets.append(int(match.group("cap")))
-            except (TypeError, ValueError):
-                continue
-    if not budgets:
+            candidate = _candidate_source_budget_candidate_record(
+                text=text,
+                lowered=lowered,
+                match=match,
+                pattern_name=pattern_name,
+                default_type=default_type,
+                constraint_index=constraint_index,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    return _candidate_deduplicated_source_budget_candidates(candidates)
+
+
+def _candidate_source_budget_candidate_record(
+    *,
+    text: str,
+    lowered: str,
+    match: re.Match[str],
+    pattern_name: str,
+    default_type: str,
+    constraint_index: int | None,
+) -> dict[str, Any] | None:
+    try:
+        value = int(match.group("cap"))
+    except (TypeError, ValueError):
         return None
-    return budgets[0]
+    if value <= 0:
+        return None
+    cap_start, cap_end = match.span("cap")
+    evidence_start = max(0, match.start() - 90)
+    evidence_end = min(len(text), match.end() + 120)
+    evidence = _preview_text(
+        text[evidence_start:evidence_end].strip(),
+        limit=240,
+    )
+    candidate_type = _candidate_source_budget_candidate_type(
+        lowered=lowered,
+        cap_start=cap_start,
+        cap_end=cap_end,
+        default_type=default_type,
+    )
+    record: dict[str, Any] = {
+        "candidate_type": candidate_type,
+        "value": value,
+        "pattern": pattern_name,
+        "evidence": evidence,
+    }
+    if constraint_index is not None:
+        record["constraint_index"] = constraint_index
+    return record
+
+
+def _candidate_source_budget_candidate_type(
+    *,
+    lowered: str,
+    cap_start: int,
+    cap_end: int,
+    default_type: str,
+) -> str:
+    before = lowered[max(0, cap_start - 100):cap_start]
+    after = lowered[cap_end:min(len(lowered), cap_end + 120)]
+    window = lowered[max(0, cap_start - 120):min(len(lowered), cap_end + 140)]
+    strong_global_markers = (
+        "max_unique_sources",
+        "overall",
+        "global",
+        "total",
+        "aggregate",
+        "cumulative",
+        "standard budget",
+        "run-level",
+        "run level",
+        "runner-level",
+        "runner level",
+        "totaling",
+        "totalling",
+        "total remains",
+        "unique-source total",
+        "unique source total",
+        "complete ledger",
+        "final unique-source count",
+        "final unique source count",
+    )
+    allocation_after_markers = (
+        "per provider",
+        "per vendor",
+        "per task",
+        "per angle",
+        "each provider",
+        "each vendor",
+        "each task",
+        "each angle",
+        "additional",
+        "standards source",
+        "standards sources",
+        "standard source",
+        "standard sources",
+        "official page",
+        "official pages",
+        "core official",
+    )
+    allocation_before_markers = (
+        "per provider",
+        "per vendor",
+        "per task",
+        "per angle",
+        "reserve",
+        "allocation",
+        "allocate",
+    )
+    strong_global_before = any(marker in before for marker in strong_global_markers)
+    if default_type == "allocation_sub_budget":
+        return "allocation_sub_budget"
+    if strong_global_before:
+        return "global_total_budget"
+    if any(marker in after for marker in allocation_after_markers):
+        return "allocation_sub_budget"
+    if any(marker in before[-70:] for marker in allocation_before_markers):
+        return "allocation_sub_budget"
+    if any(marker in window for marker in strong_global_markers):
+        return "global_total_budget"
+    if default_type == "global_total_budget":
+        return "global_total_budget"
+    return "ambiguous_source_budget"
+
+
+def _candidate_deduplicated_source_budget_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduplicated: list[dict[str, Any]] = []
+    for candidate in candidates:
+        key = (
+            candidate.get("candidate_type"),
+            candidate.get("value"),
+            candidate.get("constraint_index"),
+            candidate.get("evidence"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(dict(candidate))
+    return deduplicated
 
 
 def _semantic_task_source_cap_int(value: Any) -> int | None:
@@ -3985,14 +4722,50 @@ def _materialize_candidate_runner_source_budget_cap(
     total_cap = sum(caps)
     existing_runner_budget = normalized.get("runner_source_budget")
     existing_cap = _candidate_runner_source_budget_cap(existing_runner_budget)
-    declared_budget = (
-        min(existing_cap, max_sources) if existing_cap is not None else max_sources
+    existing_typed_cap = _candidate_runner_source_budget_explicit_typed_cap(
+        existing_runner_budget
+    )
+    typed_runner_compatible = (
+        existing_typed_cap is not None and existing_typed_cap <= max_sources
+    )
+    if typed_runner_compatible:
+        declared_budget = existing_typed_cap
+    else:
+        declared_budget = max_sources
+    existing_budget_interpretation = (
+        existing_runner_budget.get("budget_interpretation")
+        if isinstance(existing_runner_budget, Mapping)
+        else None
+    )
+    if isinstance(existing_budget_interpretation, Mapping):
+        budget_interpretation = copy.deepcopy(dict(existing_budget_interpretation))
+        budget_interpretation["request_max_sources"] = max_sources
+        budget_interpretation["typed_runner_max_unique_sources"] = existing_typed_cap
+        budget_interpretation["typed_runner_limit_compatible"] = (
+            typed_runner_compatible
+        )
+    else:
+        constraints_for_interpretation = (
+            normalized.get("constraints")
+            if isinstance(normalized.get("constraints"), list)
+            else []
+        )
+        budget_interpretation = _candidate_source_budget_interpretation(
+            constraints_for_interpretation,
+            request_max_sources=max_sources,
+            existing_runner_budget=existing_runner_budget,
+        )
+    budget_interpretation["selected_max_unique_sources"] = declared_budget
+    budget_interpretation["selected_source"] = (
+        "typed_runner_limit" if typed_runner_compatible else "request_max_sources"
     )
     runner_source_budget = _candidate_runner_source_budget_record(
         declared_source_budget=declared_budget,
         task_max_sources_sum=total_cap,
         bounded_task_count=len(caps),
         removed_constraints=[],
+        request_max_sources=max_sources,
+        budget_interpretation=budget_interpretation,
     )
     if isinstance(existing_runner_budget, Mapping):
         merged_runner_budget = _review_visible_runner_source_budget_metadata(
@@ -4004,19 +4777,42 @@ def _materialize_candidate_runner_source_budget_cap(
 
     constraints = normalized.get("constraints")
     appended_constraint = None
-    if isinstance(constraints, list) and not _candidate_constraints_preserve_runner_source_budget(
-        constraints,
-        declared_source_budget=declared_budget,
-    ):
-        appended_constraint = (
-            "Runner-level source budget is preserved as a unique-source reuse "
-            f"budget: max_unique_sources={declared_budget}. "
-            f"The combined per-task source ceilings total {total_cap}, so "
-            "execution must reuse sources through a shared source pool and must "
-            "not treat per-task max_sources as additive permission for unique "
-            "source retrievals."
-        )
-        normalized["constraints"] = [*constraints, appended_constraint]
+    removed_runner_budget_constraints: list[str] = []
+    if isinstance(constraints, list):
+        if (
+            existing_cap is not None
+            and existing_cap != declared_budget
+            and _candidate_runner_source_budget_is_natural_language_materialized(
+                existing_runner_budget
+            )
+        ):
+            kept_constraints = []
+            for constraint in constraints:
+                if (
+                    _candidate_declared_global_source_budget(constraint) == existing_cap
+                    and _candidate_constraint_preserves_executable_source_budget(
+                        constraint,
+                        declared_source_budget=existing_cap,
+                    )
+                ):
+                    removed_runner_budget_constraints.append(str(constraint))
+                    continue
+                kept_constraints.append(constraint)
+            constraints = kept_constraints
+            normalized["constraints"] = constraints
+        if not _candidate_constraints_preserve_runner_source_budget(
+            constraints,
+            declared_source_budget=declared_budget,
+        ):
+            appended_constraint = (
+                "Runner-level source budget is preserved as a unique-source reuse "
+                f"budget: max_unique_sources={declared_budget}. "
+                f"The combined per-task source ceilings total {total_cap}, so "
+                "execution must reuse sources through a shared source pool and must "
+                "not treat per-task max_sources as additive permission for unique "
+                "source retrievals."
+            )
+            normalized["constraints"] = [*constraints, appended_constraint]
 
     materialization = {
         "field": "runner_source_budget",
@@ -4027,9 +4823,14 @@ def _materialize_candidate_runner_source_budget_cap(
         "bounded_task_count": len(caps),
         "reuse_required": total_cap > declared_budget,
         "runner_source_budget": copy.deepcopy(runner_source_budget),
+        "budget_interpretation": copy.deepcopy(budget_interpretation),
     }
     if appended_constraint is not None:
         materialization["replacement_constraint"] = appended_constraint
+    if removed_runner_budget_constraints:
+        materialization["removed_runner_budget_constraints"] = (
+            removed_runner_budget_constraints
+        )
     return normalized, materialization
 
 
@@ -5849,10 +6650,13 @@ def _semantic_repair_guidance_for_codes(
         guidance.append(
             " If `bounded_task_requirement_exceeds_max_sources` appears, do not "
             "raise any bounded_task.max_sources above 5 and do not collapse the "
-            "obligation into an impossible single task. Split the over-broad "
-            "source/vendor/jurisdiction/source-artifact obligation into multiple "
-            "bounded source-group tasks, each executable within max_sources 1-5, "
-            "then synthesize across those groups."
+            "obligation into generic wrapper tasks. Split the over-broad "
+            "source/vendor/jurisdiction/source-artifact obligation only when each "
+            "new task has a deterministic typed provider, document, entity, "
+            "jurisdiction, standard, topic, or evidence-dimension assignment. If "
+            "no deterministic partition is available, keep the substantive task "
+            "bounded and rely on shared source-pool reuse, or regenerate meaningful "
+            "semantic tasks through the locked oracle."
         )
     if code_set & {
         "broad_question_angle_count_out_of_range",
@@ -13219,6 +14023,58 @@ def _candidate_runner_source_budget_cap(runner_source_budget: Any) -> int | None
         if value is not None and value > 0:
             return value
     return None
+
+
+def _candidate_runner_source_budget_explicit_typed_cap(
+    runner_source_budget: Any,
+) -> int | None:
+    if not isinstance(runner_source_budget, Mapping):
+        return None
+    if _candidate_runner_source_budget_is_natural_language_materialized(
+        runner_source_budget
+    ):
+        return None
+    origin = str(
+        runner_source_budget.get("budget_origin")
+        or runner_source_budget.get("source_limit_origin")
+        or runner_source_budget.get("source")
+        or ""
+    ).lower()
+    if origin == "request_max_sources":
+        return None
+    if runner_source_budget.get("materialized_from_request_source_limit") is True:
+        return None
+    return _candidate_runner_source_budget_cap(runner_source_budget)
+
+
+def _candidate_runner_source_budget_is_natural_language_materialized(
+    runner_source_budget: Any,
+) -> bool:
+    if not isinstance(runner_source_budget, Mapping):
+        return False
+    if runner_source_budget.get("materialized_from_natural_language_constraints") is True:
+        return True
+    origin = str(
+        runner_source_budget.get("budget_origin")
+        or runner_source_budget.get("source_limit_origin")
+        or runner_source_budget.get("source")
+        or ""
+    ).lower()
+    if "natural" in origin and "constraint" in origin:
+        return True
+    interpretation = runner_source_budget.get("budget_interpretation")
+    if isinstance(interpretation, Mapping):
+        selected_source = str(interpretation.get("selected_source") or "").lower()
+        if selected_source == "natural_language_global_total":
+            return True
+    materialized_constraint_count = _semantic_task_source_cap_int(
+        runner_source_budget.get("materialized_constraint_count")
+    )
+    return (
+        materialized_constraint_count is not None
+        and materialized_constraint_count > 0
+        and "request_max_sources" not in runner_source_budget
+    )
 
 
 def _candidate_runner_source_budget_preserves_cap(

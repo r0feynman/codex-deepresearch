@@ -6019,6 +6019,26 @@ class SemanticPlannerTests(unittest.TestCase):
         candidate["bounded_tasks"][0]["done_condition"] = (
             "Complete when 12 official sources are checked with caveats."
         )
+        candidate["bounded_tasks"][0]["source_partitions"] = [
+            {
+                "partition_id": "microsoft",
+                "provider": "Microsoft identity platform",
+                "label": "Microsoft identity platform documentation",
+                "max_sources": 4,
+            },
+            {
+                "partition_id": "google",
+                "provider": "Google OAuth",
+                "label": "Google OAuth documentation",
+                "max_sources": 4,
+            },
+            {
+                "partition_id": "github",
+                "provider": "GitHub OAuth",
+                "label": "GitHub OAuth documentation",
+                "max_sources": 4,
+            },
+        ]
 
         original_validation = validate_semantic_candidate_plan(
             original_question=question,
@@ -6045,10 +6065,22 @@ class SemanticPlannerTests(unittest.TestCase):
         repaired_task_ids = {
             task["task_id"] for task in repaired["bounded_tasks"]
         }
+        plan_text = json.dumps(repaired, ensure_ascii=False).lower()
         self.assertNotIn(original_task_id, repaired_task_ids)
         self.assertTrue(set(split_task_ids).issubset(repaired_task_ids))
+        self.assertNotIn("source group", plan_text)
+        self.assertNotIn("srcgrp", plan_text)
         for task in repaired["bounded_tasks"]:
             self.assertLessEqual(task["max_sources"], 5)
+        for task_id in split_task_ids:
+            split_task = next(
+                task for task in repaired["bounded_tasks"] if task["task_id"] == task_id
+            )
+            self.assertIn("source_partition", split_task["source_policy"])
+            self.assertIn(
+                split_task["source_policy"]["source_partition"]["assignment_type"],
+                {"provider", "vendor"},
+            )
         for requirement in repaired["requirement_coverage_map"]:
             covered = set(requirement["covered_by_task_ids"])
             self.assertNotIn(original_task_id, covered)
@@ -6059,6 +6091,88 @@ class SemanticPlannerTests(unittest.TestCase):
             plan=repaired,
         )
         self.assertTrue(repaired_validation["ok"], repaired_validation)
+
+    def test_source_cap_repair_uses_shared_pool_instead_of_generic_source_groups(self) -> None:
+        question = (
+            "Compare Microsoft, Google, GitHub, and Okta OAuth device-flow "
+            "documentation against RFC 8628."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        original_task_id = candidate["bounded_tasks"][0]["task_id"]
+        candidate["constraints"] = [
+            (
+                "Stay within the standard budget of at most 20 unique sources, "
+                "8 results, and no visual evidence."
+            )
+        ]
+        candidate["bounded_tasks"][0]["max_sources"] = 5
+        candidate["bounded_tasks"][0]["query"] = (
+            "Review the completed OAuth device-flow comparison for undocumented "
+            "assumptions and missing provider fields using 20 official sources."
+        )
+        candidate["bounded_tasks"][0]["expected_artifacts"] = [
+            "unknowns and limitations note",
+            "assumption audit",
+            "budget compliance record",
+        ]
+        candidate["bounded_tasks"][0]["success_criteria"] = [
+            "Every missing or non-comparable field is disclosed.",
+            "The source ledger contains at most 20 unique sources.",
+        ]
+        candidate["bounded_tasks"][0]["done_condition"] = (
+            "Complete when 20 official sources are checked for status, evidence, "
+            "caveats, and remediation next actions."
+        )
+
+        split_repaired, split_materializations = _materialize_candidate_source_cap_splits(
+            candidate,
+            budget_cap={"max_sources": 20},
+        )
+        source_repaired, _source_budget_materializations = (
+            _materialize_candidate_source_cap_constraints(
+                split_repaired,
+                source_cap_normalizations=[],
+                budget_cap={"max_sources": 20},
+            )
+        )
+        repaired, _budget_materializations = _materialize_candidate_budget_caps(
+            source_repaired,
+            budget_cap={"max_results": 8, "max_sources": 20},
+        )
+
+        materialization = next(
+            materialization
+            for materialization in split_materializations
+            if materialization.get("original_task_id") == original_task_id
+        )
+        task_ids = [task["task_id"] for task in repaired["bounded_tasks"]]
+        plan_text = json.dumps(repaired, ensure_ascii=False).lower()
+        repaired_task = next(
+            task for task in repaired["bounded_tasks"] if task["task_id"] == original_task_id
+        )
+
+        self.assertEqual(
+            materialization["materialization"],
+            "source_cap_split_deferred_to_shared_source_pool",
+        )
+        self.assertIn(original_task_id, task_ids)
+        self.assertFalse(any("srcgrp" in task_id.lower() for task_id in task_ids))
+        self.assertNotIn("source group", plan_text)
+        self.assertNotIn("srcgrp", plan_text)
+        self.assertNotRegex(plan_text, r"\bsource\s+group\s+\d+\s+of\s+\d+\b")
+        self.assertTrue(repaired_task["source_pool_reuse_required"])
+        self.assertIn("shared_source_pool", repaired_task["source_policy"])
+        self.assertEqual(repaired["runner_source_budget"]["max_unique_sources"], 20)
+        self.assertEqual(repaired["runner_source_budget"]["request_max_sources"], 20)
+        self.assertEqual(
+            repaired["runner_source_budget"]["allocation_strategy"],
+            "shared_source_pool",
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(validation["ok"], validation)
 
     def test_source_cap_repair_keeps_unsplittable_over_cap_requirement_blocked(self) -> None:
         question = (
@@ -6119,7 +6233,7 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertTrue(
             any(
                 materialization.get("materialization")
-                == "source_cap_split_blocked_task_ceiling"
+                == "source_cap_split_requires_semantic_partitions"
                 and materialization.get("blocked_feasibility_code")
                 == "bounded_task_requirement_exceeds_max_sources"
                 for materialization in split_materializations
@@ -6337,13 +6451,13 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(len(semantic_plan["angles"]), 4)
         self.assertGreaterEqual(len(semantic_plan["bounded_tasks"]), 6)
         self.assertLessEqual(len(semantic_plan["bounded_tasks"]), 12)
-        self.assertEqual(semantic_plan["question_scope"], "medium")
+        self.assertEqual(semantic_plan["question_scope"], "narrow")
         self.assertEqual(
             semantic_plan["scope_downgrade"]["status"],
             "oracle_bounded_semantic_scope_downgrade",
         )
         self.assertEqual(semantic_plan["scope_downgrade"]["from_scope"], "broad")
-        self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], "medium")
+        self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], "narrow")
         self.assertGreaterEqual(semantic_plan["scope_downgrade"]["retry_attempt"], 2)
         self.assertFalse(semantic_plan["scope_downgrade"]["generic_padding_added"])
         self.assertEqual(
@@ -10026,6 +10140,212 @@ class SemanticPlannerTests(unittest.TestCase):
             plan=repaired,
         )
         self.assertTrue(repaired_validation["ok"], repaired_validation)
+
+    def test_sem_reg_011_source_budget_uses_global_total_not_allocations(self) -> None:
+        question = (
+            "Compare Microsoft, Google, GitHub, and Okta OAuth device-flow "
+            "documentation against RFC 8628"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=4,
+            tasks_per_angle=4,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "deliverable_shape",
+            ),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = [
+            (
+                "Stay within the standard budget of at most 20 unique sources, "
+                "8 search results per search operation where applicable, and "
+                "8 subagents."
+            ),
+            (
+                "Allocate the source budget explicitly: up to 2 authoritative "
+                "standards sources, up to 4 official sources per provider across "
+                "4 providers, and up to 2 additional official pages for "
+                "contradiction resolution, totaling no more than 20 unique sources."
+            ),
+        ]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+
+        repaired, source_materializations = (
+            _materialize_candidate_source_cap_constraints(
+                candidate,
+                source_cap_normalizations=[],
+                budget_cap={"max_sources": 20},
+            )
+        )
+        repaired, budget_materializations = _materialize_candidate_budget_caps(
+            repaired,
+            budget_cap={"max_results": 8, "max_sources": 20},
+        )
+
+        self.assertTrue(source_materializations)
+        self.assertTrue(budget_materializations)
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 20)
+        self.assertEqual(runner_budget["declared_source_budget"], 20)
+        self.assertEqual(runner_budget["request_max_sources"], 20)
+        self.assertEqual(runner_budget["task_max_sources_sum"], 48)
+        self.assertEqual(runner_budget["allocation_strategy"], "shared_source_pool")
+        self.assertEqual(runner_budget["enforcement_scope"], "run")
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("max_unique_sources=20", constraints_text)
+        self.assertNotRegex(constraints_text, r"max_unique_sources=2\b")
+
+        interpretation = runner_budget["budget_interpretation"]
+        self.assertEqual(interpretation["selected_max_unique_sources"], 20)
+        self.assertEqual(interpretation["selected_source"], "request_max_sources")
+        global_values = [
+            candidate["value"]
+            for candidate in interpretation["global_total_budget_candidates"]
+        ]
+        allocation_values = [
+            candidate["value"]
+            for candidate in interpretation["allocation_sub_budget_candidates"]
+        ]
+        self.assertIn(20, global_values)
+        self.assertIn(4, allocation_values)
+        self.assertGreaterEqual(allocation_values.count(2), 2)
+        self.assertFalse(
+            interpretation["allocation_candidates_used_as_global_limit"]
+        )
+
+    def test_request_source_budget_overrides_natural_language_materialized_cap(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+        stale_constraint = (
+            "Runner-level source budget is preserved as a unique-source reuse "
+            "budget: max_unique_sources=2. The combined per-task source ceilings "
+            "total 60, so execution must reuse sources through a shared source pool."
+        )
+        candidate["constraints"] = [stale_constraint]
+        candidate["runner_source_budget"] = {
+            "budget_type": "runner_level_unique_source_reuse",
+            "max_unique_sources": 2,
+            "declared_source_budget": 2,
+            "task_max_sources_sum": 60,
+            "bounded_task_count": 20,
+            "reuse_required": True,
+            "allocation_strategy": "shared_source_pool",
+            "enforcement_scope": "run",
+            "materialized_constraint_count": 1,
+            "materialized_from_natural_language_constraints": True,
+        }
+
+        repaired, materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_sources": 20},
+        )
+
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 20)
+        self.assertEqual(runner_budget["declared_source_budget"], 20)
+        self.assertEqual(runner_budget["request_max_sources"], 20)
+        self.assertEqual(runner_budget["task_max_sources_sum"], 60)
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("max_unique_sources=20", constraints_text)
+        self.assertNotRegex(constraints_text, r"max_unique_sources=2\b")
+        source_materialization = next(
+            materialization
+            for materialization in materializations
+            if materialization.get("field") == "runner_source_budget"
+        )
+        self.assertEqual(
+            source_materialization["removed_runner_budget_constraints"],
+            [stale_constraint],
+        )
+        self.assertEqual(
+            runner_budget["budget_interpretation"]["selected_source"],
+            "request_max_sources",
+        )
+
+    def test_typed_runner_source_budget_compatible_cap_is_preserved(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "f" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = []
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+        candidate["runner_source_budget"] = {
+            "budget_type": "runner_level_unique_source_reuse",
+            "max_unique_sources": 12,
+            "declared_source_budget": 12,
+            "task_max_sources_sum": 60,
+            "bounded_task_count": 20,
+            "reuse_required": True,
+            "allocation_strategy": "shared_source_pool",
+            "enforcement_scope": "run",
+        }
+
+        repaired, materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_sources": 20},
+        )
+
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 12)
+        self.assertEqual(runner_budget["declared_source_budget"], 12)
+        self.assertEqual(runner_budget["request_max_sources"], 20)
+        self.assertEqual(runner_budget["task_max_sources_sum"], 60)
+        self.assertEqual(
+            runner_budget["budget_interpretation"]["selected_source"],
+            "typed_runner_limit",
+        )
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("max_unique_sources=12", constraints_text)
+        self.assertNotIn("max_unique_sources=20", constraints_text)
+        source_materialization = next(
+            materialization
+            for materialization in materializations
+            if materialization.get("field") == "runner_source_budget"
+        )
+        self.assertEqual(
+            source_materialization["preserved_declared_source_budget"],
+            12,
+        )
 
     def test_request_source_budget_materialized_without_stale_constraints(self) -> None:
         question = "Compare official agency permit evidence across Korea municipalities"
