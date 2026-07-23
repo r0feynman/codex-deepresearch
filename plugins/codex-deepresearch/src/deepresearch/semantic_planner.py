@@ -8215,11 +8215,12 @@ def _forbidden_angle_reference_is_negative_scope(
         rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
         rf"\b{re.escape(normalized_term)}\b(?:\s+\w+){{0,6}}\s+"
         rf"(?:excluded|out of scope|not in scope|not part of scope)\b",
-        rf"\bdo\s+not\b(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"\b(?:do\s+not|don\s+t|must\s+not|should\s+not|cannot|never)\b"
+        rf"(?:\s+\w+){{0,14}}\s+{re.escape(normalized_term)}\b",
         rf"\b(?:rather\s+than|instead\s+of)\b(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
-        rf"\b(?:prevent|prevents|preventing|prevented)\b(?:\s+\w+){{0,6}}\s+"
+        rf"\b(?:prevent|prevents|preventing|prevented)\b(?:\s+\w+){{0,14}}\s+"
         rf"(?:drift\s+)?(?:into|to|toward|towards)\b"
-        rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
+        rf"(?:\s+\w+){{0,14}}\s+{re.escape(normalized_term)}\b",
         rf"\b(?:exclusion|exclusions)\s+of\b"
         rf"(?:\s+\w+){{0,6}}\s+{re.escape(normalized_term)}\b",
     )
@@ -9130,6 +9131,23 @@ def _candidate_requirement_is_req003_comparison(
         "comparison_matrix",
         "comparison_table",
     }:
+        return True
+    if requirement_id == "req_003" and _contains_any(
+        user_facing_text,
+        (
+            "structured comparison",
+            "structured cross-modal comparison",
+            "structured cross modal comparison",
+            "cross-modal comparison",
+            "cross modal comparison",
+        ),
+    ):
+        return True
+    if (
+        requirement_id == "req_003"
+        and _contains_any(user_facing_text, ("structured", "cross-modal", "cross modal"))
+        and _contains_any(user_facing_text, ("compare", "comparison"))
+    ):
         return True
     output_shape_text = " ".join(
         _string_list(requirement.get("output_shape_constraints"))

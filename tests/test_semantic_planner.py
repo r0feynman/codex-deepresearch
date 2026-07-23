@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -2180,6 +2181,74 @@ class SemanticPlannerTests(unittest.TestCase):
             substitute["forbidden_angle_terms_found"],
         )
 
+    def test_semantic_substitute_check_allows_forbidden_phrase_in_prohibitive_constraints(self) -> None:
+        oracle = self.semantic_internal_leakage_oracle()
+        oracle["forbidden_angles"].append("legal, insurance, or financial advice")
+        plan = self.semantic_internal_leakage_review_plan(
+            query=(
+                "Compare official flood-zone map images and textual guidance for "
+                "homeowner risk communication."
+            ),
+            expected_artifacts=[
+                "cross-modal flood-zone map and guidance comparison notes",
+            ],
+            success_criteria=[
+                "Compare official map-image observations with official homeowner guidance.",
+                "Separate facts, caveats, and unknowns for risk communication.",
+            ],
+            done_condition=(
+                "Stop when official flood map images and textual guidance are "
+                "compared for homeowner communication caveats."
+            ),
+        )
+        plan = replace(
+            plan,
+            constraints=[
+                (
+                    "Do not make property-specific flood determinations or provide "
+                    "legal, insurance, or financial advice."
+                )
+            ],
+        )
+
+        substitute = _semantic_substitute_implementation_check(plan=plan, oracle=oracle)
+
+        self.assertTrue(substitute["passed"], substitute)
+        self.assertNotIn(
+            "legal, insurance, or financial advice",
+            substitute["forbidden_angle_terms_found"],
+        )
+
+        positive_constraint = self.semantic_internal_leakage_review_plan(
+            query=(
+                "Compare official flood-zone map images and textual guidance for "
+                "homeowner risk communication."
+            ),
+            expected_artifacts=[
+                "cross-modal flood-zone map and guidance comparison notes",
+            ],
+            success_criteria=[
+                "Compare official map-image observations with official homeowner guidance.",
+            ],
+        )
+        positive_constraint = replace(
+            positive_constraint,
+            constraints=[
+                "Include legal, insurance, or financial advice as a homeowner action angle."
+            ],
+        )
+
+        positive_substitute = _semantic_substitute_implementation_check(
+            plan=positive_constraint,
+            oracle=oracle,
+        )
+
+        self.assertFalse(positive_substitute["passed"], positive_substitute)
+        self.assertIn(
+            "legal, insurance, or financial advice",
+            positive_substitute["forbidden_angle_terms_found"],
+        )
+
     def test_semantic_substitute_check_still_blocks_software_architecture_leakage(self) -> None:
         oracle = self.semantic_internal_leakage_oracle()
         oracle["forbidden_internal_implementation_terms"].append("architecture")
@@ -4185,6 +4254,134 @@ class SemanticPlannerTests(unittest.TestCase):
         for expected in ("source-backed reference", "status", "evidence", "caveat"):
             self.assertIn(expected, repaired_text)
         self.assertIn("unknown", repaired_text)
+
+    def test_req003_structured_cross_modal_comparison_materializes_neutral_deliverable(self) -> None:
+        question = (
+            "Compare official flood-zone map images and textual guidance for "
+            "homeowner risk communication."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "f" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="medium",
+            angle_count=5,
+            tasks_per_angle=3,
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(1, 2),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        for task in candidate["bounded_tasks"]:
+            task["expected_artifacts"] = ["official flood evidence notes"]
+            task["success_criteria"] = [
+                "Collect official flood-zone source evidence and caveats."
+            ]
+            task["done_condition"] = "Stop when official flood evidence notes are recorded."
+        comparison_angle = candidate["angles"][4]
+        comparison_angle["route"] = "text_only"
+        comparison_angle["evidence_need"] = "comparative_analysis"
+        comparison_angle["expected_visual_targets"] = []
+        comparison_angle["title"] = "Flood Map And Homeowner Guidance Comparison"
+        comparison_angle["research_question"] = (
+            "How should official flood-zone map observations and homeowner textual "
+            "guidance be compared for risk communication?"
+        )
+        comparison_task = candidate["bounded_tasks"][-1]
+        comparison_task["angle_id"] = comparison_angle["angle_id"]
+        comparison_task["route"] = "text_only"
+        comparison_task["expected_visual_targets"] = []
+        comparison_task["max_images"] = 0
+        comparison_task["query"] = (
+            "Build a structured cross-modal comparison of official flood-zone map "
+            "observations and homeowner textual guidance."
+        )
+        comparison_task["expected_artifacts"] = [
+            "structured cross-modal comparison notes"
+        ]
+        comparison_task["success_criteria"] = [
+            "Compare official map observations and textual guidance with evidence."
+        ]
+        comparison_task["done_condition"] = (
+            "Stop when map-image observations and homeowner textual guidance are compared."
+        )
+        candidate["constraints"] = [
+            (
+                "Do not make property-specific flood determinations or provide "
+                "legal, insurance, or financial advice."
+            )
+        ]
+        candidate["requirement_coverage_map"].append(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "analysis_comparison_output_shape",
+                "requirement_text": (
+                    "Produce a structured cross-modal comparison of official "
+                    "flood-zone map images and textual guidance for homeowner "
+                    "risk communication."
+                ),
+                "prompt_text": "structured cross-modal comparison",
+                "expected_modalities": [
+                    "visual interpretation",
+                    "textual comparison",
+                ],
+                "output_shape_constraints": [
+                    "structured cross-modal comparison",
+                    "source-backed evidence and caveats",
+                ],
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": [comparison_angle["angle_id"]],
+                "covered_by_task_ids": [comparison_task["task_id"]],
+                "coverage_status": "covered",
+            }
+        )
+
+        repaired, materializations = _materialize_candidate_req003_comparison_deliverable(
+            candidate,
+            raw_request={
+                "visual_preference": "visual_required",
+                "semantic_convergence_attempt": 2,
+                "previous_candidate_validation_failure_codes": [],
+            },
+            original_question=question,
+        )
+
+        self.assertTrue(materializations, materializations)
+        self.assertEqual(materializations[0]["task_id"], comparison_task["task_id"])
+        self.assertEqual(
+            materializations[0]["comparison_context"],
+            "neutral_comparison_contract",
+        )
+        repaired_task = next(
+            task
+            for task in repaired["bounded_tasks"]
+            if task["task_id"] == comparison_task["task_id"]
+        )
+        repaired_text = json.dumps(repaired_task, ensure_ascii=False).lower()
+        for expected in (
+            "compared item",
+            "source-backed reference",
+            "status",
+            "evidence",
+            "caveat",
+            "unknown",
+        ):
+            self.assertIn(expected, repaired_text)
+        self.assertNotIn("remediation", repaired_text)
+        self.assertNotIn("compliance", repaired_text)
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+            visual_preference="visual_required",
+        )
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+        self.assertNotIn("substitute_implementation_check_failed", failure_codes)
 
     def test_req003_neutral_repair_scrubs_unasked_template_leakage(self) -> None:
         question = "Compare two transit fare policies using source-backed evidence."
