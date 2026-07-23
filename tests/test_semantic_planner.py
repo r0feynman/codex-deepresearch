@@ -1835,6 +1835,131 @@ class SemanticPlannerTests(unittest.TestCase):
             task["done_condition"] = "Stop when source-backed guidance notes are ready."
         return candidate
 
+    def nextjs_cache_hazard_candidate(self) -> tuple[str, dict]:
+        question = (
+            "Research cache invalidation implementation hazards for a Next.js "
+            "migration using current official docs."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        angle_specs = (
+            (
+                "official_source",
+                "Next.js Cache Layer Official Docs",
+                "Which current official Next.js docs define cache invalidation behavior?",
+                "Official cache behavior notes",
+            ),
+            (
+                "failure_pattern",
+                "Cache Invalidation Failure Modes",
+                "Which cache invalidation hazards can affect a Next.js migration?",
+                "Cache hazard source notes",
+            ),
+            (
+                "implementation_detail",
+                "Migration Impact By Cache API",
+                "Which cache layers and APIs change migration behavior?",
+                "Cache layer and API notes",
+            ),
+            (
+                "risk_or_guardrail",
+                "Detection And Validation Methods",
+                "How can migration teams detect stale or invalid cache behavior?",
+                "Validation method notes",
+            ),
+            (
+                "risk_or_guardrail",
+                "Mitigation And Guardrails",
+                "Which guardrails reduce Next.js migration cache invalidation risk?",
+                "Mitigation guardrail notes",
+            ),
+        )
+        for index, angle in enumerate(candidate["angles"], start=1):
+            need, title, research_question, artifact = angle_specs[index - 1]
+            angle["route"] = "text_only"
+            angle["evidence_need"] = need
+            angle["title"] = title
+            angle["research_question"] = research_question
+            angle["why_this_angle_matters"] = (
+                "This preserves the Next.js migration cache invalidation subject."
+            )
+            angle["included_scope"] = [question]
+            angle["expected_source_types"] = ["current official Next.js documentation"]
+            angle["expected_visual_targets"] = []
+            angle["expected_artifacts"] = [artifact]
+            angle["success_criteria"] = [
+                "Use current official Next.js documentation.",
+                "Record source evidence, caveats, and version notes.",
+            ]
+            angle["report_section"] = f"Next.js Cache Migration {index}"
+            angle["risk_or_contradiction_checks"] = [
+                "Check version-sensitive documentation caveats."
+            ]
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task["query"] = (
+                "Collect current official Next.js cache invalidation migration "
+                f"documentation evidence for task {index}."
+            )
+            task["expected_source_types"] = ["current official Next.js documentation"]
+            task["expected_artifacts"] = ["official cache behavior notes"]
+            task["success_criteria"] = [
+                "Use current official Next.js documentation.",
+                "Record source evidence, caveats, and version notes.",
+            ]
+            task["done_condition"] = (
+                "Stop when source-backed cache behavior evidence and caveats are recorded."
+            )
+        task_ids = [task["task_id"] for task in candidate["bounded_tasks"]]
+        angle_ids = [angle["angle_id"] for angle in candidate["angles"]]
+        candidate["requirement_coverage_map"].append(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "requested analysis/comparison/output shape",
+                "requirement_text": (
+                    "Produce a structured analysis for a Next.js migration that "
+                    "identifies cache invalidation hazards, mechanism/cause, "
+                    "migration impact across cache layers/APIs, detection/"
+                    "verification, mitigation/prevention, evidence-backed guidance, "
+                    "official citations, and version-sensitive caveats; include an "
+                    "executive summary, cache-layer/API comparison, prioritized "
+                    "hazard catalog, and migration checklist."
+                ),
+                "prompt_text": question,
+                "expected_modalities": ["text", "structured analysis"],
+                "output_shape_constraints": [
+                    "executive summary",
+                    "cache-layer/API comparison",
+                    "prioritized hazard catalog",
+                    "migration checklist",
+                    "official citations",
+                    "version-sensitive caveats",
+                ],
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": angle_ids,
+                "covered_by_task_ids": task_ids,
+                "coverage_status": "covered",
+            }
+        )
+        return question, candidate
+
     def reduce_candidate_to_scope(
         self,
         candidate: dict,
@@ -4344,6 +4469,246 @@ class SemanticPlannerTests(unittest.TestCase):
                 row_terms=row_terms,
             )
         )
+
+    def test_req003_hazard_migration_final_artifact_contract_passes(self) -> None:
+        question, candidate = self.nextjs_cache_hazard_candidate()
+        final_task = candidate["bounded_tasks"][-1]
+        final_task["query"] = (
+            "Build the final Next.js cache invalidation prioritized hazard catalog "
+            "and migration checklist."
+        )
+        final_task["expected_artifacts"] = [
+            "executive summary",
+            "cache-layer/API comparison",
+            "prioritized hazard catalog",
+            "migration checklist",
+            "official citations",
+            "version-sensitive caveats",
+        ]
+        final_task["success_criteria"] = [
+            (
+                "Prioritized hazard catalog rows include hazard, mechanism/cause, "
+                "impact/consequence, detection/verification, mitigation/prevention, "
+                "official documentation evidence, and caveat/unknown or version note."
+            ),
+            (
+                "Migration checklist rows include change or affected cache layer/API, "
+                "migration impact, action/mitigation, validation/test, rollback/"
+                "guardrail, official docs evidence, and caveat/version note."
+            ),
+        ]
+        final_task["done_condition"] = (
+            "Stop when the final hazard catalog and migration checklist have "
+            "source-backed evidence, caveats, unknowns, and version notes."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+
+    def test_req003_hazard_migration_scattered_investigation_without_final_artifact_fails(self) -> None:
+        question, candidate = self.nextjs_cache_hazard_candidate()
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+
+    def test_req003_hazard_migration_hazard_catalog_without_migration_checklist_fails(self) -> None:
+        question, candidate = self.nextjs_cache_hazard_candidate()
+        final_task = candidate["bounded_tasks"][-1]
+        final_task["query"] = (
+            "Build the final Next.js cache invalidation prioritized hazard catalog."
+        )
+        final_task["expected_artifacts"] = [
+            "executive summary",
+            "prioritized hazard catalog",
+            "official citations",
+            "version-sensitive caveats",
+        ]
+        final_task["success_criteria"] = [
+            (
+                "Prioritized hazard catalog rows include hazard, mechanism/cause, "
+                "impact/consequence, detection/verification, mitigation/prevention, "
+                "official documentation evidence, and caveat/unknown or version note."
+            )
+        ]
+        final_task["done_condition"] = (
+            "Stop when the final hazard catalog has source-backed evidence, "
+            "caveats, unknowns, and version notes."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+
+    def test_req003_hazard_migration_migration_checklist_without_hazard_catalog_fails(self) -> None:
+        question, candidate = self.nextjs_cache_hazard_candidate()
+        final_task = candidate["bounded_tasks"][-1]
+        final_task["query"] = (
+            "Build the final Next.js cache invalidation implementation checklist."
+        )
+        final_task["expected_artifacts"] = [
+            "executive summary",
+            "migration checklist",
+            "cache layer/API table",
+            "official citations",
+            "version-sensitive caveats",
+        ]
+        final_task["success_criteria"] = [
+            (
+                "Migration checklist rows include change or affected cache layer/API, "
+                "migration impact, action/mitigation, validation/test, rollback/"
+                "guardrail, official docs evidence, and caveat/version note."
+            )
+        ]
+        final_task["done_condition"] = (
+            "Stop when the final migration checklist has source-backed evidence, "
+            "caveats, unknowns, and version notes."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+
+    def test_req003_hazard_migration_generic_checklist_without_evidence_caveat_fails(self) -> None:
+        question, candidate = self.nextjs_cache_hazard_candidate()
+        final_task = candidate["bounded_tasks"][-1]
+        final_task["query"] = (
+            "Build the final Next.js cache invalidation migration checklist table."
+        )
+        final_task["expected_artifacts"] = [
+            "migration checklist",
+            "cache layer/API table",
+        ]
+        final_task["success_criteria"] = [
+            (
+                "Rows include change, affected layer/API, migration impact, "
+                "action/mitigation, validation/test, and rollback/guardrail."
+            )
+        ]
+        final_task["done_condition"] = (
+            "Stop when the final migration checklist covers every cache layer/API."
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
+
+    def test_req003_api_dashboard_visual_to_text_deliverable_still_passes_validation(self) -> None:
+        question = (
+            "Compare API dashboard screenshots for rate-limit semantics and the "
+            "official implementation docs behind them."
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "v" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+            visual_angle_indexes=(),
+        )
+        candidate = json.loads(json.dumps(response["candidate_plan"]))
+        for index, task in enumerate(candidate["bounded_tasks"], start=1):
+            task["route"] = "text_only"
+            task["expected_visual_targets"] = []
+            task["max_images"] = 0
+            task["query"] = (
+                f"Collect API rate-limit documentation source evidence task {index}."
+            )
+            task["expected_artifacts"] = ["API documentation source notes"]
+            task["success_criteria"] = [
+                "Use official API implementation documentation."
+            ]
+            task["done_condition"] = "Stop when source-backed API notes are ready."
+        comparison_task = candidate["bounded_tasks"][-1]
+        comparison_task["query"] = (
+            "Assemble the provider mapping records into one side-by-side rate-limit "
+            "semantics table with uniform evidence and uncertainty fields."
+        )
+        comparison_task["expected_source_types"] = [
+            "provider mapping records",
+            "official API implementation documentation",
+            "citation ledger",
+        ]
+        comparison_task["expected_artifacts"] = [
+            "side-by-side semantic comparison table"
+        ]
+        comparison_task["success_criteria"] = [
+            (
+                "Include provider/dashboard, screenshot field, observed value or "
+                "state, documented rule, mapping status, evidence, caveat or "
+                "unknown, and freshness note."
+            ),
+            "Use consistent status vocabulary.",
+            "Leave unsupported cells explicitly unknown.",
+        ]
+        comparison_task["done_condition"] = (
+            "Done when one structured comparison table contains every provider "
+            "mapping and all required status, evidence, caveat, unknown, and "
+            "freshness columns."
+        )
+        task_ids = [task["task_id"] for task in candidate["bounded_tasks"]]
+        angle_ids = [angle["angle_id"] for angle in candidate["angles"]]
+        candidate["requirement_coverage_map"].append(
+            {
+                "requirement_id": "req_003",
+                "requirement_type": "requested analysis/comparison/output shape",
+                "requirement_text": (
+                    "Produce a side-by-side semantic comparison that extracts what "
+                    "each screenshot communicates, maps it to the relevant official "
+                    "documentation, and identifies matches, differences, ambiguities, "
+                    "and implementation implications."
+                ),
+                "prompt_text": question,
+                "explicit": True,
+                "non_negotiable": True,
+                "covered_by_angle_ids": angle_ids,
+                "covered_by_task_ids": task_ids,
+                "coverage_status": "covered",
+            }
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=candidate,
+            visual_preference="text_only",
+        )
+
+        failure_codes = {failure["code"] for failure in validation["failures"]}
+        self.assertNotIn("REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE", failure_codes)
 
     def test_req003_neutral_deliverable_without_status_caveat_is_repaired(self) -> None:
         question = "Compare two transit fare policies using source-backed evidence."

@@ -5810,13 +5810,18 @@ def _semantic_repair_guidance_for_codes(
     }:
         guidance.append(
             " If `REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE` appears, add a bounded "
-            "text/document/structured task and expected artifact for a consolidated "
-            "side-by-side comparison deliverable using the entities and comparison "
-            "axes from the user's own question. Include fields for requirement or "
-            "criterion, each compared item/standard/source named by the user, "
-            "match/partial/mismatch/unverifiable status where compliance-style "
-            "judgment is requested, evidence, caveats, and remediation or next action "
-            "only when the oracle asks for it."
+            "text/document/structured task and expected artifact for the requested "
+            "final analysis contract. Use the contract shape implied by the oracle: "
+            "side-by-side comparison rows; visual observation to official text/"
+            "document meaning mapping; prioritized hazard/risk catalog; migration "
+            "or implementation checklist; or policy/regulatory compliance matrix. "
+            "For comparison contracts this may still be a consolidated side-by-side "
+            "comparison deliverable with match/partial/mismatch/unverifiable "
+            "status fields. "
+            "The final task must include the shape-specific row fields, source "
+            "evidence, and caveat/unknown or version-note fields; add remediation, "
+            "rollback, or prioritized next actions only when that contract asks for "
+            "them."
         )
     if code_set & {
         "REQ_003_PRIORITIZED_REMEDIATION_MISSING",
@@ -8049,11 +8054,20 @@ def _semantic_review_oracle_semantic_blockers(
         for requirement in _list(oracle.get("oracle_requirement_map"))
         if isinstance(requirement, Mapping)
     ]
-    if any(_candidate_requirement_is_req003_comparison(req) for req in requirements):
+    if any(
+        _candidate_requirement_is_req003_final_artifact_contract(
+            req,
+            original_question=question,
+        )
+        for req in requirements
+    ):
         comparison_requirements = [
             req
             for req in requirements
-            if _candidate_requirement_is_req003_comparison(req)
+            if _candidate_requirement_is_req003_final_artifact_contract(
+                req,
+                original_question=question,
+            )
         ]
         row_terms = _candidate_req003_comparison_row_terms(
             task={},
@@ -8066,21 +8080,32 @@ def _semantic_review_oracle_semantic_blockers(
             ),
         )
         if not any(
-            _candidate_has_comparison_deliverable_task(
+            _candidate_has_req003_final_artifact_contract_task(
                 tasks=tasks,
                 requirement=req,
+                original_question=question,
                 row_terms=row_terms,
             )
             for req in comparison_requirements
         ):
+            contract_shapes = _ordered_unique(
+                shape
+                for req in comparison_requirements
+                for shape in _candidate_req003_final_artifact_contract_shapes(
+                    req,
+                    original_question=question,
+                )
+            )
             blockers.append(
                 {
                     "code": "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
                     "message": (
                         "Req_003 comparison/output-shape oracle requirements need a "
-                        "bounded side-by-side comparison deliverable with status, "
-                        "evidence, and caveat/unknown fields."
+                        "bounded final deliverable task whose row fields match the "
+                        "requested analysis type, with evidence and caveat/unknown "
+                        "fields."
                     ),
+                    "contract_shapes": contract_shapes,
                 }
             )
         if any(
@@ -9268,6 +9293,712 @@ def _candidate_requirement_is_req003_comparison(
     )
 
 
+REQ003_FINAL_ARTIFACT_CONTRACT_SHAPES = (
+    "comparison",
+    "visual_to_text_comparison",
+    "hazard_risk_analysis",
+    "migration_implementation_guidance",
+    "policy_regulatory_compliance",
+)
+
+
+def _candidate_requirement_is_req003_output_shape_requirement(
+    requirement: Mapping[str, Any],
+) -> bool:
+    requirement_id = str(requirement.get("requirement_id") or "").lower()
+    requirement_type = str(requirement.get("requirement_type") or "").lower()
+    if requirement_type in {
+        "analysis_and_output_shape",
+        "analysis_comparison_output_shape",
+        "analysis_output_shape",
+        "requested analysis/comparison/output shape",
+    }:
+        return True
+    if "output" in requirement_type and (
+        "analysis" in requirement_type or "comparison" in requirement_type
+    ):
+        return True
+    if requirement_id != "req_003":
+        return False
+    if requirement_type in {
+        "subject",
+        "source_quality",
+        "time_range",
+        "geography",
+        "visual_modality",
+        "deliverable_shape",
+        "safety_risk",
+        "user_constraint",
+    }:
+        return False
+    requirement_only_text = json.dumps(
+        [
+            requirement.get("prompt_text"),
+            requirement.get("requirement_text"),
+            requirement.get("expected_modalities"),
+            requirement.get("output_shape_constraints"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+    return _contains_any(
+        requirement_only_text,
+        (
+            "output shape",
+            "deliverable",
+            "structured analysis",
+            "structured comparison",
+            "side-by-side",
+            "side by side",
+            "comparison table",
+            "comparison matrix",
+            "hazard catalog",
+            "risk register",
+            "migration checklist",
+            "implementation checklist",
+            "compliance matrix",
+            "requirements matrix",
+            "policy matrix",
+        ),
+    )
+
+
+def _candidate_req003_contract_text(
+    requirement: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> str:
+    return json.dumps(
+        [
+            original_question,
+            requirement.get("prompt_text"),
+            requirement.get("requirement_text"),
+            requirement.get("expected_modalities"),
+            requirement.get("output_shape_constraints"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+
+
+def _candidate_req003_final_artifact_contract_shapes(
+    requirement: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> tuple[str, ...]:
+    if not _candidate_requirement_is_req003_output_shape_requirement(requirement):
+        return ()
+    text = _candidate_req003_contract_text(
+        requirement,
+        original_question=original_question,
+    )
+    shapes: list[str] = []
+    visual_requested = _contains_any(
+        text,
+        (
+            "visual",
+            "image",
+            "screenshot",
+            "screen capture",
+            "dashboard",
+            "map image",
+            "pictogram",
+            "\uc2dc\uac01",
+            "\uc774\ubbf8\uc9c0",
+            "\uc2a4\ud06c\ub9b0\uc0f7",
+        ),
+    )
+    text_document_requested = _contains_any(
+        text,
+        (
+            "official documentation",
+            "official docs",
+            "documentation",
+            "documented rule",
+            "textual guidance",
+            "official guidance",
+            "document meaning",
+            "text meaning",
+            "\uacf5\uc2dd",
+            "\ubb38\uc11c",
+            "\uc9c0\uce68",
+        ),
+    )
+    comparison_requested = _contains_any(
+        text,
+        (
+            "compare",
+            "comparison",
+            "mapping",
+            "map it to",
+            "against",
+            "match",
+            "mismatch",
+            "ambiguity",
+            "cross-modal",
+            "cross modal",
+            "\ube44\uad50",
+            "\ub300\uc870",
+            "\uc77c\uce58",
+            "\ubd88\uc77c\uce58",
+            "\ubaa8\ud638",
+        ),
+    )
+    hazard_requested = _contains_any(
+        text,
+        (
+            "hazard",
+            "hazards",
+            "risk analysis",
+            "risk catalog",
+            "risk register",
+            "risk matrix",
+            "failure mode",
+            "failure pattern",
+            "implementation hazard",
+            "pitfall",
+            "cache invalidation",
+        ),
+    ) and _contains_any(
+        text,
+        (
+            "mechanism",
+            "cause",
+            "why each",
+            "why it",
+            "impact",
+            "consequence",
+            "detection",
+            "verification",
+            "mitigation",
+            "prevention",
+            "guardrail",
+            "catalog",
+        ),
+    )
+    migration_requested = _contains_any(
+        text,
+        (
+            "migration",
+            "migrate",
+            "upgrade",
+            "implementation guidance",
+            "implementation checklist",
+            "migration checklist",
+            "rollback",
+            "roll back",
+            "guardrail",
+        ),
+    ) and _contains_any(
+        text,
+        (
+            "affected layer",
+            "layer/api",
+            "layer or api",
+            "cache layer",
+            "api",
+            "change",
+            "migration impact",
+            "validation",
+            "test",
+            "version note",
+            "version-sensitive",
+            "current official",
+        ),
+    )
+    policy_requested = _contains_any(
+        text,
+        (
+            "compliance",
+            "regulatory",
+            "regulation",
+            "jurisdiction",
+            "policy requirement",
+            "requirement matrix",
+            "criterion matrix",
+            "criteria matrix",
+        ),
+    ) and _contains_any(
+        text,
+        (
+            "status",
+            "exception",
+            "match",
+            "mismatch",
+            "partial",
+            "compliance",
+        ),
+    ) and _contains_any(
+        text,
+        (
+            "evidence",
+            "citation",
+            "source",
+        ),
+    ) and _contains_any(
+        text,
+        (
+            "exception",
+            "caveat",
+            "unknown",
+            "limitation",
+        ),
+    ) and _contains_any(
+        text,
+        (
+            "matrix",
+            "table",
+            "checklist",
+            "row",
+            "rows",
+        ),
+    )
+    visual_contract_requested = visual_requested and text_document_requested and (
+        _contains_any(
+            text,
+            (
+                "visual-to-text",
+                "visual to text",
+                "screenshot-to-documentation",
+                "screenshot to documentation",
+                "structured screenshot-to-documentation comparison",
+                "structured cross-modal comparison",
+                "structured cross modal comparison",
+                "cross-modal comparison",
+                "cross modal comparison",
+                "mapping table",
+                "semantic comparison table",
+                "side-by-side semantic comparison",
+                "side by side semantic comparison",
+                "maps it to",
+                "map visual",
+                "map screenshot",
+            ),
+        )
+        or (
+            comparison_requested
+            and _contains_any(
+                text,
+                (
+                    "table",
+                    "matrix",
+                    "row",
+                    "rows",
+                    "status",
+                    "match",
+                    "mismatch",
+                    "ambiguity",
+                    "unknown",
+                ),
+            )
+        )
+    )
+    if visual_contract_requested:
+        shapes.append("visual_to_text_comparison")
+    if hazard_requested:
+        shapes.append("hazard_risk_analysis")
+    if migration_requested:
+        shapes.append("migration_implementation_guidance")
+    if policy_requested:
+        shapes.append("policy_regulatory_compliance")
+    if shapes:
+        return tuple(_ordered_unique(shapes))
+    if _candidate_requirement_is_req003_comparison(requirement):
+        return ("comparison",)
+    return ()
+
+
+def _candidate_requirement_is_req003_final_artifact_contract(
+    requirement: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> bool:
+    return bool(
+        _candidate_req003_final_artifact_contract_shapes(
+            requirement,
+            original_question=original_question,
+        )
+    )
+
+
+def _candidate_has_req003_final_artifact_contract_task(
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+    requirement: Mapping[str, Any],
+    original_question: str,
+    row_terms: Mapping[str, Any] | None = None,
+) -> bool:
+    shapes = _candidate_req003_final_artifact_contract_shapes(
+        requirement,
+        original_question=original_question,
+    )
+    if not shapes:
+        return True
+    return all(
+        any(
+            _candidate_task_satisfies_req003_contract_shape(
+                task=task,
+                requirement=requirement,
+                original_question=original_question,
+                shape=shape,
+                row_terms=row_terms,
+            )
+            for task in tasks
+        )
+        for shape in shapes
+    )
+
+
+def _candidate_task_satisfies_req003_contract_shape(
+    *,
+    task: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+    original_question: str,
+    shape: str,
+    row_terms: Mapping[str, Any] | None,
+) -> bool:
+    if shape == "comparison":
+        return _candidate_has_comparison_deliverable_task(
+            tasks=[task],
+            requirement=requirement,
+            row_terms=row_terms,
+        )
+    text = _candidate_task_deliverable_text(task)
+    if not text:
+        return False
+    if str(task.get("route") or "text_only") != "text_only":
+        return False
+    if shape == "visual_to_text_comparison":
+        return _candidate_has_req003_visual_to_text_contract(text)
+    if shape == "hazard_risk_analysis":
+        return _candidate_has_req003_hazard_risk_contract(
+            text,
+            requirement=requirement,
+            original_question=original_question,
+        )
+    if shape == "migration_implementation_guidance":
+        return _candidate_has_req003_migration_guidance_contract(text)
+    if shape == "policy_regulatory_compliance":
+        return _candidate_has_req003_policy_compliance_contract(text)
+    return False
+
+
+def _candidate_req003_has_final_marker(
+    text: str,
+    *,
+    artifact_terms: Sequence[str],
+) -> bool:
+    if not _contains_any(text, artifact_terms):
+        return False
+    return _contains_any(
+        text,
+        (
+            "final",
+            "synthesis",
+            "synthesize",
+            "consolidated",
+            "assemble",
+            "produce",
+            "build",
+            "deliverable",
+            "catalog",
+            "checklist",
+            "register",
+            "matrix",
+            "table",
+            "runbook",
+            "playbook",
+            "executive summary",
+            "report-ready",
+        ),
+    )
+
+
+def _candidate_req003_has_field_groups(
+    text: str,
+    groups: Sequence[Sequence[str]],
+) -> bool:
+    return all(_contains_any(text, group) for group in groups)
+
+
+def _candidate_has_req003_visual_to_text_contract(text: str) -> bool:
+    if not _candidate_req003_has_final_marker(
+        text,
+        artifact_terms=(
+            "visual-to-text",
+            "visual to text",
+            "screenshot-to-documentation",
+            "screenshot to documentation",
+            "cross-modal comparison",
+            "cross modal comparison",
+            "semantic comparison",
+            "mapping table",
+            "comparison table",
+            "comparison matrix",
+            "side-by-side comparison",
+            "side by side comparison",
+            "structured comparison",
+            "\ub300\uc870\ud45c",
+            "\ube44\uad50\ud45c",
+            "\uc900\uc218 \ub300\uc870\ud45c",
+        ),
+    ):
+        return False
+    return _candidate_req003_has_field_groups(
+        text,
+        (
+            (
+                "visual observation",
+                "visual evidence",
+                "screenshot field",
+                "observed value",
+                "observed state",
+                "map observation",
+                "image observation",
+                "pictogram visual message",
+                "visual message",
+                "map-image observation",
+                "\uc774\ubbf8\uc9c0 \uad00\ucc30",
+                "\uc774\ubbf8\uc9c0 \uad00\ucc30\uac12",
+                "\uac01 \uc774\ubbf8\uc9c0",
+                "\uc0ac\uc9c4",
+                "\uc2dc\uac01 \uba54\uc2dc\uc9c0",
+            ),
+            (
+                "official text",
+                "official documentation",
+                "official docs",
+                "document meaning",
+                "documented rule",
+                "textual guidance",
+                "behavior guidance",
+                "official guidance",
+                "documentation",
+                "\uacf5\uc2dd \uae30\uc900",
+                "\uacf5\uc2dd \uaddc\uc815",
+                "\uacf5\uc2dd \uc548\ub0b4",
+                "\ubb38\uc11c",
+                "\uae30\uc900",
+            ),
+            (
+                "status",
+                "match",
+                "mismatch",
+                "ambiguity",
+                "ambiguous",
+                "partial",
+                "unverifiable",
+                "difference",
+                "omission",
+                "\ud310\uc815",
+                "\uc0c1\ud0dc",
+                "\uc77c\uce58",
+                "\ubd88\uc77c\uce58",
+                "\ucc28\uc774",
+                "\uc900\uc218",
+            ),
+            (
+                "evidence",
+                "citation",
+                "source-backed",
+                "source",
+                "\uadfc\uac70",
+                "\ucd9c\ucc98",
+            ),
+            (
+                "uncertainty",
+                "unknown",
+                "caveat",
+                "unverifiable",
+                "ambiguous",
+                "\uc8fc\uc758\uc0ac\ud56d",
+                "\ubbf8\ud655\uc778",
+                "\ud655\uc778\ubd88\uac00",
+            ),
+        ),
+    )
+
+
+def _candidate_req003_requirement_requires_priority(
+    requirement: Mapping[str, Any],
+    *,
+    original_question: str,
+) -> bool:
+    text = _candidate_req003_contract_text(
+        requirement,
+        original_question=original_question,
+    )
+    return _contains_any(
+        text,
+        ("prioritized", "priority", "ranked", "ranking", "severity"),
+    )
+
+
+def _candidate_has_req003_hazard_risk_contract(
+    text: str,
+    *,
+    requirement: Mapping[str, Any],
+    original_question: str,
+) -> bool:
+    if not _candidate_req003_has_final_marker(
+        text,
+        artifact_terms=(
+            "hazard catalog",
+            "hazard analysis",
+            "risk catalog",
+            "risk register",
+            "risk matrix",
+            "failure mode catalog",
+            "implementation hazard",
+            "prioritized hazard",
+        ),
+    ):
+        return False
+    if _candidate_req003_requirement_requires_priority(
+        requirement,
+        original_question=original_question,
+    ) and not _contains_any(
+        text,
+        ("priority", "prioritized", "rank", "ranked", "severity"),
+    ):
+        return False
+    return _candidate_req003_has_field_groups(
+        text,
+        (
+            ("hazard", "risk", "failure mode", "pitfall"),
+            ("mechanism", "cause", "why", "occurs", "trigger"),
+            ("impact", "consequence", "effect", "severity", "regression"),
+            (
+                "detection",
+                "detect",
+                "verification",
+                "verify",
+                "validation",
+                "test",
+            ),
+            (
+                "mitigation",
+                "prevent",
+                "prevention",
+                "guardrail",
+                "remediation",
+                "action",
+            ),
+            (
+                "evidence",
+                "citation",
+                "official docs",
+                "official documentation",
+                "source-backed",
+                "source",
+            ),
+            (
+                "caveat",
+                "unknown",
+                "uncertainty",
+                "version note",
+                "version-sensitive",
+                "version",
+                "limitation",
+            ),
+        ),
+    )
+
+
+def _candidate_has_req003_migration_guidance_contract(text: str) -> bool:
+    if not _candidate_req003_has_final_marker(
+        text,
+        artifact_terms=(
+            "migration checklist",
+            "implementation checklist",
+            "migration guidance",
+            "implementation guidance",
+            "migration runbook",
+            "implementation runbook",
+            "guardrail checklist",
+            "rollback checklist",
+        ),
+    ):
+        return False
+    return _candidate_req003_has_field_groups(
+        text,
+        (
+            (
+                "change",
+                "affected layer",
+                "affected cache layer",
+                "affected api",
+                "layer/api",
+                "layer or api",
+                "cache layer",
+                "api",
+            ),
+            ("migration impact", "impact", "consequence", "affected"),
+            (
+                "action",
+                "mitigation",
+                "prevent",
+                "prevention",
+                "guardrail",
+                "update",
+            ),
+            (
+                "validation",
+                "test",
+                "verification",
+                "verify",
+                "detection",
+                "detect",
+            ),
+            ("rollback", "roll back", "guardrail", "feature flag", "fallback"),
+            (
+                "evidence",
+                "citation",
+                "official docs",
+                "official documentation",
+                "source-backed",
+                "source",
+            ),
+            (
+                "caveat",
+                "version note",
+                "version-sensitive",
+                "unknown",
+                "limitation",
+                "version",
+            ),
+        ),
+    )
+
+
+def _candidate_has_req003_policy_compliance_contract(text: str) -> bool:
+    if not _candidate_req003_has_final_marker(
+        text,
+        artifact_terms=(
+            "compliance matrix",
+            "policy matrix",
+            "regulatory matrix",
+            "requirements matrix",
+            "requirement table",
+            "criterion table",
+            "criteria table",
+            "policy checklist",
+            "compliance checklist",
+        ),
+    ):
+        return False
+    return _candidate_req003_has_field_groups(
+        text,
+        (
+            ("requirement", "criterion", "criteria"),
+            ("jurisdiction", "source", "regulation", "policy"),
+            ("status", "compliance", "match", "mismatch", "partial", "unknown"),
+            ("evidence", "citation", "source-backed", "source"),
+            ("exception", "caveat", "unknown", "limitation"),
+        ),
+    )
+
+
 def _candidate_has_comparison_deliverable_task(
     *,
     tasks: Sequence[Mapping[str, Any]],
@@ -10049,7 +10780,10 @@ def validate_semantic_candidate_plan(
                 )
         if (
             requirement.get("non_negotiable") is True
-            and _candidate_requirement_is_req003_comparison(requirement)
+            and _candidate_requirement_is_req003_final_artifact_contract(
+                requirement,
+                original_question=question,
+            )
         ):
             row_terms = _candidate_req003_comparison_row_terms(
                 task={},
@@ -10060,9 +10794,14 @@ def validate_semantic_candidate_plan(
                     requirement
                 ),
             )
-            if not _candidate_has_comparison_deliverable_task(
+            contract_shapes = _candidate_req003_final_artifact_contract_shapes(
+                requirement,
+                original_question=question,
+            )
+            if not _candidate_has_req003_final_artifact_contract_task(
                 tasks=tasks,
                 requirement=requirement,
+                original_question=question,
                 row_terms=row_terms,
             ):
                 failures.append(
@@ -10071,10 +10810,11 @@ def validate_semantic_candidate_plan(
                         "requirement_id": requirement.get("requirement_id"),
                         "message": (
                             "Canonical req_003 comparison/output-shape requirements "
-                            "need a bounded side-by-side comparison deliverable with "
-                            "match/partial/mismatch/unverifiable status, evidence, "
-                            "and caveat/unknown fields."
+                            "need a bounded final deliverable task whose row fields "
+                            "match the requested analysis type, with evidence and "
+                            "caveat/unknown fields."
                         ),
+                        "contract_shapes": list(contract_shapes),
                     }
                 )
             if (
