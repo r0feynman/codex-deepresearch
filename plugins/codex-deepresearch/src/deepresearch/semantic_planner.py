@@ -9362,10 +9362,64 @@ def _candidate_has_comparison_deliverable_task(
         ):
             continue
         if strict_status_fields:
-            if not all(_contains_any(text, group) for group in status_groups):
+            if not (
+                all(_contains_any(text, group) for group in status_groups)
+                or _candidate_has_req003_semantic_mapping_status_contract(text)
+            ):
                 continue
         return True
     return False
+
+
+def _candidate_has_req003_semantic_mapping_status_contract(text: str) -> bool:
+    """Recognize explicit mapping-status schemas without requiring fixed enum words."""
+
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    if not _contains_any(
+        lowered,
+        (
+            "mapping status",
+            "status vocabulary",
+            "consistent status",
+            "status column",
+            "status field",
+            "status fields",
+            "status, evidence",
+            "판정 상태",
+            "상태 열",
+            "상태 필드",
+        ),
+    ):
+        return False
+    if not _contains_any(
+        lowered,
+        (
+            "map screenshot",
+            "maps it to",
+            "mapping records",
+            "provider mapping",
+            "screenshot field",
+            "dashboard",
+            "documented rule",
+            "official documentation",
+            "rate-limit semantics",
+            "rate limit semantics",
+            "semantic comparison",
+            "semantic mapping",
+            "cross-modal",
+        ),
+    ):
+        return False
+    return all(
+        _contains_any(lowered, group)
+        for group in (
+            ("status", "판정", "상태"),
+            ("evidence", "citation", "source-backed", "근거", "인용", "출처"),
+            ("caveat", "unknown", "uncertainty", "미확인", "주의사항"),
+        )
+    )
 
 
 def _candidate_has_req003_comparison_field_schema_task(

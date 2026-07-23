@@ -61,6 +61,8 @@ from deepresearch.semantic_planner import (  # noqa: E402
     write_semantic_planner_validation,
     _codex_semantic_candidate_validation,
     _codex_semantic_planner_validation_max_attempts,
+    _candidate_has_comparison_deliverable_task,
+    _candidate_req003_comparison_row_terms,
     _has_forbidden_internal_leakage,
     _materialize_candidate_budget_caps,
     _materialize_candidate_broad_cardinality,
@@ -4223,6 +4225,125 @@ class SemanticPlannerTests(unittest.TestCase):
             "unknown",
         ):
             self.assertIn(expected, task_text)
+
+    def test_req003_api_dashboard_mapping_status_contract_counts_as_deliverable(self) -> None:
+        question = (
+            "Compare API dashboard screenshots for rate-limit semantics and the "
+            "official implementation docs behind them."
+        )
+        requirement = {
+            "requirement_id": "req_003",
+            "requirement_type": "requested analysis/comparison/output shape",
+            "requirement_text": (
+                "Produce a side-by-side semantic comparison that extracts what each "
+                "screenshot communicates, maps it to the relevant official documentation, "
+                "and identifies matches, differences, ambiguities, and implementation "
+                "implications."
+            ),
+            "prompt_text": question,
+            "non_negotiable": True,
+        }
+        row_terms = _candidate_req003_comparison_row_terms(
+            task={},
+            angle={},
+            requirements=[requirement],
+            original_question=question,
+            prioritized_remediation=False,
+        )
+        task = {
+            "task_id": "task_013",
+            "angle_id": "angle_005",
+            "route": "text_only",
+            "max_images": 0,
+            "expected_visual_targets": [],
+            "query": (
+                "Assemble the provider mapping records into one side-by-side "
+                "rate-limit semantics table with uniform evidence and uncertainty fields."
+            ),
+            "expected_source_types": [
+                "provider mapping records",
+                "citation ledger",
+                "provenance records",
+            ],
+            "expected_artifacts": ["side-by-side semantic comparison table"],
+            "success_criteria": [
+                (
+                    "Include provider/dashboard, screenshot field, observed value or state, "
+                    "documented rule, mapping status, evidence, caveat or unknown, and "
+                    "freshness note."
+                ),
+                "Use consistent status vocabulary.",
+                "Leave unsupported cells explicitly unknown.",
+            ],
+            "done_condition": (
+                "Done when one structured comparison table contains every provider mapping "
+                "and all required status, evidence, caveat, unknown, and freshness columns."
+            ),
+        }
+
+        self.assertTrue(
+            _candidate_has_comparison_deliverable_task(
+                tasks=[task],
+                requirement=requirement,
+                row_terms=row_terms,
+            )
+        )
+
+    def test_req003_api_dashboard_generic_table_without_caveat_unknown_still_fails(self) -> None:
+        question = (
+            "Compare API dashboard screenshots for rate-limit semantics and the "
+            "official implementation docs behind them."
+        )
+        requirement = {
+            "requirement_id": "req_003",
+            "requirement_type": "requested analysis/comparison/output shape",
+            "requirement_text": (
+                "Produce a side-by-side semantic comparison that extracts what each "
+                "screenshot communicates, maps it to the relevant official documentation, "
+                "and identifies matches, differences, ambiguities, and implementation "
+                "implications."
+            ),
+            "prompt_text": question,
+            "non_negotiable": True,
+        }
+        row_terms = _candidate_req003_comparison_row_terms(
+            task={},
+            angle={},
+            requirements=[requirement],
+            original_question=question,
+            prioritized_remediation=False,
+        )
+        task = {
+            "task_id": "task_013",
+            "angle_id": "angle_005",
+            "route": "text_only",
+            "max_images": 0,
+            "expected_visual_targets": [],
+            "query": (
+                "Assemble the provider mapping records into one side-by-side "
+                "rate-limit semantics table."
+            ),
+            "expected_artifacts": ["side-by-side semantic comparison table"],
+            "success_criteria": [
+                (
+                    "Include provider/dashboard, screenshot field, documented rule, "
+                    "mapping status, and evidence."
+                ),
+                "Use consistent status vocabulary.",
+            ],
+            "done_condition": (
+                "Done when one structured comparison table contains every provider mapping "
+                "and required status, evidence, and freshness columns."
+            ),
+        }
+
+        self.assertFalse(
+            _candidate_has_comparison_deliverable_task(
+                tasks=[task],
+                requirement=requirement,
+                row_terms=row_terms,
+            )
+        )
 
     def test_req003_neutral_deliverable_without_status_caveat_is_repaired(self) -> None:
         question = "Compare two transit fare policies using source-backed evidence."
