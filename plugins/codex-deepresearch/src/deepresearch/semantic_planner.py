@@ -156,6 +156,9 @@ SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS = (
     "max_results",
     "max_sources",
     "max_images",
+    "semantic_entity_refs",
+    "semantic_dimension_refs",
+    "final_deliverable_binding",
 )
 SEMANTIC_MATERIALIZATION_SEARCH_RESULT_FIELD_PREFIX = "semantic_task_"
 SEMANTIC_MATERIALIZATION_PLAN_HASH_FIELD = "semantic_materialization_plan_hash"
@@ -530,6 +533,12 @@ class SemanticPlan:
     domain_entities: list[dict[str, Any]] = field(default_factory=list)
     constraints: list[dict[str, Any]] = field(default_factory=list)
     runner_source_budget: dict[str, Any] = field(default_factory=dict)
+    selected_entities: list[dict[str, Any]] = field(default_factory=list)
+    required_dimensions: list[dict[str, Any]] = field(default_factory=list)
+    coverage_matrix: list[dict[str, Any]] = field(default_factory=list)
+    task_partition_contract: dict[str, Any] = field(default_factory=dict)
+    source_budget_contract: dict[str, Any] = field(default_factory=dict)
+    final_deliverable_contract: dict[str, Any] = field(default_factory=dict)
     question_scope: str = "narrow"
     scope_downgrade: dict[str, Any] | None = None
     decomposition_strategy: str = ""
@@ -895,6 +904,13 @@ def codex_semantic_candidate_plan(
             candidate, placeholder_selection_materializations = (
                 _materialize_candidate_placeholder_selection_workflow(candidate)
             )
+            candidate, typed_contract_materializations = (
+                _materialize_candidate_typed_semantic_contracts(
+                    candidate,
+                    raw_request=raw_request,
+                    original_question=original_question,
+                )
+            )
             if source_cap_normalizations:
                 raw_response["candidate_plan"] = candidate
                 raw_response["candidate_plan_source_cap_normalizations"] = (
@@ -960,6 +976,11 @@ def codex_semantic_candidate_plan(
                 raw_response[
                     "candidate_plan_placeholder_selection_materializations"
                 ] = placeholder_selection_materializations
+            if typed_contract_materializations:
+                raw_response["candidate_plan"] = candidate
+                raw_response["candidate_plan_typed_contract_materializations"] = (
+                    typed_contract_materializations
+                )
             candidate_validation = _codex_semantic_candidate_validation(
                 original_question=original_question,
                 candidate=candidate,
@@ -1133,6 +1154,36 @@ def codex_semantic_candidate_plan(
         runner_source_budget=(
             dict(candidate.get("runner_source_budget"))
             if isinstance(candidate.get("runner_source_budget"), Mapping)
+            else {}
+        ),
+        selected_entities=[
+            dict(item)
+            for item in _list(candidate.get("selected_entities"))
+            if isinstance(item, Mapping)
+        ],
+        required_dimensions=[
+            dict(item)
+            for item in _list(candidate.get("required_dimensions"))
+            if isinstance(item, Mapping)
+        ],
+        coverage_matrix=[
+            dict(item)
+            for item in _list(candidate.get("coverage_matrix"))
+            if isinstance(item, Mapping)
+        ],
+        task_partition_contract=(
+            dict(candidate.get("task_partition_contract"))
+            if isinstance(candidate.get("task_partition_contract"), Mapping)
+            else {}
+        ),
+        source_budget_contract=(
+            dict(candidate.get("source_budget_contract"))
+            if isinstance(candidate.get("source_budget_contract"), Mapping)
+            else {}
+        ),
+        final_deliverable_contract=(
+            dict(candidate.get("final_deliverable_contract"))
+            if isinstance(candidate.get("final_deliverable_contract"), Mapping)
             else {}
         ),
         question_scope=str(candidate["question_scope"]),
@@ -1434,6 +1485,12 @@ def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> di
         "angles",
         "bounded_tasks",
         "language",
+        "selected_entities",
+        "required_dimensions",
+        "coverage_matrix",
+        "task_partition_contract",
+        "source_budget_contract",
+        "final_deliverable_contract",
     )
     missing = [field for field in required_fields if field not in candidate_plan]
     if missing:
@@ -1448,6 +1505,12 @@ def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> di
     if not isinstance(candidate_plan.get("bounded_tasks"), list) or not candidate_plan["bounded_tasks"]:
         raise SemanticPlannerAdapterUnavailable(
             "Codex semantic candidate_plan must include non-empty bounded_tasks"
+        )
+    malformed_contracts = _candidate_typed_contract_shape_failures(candidate_plan)
+    if malformed_contracts:
+        raise SemanticPlannerAdapterUnavailable(
+            "Codex semantic candidate_plan has malformed typed semantic contracts: "
+            + ", ".join(malformed_contracts)
         )
     return candidate_plan
 
@@ -1492,6 +1555,41 @@ def _normalize_candidate_executable_source_caps(
     return normalized, normalizations
 
 
+def _candidate_typed_contract_shape_failures(candidate: Mapping[str, Any]) -> list[str]:
+    failures: list[str] = []
+    for field_name in ("selected_entities", "required_dimensions", "coverage_matrix"):
+        if not isinstance(candidate.get(field_name), list):
+            failures.append(f"{field_name}_not_list")
+    for field_name in (
+        "task_partition_contract",
+        "source_budget_contract",
+        "final_deliverable_contract",
+    ):
+        if not isinstance(candidate.get(field_name), Mapping):
+            failures.append(f"{field_name}_not_object")
+    entities = candidate.get("selected_entities")
+    if isinstance(entities, list):
+        for index, entity in enumerate(entities, start=1):
+            if not isinstance(entity, Mapping):
+                failures.append(f"selected_entities[{index}]_not_object")
+                continue
+            if not str(entity.get("entity_id") or "").strip():
+                failures.append(f"selected_entities[{index}].entity_id_missing")
+            if not str(entity.get("name") or "").strip():
+                failures.append(f"selected_entities[{index}].name_missing")
+    dimensions = candidate.get("required_dimensions")
+    if isinstance(dimensions, list):
+        for index, dimension in enumerate(dimensions, start=1):
+            if not isinstance(dimension, Mapping):
+                failures.append(f"required_dimensions[{index}]_not_object")
+                continue
+            if not str(dimension.get("dimension_id") or "").strip():
+                failures.append(f"required_dimensions[{index}].dimension_id_missing")
+            if not str(dimension.get("name") or "").strip():
+                failures.append(f"required_dimensions[{index}].name_missing")
+    return failures
+
+
 def _semantic_repair_materialization_allowed(raw_request: Mapping[str, Any]) -> bool:
     """Allow heavier plan repair only after convergence has reviewer/validator input."""
 
@@ -1519,10 +1617,6 @@ def _materialize_candidate_source_cap_splits(
     materializations: list[dict[str, Any]] = []
     normalized_tasks: list[Any] = []
     mapping_task_count = sum(1 for task in raw_tasks if isinstance(task, Mapping))
-    shared_source_budget_available = _candidate_shared_source_budget_available(
-        normalized,
-        budget_cap=budget_cap,
-    )
     for index, task in enumerate(raw_tasks, start=1):
         if not isinstance(task, Mapping):
             normalized_tasks.append(task)
@@ -1551,7 +1645,12 @@ def _materialize_candidate_source_cap_splits(
         )
         if not semantic_partitions:
             original_task_id = str(task.get("task_id") or f"task_{index:03d}")
-            if shared_source_budget_available:
+            if _candidate_shared_source_budget_available(
+                normalized,
+                task=task,
+                required_sources=required_sources,
+                budget_cap=budget_cap,
+            ):
                 normalized_task = _candidate_source_pool_reuse_task(
                     task,
                     original_task_id=original_task_id,
@@ -1997,31 +2096,191 @@ def _candidate_append_source_split_constraint(
 def _candidate_shared_source_budget_available(
     candidate: Mapping[str, Any],
     *,
+    task: Mapping[str, Any],
+    required_sources: int,
     budget_cap: Any = None,
 ) -> bool:
+    _ = budget_cap
+    return _candidate_shared_source_pool_has_reuse_proof(
+        candidate=candidate,
+        task=task,
+        required_sources=required_sources,
+    )
+
+
+def _candidate_shared_source_pool_has_reuse_proof(
+    *,
+    candidate: Mapping[str, Any],
+    task: Mapping[str, Any],
+    required_sources: int,
+) -> bool:
+    payloads: list[Any] = [candidate, task]
     runner_source_budget = candidate.get("runner_source_budget")
-    runner_cap = _candidate_runner_source_budget_cap(runner_source_budget)
-    if runner_cap is not None and runner_cap > 0:
-        if not isinstance(runner_source_budget, Mapping):
-            return True
-        allocation_strategy = str(
-            runner_source_budget.get("allocation_strategy") or ""
-        ).lower()
-        budget_type = str(runner_source_budget.get("budget_type") or "").lower()
-        if (
-            "shared_source_pool" in allocation_strategy
-            or "shared source pool" in allocation_strategy
-            or "reuse" in allocation_strategy
-            or "reuse" in budget_type
-            or runner_source_budget.get("reuse_required") is True
+    if isinstance(runner_source_budget, Mapping):
+        payloads.append(runner_source_budget)
+    source_policy = task.get("source_policy")
+    if isinstance(source_policy, Mapping):
+        payloads.append(source_policy)
+    for payload in payloads:
+        if _candidate_source_pool_coverage_payload_valid(
+            payload,
+            required_sources=required_sources,
         ):
             return True
-    request_max_sources = (
-        _semantic_task_source_cap_int(budget_cap.get("max_sources"))
-        if isinstance(budget_cap, Mapping)
-        else None
+    return False
+
+
+def _candidate_source_pool_coverage_payload_valid(
+    payload: Any,
+    *,
+    required_sources: int,
+) -> bool:
+    if isinstance(payload, list):
+        return _candidate_source_reuse_assignment_count(payload) >= required_sources
+    if not isinstance(payload, Mapping):
+        return False
+    for field_name in (
+        "source_reuse_assignments",
+        "explicit_source_reuse_assignments",
+        "shared_source_pool_assignments",
+        "source_pool_reuse_assignments",
+        "upstream_source_assignments",
+    ):
+        if (
+            _candidate_source_reuse_assignment_count(payload.get(field_name))
+            >= required_sources
+        ):
+            return True
+    for field_name in (
+        "shared_source_pool",
+        "source_pool",
+        "source_pool_coverage",
+        "shared_source_pool_coverage",
+        "upstream_source_pool_coverage",
+        "reuse_proof",
+        "source_reuse_plan",
+    ):
+        if _candidate_source_pool_coverage_payload_valid(
+            payload.get(field_name),
+            required_sources=required_sources,
+        ):
+            return True
+    source_id_count = _candidate_source_id_count(payload)
+    declared_count = max(
+        [
+            value
+            for value in (
+                _semantic_task_source_cap_int(payload.get(field_name))
+                for field_name in (
+                    "covered_required_source_count",
+                    "covered_source_count",
+                    "assigned_source_count",
+                    "available_source_count",
+                    "reuse_assignment_count",
+                    "source_count",
+                )
+            )
+            if value is not None
+        ]
+        or [0]
     )
-    return request_max_sources is not None and request_max_sources > 0
+    coverage_status = str(
+        payload.get("coverage_status")
+        or payload.get("status")
+        or payload.get("assignment_status")
+        or ""
+    ).lower()
+    status_valid = coverage_status in {
+        "complete",
+        "covered",
+        "verified",
+        "assigned",
+        "proven",
+        "ready",
+    }
+    proof_flag = any(
+        payload.get(field_name) is True
+        for field_name in (
+            "covers_required_sources",
+            "coverage_verified",
+            "reuse_assignments_verified",
+            "upstream_pool_coverage_verified",
+        )
+    )
+    covered_count = max(source_id_count, declared_count)
+    return covered_count >= required_sources and (status_valid or proof_flag)
+
+
+def _candidate_source_reuse_assignment_count(value: Any) -> int:
+    if isinstance(value, Mapping):
+        nested_count = _candidate_source_id_count(value)
+        if nested_count:
+            return nested_count
+        for field_name in (
+            "assignments",
+            "source_reuse_assignments",
+            "explicit_source_reuse_assignments",
+            "source_ids",
+            "assigned_source_ids",
+            "covered_source_ids",
+        ):
+            nested_count = _candidate_source_reuse_assignment_count(value.get(field_name))
+            if nested_count:
+                return nested_count
+        return 0
+    if not isinstance(value, list):
+        return 0
+    source_ids: set[str] = set()
+    assignment_records = 0
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            source_ids.add(item.strip())
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        nested_ids = _candidate_source_ids_from_payload(item)
+        if nested_ids:
+            source_ids.update(nested_ids)
+        elif any(
+            item.get(field_name)
+            for field_name in (
+                "source_id",
+                "pool_source_id",
+                "assigned_source",
+                "covered_source",
+                "task_id",
+            )
+        ):
+            assignment_records += 1
+    return len(source_ids) if source_ids else assignment_records
+
+
+def _candidate_source_id_count(payload: Mapping[str, Any]) -> int:
+    return len(_candidate_source_ids_from_payload(payload))
+
+
+def _candidate_source_ids_from_payload(payload: Mapping[str, Any]) -> set[str]:
+    source_ids: set[str] = set()
+    for field_name in (
+        "source_id",
+        "pool_source_id",
+        "assigned_source",
+        "covered_source",
+    ):
+        value = payload.get(field_name)
+        if isinstance(value, str) and value.strip():
+            source_ids.add(value.strip())
+    for field_name in (
+        "source_ids",
+        "assigned_source_ids",
+        "covered_source_ids",
+        "upstream_source_ids",
+        "pool_source_ids",
+    ):
+        values = payload.get(field_name)
+        if isinstance(values, list):
+            source_ids.update(str(value).strip() for value in values if str(value).strip())
+    return source_ids
 
 
 def _candidate_source_cap_semantic_partitions(
@@ -3906,6 +4165,7 @@ def _materialize_candidate_source_cap_constraints(
             request_max_sources=request_max_sources,
             budget_interpretation=budget_interpretation,
         )
+        runner_source_budget["_current_source_cap_constraint_repair"] = True
         existing_runner_budget = normalized.get("runner_source_budget")
         if isinstance(existing_runner_budget, Mapping):
             merged_runner_budget = _review_visible_runner_source_budget_metadata(
@@ -4181,6 +4441,37 @@ def _materialize_candidate_task_source_cap_feasibility(
             )
             continue
 
+        if not _candidate_shared_source_budget_available(
+            normalized,
+            task=normalized_task,
+            required_sources=required_sources,
+        ):
+            normalized_tasks.append(normalized_task)
+            materializations.append(
+                {
+                    "task_id": normalized_task.get("task_id"),
+                    "task_index": index,
+                    "field": "bounded_tasks",
+                    "materialization": "source_cap_feasibility_requires_shared_pool_proof",
+                    "repair_status": "blocked",
+                    "blocked_reason": "shared_source_pool_coverage_unproven",
+                    "blocked_feasibility_code": (
+                        "bounded_task_requirement_exceeds_max_sources"
+                    ),
+                    "previous_required_sources": required_sources,
+                    "max_sources": max_sources,
+                    "source_cap_reasons": list(source_reasons),
+                    "explicit_requirement_counts": dict(source_counts),
+                    "message": (
+                        "A bounded task that needs more sources than its own cap "
+                        "can only reuse a shared source pool when typed upstream "
+                        "coverage or explicit source reuse assignments prove the "
+                        "counted evidence obligation is already covered."
+                    ),
+                }
+            )
+            continue
+
         angle = angles_by_id.get(str(normalized_task.get("angle_id") or ""))
         angle_title = (
             str(angle.get("title") or "").strip()
@@ -4271,6 +4562,11 @@ def _candidate_source_budget_interpretation(
 ) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     for index, constraint in enumerate(constraints, start=1):
+        if _candidate_ignore_prior_materialized_source_budget_constraint(
+            constraint,
+            existing_runner_budget=existing_runner_budget,
+        ):
+            continue
         candidates.extend(
             _candidate_declared_source_budget_candidates(
                 constraint,
@@ -4306,18 +4602,20 @@ def _candidate_source_budget_interpretation(
             or typed_runner_cap <= request_max_sources
         )
     )
-    if typed_runner_compatible:
-        selected_cap = typed_runner_cap
-        selected_source = "typed_runner_limit"
-    elif request_max_sources is not None and request_max_sources > 0:
-        selected_cap = request_max_sources
-        selected_source = "request_max_sources"
-    elif natural_language_global is not None:
+    selected_cap = request_max_sources if request_max_sources and request_max_sources > 0 else None
+    selected_source = "request_max_sources" if selected_cap is not None else "none"
+    if natural_language_global is not None and (
+        selected_cap is None or natural_language_global < selected_cap
+    ):
         selected_cap = natural_language_global
         selected_source = "natural_language_global_total"
-    else:
-        selected_cap = None
-        selected_source = "none"
+    if typed_runner_compatible:
+        if selected_cap is None or typed_runner_cap < selected_cap:
+            selected_cap = typed_runner_cap
+            selected_source = "typed_runner_limit"
+    elif selected_cap is None and natural_language_global is not None:
+        selected_cap = natural_language_global
+        selected_source = "natural_language_global_total"
 
     interpretation: dict[str, Any] = {
         "selected_max_unique_sources": selected_cap,
@@ -4344,6 +4642,12 @@ def _candidate_source_budget_interpretation(
         "natural_language_global_total",
     }:
         interpretation["allocation_candidates_used_as_global_limit"] = False
+    if (
+        natural_language_global is not None
+        and request_max_sources is not None
+        and natural_language_global > request_max_sources
+    ):
+        interpretation["request_max_sources_used_as_ceiling"] = True
     return interpretation
 
 
@@ -4352,6 +4656,38 @@ def _candidate_source_budget_interpretation_selected_cap(
 ) -> int | None:
     return _semantic_task_source_cap_int(
         interpretation.get("selected_max_unique_sources")
+    )
+
+
+def _candidate_ignore_prior_materialized_source_budget_constraint(
+    constraint: Any,
+    *,
+    existing_runner_budget: Any,
+) -> bool:
+    if not _candidate_runner_source_budget_is_natural_language_materialized(
+        existing_runner_budget
+    ):
+        return False
+    if not isinstance(constraint, str):
+        return False
+    lowered = constraint.lower()
+    generated_preservation_markers = (
+        "runner-level source budget is preserved",
+        "runner level source budget is preserved",
+        "runner-level unique-source reuse budget",
+        "runner level unique-source reuse budget",
+        "executable source caps are task-specific",
+    )
+    if not any(marker in lowered for marker in generated_preservation_markers):
+        return False
+    return (
+        "max_unique_sources" in lowered
+        and (
+            "combined per-task source ceilings total" in lowered
+            or "task_max_sources_sum" in lowered
+            or "bounded_tasks.max_sources is authoritative" in lowered
+            or "shared source pool" in lowered
+        )
     )
 
 
@@ -4415,7 +4751,7 @@ def _candidate_declared_source_budget_candidates(
         (
             "named_global_source_budget",
             "global_total_budget",
-            r"\b(?:overall|global|total|aggregate|cumulative|standard|run[- ]level|runner[- ]level)\s+(?:unique[- ]source\s+|source\s+)?budget(?:\s+of)?\s*(?:is|=|:)?\s*(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)?\s*(?P<cap>\d{1,4})\b",
+            r"\b(?:overall|global|total|aggregate|cumulative|run[- ]level|runner[- ]level)\s+(?:unique[- ]source\s+|source\s+)?budget(?:\s+of)?\s*(?:is|=|:)?\s*(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)?\s*(?P<cap>\d{1,4})\b",
         ),
         (
             "global_sources_cap_phrase",
@@ -4426,6 +4762,16 @@ def _candidate_declared_source_budget_candidates(
             "global_totaling_phrase",
             "global_total_budget",
             r"\b(?:totaling|totalling|total(?:ly)? remains|final(?: unique[- ]source)? count is|unique[- ]source total is|unique source total is|complete ledger(?: remains)?(?: at)?)\b[^.\n;]{0,80}\b(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)?\s*(?P<cap>\d{1,4})\b\s*(?:unique[- ])?(?:source|sources|retrievals?)\b",
+        ),
+        (
+            "numeric_total_sources_phrase",
+            "global_total_budget",
+            r"\b(?P<cap>\d{1,4})\b\s+(?:total|overall|aggregate|cumulative)\s+(?:unique[- ])?(?:source|sources|source retrievals|retrievals?)\b",
+        ),
+        (
+            "numeric_total_sources_phrase",
+            "global_total_budget",
+            r"\b(?P<cap>\d{1,4})\b\s*(?:total|overall|global|aggregate|cumulative|unique[- ]source|unique\s+source)\s+(?:unique[- ])?(?:source|sources|retrievals?)\b",
         ),
         (
             "complete_ledger_cap",
@@ -4490,6 +4836,12 @@ def _candidate_source_budget_candidate_record(
     if value <= 0:
         return None
     cap_start, cap_end = match.span("cap")
+    if _candidate_source_budget_cap_attached_to_non_source_unit(
+        lowered=lowered,
+        cap_start=cap_start,
+        cap_end=cap_end,
+    ):
+        return None
     evidence_start = max(0, match.start() - 90)
     evidence_end = min(len(text), match.end() + 120)
     evidence = _preview_text(
@@ -4513,6 +4865,36 @@ def _candidate_source_budget_candidate_record(
     return record
 
 
+def _candidate_source_budget_cap_attached_to_non_source_unit(
+    *,
+    lowered: str,
+    cap_start: int,
+    cap_end: int,
+) -> bool:
+    same_sentence_after = re.split(r"[.;\n]", lowered[cap_end:])[0]
+    immediate_after = same_sentence_after[:80]
+    non_source_unit_patterns = (
+        r"^\s*(?:search\s+)?result(?:s| targets?)?\b",
+        r"^\s*(?:image|images|visuals?|photos?|screenshots?)\b",
+        r"^\s*(?:subagent|subagents|agents?|verifier invocations?|model api calls?)\b",
+        r"^\s*(?:cost|usd|dollars?)\b",
+    )
+    if any(re.search(pattern, immediate_after) for pattern in non_source_unit_patterns):
+        source_unit_before_separator = re.match(
+            r"^[^,;.\n]*(?:source|sources|retrieval|retrievals|pages?)\b",
+            immediate_after,
+        )
+        return source_unit_before_separator is None
+    same_sentence_before = re.split(r"[.;\n]", lowered[:cap_start])[-1]
+    immediate_before = same_sentence_before[-80:]
+    return bool(
+        re.search(
+            r"\b(?:result(?:s| targets?)?|images?|visuals?|photos?|screenshots?|subagents?|agents?)\s*(?:of|:|=|<=|at most|no more than)?\s*$",
+            immediate_before,
+        )
+    )
+
+
 def _candidate_source_budget_candidate_type(
     *,
     lowered: str,
@@ -4523,6 +4905,8 @@ def _candidate_source_budget_candidate_type(
     before = lowered[max(0, cap_start - 100):cap_start]
     after = lowered[cap_end:min(len(lowered), cap_end + 120)]
     window = lowered[max(0, cap_start - 120):min(len(lowered), cap_end + 140)]
+    same_sentence_before = re.split(r"[.;\n]", before)[-1]
+    same_sentence_after = re.split(r"[.;\n]", after)[0]
     strong_global_markers = (
         "max_unique_sources",
         "overall",
@@ -4544,14 +4928,28 @@ def _candidate_source_budget_candidate_type(
         "final unique-source count",
         "final unique source count",
     )
+    strong_global_after_markers = (
+        "total",
+        "overall",
+        "aggregate",
+        "cumulative",
+        "run-level",
+        "run level",
+        "runner-level",
+        "runner level",
+    )
     allocation_after_markers = (
         "per provider",
         "per vendor",
         "per task",
+        "per bounded task",
         "per angle",
+        "for each bounded task",
         "each provider",
         "each vendor",
         "each task",
+        "each bounded task",
+        "every bounded task",
         "each angle",
         "additional",
         "standards source",
@@ -4566,19 +4964,30 @@ def _candidate_source_budget_candidate_type(
         "per provider",
         "per vendor",
         "per task",
+        "per bounded task",
         "per angle",
+        "each bounded task",
+        "every bounded task",
+        "bounded task may",
+        "bounded task can",
+        "bounded task must",
         "reserve",
         "allocation",
         "allocate",
     )
-    strong_global_before = any(marker in before for marker in strong_global_markers)
+    strong_global_before = any(
+        marker in same_sentence_before for marker in strong_global_markers
+    )
+    strong_global_after = any(
+        marker in same_sentence_after[:70] for marker in strong_global_after_markers
+    )
     if default_type == "allocation_sub_budget":
         return "allocation_sub_budget"
-    if strong_global_before:
+    if strong_global_before or strong_global_after:
         return "global_total_budget"
-    if any(marker in after for marker in allocation_after_markers):
+    if any(marker in same_sentence_after for marker in allocation_after_markers):
         return "allocation_sub_budget"
-    if any(marker in before[-70:] for marker in allocation_before_markers):
+    if any(marker in same_sentence_before[-70:] for marker in allocation_before_markers):
         return "allocation_sub_budget"
     if any(marker in window for marker in strong_global_markers):
         return "global_total_budget"
@@ -4623,6 +5032,55 @@ def _semantic_task_source_cap_int(value: Any) -> int | None:
     return None
 
 
+def _candidate_effective_search_result_cap(
+    constraints: Any,
+    *,
+    request_max_results: int | None,
+) -> tuple[int | None, int | None]:
+    declared_cap = _candidate_declared_search_result_cap(constraints)
+    if request_max_results is not None and request_max_results > 0:
+        if declared_cap is not None and declared_cap < request_max_results:
+            return declared_cap, declared_cap
+        return request_max_results, declared_cap
+    return declared_cap, declared_cap
+
+
+def _candidate_declared_search_result_cap(constraints: Any) -> int | None:
+    if not isinstance(constraints, list):
+        return None
+    values: list[int] = []
+    for constraint in constraints:
+        values.extend(_candidate_declared_search_result_cap_values(constraint))
+    return min(values) if values else None
+
+
+def _candidate_declared_search_result_cap_values(constraint: Any) -> list[int]:
+    if not isinstance(constraint, str):
+        return []
+    text = str(constraint)
+    lowered = text.lower()
+    if not (
+        "result" in lowered
+        or "max_results" in lowered
+        or "검색 결과" in text
+    ):
+        return []
+    patterns = (
+        r"\bmax[_ -]?results\b\s*(?:=|:|is|must be|must not exceed|not exceed|at most|no more than|up to|<=|less than or equal to)\s*(?P<cap>\d{1,4})\b",
+        r"\b(?:at most|no more than|maximum of|max(?:imum)?|must not exceed|not exceed|up to|<=|less than or equal to)\s*(?P<cap>\d{1,4})\b\s*(?:search\s+)?results?\b(?:\s+per\s+(?:search\s+operation|search|operation|query|bounded\s+task|task))?",
+        r"\b(?P<cap>\d{1,4})\b\s*(?:search\s+)?results?\s+per\s+(?:search\s+operation|search|operation|query|bounded\s+task|task)\b",
+        r"\b검색 결과\b[^0-9]{0,40}(?P<cap>\d{1,4})\b",
+        r"\b(?P<cap>\d{1,4})\b[^0-9]{0,20}\b검색 결과\b",
+    )
+    values: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, lowered if pattern.isascii() else text):
+            value = _semantic_task_source_cap_int(match.group("cap"))
+            if value is not None and value > 0:
+                values.append(value)
+    return values
+
+
 def _materialize_candidate_budget_caps(
     candidate: Mapping[str, Any],
     *,
@@ -4634,7 +5092,11 @@ def _materialize_candidate_budget_caps(
 
     materializations: list[dict[str, Any]] = []
     raw_constraints = normalized.get("constraints")
-    max_results = _semantic_task_source_cap_int(budget_cap.get("max_results"))
+    request_max_results = _semantic_task_source_cap_int(budget_cap.get("max_results"))
+    max_results, declared_search_result_cap = _candidate_effective_search_result_cap(
+        raw_constraints,
+        request_max_results=request_max_results,
+    )
     if max_results is not None and max_results >= 1 and isinstance(raw_constraints, list):
         if not _candidate_constraints_mention_search_result_cap(
             raw_constraints,
@@ -4648,6 +5110,8 @@ def _materialize_candidate_budget_caps(
                 {
                     "field": "constraints",
                     "max_results": max_results,
+                    "request_max_results": request_max_results,
+                    "declared_search_result_cap": declared_search_result_cap,
                     "materialization": "appended_search_result_cap_constraint",
                 }
             )
@@ -4662,14 +5126,19 @@ def _materialize_candidate_budget_caps(
                 continue
             normalized_task = dict(task)
             previous = _semantic_task_source_cap_int(task.get("max_results"))
-            if previous != max_results:
-                normalized_task["max_results"] = max_results
+            materialized = (
+                max_results
+                if previous is None or previous < 1 or previous > max_results
+                else previous
+            )
+            if previous != materialized:
+                normalized_task["max_results"] = materialized
                 task_materializations.append(
                     {
                         "task_id": task.get("task_id"),
                         "task_index": index,
                         "previous_max_results": previous,
-                        "materialized_max_results": max_results,
+                        "materialized_max_results": materialized,
                     }
                 )
             normalized_tasks.append(normalized_task)
@@ -4679,6 +5148,8 @@ def _materialize_candidate_budget_caps(
                 {
                     "field": "bounded_tasks.max_results",
                     "max_results": max_results,
+                    "request_max_results": request_max_results,
+                    "declared_search_result_cap": declared_search_result_cap,
                     "task_count": len(task_materializations),
                     "tasks": task_materializations,
                 }
@@ -4722,43 +5193,64 @@ def _materialize_candidate_runner_source_budget_cap(
     total_cap = sum(caps)
     existing_runner_budget = normalized.get("runner_source_budget")
     existing_cap = _candidate_runner_source_budget_cap(existing_runner_budget)
-    existing_typed_cap = _candidate_runner_source_budget_explicit_typed_cap(
-        existing_runner_budget
+    constraints_for_interpretation = (
+        normalized.get("constraints")
+        if isinstance(normalized.get("constraints"), list)
+        else []
     )
-    typed_runner_compatible = (
-        existing_typed_cap is not None and existing_typed_cap <= max_sources
+    budget_interpretation = _candidate_source_budget_interpretation(
+        constraints_for_interpretation,
+        request_max_sources=max_sources,
+        existing_runner_budget=existing_runner_budget,
     )
-    if typed_runner_compatible:
-        declared_budget = existing_typed_cap
-    else:
-        declared_budget = max_sources
     existing_budget_interpretation = (
         existing_runner_budget.get("budget_interpretation")
         if isinstance(existing_runner_budget, Mapping)
         else None
     )
-    if isinstance(existing_budget_interpretation, Mapping):
+    existing_selected_cap = (
+        _candidate_source_budget_interpretation_selected_cap(
+            existing_budget_interpretation
+        )
+        if isinstance(existing_budget_interpretation, Mapping)
+        else None
+    )
+    if (
+        existing_selected_cap is not None
+        and existing_selected_cap <= max_sources
+        and (
+            not _candidate_runner_source_budget_is_natural_language_materialized(
+                existing_runner_budget
+            )
+            or (
+                isinstance(existing_runner_budget, Mapping)
+                and existing_runner_budget.get(
+                    "_current_source_cap_constraint_repair"
+                )
+                is True
+            )
+        )
+    ):
+        fresh_budget_interpretation = budget_interpretation
         budget_interpretation = copy.deepcopy(dict(existing_budget_interpretation))
         budget_interpretation["request_max_sources"] = max_sources
-        budget_interpretation["typed_runner_max_unique_sources"] = existing_typed_cap
-        budget_interpretation["typed_runner_limit_compatible"] = (
-            typed_runner_compatible
-        )
-    else:
-        constraints_for_interpretation = (
-            normalized.get("constraints")
-            if isinstance(normalized.get("constraints"), list)
-            else []
-        )
-        budget_interpretation = _candidate_source_budget_interpretation(
-            constraints_for_interpretation,
-            request_max_sources=max_sources,
-            existing_runner_budget=existing_runner_budget,
-        )
-    budget_interpretation["selected_max_unique_sources"] = declared_budget
-    budget_interpretation["selected_source"] = (
-        "typed_runner_limit" if typed_runner_compatible else "request_max_sources"
+        for field_name in (
+            "typed_runner_max_unique_sources",
+            "typed_runner_limit_compatible",
+            "typed_runner_limit_conflict",
+            "request_max_sources_used_as_ceiling",
+        ):
+            if field_name in fresh_budget_interpretation:
+                budget_interpretation[field_name] = copy.deepcopy(
+                    fresh_budget_interpretation[field_name]
+                )
+    declared_budget = _candidate_source_budget_interpretation_selected_cap(
+        budget_interpretation
     )
+    if declared_budget is None:
+        declared_budget = max_sources
+        budget_interpretation["selected_max_unique_sources"] = declared_budget
+        budget_interpretation["selected_source"] = "request_max_sources"
     runner_source_budget = _candidate_runner_source_budget_record(
         declared_source_budget=declared_budget,
         task_max_sources_sum=total_cap,
@@ -4816,7 +5308,11 @@ def _materialize_candidate_runner_source_budget_cap(
 
     materialization = {
         "field": "runner_source_budget",
-        "materialization": "preserved_request_source_budget",
+        "materialization": (
+            "preserved_request_source_budget"
+            if budget_interpretation.get("selected_source") == "request_max_sources"
+            else "preserved_stricter_source_budget"
+        ),
         "request_max_sources": max_sources,
         "preserved_declared_source_budget": declared_budget,
         "task_max_sources_sum": total_cap,
@@ -4862,6 +5358,8 @@ def _review_visible_runner_source_budget_metadata(
     visible: dict[str, Any] = {}
     for raw_key, value in runner_source_budget.items():
         key = renamed_fields.get(str(raw_key), str(raw_key))
+        if key.startswith("_"):
+            continue
         if _contains_budget_cap_term(key):
             continue
         if _contains_budget_cap_term(value):
@@ -4885,7 +5383,9 @@ def _candidate_constraints_mention_search_result_cap(
         rf"\bmax_results\b\s*[:=]\s*{max_results}\b",
         rf"\bmax[_ -]?results\b[^0-9]{{0,40}}\b{max_results}\b",
         rf"\bsearch results\b[^0-9]{{0,80}}\b{max_results}\b",
+        rf"\b{max_results}\b\s*(?:search\s+)?results?\b",
         rf"\b검색 결과\b[^0-9]{{0,80}}\b{max_results}\b",
+        rf"\b{max_results}\b[^0-9]{{0,20}}\b검색 결과\b",
     )
     return any(re.search(pattern, text) for pattern in patterns)
 
@@ -5169,6 +5669,675 @@ def _materialize_candidate_visual_image_cap_feasibility(
         normalized_tasks.append(normalized_task)
     normalized["bounded_tasks"] = normalized_tasks
     return normalized, materializations
+
+
+def _materialize_candidate_typed_semantic_contracts(
+    candidate: Mapping[str, Any],
+    *,
+    raw_request: Mapping[str, Any] | None = None,
+    original_question: str = "",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Materialize comparison-planning contracts as machine-readable fields."""
+
+    normalized = copy.deepcopy(dict(candidate))
+    tasks = [
+        task
+        for task in _list(normalized.get("bounded_tasks"))
+        if isinstance(task, Mapping)
+    ]
+    angles = [
+        angle
+        for angle in _list(normalized.get("angles"))
+        if isinstance(angle, Mapping)
+    ]
+    constraints = _list(normalized.get("constraints"))
+    contract_text = _candidate_typed_contract_text(
+        original_question=original_question,
+        constraints=constraints,
+        angles=angles,
+        tasks=tasks,
+    )
+    existing_entities = [
+        dict(item)
+        for item in _list(normalized.get("selected_entities"))
+        if isinstance(item, Mapping)
+    ]
+    entities = (
+        existing_entities
+        if "selected_entities" in normalized
+        else _candidate_infer_selected_entities(
+            normalized,
+            text=contract_text,
+        )
+    )
+    existing_dimensions = [
+        dict(item)
+        for item in _list(normalized.get("required_dimensions"))
+        if isinstance(item, Mapping)
+    ]
+    dimensions = (
+        existing_dimensions
+        if "required_dimensions" in normalized
+        else _candidate_infer_required_dimensions(
+            normalized,
+            text=contract_text,
+        )
+    )
+    comparison_contract = _candidate_requires_typed_comparison_contract(
+        text=contract_text,
+        entities=entities,
+        dimensions=dimensions,
+    )
+    if not comparison_contract:
+        return normalized, []
+
+    materializations: list[dict[str, Any]] = []
+    entities = _candidate_normalize_selected_entities(entities)
+    dimensions = _candidate_normalize_required_dimensions(dimensions)
+    if not entities or not dimensions:
+        return normalized, []
+
+    normalized["selected_entities"] = entities
+    if existing_entities != entities:
+        materializations.append(
+            {
+                "field": "selected_entities",
+                "materialization": "typed_comparison_entities",
+                "entity_count": len(entities),
+            }
+        )
+    normalized["required_dimensions"] = dimensions
+    if existing_dimensions != dimensions:
+        materializations.append(
+            {
+                "field": "required_dimensions",
+                "materialization": "typed_comparison_dimensions",
+                "dimension_count": len(dimensions),
+            }
+        )
+
+    partition_contract = _candidate_task_partition_contract(
+        normalized.get("task_partition_contract"),
+        entities=entities,
+        comparison_text=contract_text,
+    )
+    previous_partition_contract = normalized.get("task_partition_contract")
+    normalized["task_partition_contract"] = partition_contract
+    if previous_partition_contract != partition_contract:
+        materializations.append(
+            {
+                "field": "task_partition_contract",
+                "materialization": "typed_task_partition_contract",
+                "max_entities_per_task": partition_contract.get(
+                    "max_entities_per_task"
+                ),
+            }
+        )
+
+    source_budget_contract = _candidate_source_budget_contract(
+        normalized.get("source_budget_contract"),
+        runner_source_budget=normalized.get("runner_source_budget"),
+        tasks=tasks,
+        raw_request=raw_request,
+    )
+    previous_source_budget_contract = normalized.get("source_budget_contract")
+    normalized["source_budget_contract"] = source_budget_contract
+    if previous_source_budget_contract != source_budget_contract:
+        materializations.append(
+            {
+                "field": "source_budget_contract",
+                "materialization": "typed_source_budget_contract",
+                "runner_max_unique_sources": source_budget_contract.get(
+                    "runner_max_unique_sources"
+                ),
+                "max_task_sources": source_budget_contract.get("max_task_sources"),
+            }
+        )
+
+    deliverable_contract = _candidate_final_deliverable_contract(
+        normalized.get("final_deliverable_contract"),
+        original_question=original_question,
+        dimensions=dimensions,
+    )
+    previous_deliverable_contract = normalized.get("final_deliverable_contract")
+    normalized["final_deliverable_contract"] = deliverable_contract
+    if previous_deliverable_contract != deliverable_contract:
+        materializations.append(
+            {
+                "field": "final_deliverable_contract",
+                "materialization": "typed_final_deliverable_contract",
+                "required_section_count": len(
+                    deliverable_contract.get("required_sections") or []
+                ),
+            }
+        )
+
+    previous_tasks = normalized.get("bounded_tasks")
+    normalized_tasks = []
+    task_annotations: list[dict[str, Any]] = []
+    for task in tasks:
+        task_dict = dict(task)
+        entity_ids = _candidate_record_selected_entity_ids(
+            task_dict,
+            entities=entities,
+        )
+        dimension_ids = _candidate_record_required_dimension_ids(
+            task_dict,
+            dimensions=dimensions,
+        )
+        previous_entity_ids = _string_list(task_dict.get("semantic_entity_refs"))
+        previous_dimension_ids = _string_list(task_dict.get("semantic_dimension_refs"))
+        if entity_ids != previous_entity_ids:
+            task_dict["semantic_entity_refs"] = entity_ids
+        if dimension_ids != previous_dimension_ids:
+            task_dict["semantic_dimension_refs"] = dimension_ids
+        previous_deliverable_binding = task_dict.get("final_deliverable_binding")
+        if _candidate_task_is_final_deliverable(task_dict) and not isinstance(
+            previous_deliverable_binding,
+            Mapping,
+        ):
+            task_dict["final_deliverable_binding"] = {
+                "contract_type": deliverable_contract.get("contract_type"),
+                "required_sections": list(
+                    deliverable_contract.get("required_sections") or []
+                ),
+                "binding": "final_synthesis_deliverable",
+            }
+        if entity_ids != previous_entity_ids or dimension_ids != previous_dimension_ids:
+            task_annotations.append(
+                {
+                    "task_id": task_dict.get("task_id"),
+                    "semantic_entity_refs": entity_ids,
+                    "semantic_dimension_refs": dimension_ids,
+                    "final_deliverable_binding": task_dict.get(
+                        "final_deliverable_binding"
+                    ),
+                }
+            )
+        normalized_tasks.append(task_dict)
+    normalized["bounded_tasks"] = normalized_tasks
+    if previous_tasks != normalized_tasks:
+        materializations.append(
+            {
+                "field": "bounded_tasks.semantic_contract_refs",
+                "materialization": "typed_task_contract_refs",
+                "task_count": len(task_annotations),
+                "tasks": task_annotations[:20],
+            }
+        )
+
+    coverage_matrix = _candidate_build_coverage_matrix(
+        entities=entities,
+        dimensions=dimensions,
+        tasks=[
+            task for task in normalized_tasks if isinstance(task, Mapping)
+        ],
+    )
+    previous_coverage_matrix = normalized.get("coverage_matrix")
+    normalized["coverage_matrix"] = coverage_matrix
+    if previous_coverage_matrix != coverage_matrix:
+        materializations.append(
+            {
+                "field": "coverage_matrix",
+                "materialization": "typed_entity_dimension_coverage_matrix",
+                "cell_count": len(coverage_matrix),
+                "missing_cell_count": sum(
+                    1 for cell in coverage_matrix if cell.get("status") != "covered"
+                ),
+            }
+        )
+
+    return normalized, materializations
+
+
+def _candidate_typed_contract_text(
+    *,
+    original_question: str,
+    constraints: Sequence[Any],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> str:
+    values: list[Any] = [original_question, constraints]
+    for angle in angles:
+        values.extend(
+            [
+                angle.get("title"),
+                angle.get("research_question"),
+                angle.get("included_scope"),
+                angle.get("expected_artifacts"),
+                angle.get("success_criteria"),
+                angle.get("report_section"),
+            ]
+        )
+    for task in tasks:
+        values.extend(
+            [
+                task.get("query"),
+                task.get("expected_source_types"),
+                task.get("expected_artifacts"),
+                task.get("success_criteria"),
+                task.get("done_condition"),
+            ]
+        )
+    return json.dumps(values, ensure_ascii=False, sort_keys=True)
+
+
+def _candidate_requires_typed_comparison_contract(
+    *,
+    text: str,
+    entities: Sequence[Mapping[str, Any]],
+    dimensions: Sequence[Mapping[str, Any]],
+) -> bool:
+    lowered = text.lower()
+    if len(entities) < 2 or not dimensions:
+        return False
+    return _contains_any(
+        lowered,
+        (
+            "compare",
+            "comparison",
+            "side-by-side",
+            "side by side",
+            "versus",
+            " vs ",
+            "across",
+            "matrix",
+            "표",
+            "비교",
+        ),
+    ) and _contains_any(
+        lowered,
+        (
+            "provider",
+            "vendor",
+            "jurisdiction",
+            "agency",
+            "product",
+            "browser",
+            "model",
+            "documentation",
+            "official",
+        ),
+    )
+
+
+_TYPED_CONTRACT_ENTITY_STOPWORDS = {
+    "api",
+    "compare",
+    "comparison",
+    "documentation",
+    "implementation",
+    "official",
+    "oauth",
+    "provider",
+    "providers",
+    "request",
+    "response",
+    "source",
+    "sources",
+    "the",
+}
+
+
+def _candidate_infer_selected_entities(
+    candidate: Mapping[str, Any],
+    *,
+    text: str,
+) -> list[dict[str, Any]]:
+    entities: list[dict[str, Any]] = []
+
+    def add(name: str, entity_type: str, evidence: str) -> None:
+        normalized = " ".join(str(name or "").strip().split())
+        if not normalized:
+            return
+        lowered_name = normalized.lower()
+        if lowered_name in _TYPED_CONTRACT_ENTITY_STOPWORDS:
+            return
+        if any(item["name"].lower() == lowered_name for item in entities):
+            return
+        entities.append(
+            {
+                "entity_id": f"entity_{len(entities) + 1:03d}",
+                "name": normalized,
+                "type": entity_type,
+                "evidence": evidence,
+                "required": True,
+            }
+        )
+
+    for entity in _list(candidate.get("domain_entities")):
+        if not isinstance(entity, Mapping):
+            continue
+        name = str(entity.get("name") or "").strip()
+        entity_type = str(entity.get("type") or "named_entity")
+        if _candidate_entity_type_is_comparison_subject(entity_type, name):
+            add(name, entity_type, str(entity.get("evidence") or "domain_entities"))
+    for standard in re.findall(r"\bRFC\s*\d{3,5}\b", text, flags=re.IGNORECASE):
+        add(standard.upper(), "standard", "RFC mention")
+    if len(entities) < 2:
+        for name in _candidate_capitalized_comparison_names(text):
+            add(name, "named_entity", "capitalized comparison mention")
+    return entities[:20]
+
+
+def _candidate_entity_type_is_comparison_subject(entity_type: str, name: str) -> bool:
+    lowered_type = entity_type.lower()
+    lowered_name = name.lower()
+    if lowered_name in _TYPED_CONTRACT_ENTITY_STOPWORDS:
+        return False
+    return any(
+        token in lowered_type
+        for token in (
+            "provider",
+            "vendor",
+            "jurisdiction",
+            "agency",
+            "product",
+            "browser",
+            "model",
+            "standard",
+            "document",
+            "artifact",
+            "named_entity",
+        )
+    )
+
+
+def _candidate_capitalized_comparison_names(text: str) -> list[str]:
+    names: list[str] = []
+    for match in re.finditer(
+        r"\b[A-Z][A-Za-z0-9.+#-]*(?:\s+[A-Z][A-Za-z0-9.+#-]*){0,2}\b",
+        text,
+    ):
+        name = " ".join(match.group(0).split())
+        lowered = name.lower()
+        if lowered in _TYPED_CONTRACT_ENTITY_STOPWORDS:
+            continue
+        if len(name) <= 1:
+            continue
+        names.append(name)
+    return _ordered_unique(names)
+
+
+def _candidate_infer_required_dimensions(
+    candidate: Mapping[str, Any],
+    *,
+    text: str,
+) -> list[dict[str, Any]]:
+    dimensions: list[dict[str, Any]] = []
+
+    def add(name: str, evidence: str) -> None:
+        normalized = " ".join(str(name or "").strip().split())
+        if not normalized:
+            return
+        if any(item["name"].lower() == normalized.lower() for item in dimensions):
+            return
+        dimensions.append(
+            {
+                "dimension_id": f"dimension_{len(dimensions) + 1:03d}",
+                "name": normalized,
+                "evidence": evidence,
+                "required": True,
+            }
+        )
+
+    lowered = text.lower()
+    for needles, name in (
+        (("initiation", "authorize endpoint", "authorization endpoint"), "initiation endpoint"),
+        (("request parameter", "request parameters", "parameters"), "request parameters"),
+        (("discovery", "metadata"), "discovery metadata"),
+        (("support status", "support-status"), "support status"),
+        (("pricing", "cost", "rate limit", "limit"), "pricing or limits"),
+        (("risk", "guardrail", "safety"), "risk or guardrails"),
+        (("migration", "rollback"), "implementation impact"),
+        (("visual", "image", "chart", "figure"), "visual evidence interpretation"),
+        (("primary source basis", "source quality axis"), "official source basis"),
+    ):
+        if _contains_any(lowered, needles):
+            add(name, "prompt or task term")
+    if not dimensions:
+        for requirement in _list(candidate.get("requirement_coverage_map")):
+            if not isinstance(requirement, Mapping):
+                continue
+            requirement_type = str(requirement.get("requirement_type") or "")
+            if requirement_type in {"subject", "deliverable_shape"}:
+                continue
+            text_value = str(
+                requirement.get("requirement_text")
+                or requirement.get("prompt_text")
+                or requirement_type
+            )
+            add(text_value[:80], f"requirement:{requirement_type}")
+    if not dimensions and _contains_any(lowered, ("compare", "comparison", "비교")):
+        add("comparison evidence", "comparison fallback")
+    return dimensions[:12]
+
+
+def _candidate_normalize_selected_entities(
+    entities: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for index, entity in enumerate(entities, start=1):
+        name = str(entity.get("name") or entity.get("entity") or "").strip()
+        if not name:
+            continue
+        output.append(
+            {
+                **dict(entity),
+                "entity_id": str(entity.get("entity_id") or f"entity_{index:03d}"),
+                "name": " ".join(name.split()),
+                "type": str(entity.get("type") or "named_entity"),
+                "required": entity.get("required", True) is not False,
+            }
+        )
+    return output
+
+
+def _candidate_normalize_required_dimensions(
+    dimensions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for index, dimension in enumerate(dimensions, start=1):
+        name = str(dimension.get("name") or dimension.get("dimension") or "").strip()
+        if not name:
+            continue
+        output.append(
+            {
+                **dict(dimension),
+                "dimension_id": str(
+                    dimension.get("dimension_id") or f"dimension_{index:03d}"
+                ),
+                "name": " ".join(name.split()),
+                "required": dimension.get("required", True) is not False,
+            }
+        )
+    return output
+
+
+def _candidate_task_partition_contract(
+    existing: Any,
+    *,
+    entities: Sequence[Mapping[str, Any]],
+    comparison_text: str,
+) -> dict[str, Any]:
+    contract = dict(existing) if isinstance(existing, Mapping) and existing else {}
+    contract.setdefault("contract_type", "named_entity_comparison_partition")
+    contract.setdefault("partition_key", "selected_entities")
+    contract.setdefault(
+        "max_entities_per_task",
+        2 if len(entities) >= 3 else max(1, len(entities)),
+    )
+    contract.setdefault("entity_count", len(entities))
+    contract.setdefault(
+        "grouping_rule",
+        (
+            "Each bounded task may cover at most two selected entities unless "
+            "the task is a final synthesis deliverable."
+        ),
+    )
+    contract.setdefault("enforcement", "strict")
+    contract.setdefault("materialized_from", "typed_semantic_contract")
+    if "provider" in comparison_text.lower():
+        contract.setdefault("entity_kind", "provider")
+    return contract
+
+
+def _candidate_source_budget_contract(
+    existing: Any,
+    *,
+    runner_source_budget: Any,
+    tasks: Sequence[Mapping[str, Any]],
+    raw_request: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    contract = dict(existing) if isinstance(existing, Mapping) and existing else {}
+    contract.setdefault("contract_type", "source_budget")
+    runner_cap = _candidate_runner_source_budget_cap(runner_source_budget)
+    if runner_cap is None and isinstance(raw_request, Mapping):
+        budget_cap = raw_request.get("budget_cap")
+        if isinstance(budget_cap, Mapping):
+            runner_cap = _semantic_task_source_cap_int(budget_cap.get("max_sources"))
+    task_caps = [
+        cap
+        for cap in (
+            _semantic_task_source_cap_int(task.get("max_sources")) for task in tasks
+        )
+        if cap is not None
+    ]
+    if runner_cap is not None:
+        contract["runner_max_unique_sources"] = runner_cap
+    contract["task_max_sources_sum"] = sum(task_caps)
+    contract["max_task_sources"] = max(task_caps) if task_caps else None
+    contract["per_task_cap_field"] = "bounded_tasks.max_sources"
+    contract["runner_cap_field"] = "runner_source_budget.max_unique_sources"
+    contract["cap_semantics"] = (
+        "runner_max_unique_sources is a run-level unique source cap; "
+        "bounded_tasks.max_sources is a per-task retrieval ceiling."
+    )
+    contract["reuse_required"] = bool(
+        runner_cap is not None and sum(task_caps) > runner_cap
+    )
+    return contract
+
+
+def _candidate_final_deliverable_contract(
+    existing: Any,
+    *,
+    original_question: str,
+    dimensions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    contract = dict(existing) if isinstance(existing, Mapping) and existing else {}
+    if not contract:
+        lowered = original_question.lower()
+        wants_table = _contains_any(lowered, ("table", "matrix", "표", "매트릭스"))
+        contract = {
+            "contract_type": "comparison_report",
+            "required_sections": [
+                "entity-by-dimension comparison",
+                "evidence-backed caveats",
+                "final judgment",
+            ],
+            "required_tables": (
+                ["entity_dimension_matrix"] if wants_table or dimensions else []
+            ),
+            "required_judgments": [
+                "supported",
+                "partial",
+                "unknown_or_unverifiable",
+            ],
+            "materialized_from": "typed_semantic_contract",
+        }
+    contract.setdefault("required_sections", [])
+    contract.setdefault("required_tables", [])
+    contract.setdefault("required_judgments", [])
+    return contract
+
+
+def _candidate_record_selected_entity_ids(
+    record: Mapping[str, Any],
+    *,
+    entities: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    existing = _string_list(record.get("semantic_entity_refs"))
+    valid_ids = {str(entity.get("entity_id")) for entity in entities}
+    if existing and set(existing) <= valid_ids:
+        return existing
+    text = json.dumps(record, ensure_ascii=False, sort_keys=True).lower()
+    matched: list[str] = []
+    for entity in entities:
+        entity_id = str(entity.get("entity_id") or "")
+        name = str(entity.get("name") or "")
+        if entity_id and name and _candidate_entity_name_in_text(name, text):
+            matched.append(entity_id)
+    return matched
+
+
+def _candidate_record_required_dimension_ids(
+    record: Mapping[str, Any],
+    *,
+    dimensions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    existing = _string_list(record.get("semantic_dimension_refs"))
+    valid_ids = {str(dimension.get("dimension_id")) for dimension in dimensions}
+    if existing and set(existing) <= valid_ids:
+        return existing
+    text = json.dumps(record, ensure_ascii=False, sort_keys=True).lower()
+    matched: list[str] = []
+    for dimension in dimensions:
+        dimension_id = str(dimension.get("dimension_id") or "")
+        name = str(dimension.get("name") or "")
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", name.lower())
+            if token not in {"or", "and", "the", "basis"}
+        ]
+        if dimension_id and tokens and any(
+            re.search(rf"\b{re.escape(token)}\b", text) for token in tokens
+        ):
+            matched.append(dimension_id)
+    return matched
+
+
+def _candidate_entity_name_in_text(name: str, lowered_text: str) -> bool:
+    lowered_name = name.lower()
+    if re.search(rf"\b{re.escape(lowered_name)}\b", lowered_text):
+        return True
+    compact_name = re.sub(r"[^a-z0-9]+", "", lowered_name)
+    compact_text = re.sub(r"[^a-z0-9]+", "", lowered_text)
+    return bool(compact_name and compact_name in compact_text)
+
+
+def _candidate_build_coverage_matrix(
+    *,
+    entities: Sequence[Mapping[str, Any]],
+    dimensions: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    matrix: list[dict[str, Any]] = []
+    for entity in entities:
+        entity_id = str(entity.get("entity_id") or "")
+        if not entity_id or entity.get("required") is False:
+            continue
+        for dimension in dimensions:
+            dimension_id = str(dimension.get("dimension_id") or "")
+            if not dimension_id or dimension.get("required") is False:
+                continue
+            covered_by = [
+                str(task.get("task_id"))
+                for task in tasks
+                if entity_id in _string_list(task.get("semantic_entity_refs"))
+                and dimension_id in _string_list(task.get("semantic_dimension_refs"))
+            ]
+            matrix.append(
+                {
+                    "entity_id": entity_id,
+                    "entity_name": entity.get("name"),
+                    "dimension_id": dimension_id,
+                    "dimension": dimension.get("name"),
+                    "status": "covered" if covered_by else "missing",
+                    "covered_by_task_ids": covered_by,
+                }
+            )
+    return matrix
 
 
 def _semantic_count_word_to_int(value: str) -> int | None:
@@ -6654,9 +7823,34 @@ def _semantic_repair_guidance_for_codes(
             "source/vendor/jurisdiction/source-artifact obligation only when each "
             "new task has a deterministic typed provider, document, entity, "
             "jurisdiction, standard, topic, or evidence-dimension assignment. If "
-            "no deterministic partition is available, keep the substantive task "
-            "bounded and rely on shared source-pool reuse, or regenerate meaningful "
-            "semantic tasks through the locked oracle."
+            "no deterministic partition is available, use shared source-pool reuse "
+            "only when typed upstream coverage metadata or explicit source reuse "
+            "assignments prove the counted obligation is already covered; otherwise "
+            "leave the task blocked for replanning through the locked oracle."
+        )
+    if code_set & {
+        "typed_coverage_matrix_incomplete",
+        "typed_coverage_matrix_missing",
+        "typed_selected_entities_missing",
+        "typed_required_dimensions_missing",
+    }:
+        guidance.append(
+            " If typed semantic contract coverage fails, emit selected_entities and "
+            "required_dimensions as structured fields, then make bounded_tasks cover "
+            "every required entity x dimension cell or explicitly mark non-applicable "
+            "cells with evidence-backed rationale. Do not hide required providers, "
+            "jurisdictions, products, documents, or artifacts inside prose-only "
+            "constraints."
+        )
+    if code_set & {
+        "typed_task_partition_contract_violation",
+        "typed_task_partition_contract_invalid",
+    }:
+        guidance.append(
+            " If the task partition contract fails, split or reassign bounded_tasks "
+            "so each non-final evidence-collection task stays within "
+            "task_partition_contract.max_entities_per_task. Keep final synthesis "
+            "tasks separate from provider/entity-specific evidence tasks."
         )
     if code_set & {
         "broad_question_angle_count_out_of_range",
@@ -11829,6 +13023,7 @@ def validate_semantic_candidate_plan(
             tasks=tasks,
         )
     )
+    failures.extend(_candidate_typed_contract_validation_failures(plan=plan, tasks=tasks))
     if request_visual_preference == "text_only":
         text_only_violations: list[dict[str, Any]] = []
         for angle in angles:
@@ -12355,6 +13550,246 @@ def _candidate_semantic_angle_release_duplicate_failures(
             "threshold": SEMANTIC_ANGLE_NEAR_DUPLICATE_THRESHOLD,
         }
     ]
+
+
+def _candidate_typed_contract_validation_failures(
+    *,
+    plan: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    selected_entities = [
+        item
+        for item in _list(plan.get("selected_entities"))
+        if isinstance(item, Mapping)
+    ]
+    required_dimensions = [
+        item
+        for item in _list(plan.get("required_dimensions"))
+        if isinstance(item, Mapping)
+    ]
+    coverage_matrix = [
+        item
+        for item in _list(plan.get("coverage_matrix"))
+        if isinstance(item, Mapping)
+    ]
+    partition_contract = plan.get("task_partition_contract")
+    strict_contract = (
+        isinstance(partition_contract, Mapping)
+        and str(partition_contract.get("enforcement") or "") == "strict"
+    )
+    selected_entity_ids = {
+        str(entity.get("entity_id") or "")
+        for entity in selected_entities
+        if str(entity.get("entity_id") or "").strip()
+    }
+    required_dimension_ids = {
+        str(dimension.get("dimension_id") or "")
+        for dimension in required_dimensions
+        if str(dimension.get("dimension_id") or "").strip()
+    }
+    task_ids = {
+        str(task.get("task_id") or "")
+        for task in tasks
+        if str(task.get("task_id") or "").strip()
+    }
+    if selected_entities or required_dimensions or coverage_matrix:
+        if not selected_entities:
+            failures.append({"code": "typed_selected_entities_missing"})
+        if not required_dimensions:
+            failures.append({"code": "typed_required_dimensions_missing"})
+        if selected_entities and required_dimensions and not coverage_matrix:
+            failures.append({"code": "typed_coverage_matrix_missing"})
+    if coverage_matrix:
+        unknown_cells = []
+        missing_task_link_cells = []
+        missing_cells = [
+            dict(cell)
+            for cell in coverage_matrix
+            if str(cell.get("status") or "") != "covered"
+            and cell.get("required", True) is not False
+        ]
+        for cell in coverage_matrix:
+            entity_id = str(cell.get("entity_id") or "")
+            dimension_id = str(cell.get("dimension_id") or "")
+            covered_by = _string_list(cell.get("covered_by_task_ids"))
+            if entity_id and entity_id not in selected_entity_ids:
+                unknown_cells.append(
+                    {
+                        "field": "entity_id",
+                        "value": entity_id,
+                        "cell": dict(cell),
+                    }
+                )
+            if dimension_id and dimension_id not in required_dimension_ids:
+                unknown_cells.append(
+                    {
+                        "field": "dimension_id",
+                        "value": dimension_id,
+                        "cell": dict(cell),
+                    }
+                )
+            unknown_task_ids = [
+                task_id for task_id in covered_by if task_id not in task_ids
+            ]
+            if unknown_task_ids:
+                unknown_cells.append(
+                    {
+                        "field": "covered_by_task_ids",
+                        "value": unknown_task_ids,
+                        "cell": dict(cell),
+                    }
+                )
+            if str(cell.get("status") or "") == "covered" and not covered_by:
+                missing_task_link_cells.append(dict(cell))
+        if unknown_cells:
+            failures.append(
+                {
+                    "code": "typed_coverage_matrix_unknown_references",
+                    "unknown_reference_count": len(unknown_cells),
+                    "unknown_references": unknown_cells[:20],
+                }
+            )
+        if missing_task_link_cells:
+            failures.append(
+                {
+                    "code": "typed_coverage_matrix_missing_task_links",
+                    "cell_count": len(missing_task_link_cells),
+                    "cells": missing_task_link_cells[:20],
+                }
+            )
+        if missing_cells:
+            failures.append(
+                {
+                    "code": "typed_coverage_matrix_incomplete",
+                    "missing_cell_count": len(missing_cells),
+                    "missing_cells": missing_cells[:20],
+                    "message": (
+                        "Selected entity by required dimension coverage must be "
+                        "complete before independent reviewer judgment."
+                    ),
+                    "retryable": True,
+                }
+            )
+    if strict_contract:
+        max_entities = _semantic_task_source_cap_int(
+            partition_contract.get("max_entities_per_task")
+        )
+        if max_entities is None or max_entities < 1:
+            failures.append(
+                {
+                    "code": "typed_task_partition_contract_invalid",
+                    "field": "max_entities_per_task",
+                }
+            )
+        else:
+            violations = []
+            unknown_ref_tasks = []
+            for task in tasks:
+                if _candidate_task_is_final_deliverable(task):
+                    continue
+                entity_refs = _string_list(task.get("semantic_entity_refs"))
+                unknown_entity_refs = [
+                    entity_ref
+                    for entity_ref in entity_refs
+                    if entity_ref not in selected_entity_ids
+                ]
+                unknown_dimension_refs = [
+                    dimension_ref
+                    for dimension_ref in _string_list(task.get("semantic_dimension_refs"))
+                    if dimension_ref not in required_dimension_ids
+                ]
+                if unknown_entity_refs or unknown_dimension_refs:
+                    unknown_ref_tasks.append(
+                        {
+                            "task_id": task.get("task_id"),
+                            "unknown_entity_refs": unknown_entity_refs,
+                            "unknown_dimension_refs": unknown_dimension_refs,
+                        }
+                    )
+                if len(entity_refs) > max_entities:
+                    violations.append(
+                        {
+                            "task_id": task.get("task_id"),
+                            "semantic_entity_refs": entity_refs,
+                            "entity_ref_count": len(entity_refs),
+                            "max_entities_per_task": max_entities,
+                        }
+                    )
+            if unknown_ref_tasks:
+                failures.append(
+                    {
+                        "code": "typed_task_contract_unknown_references",
+                        "task_count": len(unknown_ref_tasks),
+                        "tasks": unknown_ref_tasks[:20],
+                    }
+                )
+            if violations:
+                failures.append(
+                    {
+                        "code": "typed_task_partition_contract_violation",
+                        "violation_count": len(violations),
+                        "violations": violations[:20],
+                        "message": (
+                            "Bounded tasks exceed the typed entity partition cap; "
+                            "split or reassign entity-specific research tasks."
+                        ),
+                        "retryable": True,
+                    }
+                )
+    source_budget_contract = plan.get("source_budget_contract")
+    runner_source_budget = plan.get("runner_source_budget")
+    if isinstance(source_budget_contract, Mapping) and source_budget_contract:
+        contract_runner_cap = _semantic_task_source_cap_int(
+            source_budget_contract.get("runner_max_unique_sources")
+        )
+        runner_cap = _candidate_runner_source_budget_cap(runner_source_budget)
+        if runner_cap is not None and contract_runner_cap != runner_cap:
+            failures.append(
+                {
+                    "code": "typed_source_budget_contract_mismatch",
+                    "runner_source_budget_cap": runner_cap,
+                    "source_budget_contract_cap": contract_runner_cap,
+                }
+            )
+    final_deliverable_contract = plan.get("final_deliverable_contract")
+    if selected_entities and required_dimensions:
+        if not isinstance(final_deliverable_contract, Mapping):
+            failures.append({"code": "typed_final_deliverable_contract_missing"})
+        elif not _string_list(final_deliverable_contract.get("required_sections")):
+            failures.append(
+                {
+                    "code": "typed_final_deliverable_contract_incomplete",
+                    "field": "required_sections",
+                }
+            )
+    return failures
+
+
+def _candidate_task_is_final_deliverable(task: Mapping[str, Any]) -> bool:
+    text = json.dumps(
+        [
+            task.get("query"),
+            task.get("expected_artifacts"),
+            task.get("success_criteria"),
+            task.get("done_condition"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+    return _contains_any(
+        text,
+        (
+            "final",
+            "synthesis",
+            "side-by-side",
+            "side by side",
+            "comparison deliverable",
+            "final report",
+            "\ucd5c\uc885",
+            "\uc885\ud569",
+        ),
+    )
 
 
 def _semantic_release_angle_content_tokens(angle: Mapping[str, Any]) -> set[str]:
@@ -13028,6 +14463,12 @@ def _codex_semantic_raw_request(
             "intent_summary": "string",
             "domain_entities": "list",
             "constraints": "list",
+            "selected_entities": "required list of named providers/jurisdictions/products/docs/artifacts; empty only when no entity contract applies",
+            "required_dimensions": "required list of comparison or analysis dimensions; empty only when no dimension contract applies",
+            "coverage_matrix": "required list of selected_entity x required_dimension coverage cells; empty only when no typed coverage contract applies",
+            "task_partition_contract": "required object with partition_key and max_entities_per_task when entity partitioning applies",
+            "source_budget_contract": "required object separating runner max_unique_sources from per-task max_sources",
+            "final_deliverable_contract": "required object listing required report sections/tables/judgments",
             "question_scope": "broad|medium|narrow",
             "decomposition_strategy": "string",
             "requirement_coverage_map": "list",
@@ -13093,6 +14534,17 @@ def _fixture_semantic_candidate_response_for_validation_tests(
         "negative_scope": _fixture_negative_scope(question, subject),
         "angles": angles,
         "bounded_tasks": bounded_tasks,
+        "selected_entities": [],
+        "required_dimensions": [],
+        "coverage_matrix": [],
+        "task_partition_contract": {},
+        "source_budget_contract": {},
+        "final_deliverable_contract": {
+            "contract_type": "research_report",
+            "required_sections": ["evidence summary", "caveats"],
+            "required_tables": [],
+            "required_judgments": ["supported", "unknown_or_unverifiable"],
+        },
     }
     return {
         "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
@@ -15799,6 +17251,13 @@ def _semantic_materialization_field_mismatches(
     for field in SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS:
         actual_field = field_map.get(field, field) if field_map else field
         if actual_field not in actual:
+            expected_value = _semantic_materialization_value(expected, field)
+            if field in {
+                "semantic_entity_refs",
+                "semantic_dimension_refs",
+                "final_deliverable_binding",
+            } and expected_value in ([], {}):
+                continue
             if not require_all_fields:
                 continue
             mismatches.append(
@@ -15809,7 +17268,7 @@ def _semantic_materialization_field_mismatches(
                     "field": actual_field,
                     "semantic_field": field,
                     "code": "field_missing",
-                    "expected": _semantic_materialization_value(expected, field),
+                    "expected": expected_value,
                     "actual": None,
                 }
             )
@@ -15849,9 +17308,11 @@ def _semantic_materialization_value(
         "expected_visual_targets",
         "expected_artifacts",
         "success_criteria",
+        "semantic_entity_refs",
+        "semantic_dimension_refs",
     }:
         return _string_list(value)
-    if comparison_field == "source_policy":
+    if comparison_field in {"source_policy", "final_deliverable_binding"}:
         return _normalize_mapping_value(value)
     if comparison_field in {"max_results", "max_sources", "max_images"}:
         try:

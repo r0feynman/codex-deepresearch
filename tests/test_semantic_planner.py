@@ -42,6 +42,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     PLANNER_MODE_MANUAL_ANGLES,
     SEMANTIC_FIT_SCORE_THRESHOLD,
     SEMANTIC_PLANNER_CONVERGENCE_FILENAME,
+    SEMANTIC_PLANNER_SCHEMA_VERSION,
     SemanticAngle,
     SemanticPlan,
     SEMANTIC_MATERIALIZATION_ALIGNMENT_FIELDS,
@@ -62,6 +63,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _codex_semantic_candidate_validation,
     _codex_semantic_planner_validation_max_attempts,
     _candidate_has_comparison_deliverable_task,
+    _candidate_plan_from_adapter_response,
     _candidate_req003_comparison_row_terms,
     _has_forbidden_internal_leakage,
     _materialize_candidate_budget_caps,
@@ -72,6 +74,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _materialize_candidate_source_cap_splits,
     _materialize_candidate_source_cap_constraints,
     _materialize_candidate_task_source_cap_feasibility,
+    _materialize_candidate_typed_semantic_contracts,
     _materialize_candidate_visual_image_cap_feasibility,
     _normalize_candidate_executable_source_caps,
     _repair_candidate_requirement_coverage,
@@ -207,6 +210,63 @@ class SemanticPlannerTests(unittest.TestCase):
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    def typed_semantic_contract_payload(self) -> dict:
+        return {
+            "selected_entities": [
+                {
+                    "entity_id": "entity_001",
+                    "name": "GitHub",
+                    "entity_type": "provider",
+                    "required": True,
+                },
+                {
+                    "entity_id": "entity_002",
+                    "name": "Google",
+                    "entity_type": "provider",
+                    "required": True,
+                },
+            ],
+            "required_dimensions": [
+                {
+                    "dimension_id": "dimension_001",
+                    "name": "initiation_endpoint",
+                    "required": True,
+                },
+                {
+                    "dimension_id": "dimension_002",
+                    "name": "device_code_polling",
+                    "required": True,
+                },
+            ],
+            "coverage_matrix": [
+                {
+                    "entity_id": "entity_001",
+                    "dimension_id": "dimension_001",
+                    "status": "covered",
+                    "covered_by_task_ids": ["task_001"],
+                },
+                {
+                    "entity_id": "entity_002",
+                    "dimension_id": "dimension_002",
+                    "status": "covered",
+                    "covered_by_task_ids": ["task_002"],
+                },
+            ],
+            "task_partition_contract": {
+                "max_entities_per_task": 2,
+                "partition_mode": "entity_dimension_pairs",
+            },
+            "source_budget_contract": {
+                "max_unique_sources": 20,
+                "per_task_max_sources": 5,
+                "budget_scope": "global",
+            },
+            "final_deliverable_contract": {
+                "required_sections": ["Provider Coverage", "Comparison Matrix"],
+                "required_tables": ["entity_dimension_coverage"],
+            },
+        }
 
     def write_fake_codex_executable(self, bin_dir: Path) -> Path:
         fake_codex = bin_dir / "codex"
@@ -1351,6 +1411,17 @@ class SemanticPlannerTests(unittest.TestCase):
                 "negative_scope": ["Do not use local deterministic template output."],
                 "angles": angles,
                 "bounded_tasks": bounded_tasks,
+                "selected_entities": [],
+                "required_dimensions": [],
+                "coverage_matrix": [],
+                "task_partition_contract": {},
+                "source_budget_contract": {},
+                "final_deliverable_contract": {
+                    "contract_type": "research_report",
+                    "required_sections": ["evidence summary", "caveats"],
+                    "required_tables": [],
+                    "required_judgments": ["supported", "unknown_or_unverifiable"],
+                },
             },
         }
 
@@ -1397,6 +1468,16 @@ class SemanticPlannerTests(unittest.TestCase):
             domain_entities=list(candidate.get("domain_entities") or []),
             constraints=list(candidate.get("constraints") or []),
             runner_source_budget=dict(candidate.get("runner_source_budget") or {}),
+            selected_entities=list(candidate.get("selected_entities") or []),
+            required_dimensions=list(candidate.get("required_dimensions") or []),
+            coverage_matrix=list(candidate.get("coverage_matrix") or []),
+            task_partition_contract=dict(
+                candidate.get("task_partition_contract") or {}
+            ),
+            source_budget_contract=dict(candidate.get("source_budget_contract") or {}),
+            final_deliverable_contract=dict(
+                candidate.get("final_deliverable_contract") or {}
+            ),
             question_scope=str(candidate["question_scope"]),
             scope_downgrade=(
                 dict(candidate["scope_downgrade"])
@@ -6092,7 +6173,7 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         self.assertTrue(repaired_validation["ok"], repaired_validation)
 
-    def test_source_cap_repair_uses_shared_pool_instead_of_generic_source_groups(self) -> None:
+    def test_source_cap_repair_keeps_unproven_shared_pool_requirement_blocked(self) -> None:
         question = (
             "Compare Microsoft, Google, GitHub, and Okta OAuth device-flow "
             "documentation against RFC 8628."
@@ -6153,21 +6234,112 @@ class SemanticPlannerTests(unittest.TestCase):
 
         self.assertEqual(
             materialization["materialization"],
-            "source_cap_split_deferred_to_shared_source_pool",
+            "source_cap_split_requires_semantic_partitions",
+        )
+        self.assertEqual(materialization["repair_status"], "blocked")
+        self.assertEqual(
+            materialization["blocked_feasibility_code"],
+            "bounded_task_requirement_exceeds_max_sources",
         )
         self.assertIn(original_task_id, task_ids)
         self.assertFalse(any("srcgrp" in task_id.lower() for task_id in task_ids))
         self.assertNotIn("source group", plan_text)
         self.assertNotIn("srcgrp", plan_text)
         self.assertNotRegex(plan_text, r"\bsource\s+group\s+\d+\s+of\s+\d+\b")
-        self.assertTrue(repaired_task["source_pool_reuse_required"])
-        self.assertIn("shared_source_pool", repaired_task["source_policy"])
+        self.assertNotIn("source_pool_reuse_required", repaired_task)
+        self.assertIn("20 official sources", repaired_task["query"])
         self.assertEqual(repaired["runner_source_budget"]["max_unique_sources"], 20)
         self.assertEqual(repaired["runner_source_budget"]["request_max_sources"], 20)
         self.assertEqual(
             repaired["runner_source_budget"]["allocation_strategy"],
             "shared_source_pool",
         )
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_source_cap_repair_uses_shared_pool_with_explicit_reuse_assignments(self) -> None:
+        question = (
+            "Compare Microsoft, Google, GitHub, and Okta OAuth device-flow "
+            "documentation against RFC 8628."
+        )
+        candidate = self.text_only_oauth_candidate(question=question)
+        original_task_id = candidate["bounded_tasks"][0]["task_id"]
+        candidate["constraints"] = [
+            (
+                "Stay within the standard budget of at most 20 unique sources, "
+                "8 results, and no visual evidence."
+            )
+        ]
+        candidate["runner_source_budget"] = {
+            "budget_type": "runner_level_unique_source_reuse",
+            "max_unique_sources": 20,
+            "declared_source_budget": 20,
+            "task_max_sources_sum": 20,
+            "bounded_task_count": len(candidate["bounded_tasks"]),
+            "reuse_required": True,
+            "allocation_strategy": "shared_source_pool",
+            "enforcement_scope": "run",
+            "source_reuse_assignments": [
+                f"src_pool_{index:02d}" for index in range(1, 21)
+            ],
+            "coverage_status": "verified",
+        }
+        candidate["bounded_tasks"][0]["max_sources"] = 5
+        candidate["bounded_tasks"][0]["query"] = (
+            "Review the completed OAuth device-flow comparison for undocumented "
+            "assumptions and missing provider fields using 20 official sources."
+        )
+        candidate["bounded_tasks"][0]["expected_artifacts"] = [
+            "unknowns and limitations note",
+            "assumption audit",
+            "budget compliance record",
+        ]
+        candidate["bounded_tasks"][0]["success_criteria"] = [
+            "Every missing or non-comparable field is disclosed.",
+            "The source ledger contains at most 20 unique sources.",
+        ]
+        candidate["bounded_tasks"][0]["done_condition"] = (
+            "Complete when 20 official sources are checked for status, evidence, "
+            "caveats, and remediation next actions."
+        )
+
+        repaired, materializations = _materialize_candidate_source_cap_splits(
+            candidate,
+            budget_cap={"max_sources": 20},
+        )
+        repaired, _source_budget_materializations = (
+            _materialize_candidate_source_cap_constraints(
+                repaired,
+                source_cap_normalizations=[],
+                budget_cap={"max_sources": 20},
+            )
+        )
+        repaired, _budget_materializations = _materialize_candidate_budget_caps(
+            repaired,
+            budget_cap={"max_results": 8, "max_sources": 20},
+        )
+        materialization = next(
+            materialization
+            for materialization in materializations
+            if materialization.get("original_task_id") == original_task_id
+        )
+        repaired_task = next(
+            task for task in repaired["bounded_tasks"] if task["task_id"] == original_task_id
+        )
+
+        self.assertEqual(
+            materialization["materialization"],
+            "source_cap_split_deferred_to_shared_source_pool",
+        )
+        self.assertTrue(repaired_task["source_pool_reuse_required"])
+        self.assertIn("shared_source_pool", repaired_task["source_policy"])
         validation = validate_semantic_candidate_plan(
             original_question=question,
             plan=repaired,
@@ -6404,6 +6576,36 @@ class SemanticPlannerTests(unittest.TestCase):
                 "Complete when 20 official sources are checked for status, "
                 "evidence, caveats, and remediation next actions."
             )
+            overbroad_task["source_partitions"] = [
+                {
+                    "partition_id": "nextjs_cache_docs",
+                    "assignment_type": "document_set",
+                    "assignment_value": "Next.js cache documentation",
+                    "label": "Next.js cache documentation",
+                    "max_sources": 5,
+                },
+                {
+                    "partition_id": "nextjs_revalidation_docs",
+                    "assignment_type": "document_set",
+                    "assignment_value": "Next.js revalidation documentation",
+                    "label": "Next.js revalidation documentation",
+                    "max_sources": 5,
+                },
+                {
+                    "partition_id": "vercel_cache_docs",
+                    "assignment_type": "document_set",
+                    "assignment_value": "Vercel cache documentation",
+                    "label": "Vercel cache documentation",
+                    "max_sources": 5,
+                },
+                {
+                    "partition_id": "migration_release_docs",
+                    "assignment_type": "document_set",
+                    "assignment_value": "migration and release documentation",
+                    "label": "migration and release documentation",
+                    "max_sources": 5,
+                },
+            ]
             return response
 
         def reviewer_mutator(response: dict, request: dict) -> dict:
@@ -6451,13 +6653,13 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(len(semantic_plan["angles"]), 4)
         self.assertGreaterEqual(len(semantic_plan["bounded_tasks"]), 6)
         self.assertLessEqual(len(semantic_plan["bounded_tasks"]), 12)
-        self.assertEqual(semantic_plan["question_scope"], "narrow")
+        self.assertEqual(semantic_plan["question_scope"], "medium")
         self.assertEqual(
             semantic_plan["scope_downgrade"]["status"],
             "oracle_bounded_semantic_scope_downgrade",
         )
         self.assertEqual(semantic_plan["scope_downgrade"]["from_scope"], "broad")
-        self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], "narrow")
+        self.assertEqual(semantic_plan["scope_downgrade"]["to_scope"], "medium")
         self.assertGreaterEqual(semantic_plan["scope_downgrade"]["retry_attempt"], 2)
         self.assertFalse(semantic_plan["scope_downgrade"]["generic_padding_added"])
         self.assertEqual(
@@ -9632,6 +9834,142 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(schema_path.name, "planner.json")
         self.assertIn("semantically, not by keyword or fixed template", command[-1])
 
+    def test_planner_adapter_schema_requires_typed_contract_fields(self) -> None:
+        import jsonschema
+
+        question = "Compare OAuth device-flow implementation guidance across official providers."
+        raw_request = build_codex_semantic_raw_request(
+            question=question,
+            visual_preference="text_only",
+        )
+        schema_path = (
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_adapter_schemas"
+            / "planner.json"
+        )
+        schema = self.load_json(schema_path)
+        candidate_plan = {
+            "schema_version": "codex-deepresearch.semantic-planner.v0",
+            "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+            "semantic_release_eligible": False,
+            "source": "codex_semantic",
+            "intent_summary": f"Compare official provider guidance for {question}.",
+            "domain_entities": ["GitHub", "Google"],
+            "constraints": ["Use official documentation."],
+            "question_scope": "narrow",
+            "decomposition_strategy": "Split by provider and required implementation dimension.",
+            "requirement_coverage_map": [
+                {
+                    "requirement_id": "req_001",
+                    "requirement_type": "provider_coverage",
+                    "requirement_text": "Cover selected official providers.",
+                    "coverage_status": "covered",
+                    "covered_by_angle_ids": ["angle_001"],
+                    "covered_by_task_ids": ["task_001"],
+                    "non_negotiable": True,
+                }
+            ],
+            "negative_scope": ["Do not use unofficial forum-only guidance."],
+            "angles": [
+                {
+                    "angle_id": "angle_001",
+                    "title": "Provider Device Flow Initiation Coverage",
+                    "research_question": "Which official provider docs define device-flow initiation?",
+                    "why_this_angle_matters": "It anchors the comparison in official implementation details.",
+                    "included_scope": ["GitHub and Google official provider docs"],
+                    "excluded_scope": ["Unofficial tutorials"],
+                    "route": "text_only",
+                    "evidence_need": "official_source",
+                    "expected_source_types": ["official documentation"],
+                    "expected_visual_targets": [],
+                    "expected_artifacts": ["provider comparison notes"],
+                    "search_queries": ["GitHub OAuth device flow official documentation"],
+                    "success_criteria": ["Each selected provider has an official source."],
+                    "report_section": "Provider Coverage",
+                    "risk_or_contradiction_checks": ["Provider docs may use different endpoint names."],
+                }
+            ],
+            "bounded_tasks": [
+                {
+                    "task_id": "task_001",
+                    "angle_id": "angle_001",
+                    "query": "Find official GitHub and Google OAuth device-flow initiation docs.",
+                    "route": "text_only",
+                    "freshness_requirement": "Current official docs.",
+                    "source_policy": {
+                        "policy": "official_primary_preferred",
+                        "allow_secondary": False,
+                        "required_source_quality": ["official"],
+                    },
+                    "expected_source_types": ["official documentation"],
+                    "expected_visual_targets": [],
+                    "expected_artifacts": ["source-backed comparison row"],
+                    "success_criteria": ["Both provider docs are represented."],
+                    "max_sources": 5,
+                    "max_images": 0,
+                    "done_condition": "Stop when official docs for selected providers are captured.",
+                }
+            ],
+            "language": "en",
+        }
+        candidate_plan.update(self.typed_semantic_contract_payload())
+        schema_payload = {
+            "candidate_plan": candidate_plan,
+            "provenance": {
+                "raw_request_hash": raw_request["adapter_request_hash"],
+                "adapter_invocation_kind": CODEX_SEMANTIC_ADAPTER_INVOCATION_KIND,
+                "model_or_surface": "codex-semantic-test-double",
+            },
+        }
+
+        errors = sorted(
+            jsonschema.Draft7Validator(schema).iter_errors(schema_payload),
+            key=lambda error: list(error.absolute_path),
+        )
+
+        self.assertEqual([], [error.message for error in errors])
+        candidate_required = schema["properties"]["candidate_plan"]["required"]
+        for field in self.typed_semantic_contract_payload():
+            with self.subTest(field=field):
+                self.assertIn(field, candidate_required)
+
+        missing_contract_payload = json.loads(json.dumps(schema_payload))
+        missing_contract_payload["candidate_plan"].pop("coverage_matrix")
+        missing_errors = sorted(
+            jsonschema.Draft7Validator(schema).iter_errors(missing_contract_payload),
+            key=lambda error: list(error.absolute_path),
+        )
+        self.assertIn(
+            "'coverage_matrix' is a required property",
+            [error.message for error in missing_errors],
+        )
+
+    def test_candidate_plan_normalization_requires_and_preserves_typed_contract_fields(self) -> None:
+        question = "Compare OAuth device-flow implementation guidance across official providers."
+        raw_request = build_codex_semantic_raw_request(
+            question=question,
+            visual_preference="text_only",
+        )
+        raw_response = self.codex_adapter_response(raw_request)
+        typed_contract = self.typed_semantic_contract_payload()
+        raw_response["candidate_plan"].update(json.loads(json.dumps(typed_contract)))
+
+        plan = _candidate_plan_from_adapter_response(raw_response)
+
+        for field, expected in typed_contract.items():
+            with self.subTest(field=field):
+                self.assertEqual(expected, plan[field])
+
+        raw_response["candidate_plan"].pop("coverage_matrix")
+        with self.assertRaisesRegex(
+            SemanticPlannerAdapterUnavailable,
+            "missing required fields: coverage_matrix",
+        ):
+            _candidate_plan_from_adapter_response(raw_response)
+
     def test_default_codex_semantic_adapter_command_returns_none_without_codex(self) -> None:
         with mock.patch(
             "deepresearch.semantic_planner.shutil.which",
@@ -10224,7 +10562,223 @@ class SemanticPlannerTests(unittest.TestCase):
             interpretation["allocation_candidates_used_as_global_limit"]
         )
 
-    def test_request_source_budget_overrides_natural_language_materialized_cap(self) -> None:
+    def test_sem_reg_011_mixed_budget_sentence_uses_total_sources_not_result_targets(self) -> None:
+        question = (
+            "Compare Microsoft, Google, GitHub, and Okta OAuth device-flow "
+            "documentation against RFC 8628"
+        )
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "d" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=4,
+            tasks_per_angle=3,
+            requirement_types=(
+                "subject",
+                "source_quality",
+                "deliverable_shape",
+            ),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = [
+            (
+                "Stay within the standard budget of 8 result targets, "
+                "20 total sources, 0 images, and 8 subagents."
+            )
+        ]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+
+        repaired, source_materializations = (
+            _materialize_candidate_source_cap_constraints(
+                candidate,
+                source_cap_normalizations=[],
+                budget_cap={"max_sources": 20},
+            )
+        )
+        repaired, budget_materializations = _materialize_candidate_budget_caps(
+            repaired,
+            budget_cap={"max_results": 8, "max_sources": 20},
+        )
+
+        self.assertTrue(source_materializations)
+        self.assertTrue(budget_materializations)
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 20)
+        self.assertEqual(runner_budget["declared_source_budget"], 20)
+        interpretation = runner_budget["budget_interpretation"]
+        self.assertEqual(
+            interpretation["selected_natural_language_global_total"],
+            20,
+        )
+        global_values = [
+            candidate["value"]
+            for candidate in interpretation["global_total_budget_candidates"]
+        ]
+        self.assertEqual(global_values, [20])
+        self.assertNotIn(8, global_values)
+
+    def test_stricter_global_source_budget_survives_request_ceiling(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = [
+            (
+                "No more than 12 unique sources total. Each bounded task may "
+                "consult at most 5 sources."
+            )
+        ]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+
+        repaired, source_materializations = (
+            _materialize_candidate_source_cap_constraints(
+                candidate,
+                source_cap_normalizations=[],
+                budget_cap={"max_sources": 20},
+            )
+        )
+        repaired, budget_materializations = _materialize_candidate_budget_caps(
+            repaired,
+            budget_cap={"max_sources": 20},
+        )
+
+        self.assertTrue(source_materializations)
+        self.assertTrue(budget_materializations)
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 12)
+        self.assertEqual(runner_budget["declared_source_budget"], 12)
+        self.assertEqual(runner_budget["request_max_sources"], 20)
+        self.assertEqual(
+            runner_budget["budget_interpretation"]["selected_source"],
+            "natural_language_global_total",
+        )
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("max_unique_sources=12", constraints_text)
+        self.assertNotIn("max_unique_sources=20", constraints_text)
+        validation = validate_semantic_candidate_plan(
+            original_question=question,
+            plan=repaired,
+        )
+        self.assertTrue(validation["ok"], validation)
+
+    def test_per_task_source_cap_does_not_become_global_budget(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = [
+            "Each bounded task may consult at most 5 sources."
+        ]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+
+        repaired, source_materializations = (
+            _materialize_candidate_source_cap_constraints(
+                candidate,
+                source_cap_normalizations=[],
+                budget_cap={"max_sources": 20},
+            )
+        )
+        repaired, _budget_materializations = _materialize_candidate_budget_caps(
+            repaired,
+            budget_cap={"max_sources": 20},
+        )
+
+        self.assertEqual(source_materializations, [])
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 20)
+        self.assertEqual(runner_budget["declared_source_budget"], 20)
+        self.assertEqual(runner_budget["request_max_sources"], 20)
+        interpretation = runner_budget["budget_interpretation"]
+        self.assertEqual(interpretation["selected_source"], "request_max_sources")
+        self.assertEqual(
+            [candidate["value"] for candidate in interpretation["global_total_budget_candidates"]],
+            [],
+        )
+        self.assertIn(
+            5,
+            [
+                candidate["value"]
+                for candidate in interpretation["allocation_sub_budget_candidates"]
+            ],
+        )
+
+    def test_stricter_search_result_cap_survives_request_default(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=2,
+            tasks_per_angle=2,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        candidate["constraints"] = [
+            "No more than 3 search results per search operation."
+        ]
+
+        repaired, materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_results": 8},
+        )
+
+        self.assertTrue(materializations)
+        self.assertTrue(repaired["bounded_tasks"])
+        self.assertTrue(
+            all(task["max_results"] == 3 for task in repaired["bounded_tasks"])
+        )
+        constraints_text = json.dumps(repaired["constraints"], ensure_ascii=False)
+        self.assertIn("3 search results per search operation", constraints_text)
+        self.assertNotIn("max_results=8", constraints_text)
+        task_materialization = next(
+            materialization
+            for materialization in materializations
+            if materialization.get("field") == "bounded_tasks.max_results"
+        )
+        self.assertEqual(task_materialization["max_results"], 3)
+        self.assertEqual(task_materialization["request_max_results"], 8)
+        self.assertEqual(task_materialization["declared_search_result_cap"], 3)
+
+    def test_request_source_budget_replaces_stale_materialized_cap(self) -> None:
         question = "Compare official agency permit evidence across Korea municipalities"
         request = {
             "original_question": question,
@@ -10287,6 +10841,59 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(
             runner_budget["budget_interpretation"]["selected_source"],
             "request_max_sources",
+        )
+
+    def test_fresh_true_user_source_budget_can_restate_stale_materialized_cap(self) -> None:
+        question = "Compare official agency permit evidence across Korea municipalities"
+        request = {
+            "original_question": question,
+            "depth_preset": "standard",
+            "planner_adapter": "codex_native_semantic_candidate_adapter",
+            "prompt_version": "p3-sp2-candidate-v2",
+            "adapter_request_hash": "e" * 64,
+        }
+        response = self.codex_adapter_response(
+            request,
+            question_scope="broad",
+            angle_count=5,
+            tasks_per_angle=4,
+            requirement_types=("subject", "source_quality"),
+        )
+        candidate = response["candidate_plan"]
+        for task in candidate["bounded_tasks"]:
+            task["max_sources"] = 3
+        stale_constraint = (
+            "Runner-level source budget is preserved as a unique-source reuse "
+            "budget: max_unique_sources=2. The combined per-task source ceilings "
+            "total 60, so execution must reuse sources through a shared source pool."
+        )
+        fresh_user_constraint = "No more than 2 unique sources total."
+        candidate["constraints"] = [stale_constraint, fresh_user_constraint]
+        candidate["runner_source_budget"] = {
+            "budget_type": "runner_level_unique_source_reuse",
+            "max_unique_sources": 2,
+            "declared_source_budget": 2,
+            "task_max_sources_sum": 60,
+            "bounded_task_count": 20,
+            "reuse_required": True,
+            "allocation_strategy": "shared_source_pool",
+            "enforcement_scope": "run",
+            "materialized_constraint_count": 1,
+            "materialized_from_natural_language_constraints": True,
+        }
+
+        repaired, _materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_sources": 20},
+        )
+
+        runner_budget = repaired["runner_source_budget"]
+        self.assertEqual(runner_budget["max_unique_sources"], 2)
+        self.assertEqual(runner_budget["declared_source_budget"], 2)
+        self.assertEqual(runner_budget["request_max_sources"], 20)
+        self.assertEqual(
+            runner_budget["budget_interpretation"]["selected_source"],
+            "natural_language_global_total",
         )
 
     def test_typed_runner_source_budget_compatible_cap_is_preserved(self) -> None:
@@ -10719,6 +11326,293 @@ class SemanticPlannerTests(unittest.TestCase):
             failure["explicit_requirement_counts"]["image_per_program"],
             4,
         )
+
+    def comparison_contract_candidate(self) -> dict:
+        question = (
+            "Compare OAuth device-flow implementation guidance across official "
+            "provider documentation."
+        )
+        entities = [
+            {"entity_id": "entity_001", "name": "Microsoft", "type": "provider"},
+            {"entity_id": "entity_002", "name": "Google", "type": "provider"},
+            {"entity_id": "entity_003", "name": "GitHub", "type": "provider"},
+            {"entity_id": "entity_004", "name": "Okta", "type": "provider"},
+        ]
+        dimensions = [
+            {"dimension_id": "dimension_001", "name": "initiation endpoint"},
+            {"dimension_id": "dimension_002", "name": "request parameters"},
+        ]
+        angles = [
+            {
+                "angle_id": "angle_001",
+                "title": "OAuth provider initiation endpoint comparison",
+                "research_question": (
+                    "How do official provider docs describe OAuth device-flow "
+                    "initiation endpoints?"
+                ),
+                "why_this_angle_matters": (
+                    "It verifies a provider-specific OAuth device-flow comparison axis."
+                ),
+                "included_scope": ["OAuth provider documentation"],
+                "excluded_scope": [],
+                "route": "text_only",
+                "evidence_need": "official_source",
+                "expected_source_types": ["official provider documentation"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["provider initiation notes"],
+                "search_queries": ["OAuth device flow provider initiation endpoint"],
+                "success_criteria": ["Use official provider documentation."],
+                "report_section": "Provider Initiation",
+                "risk_or_contradiction_checks": ["Check unsupported providers."],
+            },
+            {
+                "angle_id": "angle_002",
+                "title": "OAuth provider request parameter comparison",
+                "research_question": (
+                    "Which OAuth device-flow request parameters do official "
+                    "provider docs require?"
+                ),
+                "why_this_angle_matters": (
+                    "It verifies provider-specific OAuth request parameter behavior."
+                ),
+                "included_scope": ["OAuth provider documentation"],
+                "excluded_scope": [],
+                "route": "text_only",
+                "evidence_need": "comparative_analysis",
+                "expected_source_types": ["official provider documentation"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["provider parameter notes"],
+                "search_queries": ["OAuth device flow provider request parameters"],
+                "success_criteria": ["Use official provider documentation."],
+                "report_section": "Provider Parameters",
+                "risk_or_contradiction_checks": ["Check unsupported providers."],
+            },
+        ]
+        tasks = []
+        task_index = 1
+        for entity in entities:
+            for dimension in dimensions:
+                tasks.append(
+                    {
+                        "task_id": f"task_{task_index:03d}",
+                        "angle_id": (
+                            "angle_001"
+                            if dimension["dimension_id"] == "dimension_001"
+                            else "angle_002"
+                        ),
+                        "query": (
+                            f"{entity['name']} OAuth device-flow "
+                            f"{dimension['name']} official provider documentation"
+                        ),
+                        "route": "text_only",
+                        "freshness_requirement": "any",
+                        "source_policy": {
+                            "decision": "allowed",
+                            "required_source_quality": ["official provider documentation"],
+                        },
+                        "expected_source_types": ["official provider documentation"],
+                        "expected_visual_targets": [],
+                        "expected_artifacts": [
+                            f"{entity['name']} {dimension['name']} notes"
+                        ],
+                        "success_criteria": [
+                            (
+                                f"Record {entity['name']} official documentation "
+                                f"for {dimension['name']}."
+                            )
+                        ],
+                        "max_sources": 2,
+                        "max_images": 0,
+                        "done_condition": (
+                            f"Stop after {entity['name']} {dimension['name']} "
+                            "evidence and caveats are recorded."
+                        ),
+                    }
+                )
+                task_index += 1
+        return {
+            "schema_version": SEMANTIC_PLANNER_SCHEMA_VERSION,
+            "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+            "semantic_release_eligible": False,
+            "source": "codex_semantic",
+            "model_or_surface": "fixture",
+            "original_question": question,
+            "language": "en",
+            "intent_summary": "Compare OAuth device-flow behavior across providers.",
+            "domain_entities": entities,
+            "constraints": [
+                (
+                    "Compare Microsoft, Google, GitHub, and Okta official provider "
+                    "documentation across initiation endpoint and request parameters."
+                )
+            ],
+            "runner_source_budget": {
+                "budget_type": "runner_level_unique_source_reuse",
+                "max_unique_sources": 20,
+                "declared_source_budget": 20,
+                "task_max_sources_sum": 16,
+                "bounded_task_count": 8,
+                "reuse_required": False,
+            },
+            "question_scope": "narrow",
+            "decomposition_strategy": "One provider-dimension task per cell.",
+            "requirement_coverage_map": [
+                {
+                    "requirement_id": "req_001",
+                    "requirement_type": "subject",
+                    "requirement_text": question,
+                    "prompt_text": question,
+                    "prompt_span": {"start": 0, "end": len(question)},
+                    "explicit": True,
+                    "non_negotiable": True,
+                    "inferred_reason": None,
+                    "covered_by_angle_ids": ["angle_001", "angle_002"],
+                    "covered_by_task_ids": [task["task_id"] for task in tasks],
+                    "coverage_status": "covered",
+                },
+                {
+                    "requirement_id": "req_002",
+                    "requirement_type": "source_quality",
+                    "requirement_text": "Official provider documentation is required.",
+                    "prompt_text": "official provider documentation",
+                    "prompt_span": {"start": 0, "end": len(question)},
+                    "explicit": True,
+                    "non_negotiable": True,
+                    "inferred_reason": None,
+                    "covered_by_angle_ids": ["angle_001", "angle_002"],
+                    "covered_by_task_ids": [task["task_id"] for task in tasks],
+                    "coverage_status": "covered",
+                },
+            ],
+            "negative_scope": [],
+            "angles": angles,
+            "bounded_tasks": tasks,
+        }
+
+    def test_typed_contracts_materialize_entity_dimension_matrix(self) -> None:
+        candidate = self.comparison_contract_candidate()
+
+        repaired, materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+
+        self.assertEqual(len(repaired["selected_entities"]), 4)
+        self.assertEqual(len(repaired["required_dimensions"]), 2)
+        self.assertEqual(len(repaired["coverage_matrix"]), 8)
+        self.assertTrue(
+            all(cell["status"] == "covered" for cell in repaired["coverage_matrix"])
+        )
+        self.assertEqual(
+            repaired["task_partition_contract"]["max_entities_per_task"],
+            2,
+        )
+        self.assertEqual(
+            repaired["source_budget_contract"]["runner_max_unique_sources"],
+            20,
+        )
+        self.assertIn(
+            "entity-by-dimension comparison",
+            repaired["final_deliverable_contract"]["required_sections"],
+        )
+        self.assertIn(
+            "coverage_matrix",
+            {item["field"] for item in materializations},
+        )
+
+    def test_typed_coverage_matrix_catches_missing_entity_dimension(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate["bounded_tasks"] = [
+            task
+            for task in candidate["bounded_tasks"]
+            if not (
+                "Okta" in task["query"]
+                and "request parameters" in task["query"]
+            )
+        ]
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_coverage_matrix_incomplete",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_typed_partition_contract_catches_too_many_entities_per_task(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate["bounded_tasks"][0]["query"] = (
+            "Compare Microsoft, Google, and GitHub OAuth device-flow initiation "
+            "endpoint official provider documentation."
+        )
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_task_partition_contract_violation",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_sem_reg_011_like_provider_gap_fails_before_reviewer(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate["constraints"] = [
+            (
+                "Compare Microsoft, Google, GitHub, Okta, Auth0, and Amazon "
+                "Cognito official provider documentation across initiation endpoint, "
+                "request parameters, discovery metadata, and support status."
+            )
+        ]
+        candidate["domain_entities"] = [
+            {"name": "Microsoft", "type": "provider"},
+            {"name": "Google", "type": "provider"},
+            {"name": "GitHub", "type": "provider"},
+            {"name": "Okta", "type": "provider"},
+            {"name": "Auth0", "type": "provider"},
+            {"name": "Amazon Cognito", "type": "provider"},
+        ]
+        candidate["bounded_tasks"] = [
+            {
+                **candidate["bounded_tasks"][0],
+                "task_id": "task_provider_group",
+                "query": (
+                    "Compare Microsoft, Google, and GitHub OAuth device-flow "
+                    "initiation endpoint, request parameters, discovery metadata, "
+                    "and support status from official provider documentation."
+                ),
+            }
+        ]
+
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+        codes = {failure["code"] for failure in validation["failures"]}
+
+        self.assertIn("typed_coverage_matrix_incomplete", codes)
+        self.assertIn("typed_task_partition_contract_violation", codes)
 
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
         with self.assertRaisesRegex(

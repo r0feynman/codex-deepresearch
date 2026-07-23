@@ -21,6 +21,8 @@ The product goal is described in `docs/codex-deepresearch-prd.md`. The developme
 - Do not present a hypothesis as a fact. Label it as a hypothesis, candidate cause, or unverified inference until it is supported by logs, artifacts, code, tests, or external source evidence.
 - When reporting a failure, distinguish the directly observed failure path from the unproven underlying cause. Include the evidence used, such as artifact paths, log lines, command output, code references, or test results.
 - If evidence is incomplete, say what is known, what is not known, and what additional check would narrow the cause.
+- When a semantic planner, semantic release, public beta, E2E, or full-runner validation failure occurs, append an entry to `docs/semantic-planner-failure-log.md` before continuing with more fixes unless the user explicitly says not to. Record the prompt or issue, command or suite, run directory, status, reviewer/validator failure codes, directly observed cause, inferences, unknowns, and the next diagnostic or fix direction.
+- Do not let repeated failures disappear into chat history. Use the failure log to identify recurring structural patterns before adding more case-specific patches.
 
 ## Implementation Coordination
 
