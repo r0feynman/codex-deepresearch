@@ -750,3 +750,52 @@ Next diagnostic or fix direction:
 
 - `planner.json` was tightened so every object schema's `required` array contains exactly its explicit properties.
 - A follow-up live probe moved past immediate schema rejection and timed out after 120 seconds without a final JSON response.
+
+## 2026-07-24 - Issue #133 / sem-reg-001 Parallel Regression Timeout
+
+Prompt or issue:
+
+- Prompt id: `sem-reg-001`
+- Question: `한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료를 비교해줘.`
+- Issue #133 semantic regression signoff.
+
+Command or suite:
+
+- 30 semantic regression `prepare` runs launched with concurrency 4 under `/tmp/codex-dr-sem-reg-30-20260724T024221Z`.
+- Each run used `CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_TIMEOUT_SECONDS=900`, `CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS=900`, and `CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_TIMEOUT_SECONDS=900`.
+
+Run directory:
+
+- `/tmp/codex-dr-sem-reg-30-20260724T024221Z/dr_20260724T024221`
+
+Status:
+
+- `blocked_semantic_planner_unavailable`
+
+Reviewer/validator failure codes:
+
+- `release_ineligible_planner_mode`
+- `semantic_release_ineligible`
+
+Directly observed cause:
+
+- `semantic_planner_raw/planner_response.json` records `blocked_reason="Codex semantic planner adapter failed: TimeoutExpired"`.
+- `run_trace.jsonl` records `semantic_oracle_request_created`, `semantic_oracle_locked`, and `semantic_planner_request_created`, then `semantic_planner_blocked`.
+- `semantic_planner_convergence.json` records only one planner attempt; no candidate validation failures were produced because no planner response was received.
+- The same `sem-reg-001` prompt passed in a preceding single-run probe at `/tmp/codex-dr-sem-reg-schema-fix-probe-20260724T023154Z/dr_20260724T023154`.
+
+Inferences:
+
+- The `planner.json` schema blocker is not the direct cause of this failure.
+- Parallel live planner execution can exceed the planner adapter timeout even for a prompt that passes when run alone.
+- The current capacity retry path does not treat `subprocess.TimeoutExpired` as retryable, so timeout failures can bypass the bounded planner retry strategies.
+
+Unknowns:
+
+- Whether lower concurrency, a higher timeout, or timeout-specific retry/backoff is sufficient for the full 30-prompt semantic regression suite.
+- Whether other prompts in the 30-run suite would expose additional non-timeout validation failures after timeout hardening.
+
+Next diagnostic or fix direction:
+
+- Add timeout-specific adapter retry/backoff metadata for Codex semantic oracle/planner/reviewer calls without lowering semantic validator thresholds.
+- Re-run the failed prompt under a bounded timeout-retry probe before resuming the full 30 semantic regression suite.
