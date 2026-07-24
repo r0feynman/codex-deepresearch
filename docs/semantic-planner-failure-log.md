@@ -857,3 +857,53 @@ Next diagnostic or fix direction:
 - Re-run focused unit tests for typed final binding, report-bound final-task creation, visual obligation preservation, and broad evidence partition rejection.
 - Re-run `python3 -m unittest tests.test_semantic_planner`.
 - Re-run the 30 semantic regression prepare suite after focused tests pass.
+
+## 2026-07-24 - Issue #133 / Post-Typed-Fix Regression Timeout
+
+Prompt or issue:
+
+- Issue #133 semantic regression signoff after typed contract materializer hardening.
+
+Command or suite:
+
+- 30 semantic regression `prepare` rerun under `/tmp/codex-dr-sem-reg-30-after-typed-fix-20260724T044039Z`.
+- Each run used `CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_TIMEOUT_SECONDS=900`, `CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS=900`, and `CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_TIMEOUT_SECONDS=900`.
+
+Run directory:
+
+- Suite root: `/tmp/codex-dr-sem-reg-30-after-typed-fix-20260724T044039Z`
+- Timeout run: `/tmp/codex-dr-sem-reg-30-after-typed-fix-20260724T044039Z/dr_20260724T044039`
+- Successful comparison run before stop: `/tmp/codex-dr-sem-reg-30-after-typed-fix-20260724T044039Z/dr_20260724T044039_2`
+
+Status:
+
+- `sem-reg-003` completed with `semantic_review_passed` and `semantic_release_eligible=true`.
+- `sem-reg-004` completed with `blocked_semantic_planner_unavailable`.
+- The suite stopped on the `sem-reg-004` timeout and terminated the other active prompts.
+
+Reviewer/validator failure codes:
+
+- For `sem-reg-004`: `release_ineligible_planner_mode`, `semantic_release_ineligible`.
+
+Directly observed cause:
+
+- `sem-reg-004` `semantic_planner_raw/planner_response.json` records `blocked_reason="Codex semantic planner adapter failed: TimeoutExpired"`.
+- `semantic_planner_convergence.json` records one planner attempt and `terminal_failure.reason_codes=["Codex semantic planner adapter failed: TimeoutExpired"]`.
+- `run_trace.jsonl` records oracle creation, oracle lock, and planner request creation before `semantic_planner_blocked`.
+- No candidate validation failures were produced for `sem-reg-004` because no planner response was received.
+
+Inferences:
+
+- The typed contract hardening improved at least one live regression path (`sem-reg-003`) and focused revalidation of previous raw candidates, but it does not address Codex planner adapter timeout.
+- The remaining blocker for this rerun is adapter execution reliability under concurrency 4, not a deterministic typed-contract validation failure in `sem-reg-004`.
+
+Unknowns:
+
+- Whether `sem-reg-004` passes with lower concurrency or a fresh isolated single-run execution.
+- Whether active prompts terminated after the timeout would have passed or failed after planner response.
+
+Next diagnostic or fix direction:
+
+- Run `sem-reg-004` as an isolated single prompt to separate prompt complexity from concurrency pressure.
+- If isolated `sem-reg-004` passes, re-run the 30 regression suite at lower concurrency before changing timeout policy.
+- If isolated `sem-reg-004` also times out, reduce planner prompt/output complexity or add progress/failure metadata before considering retry behavior.
