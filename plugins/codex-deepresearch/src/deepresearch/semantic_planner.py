@@ -15559,6 +15559,267 @@ def _codex_semantic_raw_request(
     }
 
 
+def compact_semantic_planner_locked_oracle_for_request(
+    *,
+    original_question: str,
+    visual_preference: str | None,
+    budget_cap: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return a compact planner-facing oracle view for broad structured artifacts.
+
+    The full oracle remains persisted as ``semantic_expectation_oracle.json``.
+    This helper only reduces the JSON payload sent to the planner adapter while
+    preserving the fields used by semantic candidate validation and reviewer
+    release gates.
+    """
+
+    if not _semantic_planner_compact_oracle_mode_enabled(
+        original_question=original_question,
+        visual_preference=visual_preference,
+        locked_oracle=locked_oracle,
+    ):
+        return None
+
+    requirements = [
+        _compact_oracle_requirement(record)
+        for record in _list(locked_oracle.get("oracle_requirement_map"))
+        if isinstance(record, Mapping)
+    ]
+    non_negotiable_requirements = [
+        record for record in requirements if record.get("non_negotiable") is True
+    ]
+    if non_negotiable_requirements:
+        planner_requirements = non_negotiable_requirements
+    else:
+        planner_requirements = requirements
+    source_constraints = _ordered_unique(
+        constraint
+        for record in planner_requirements
+        for constraint in _string_list(record.get("source_quality_constraints"))
+    )
+    output_shape_constraints = _ordered_unique(
+        constraint
+        for record in planner_requirements
+        for constraint in _string_list(record.get("output_shape_constraints"))
+    )
+    expected_modalities = _ordered_unique(
+        _string_list(locked_oracle.get("expected_modalities"))
+        + [
+            modality
+            for record in planner_requirements
+            for modality in _string_list(record.get("expected_modalities"))
+        ]
+    )
+    normalized_visual_preference = _normalized_visual_preference(visual_preference)
+    max_sources = _semantic_task_source_cap_int(budget_cap.get("max_sources"))
+    max_images = _semantic_task_source_cap_int(budget_cap.get("max_images"))
+    max_results = _semantic_task_source_cap_int(budget_cap.get("max_results"))
+    final_report_shape = _ordered_unique(
+        _string_list(locked_oracle.get("expected_report_shape"))
+        + output_shape_constraints
+    )
+    return {
+        "compact_mode": True,
+        "compact_mode_schema_version": "codex-deepresearch.semantic-planner.compact-oracle.v1",
+        "compact_mode_reason": (
+            "broad_visual_optional_structured_artifact_prompt"
+        ),
+        "question_scope": locked_oracle.get("question_scope"),
+        "bounded_task_range": copy.deepcopy(locked_oracle.get("bounded_task_range")),
+        "oracle_requirement_map": planner_requirements,
+        "non_negotiable_requirements": [
+            {
+                "requirement_id": record.get("requirement_id"),
+                "requirement_text": record.get("requirement_text"),
+                "prompt_text": record.get("prompt_text"),
+                "requirement_type": record.get("requirement_type"),
+            }
+            for record in planner_requirements
+            if record.get("non_negotiable") is True
+        ],
+        "expected_entities": _compact_string_records(
+            locked_oracle.get("expected_entities")
+        ),
+        "expected_constraints": _compact_string_records(
+            locked_oracle.get("expected_constraints")
+        ),
+        "expected_modalities": expected_modalities,
+        "required_angles": [
+            {
+                "angle_requirement": record.get("angle_requirement"),
+                "subject": record.get("subject"),
+            }
+            for record in _list(locked_oracle.get("required_angles"))
+            if isinstance(record, Mapping)
+        ],
+        "forbidden_angles": _string_list(locked_oracle.get("forbidden_angles")),
+        "expected_report_shape": final_report_shape,
+        "route_constraints": {
+            "visual_preference": normalized_visual_preference,
+            "visual_route": (
+                "visual_optional_support_only"
+                if normalized_visual_preference == "visual_optional"
+                else normalized_visual_preference
+            ),
+            "must_not_upgrade_optional_visual_to_required": (
+                normalized_visual_preference == "visual_optional"
+            ),
+            "provided_images_required": False,
+        },
+        "source_obligations": {
+            "max_unique_sources": max_sources,
+            "max_results_per_task": max_results,
+            "required_source_quality": source_constraints,
+            "must_attach_sources_to_claims": True,
+            "must_separate_runner_budget_from_task_cap": True,
+        },
+        "visual_obligations": {
+            "visual_preference": normalized_visual_preference,
+            "max_images": max_images,
+            "visual_evidence_is_optional_support": (
+                normalized_visual_preference == "visual_optional"
+            ),
+            "do_not_displace_text_document_table_primary_evidence": True,
+        },
+        "final_deliverable_obligations": {
+            "expected_report_shape": final_report_shape,
+            "must_bind_final_task_to_contract": True,
+            "must_include_coverage_matrix": True,
+            "must_include_caveats_and_unknowns": True,
+        },
+        "oracle_content_hash": locked_oracle.get("oracle_content_hash"),
+    }
+
+
+def _semantic_planner_compact_oracle_mode_enabled(
+    *,
+    original_question: str,
+    visual_preference: str | None,
+    locked_oracle: Mapping[str, Any],
+) -> bool:
+    if _normalized_visual_preference(visual_preference) != "visual_optional":
+        return False
+    if str(locked_oracle.get("question_scope") or "") != "broad":
+        return False
+    searchable = json.dumps(
+        [
+            original_question,
+            locked_oracle.get("expected_entities"),
+            locked_oracle.get("expected_modalities"),
+            locked_oracle.get("required_angles"),
+            locked_oracle.get("expected_report_shape"),
+            [
+                {
+                    "requirement_text": record.get("requirement_text"),
+                    "prompt_text": record.get("prompt_text"),
+                    "requirement_type": record.get("requirement_type"),
+                    "expected_modalities": record.get("expected_modalities"),
+                    "output_shape_constraints": record.get("output_shape_constraints"),
+                }
+                for record in _list(locked_oracle.get("oracle_requirement_map"))
+                if isinstance(record, Mapping)
+            ],
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+    structured_tokens = (
+        "structured artifact",
+        "structured-artifact",
+        "model output",
+        "model-output",
+        "architectural model",
+        "architecture model",
+        "design criteria",
+        "public design",
+        "tender",
+        "bid document",
+        "procurement document",
+        "rfp",
+        "deliverable",
+        "requirements matrix",
+        "comparison matrix",
+        "comparison table",
+        "artifact",
+        "\uac74\ucd95",
+        "\ubaa8\ub378",
+        "\uc0b0\ucd9c\ubb3c",
+        "\uacf5\uacf5 \uc124\uacc4",
+        "\uc124\uacc4 \uae30\uc900",
+        "\uc785\ucc30",
+        "\ubb38\uc11c",
+        "\uacfc\uc5c5\uc9c0\uc2dc\uc11c",
+        "\uc81c\uc548\uc694\uccad\uc11c",
+        "\uc131\uacfc\ud488",
+        "\ub0a9\ud488",
+        "\ube44\uad50\ud45c",
+    )
+    if not _contains_any(searchable, structured_tokens):
+        return False
+    modalities = {
+        _normalize_text(item).replace(" ", "_")
+        for item in _string_list(locked_oracle.get("expected_modalities"))
+    }
+    if modalities & {"document", "table", "structured_artifact", "structured_model"}:
+        return True
+    return _contains_any(
+        searchable,
+        (
+            "document",
+            "table",
+            "matrix",
+            "requirements",
+            "\ubb38\uc11c",
+            "\ud45c",
+            "\uc694\uad6c\uc0ac\ud56d",
+        ),
+    )
+
+
+def _compact_oracle_requirement(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "requirement_id": record.get("requirement_id"),
+        "requirement_type": record.get("requirement_type"),
+        "prompt_text": record.get("prompt_text"),
+        "requirement_text": record.get("requirement_text"),
+        "expected_entities": _compact_string_records(record.get("expected_entities")),
+        "expected_modalities": _string_list(record.get("expected_modalities")),
+        "source_quality_constraints": _string_list(
+            record.get("source_quality_constraints")
+        ),
+        "geography_constraints": _string_list(record.get("geography_constraints")),
+        "time_constraints": _string_list(record.get("time_constraints")),
+        "output_shape_constraints": _string_list(
+            record.get("output_shape_constraints")
+        ),
+        "expected_coverage": record.get("expected_coverage"),
+        "explicit": bool(record.get("explicit")),
+        "inferred": bool(record.get("inferred")),
+        "non_negotiable": bool(record.get("non_negotiable")),
+    }
+
+
+def _compact_string_records(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            output.append(item)
+        elif isinstance(item, Mapping):
+            for key in ("name", "text", "requirement_text", "prompt_text", "subject"):
+                candidate = item.get(key)
+                if isinstance(candidate, str) and candidate:
+                    output.append(candidate)
+                    break
+            else:
+                compact = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                if compact:
+                    output.append(compact)
+    return _ordered_unique(output)
+
+
 def _fixture_semantic_candidate_response_for_validation_tests(
     request: Mapping[str, Any],
 ) -> dict[str, Any]:

@@ -956,3 +956,45 @@ Next diagnostic or fix direction:
 - Add a compact planner request mode for broad visual-optional structured-artifact prompts that preserves the same validator thresholds and locked oracle but removes redundant prompt/schema burden.
 - Add a focused test proving the compact request preserves route, source, visual, typed-contract, and final-deliverable obligations.
 - Re-run isolated `sem-reg-004` before resuming the 30-prompt suite.
+
+## 2026-07-24 - Issue #133 / Compact Planner Request Mode For sem-reg-004 Timeout
+
+Prompt or issue:
+
+- Issue #133 semantic regression signoff.
+- The immediate observed blocker is the isolated `sem-reg-004` planner adapter timeout recorded above.
+
+Command or suite:
+
+- Code hardening before re-running isolated `sem-reg-004`.
+
+Run directory:
+
+- Prior failing run: `/tmp/codex-dr-sem-reg-004-isolated-20260724T045821Z/dr_20260724T045821`
+
+Status:
+
+- Fix direction implemented locally; live isolated `sem-reg-004` still needs coordinator validation after tests.
+
+Reviewer/validator failure codes:
+
+- Prior run: `release_ineligible_planner_mode`, `semantic_release_ineligible`.
+
+Directly observed cause:
+
+- The prior planner adapter returned no candidate response and timed out while processing a broad, visual-optional, structured-artifact planner request.
+
+Inferences:
+
+- Reducing planner-facing oracle verbosity for broad visual-optional structured-artifact prompts is safer than adding a blind timeout retry, because it avoids making the user wait through another full timeout window.
+- The full locked oracle artifact can remain persisted for validator and audit use while the planner receives a compact semantic contract view.
+
+Unknowns:
+
+- Whether the compact request completes live isolated `sem-reg-004` within the same timeout.
+- Whether the compact request changes later reviewer behavior for other broad visual-optional structured-artifact prompts.
+
+Next diagnostic or fix direction:
+
+- Run focused compact-request tests and the full semantic planner unit test module.
+- Re-run isolated `sem-reg-004` from the coordinator before resuming 30 semantic regression validation.

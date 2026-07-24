@@ -7930,6 +7930,109 @@ class SemanticPlannerTests(unittest.TestCase):
                         )
                     )
 
+    def test_broad_visual_optional_structured_artifact_uses_compact_oracle_request(self) -> None:
+        question = (
+            "Compare architectural model output deliverables against public design "
+            "criteria and tender documents in a structured comparison table."
+        )
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            oracle_question_scope="broad",
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+            visual_angle_indexes=(2,),
+        )
+
+        self.assertTrue(adapter_request["_planner_requests"], result)
+        request = adapter_request["_planner_requests"][0]
+        self.assertEqual(
+            request["semantic_planner_request_mode"],
+            "compact_locked_oracle",
+        )
+        compact_oracle = request["locked_semantic_expectation_oracle"]
+        self.assertTrue(compact_oracle["compact_mode"], compact_oracle)
+        self.assertEqual(compact_oracle["question_scope"], "broad")
+        self.assertGreaterEqual(compact_oracle["bounded_task_range"]["min"], 20)
+        self.assertIn("oracle_content_hash", compact_oracle)
+        self.assertIn("semantic_expectation_oracle_hash", request)
+        self.assertEqual(
+            request["locked_semantic_expectation_oracle_full_reference"]["path"],
+            "semantic_expectation_oracle.json",
+        )
+        self.assertTrue(
+            request["locked_semantic_expectation_oracle_full_reference"][
+                "release_validator_oracle_artifact_preserved"
+            ]
+        )
+        self.assertLess(
+            request["semantic_planner_request_compaction"][
+                "compact_locked_oracle_bytes"
+            ],
+            request["semantic_planner_request_compaction"][
+                "full_locked_oracle_bytes"
+            ],
+        )
+        requirement = compact_oracle["oracle_requirement_map"][0]
+        self.assertIn("requirement_id", requirement)
+        self.assertIn("requirement_text", requirement)
+        self.assertIn("prompt_text", requirement)
+        self.assertTrue(requirement["non_negotiable"])
+        self.assertNotIn("prompt_span", requirement)
+        self.assertNotIn("inferred_reason", requirement)
+        self.assertTrue(compact_oracle["required_angles"], compact_oracle)
+        self.assertTrue(compact_oracle["forbidden_angles"], compact_oracle)
+        self.assertTrue(compact_oracle["expected_report_shape"], compact_oracle)
+        self.assertEqual(
+            compact_oracle["route_constraints"]["visual_preference"],
+            "visual_optional",
+        )
+        self.assertTrue(
+            compact_oracle["route_constraints"][
+                "must_not_upgrade_optional_visual_to_required"
+            ]
+        )
+        self.assertEqual(
+            compact_oracle["source_obligations"]["max_unique_sources"],
+            request["budget_cap"]["max_sources"],
+        )
+        self.assertEqual(
+            compact_oracle["visual_obligations"]["max_images"],
+            request["budget_cap"]["max_images"],
+        )
+        self.assertTrue(
+            compact_oracle["final_deliverable_obligations"][
+                "must_bind_final_task_to_contract"
+            ]
+        )
+
+    def test_visual_optional_non_structured_prompt_keeps_full_oracle_request(self) -> None:
+        question = (
+            "Compare public campaign poster images and textual guidance for "
+            "homeowner risk communication."
+        )
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            oracle_question_scope="broad",
+            requirement_types=("subject", "visual_modality", "source_quality"),
+            visual_angle_indexes=(2,),
+        )
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        request = adapter_request["_planner_requests"][0]
+        self.assertEqual(
+            request["semantic_planner_request_mode"],
+            "full_locked_oracle",
+        )
+        self.assertNotIn("semantic_planner_request_compaction", request)
+        self.assertNotIn("locked_semantic_expectation_oracle_full_reference", request)
+        full_oracle = request["locked_semantic_expectation_oracle"]
+        requirement = full_oracle["oracle_requirement_map"][0]
+        self.assertIn("prompt_span", requirement)
+        self.assertIn("inferred_reason", requirement)
+
     def test_broad_cardinality_shortfall_requests_replan_without_generic_padding(self) -> None:
         question = "Compare official city planning implementation indicators across local plans"
         request = {

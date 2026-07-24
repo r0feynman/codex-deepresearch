@@ -47,6 +47,7 @@ from .semantic_planner import (
     build_codex_semantic_raw_request,
     codex_semantic_candidate_validation_retry_raw_request,
     codex_semantic_review_retry_raw_request,
+    compact_semantic_planner_locked_oracle_for_request,
     semantic_convergence_artifact,
     semantic_convergence_attempt_record,
     plan_semantic_angles,
@@ -1528,9 +1529,7 @@ def _attach_locked_oracle_context_to_planner_request(
 ) -> None:
     oracle_path = run_dir / SEMANTIC_EXPECTATION_ORACLE_FILENAME
     oracle_hash = _sha256_file(oracle_path) if oracle_path.exists() else None
-    request["semantic_expectation_oracle_path"] = SEMANTIC_EXPECTATION_ORACLE_FILENAME
-    request["semantic_expectation_oracle_hash"] = oracle_hash
-    request["locked_semantic_expectation_oracle"] = {
+    full_locked_oracle = {
         "question_scope": locked_oracle.get("question_scope"),
         "bounded_task_range": locked_oracle.get("bounded_task_range"),
         "oracle_requirement_map": [
@@ -1546,6 +1545,62 @@ def _attach_locked_oracle_context_to_planner_request(
         "expected_report_shape": list(locked_oracle.get("expected_report_shape", [])),
         "oracle_content_hash": locked_oracle.get("oracle_content_hash"),
     }
+    compact_locked_oracle = compact_semantic_planner_locked_oracle_for_request(
+        original_question=str(request.get("original_question") or ""),
+        visual_preference=str(request.get("visual_preference") or ""),
+        budget_cap=(
+            request.get("budget_cap")
+            if isinstance(request.get("budget_cap"), Mapping)
+            else {}
+        ),
+        locked_oracle=full_locked_oracle,
+    )
+    request["semantic_expectation_oracle_path"] = SEMANTIC_EXPECTATION_ORACLE_FILENAME
+    request["semantic_expectation_oracle_hash"] = oracle_hash
+    if compact_locked_oracle is not None:
+        request["locked_semantic_expectation_oracle"] = compact_locked_oracle
+        request["semantic_planner_request_mode"] = "compact_locked_oracle"
+        request["locked_semantic_expectation_oracle_full_reference"] = {
+            "path": SEMANTIC_EXPECTATION_ORACLE_FILENAME,
+            "artifact_hash": oracle_hash,
+            "oracle_content_hash": locked_oracle.get("oracle_content_hash"),
+            "planner_visible_payload": "locked_semantic_expectation_oracle",
+            "release_validator_oracle_artifact_preserved": True,
+        }
+        request["semantic_planner_request_compaction"] = {
+            "enabled": True,
+            "reason": compact_locked_oracle.get("compact_mode_reason"),
+            "full_oracle_path": SEMANTIC_EXPECTATION_ORACLE_FILENAME,
+            "full_oracle_artifact_hash": oracle_hash,
+            "full_oracle_content_hash": locked_oracle.get("oracle_content_hash"),
+            "full_locked_oracle_bytes": len(
+                json.dumps(full_locked_oracle, ensure_ascii=False, sort_keys=True)
+            ),
+            "compact_locked_oracle_bytes": len(
+                json.dumps(compact_locked_oracle, ensure_ascii=False, sort_keys=True)
+            ),
+            "preserved_fields": [
+                "original_question",
+                "visual_preference",
+                "budget_cap",
+                "question_scope",
+                "bounded_task_range",
+                "oracle_requirement_map.requirement_id",
+                "oracle_requirement_map.requirement_text",
+                "expected_entities",
+                "expected_modalities",
+                "required_angles",
+                "forbidden_angles",
+                "expected_report_shape",
+                "route_constraints",
+                "source_obligations",
+                "visual_obligations",
+                "final_deliverable_obligations",
+            ],
+        }
+    else:
+        request["locked_semantic_expectation_oracle"] = full_locked_oracle
+        request["semantic_planner_request_mode"] = "full_locked_oracle"
     instructions = request.setdefault("planner_instructions", [])
     if isinstance(instructions, list):
         instructions.append(
@@ -1553,6 +1608,13 @@ def _attach_locked_oracle_context_to_planner_request(
             "all planning and retries. Do not add topics, workstreams, or task "
             "suffixes outside that oracle merely to satisfy task-count thresholds."
         )
+        if compact_locked_oracle is not None:
+            instructions.append(
+                "The planner request uses a compact locked oracle view. Treat it as "
+                "the complete planner-facing semantic contract, and use "
+                "locked_semantic_expectation_oracle_full_reference only for audit "
+                "identity, not for adding extra scope."
+            )
     _lock_semantic_planner_retry_identity(request)
     _apply_semantic_planner_retry_strategy(
         request,
