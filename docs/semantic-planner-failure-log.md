@@ -1050,3 +1050,53 @@ Next diagnostic or fix direction:
 
 - Narrow the medium compact activation test to assert the captured planner request mode and audit-reference metadata instead of requiring the entire fake medium plan to pass downstream search-handoff validation.
 - Keep the test focused on request activation and avoid changing semantic validator/reviewer thresholds.
+
+## 2026-07-24 - Issue #133 / Compact Request Still Too Large In Live sem-reg-004
+
+Prompt or issue:
+
+- Issue #133 semantic release signoff.
+- Prompt id: `sem-reg-004`
+- Prompt: `건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘.`
+
+Command or suite:
+
+- Isolated coordinator run after enabling compact mode for medium structured planners.
+
+Run directory:
+
+- `/tmp/codex-dr-sem-reg-004-compact2-isolated-20260724T054107Z/dr_20260724T054107`
+
+Status:
+
+- Coordinator stopped the run before the 900-second timeout after the planner remained without a response for more than 4 minutes.
+- This was stopped intentionally because the desired fix is not to make users wait through repeated long timeout windows.
+
+Reviewer/validator failure codes:
+
+- Not available. The planner produced no response artifact before the coordinator stopped the run.
+
+Directly observed cause:
+
+- The run did use `semantic_planner_request_mode=compact_locked_oracle`.
+- The planner request was still 32,095 bytes.
+- `locked_semantic_expectation_oracle` was the largest field at 13,555 bytes.
+- The compact metadata reported `compact_locked_oracle_bytes=8,365` and `full_locked_oracle_bytes=5,903`, so the planner-facing compact view was not actually smaller in that live run.
+- The largest duplicated sections inside the compact oracle were `oracle_requirement_map`, `non_negotiable_requirements`, `expected_report_shape`, and `final_deliverable_obligations.expected_report_shape`.
+
+Inferences:
+
+- The first compact-mode implementation reduced some audit noise but still duplicated long semantic contract text, so it did not materially reduce planner load for this class of prompt.
+- Removing duplicated planner-facing text while preserving full oracle artifacts and top-level obligations is a better next step than timeout retry.
+
+Unknowns:
+
+- Whether a genuinely smaller compact oracle is sufficient for this prompt to complete live.
+- Whether additional schema or instruction length reduction is needed after oracle payload reduction.
+
+Next diagnostic or fix direction:
+
+- Replace duplicated non-negotiable requirement bodies with requirement references.
+- Keep report-shape obligations by reference to the top-level `expected_report_shape` instead of duplicating the full list.
+- Keep source, visual, route, bounded-task, report, and oracle-hash contracts present without lowering validator or reviewer thresholds.
+- Re-run isolated `sem-reg-004` after the compact payload is measurably smaller.

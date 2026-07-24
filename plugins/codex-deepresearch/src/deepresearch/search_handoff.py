@@ -1586,7 +1586,9 @@ def _attach_locked_oracle_context_to_planner_request(
                 "question_scope",
                 "bounded_task_range",
                 "oracle_requirement_map.requirement_id",
+                "oracle_requirement_map.requirement_type",
                 "oracle_requirement_map.requirement_text",
+                "non_negotiable_requirement_refs",
                 "expected_entities",
                 "expected_modalities",
                 "required_angles",
@@ -1596,6 +1598,7 @@ def _attach_locked_oracle_context_to_planner_request(
                 "source_obligations",
                 "visual_obligations",
                 "final_deliverable_obligations",
+                "oracle_content_hash",
             ],
         }
     else:

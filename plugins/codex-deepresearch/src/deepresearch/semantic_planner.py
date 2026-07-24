@@ -15581,10 +15581,13 @@ def compact_semantic_planner_locked_oracle_for_request(
     ):
         return None
 
-    requirements = [
-        _compact_oracle_requirement(record)
+    raw_requirement_records = [
+        record
         for record in _list(locked_oracle.get("oracle_requirement_map"))
         if isinstance(record, Mapping)
+    ]
+    requirements = [
+        _compact_oracle_requirement(record) for record in raw_requirement_records
     ]
     non_negotiable_requirements = [
         record for record in requirements if record.get("non_negotiable") is True
@@ -15593,21 +15596,29 @@ def compact_semantic_planner_locked_oracle_for_request(
         planner_requirements = non_negotiable_requirements
     else:
         planner_requirements = requirements
+    non_negotiable_requirement_refs = [
+        {
+            "requirement_id": record.get("requirement_id"),
+            "requirement_type": record.get("requirement_type"),
+        }
+        for record in planner_requirements
+        if record.get("non_negotiable") is True
+    ]
     source_constraints = _ordered_unique(
         constraint
-        for record in planner_requirements
+        for record in raw_requirement_records
         for constraint in _string_list(record.get("source_quality_constraints"))
     )
     output_shape_constraints = _ordered_unique(
         constraint
-        for record in planner_requirements
+        for record in raw_requirement_records
         for constraint in _string_list(record.get("output_shape_constraints"))
     )
     expected_modalities = _ordered_unique(
         _string_list(locked_oracle.get("expected_modalities"))
         + [
             modality
-            for record in planner_requirements
+            for record in raw_requirement_records
             for modality in _string_list(record.get("expected_modalities"))
         ]
     )
@@ -15628,20 +15639,11 @@ def compact_semantic_planner_locked_oracle_for_request(
         "question_scope": locked_oracle.get("question_scope"),
         "bounded_task_range": copy.deepcopy(locked_oracle.get("bounded_task_range")),
         "oracle_requirement_map": planner_requirements,
-        "non_negotiable_requirements": [
-            {
-                "requirement_id": record.get("requirement_id"),
-                "requirement_text": record.get("requirement_text"),
-                "prompt_text": record.get("prompt_text"),
-                "requirement_type": record.get("requirement_type"),
-            }
-            for record in planner_requirements
-            if record.get("non_negotiable") is True
-        ],
+        "non_negotiable_requirement_refs": non_negotiable_requirement_refs,
         "expected_entities": _compact_string_records(
             locked_oracle.get("expected_entities")
         ),
-        "expected_constraints": _compact_string_records(
+        "expected_constraints": _compact_constraint_records(
             locked_oracle.get("expected_constraints")
         ),
         "expected_modalities": expected_modalities,
@@ -15683,7 +15685,9 @@ def compact_semantic_planner_locked_oracle_for_request(
             "do_not_displace_text_document_table_primary_evidence": True,
         },
         "final_deliverable_obligations": {
-            "expected_report_shape": final_report_shape,
+            "expected_report_shape_ref": (
+                "locked_semantic_expectation_oracle.expected_report_shape"
+            ),
             "must_bind_final_task_to_contract": True,
             "must_include_coverage_matrix": True,
             "must_include_caveats_and_unknowns": True,
@@ -15778,26 +15782,45 @@ def _semantic_planner_compact_oracle_mode_enabled(
 
 
 def _compact_oracle_requirement(record: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    requirement = {
         "requirement_id": record.get("requirement_id"),
         "requirement_type": record.get("requirement_type"),
-        "prompt_text": record.get("prompt_text"),
         "requirement_text": record.get("requirement_text"),
-        "expected_entities": _compact_string_records(record.get("expected_entities")),
-        "expected_modalities": _string_list(record.get("expected_modalities")),
-        "source_quality_constraints": _string_list(
-            record.get("source_quality_constraints")
-        ),
-        "geography_constraints": _string_list(record.get("geography_constraints")),
-        "time_constraints": _string_list(record.get("time_constraints")),
-        "output_shape_constraints": _string_list(
-            record.get("output_shape_constraints")
-        ),
-        "expected_coverage": record.get("expected_coverage"),
         "explicit": bool(record.get("explicit")),
         "inferred": bool(record.get("inferred")),
         "non_negotiable": bool(record.get("non_negotiable")),
     }
+    return requirement
+
+
+def _compact_constraint_records(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            output.append(item)
+        elif isinstance(item, Mapping):
+            requirement_id = item.get("requirement_id")
+            requirement_type = item.get("requirement_type")
+            if isinstance(requirement_id, str) and requirement_id:
+                if isinstance(requirement_type, str) and requirement_type:
+                    output.append(f"{requirement_id}:{requirement_type}")
+                else:
+                    output.append(requirement_id)
+            else:
+                for key in (
+                    "name",
+                    "text",
+                    "requirement_text",
+                    "prompt_text",
+                    "subject",
+                ):
+                    candidate = item.get(key)
+                    if isinstance(candidate, str) and candidate:
+                        output.append(candidate)
+                        break
+    return _ordered_unique(output)
 
 
 def _compact_string_records(value: Any) -> list[str]:

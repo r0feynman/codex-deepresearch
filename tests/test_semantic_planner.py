@@ -7966,6 +7966,33 @@ class SemanticPlannerTests(unittest.TestCase):
                 "release_validator_oracle_artifact_preserved"
             ]
         )
+        self.assertLess(
+            request["semantic_planner_request_compaction"][
+                "compact_locked_oracle_bytes"
+            ],
+            request["semantic_planner_request_compaction"][
+                "full_locked_oracle_bytes"
+            ],
+        )
+        self.assertIn("oracle_content_hash", compact_oracle)
+        self.assertIn("oracle_requirement_map", compact_oracle)
+        self.assertNotIn("non_negotiable_requirements", compact_oracle)
+        self.assertTrue(compact_oracle["non_negotiable_requirement_refs"])
+        requirement = compact_oracle["oracle_requirement_map"][0]
+        self.assertIn("requirement_id", requirement)
+        self.assertIn("requirement_type", requirement)
+        self.assertIn("requirement_text", requirement)
+        self.assertIn("route_constraints", compact_oracle)
+        self.assertIn("source_obligations", compact_oracle)
+        self.assertIn("visual_obligations", compact_oracle)
+        self.assertIn("final_deliverable_obligations", compact_oracle)
+        self.assertTrue(compact_oracle["expected_report_shape"], compact_oracle)
+        self.assertEqual(
+            compact_oracle["final_deliverable_obligations"][
+                "expected_report_shape_ref"
+            ],
+            "locked_semantic_expectation_oracle.expected_report_shape",
+        )
 
     def test_broad_visual_optional_structured_artifact_uses_compact_oracle_request(self) -> None:
         question = (
@@ -8013,10 +8040,14 @@ class SemanticPlannerTests(unittest.TestCase):
         requirement = compact_oracle["oracle_requirement_map"][0]
         self.assertIn("requirement_id", requirement)
         self.assertIn("requirement_text", requirement)
-        self.assertIn("prompt_text", requirement)
         self.assertTrue(requirement["non_negotiable"])
         self.assertNotIn("prompt_span", requirement)
         self.assertNotIn("inferred_reason", requirement)
+        self.assertNotIn("non_negotiable_requirements", compact_oracle)
+        self.assertEqual(
+            compact_oracle["non_negotiable_requirement_refs"][0]["requirement_id"],
+            requirement["requirement_id"],
+        )
         self.assertTrue(compact_oracle["required_angles"], compact_oracle)
         self.assertTrue(compact_oracle["forbidden_angles"], compact_oracle)
         self.assertTrue(compact_oracle["expected_report_shape"], compact_oracle)
@@ -8041,6 +8072,12 @@ class SemanticPlannerTests(unittest.TestCase):
             compact_oracle["final_deliverable_obligations"][
                 "must_bind_final_task_to_contract"
             ]
+        )
+        self.assertEqual(
+            compact_oracle["final_deliverable_obligations"][
+                "expected_report_shape_ref"
+            ],
+            "locked_semantic_expectation_oracle.expected_report_shape",
         )
 
     def test_visual_optional_non_structured_prompt_keeps_full_oracle_request(self) -> None:
