@@ -4174,6 +4174,12 @@ def _materialize_candidate_source_cap_constraints(
             merged_runner_budget.update(runner_source_budget)
             runner_source_budget = merged_runner_budget
         normalized["runner_source_budget"] = runner_source_budget
+        normalized, source_budget_contract_materialization = (
+            _materialize_candidate_source_budget_contract_from_runner(
+                normalized,
+                tasks=tasks,
+            )
+        )
         replacement = (
             "Executable source caps are task-specific: bounded_tasks.max_sources "
             "is authoritative after source-cap consistency repair. The declared "
@@ -4213,6 +4219,10 @@ def _materialize_candidate_source_cap_constraints(
                 "runner_source_budget": copy.deepcopy(runner_source_budget),
             }
         )
+        if source_budget_contract_materialization is not None:
+            materialization["source_budget_contract"] = (
+                source_budget_contract_materialization
+            )
     return normalized, [materialization]
 
 
@@ -5266,6 +5276,12 @@ def _materialize_candidate_runner_source_budget_cap(
         merged_runner_budget.update(runner_source_budget)
         runner_source_budget = merged_runner_budget
     normalized["runner_source_budget"] = runner_source_budget
+    normalized, source_budget_contract_materialization = (
+        _materialize_candidate_source_budget_contract_from_runner(
+            normalized,
+            tasks=[task for task in raw_tasks if isinstance(task, Mapping)],
+        )
+    )
 
     constraints = normalized.get("constraints")
     appended_constraint = None
@@ -5321,6 +5337,10 @@ def _materialize_candidate_runner_source_budget_cap(
         "runner_source_budget": copy.deepcopy(runner_source_budget),
         "budget_interpretation": copy.deepcopy(budget_interpretation),
     }
+    if source_budget_contract_materialization is not None:
+        materialization["source_budget_contract"] = (
+            source_budget_contract_materialization
+        )
     if appended_constraint is not None:
         materialization["replacement_constraint"] = appended_constraint
     if removed_runner_budget_constraints:
@@ -5328,6 +5348,37 @@ def _materialize_candidate_runner_source_budget_cap(
             removed_runner_budget_constraints
         )
     return normalized, materialization
+
+
+def _materialize_candidate_source_budget_contract_from_runner(
+    candidate: Mapping[str, Any],
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+    raw_request: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    normalized = copy.deepcopy(dict(candidate))
+    runner_source_budget = normalized.get("runner_source_budget")
+    if not isinstance(runner_source_budget, Mapping) or not runner_source_budget:
+        return normalized, None
+    previous = normalized.get("source_budget_contract")
+    contract = _candidate_source_budget_contract(
+        previous,
+        runner_source_budget=runner_source_budget,
+        tasks=tasks,
+        raw_request=raw_request,
+    )
+    if not contract:
+        return normalized, None
+    normalized["source_budget_contract"] = contract
+    if previous == contract:
+        return normalized, None
+    return normalized, {
+        "field": "source_budget_contract",
+        "materialization": "typed_source_budget_contract",
+        "runner_max_unique_sources": contract.get("runner_max_unique_sources"),
+        "max_task_sources": contract.get("max_task_sources"),
+        "task_max_sources_sum": contract.get("task_max_sources_sum"),
+    }
 
 
 def _candidate_constraints_preserve_runner_source_budget(
@@ -13574,9 +13625,9 @@ def _candidate_typed_contract_validation_failures(
         if isinstance(item, Mapping)
     ]
     partition_contract = plan.get("task_partition_contract")
-    strict_contract = (
-        isinstance(partition_contract, Mapping)
-        and str(partition_contract.get("enforcement") or "") == "strict"
+    typed_contract_expected = _candidate_plan_requires_typed_contract(
+        plan=plan,
+        tasks=tasks,
     )
     selected_entity_ids = {
         str(entity.get("entity_id") or "")
@@ -13593,14 +13644,49 @@ def _candidate_typed_contract_validation_failures(
         for task in tasks
         if str(task.get("task_id") or "").strip()
     }
-    if selected_entities or required_dimensions or coverage_matrix:
+    if typed_contract_expected or selected_entities or required_dimensions or coverage_matrix:
         if not selected_entities:
             failures.append({"code": "typed_selected_entities_missing"})
         if not required_dimensions:
             failures.append({"code": "typed_required_dimensions_missing"})
-        if selected_entities and required_dimensions and not coverage_matrix:
+        if not coverage_matrix:
             failures.append({"code": "typed_coverage_matrix_missing"})
+        if not isinstance(partition_contract, Mapping) or not partition_contract:
+            failures.append({"code": "typed_task_partition_contract_invalid"})
     if coverage_matrix:
+        expected_pairs = {
+            (entity_id, dimension_id)
+            for entity_id in selected_entity_ids
+            for dimension_id in required_dimension_ids
+        }
+        actual_pairs = {
+            (
+                str(cell.get("entity_id") or ""),
+                str(cell.get("dimension_id") or ""),
+            )
+            for cell in coverage_matrix
+            if str(cell.get("entity_id") or "")
+            and str(cell.get("dimension_id") or "")
+        }
+        missing_pairs = sorted(expected_pairs - actual_pairs)
+        if missing_pairs:
+            failures.append(
+                {
+                    "code": "typed_coverage_matrix_missing_cells",
+                    "expected_cell_count": len(expected_pairs),
+                    "actual_cell_count": len(actual_pairs),
+                    "missing_cell_count": len(missing_pairs),
+                    "missing_pairs": [
+                        {"entity_id": entity_id, "dimension_id": dimension_id}
+                        for entity_id, dimension_id in missing_pairs[:20]
+                    ],
+                    "message": (
+                        "Coverage matrix must include every selected entity by "
+                        "required dimension pair."
+                    ),
+                    "retryable": True,
+                }
+            )
         unknown_cells = []
         missing_task_link_cells = []
         missing_cells = [
@@ -13671,7 +13757,7 @@ def _candidate_typed_contract_validation_failures(
                     "retryable": True,
                 }
             )
-    if strict_contract:
+    if isinstance(partition_contract, Mapping) and partition_contract:
         max_entities = _semantic_task_source_cap_int(
             partition_contract.get("max_entities_per_task")
         )
@@ -13739,6 +13825,16 @@ def _candidate_typed_contract_validation_failures(
                 )
     source_budget_contract = plan.get("source_budget_contract")
     runner_source_budget = plan.get("runner_source_budget")
+    if (
+        isinstance(runner_source_budget, Mapping)
+        and runner_source_budget
+        and (
+            typed_contract_expected
+            or "source_budget_contract" in plan
+        )
+        and (not isinstance(source_budget_contract, Mapping) or not source_budget_contract)
+    ):
+        failures.append({"code": "typed_source_budget_contract_missing"})
     if isinstance(source_budget_contract, Mapping) and source_budget_contract:
         contract_runner_cap = _semantic_task_source_cap_int(
             source_budget_contract.get("runner_max_unique_sources")
@@ -13753,8 +13849,8 @@ def _candidate_typed_contract_validation_failures(
                 }
             )
     final_deliverable_contract = plan.get("final_deliverable_contract")
-    if selected_entities and required_dimensions:
-        if not isinstance(final_deliverable_contract, Mapping):
+    if typed_contract_expected or (selected_entities and required_dimensions):
+        if not isinstance(final_deliverable_contract, Mapping) or not final_deliverable_contract:
             failures.append({"code": "typed_final_deliverable_contract_missing"})
         elif not _string_list(final_deliverable_contract.get("required_sections")):
             failures.append(
@@ -13763,7 +13859,36 @@ def _candidate_typed_contract_validation_failures(
                     "field": "required_sections",
                 }
             )
+        elif not any(
+            isinstance(task, Mapping) and isinstance(task.get("final_deliverable_binding"), Mapping)
+            for task in tasks
+        ):
+            failures.append({"code": "typed_final_deliverable_contract_unbound"})
     return failures
+
+
+def _candidate_plan_requires_typed_contract(
+    *,
+    plan: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    values = [
+        plan.get("original_question"),
+        plan.get("intent_summary"),
+        plan.get("domain_entities"),
+        plan.get("constraints"),
+        plan.get("requirement_coverage_map"),
+        plan.get("angles"),
+        tasks,
+    ]
+    text = json.dumps(values, ensure_ascii=False, sort_keys=True).lower()
+    inferred_entities = _candidate_infer_selected_entities(plan, text=text)
+    inferred_dimensions = _candidate_infer_required_dimensions(plan, text=text)
+    return _candidate_requires_typed_comparison_contract(
+        text=text,
+        entities=inferred_entities,
+        dimensions=inferred_dimensions,
+    )
 
 
 def _candidate_task_is_final_deliverable(task: Mapping[str, Any]) -> bool:

@@ -591,3 +591,41 @@ Next diagnostic or fix direction:
 
 - Do not infer selected entities or dimensions when the adapter already emitted those fields, even if they are empty.
 - In materialization diff, allow absent task-level typed binding fields when the expected value is empty.
+
+## 2026-07-24 - PR #148 / Source Budget Contract Over-Blocking
+
+Prompt or issue:
+
+- Issue #133 / PR #148 typed semantic decomposition contract hardening after adversarial review.
+
+Command or suite:
+
+```bash
+python3 -m unittest tests.test_semantic_planner tests.test_search_handoff
+```
+
+Directly observed failure:
+
+- The related suite failed with 37 failures and 18 errors.
+- Multiple failures returned `blocked_semantic_planner_unavailable` before reviewer artifacts or `search_tasks.json` were produced.
+- Several direct validation failures included only `typed_source_budget_contract_missing`.
+
+Facts:
+
+- The new validation rejected plans whenever `runner_source_budget` existed but `source_budget_contract` was absent or empty.
+- Existing source-budget repair paths materialized `runner_source_budget` but did not also materialize the new typed `source_budget_contract`.
+- Focused source-budget tests failed until the typed source-budget contract was generated from the repaired runner budget.
+
+Inferences:
+
+- The validator was enforcing the right contract too early for legacy/internal repair objects, while the materializer had not yet connected the existing runner-budget data into the new typed contract field.
+
+Unknowns:
+
+- None for the directly observed source-budget over-blocking path after the focused repro and fix.
+
+Resolution:
+
+- Materialize `source_budget_contract` from `runner_source_budget` in budget-cap and source-cap repair paths.
+- Keep empty `source_budget_contract` invalid when the field is explicitly present on a typed contract plan.
+- Re-ran the focused typed-contract/source-budget tests and `python3 -m unittest tests.test_semantic_planner tests.test_search_handoff`; both passed.

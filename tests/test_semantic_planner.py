@@ -11614,6 +11614,123 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("typed_coverage_matrix_incomplete", codes)
         self.assertIn("typed_task_partition_contract_violation", codes)
 
+    def test_typed_contract_validation_rejects_empty_contracts_on_comparison_plan(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate.update(
+            {
+                "selected_entities": [],
+                "required_dimensions": [],
+                "coverage_matrix": [],
+                "task_partition_contract": {},
+                "source_budget_contract": {},
+                "final_deliverable_contract": {},
+            }
+        )
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=candidate,
+        )
+        codes = {failure["code"] for failure in validation["failures"]}
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn("typed_selected_entities_missing", codes)
+        self.assertIn("typed_required_dimensions_missing", codes)
+        self.assertIn("typed_coverage_matrix_missing", codes)
+        self.assertIn("typed_task_partition_contract_invalid", codes)
+        self.assertIn("typed_source_budget_contract_missing", codes)
+        self.assertIn("typed_final_deliverable_contract_missing", codes)
+
+    def test_typed_coverage_matrix_requires_every_entity_dimension_cell(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        repaired["coverage_matrix"] = repaired["coverage_matrix"][:1]
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        failure = next(
+            failure
+            for failure in validation["failures"]
+            if failure["code"] == "typed_coverage_matrix_missing_cells"
+        )
+        self.assertEqual(failure["expected_cell_count"], 8)
+        self.assertEqual(failure["actual_cell_count"], 1)
+
+    def test_typed_partition_contract_enforces_cap_without_strict_flag(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        repaired["task_partition_contract"].pop("enforcement", None)
+        repaired["task_partition_contract"]["max_entities_per_task"] = 1
+        repaired["bounded_tasks"][0]["semantic_entity_refs"] = [
+            "entity_001",
+            "entity_002",
+            "entity_003",
+        ]
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_task_partition_contract_violation",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_typed_source_budget_contract_required_when_runner_budget_exists(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        repaired["source_budget_contract"] = {}
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_source_budget_contract_missing",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_typed_final_deliverable_contract_requires_bound_final_task(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        for task in repaired["bounded_tasks"]:
+            task.pop("final_deliverable_binding", None)
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_final_deliverable_contract_unbound",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
         with self.assertRaisesRegex(
             SemanticPlannerAdapterUnavailable,
