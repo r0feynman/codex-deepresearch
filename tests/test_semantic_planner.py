@@ -11664,6 +11664,28 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(failure["expected_cell_count"], 8)
         self.assertEqual(failure["actual_cell_count"], 1)
 
+    def test_typed_coverage_matrix_requires_task_side_entity_dimension_refs(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        for task in repaired["bounded_tasks"]:
+            task["semantic_entity_refs"] = []
+            task["semantic_dimension_refs"] = []
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_coverage_matrix_task_ref_mismatch",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
     def test_typed_partition_contract_enforces_cap_without_strict_flag(self) -> None:
         candidate = self.comparison_contract_candidate()
         repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
@@ -11719,6 +11741,28 @@ class SemanticPlannerTests(unittest.TestCase):
         )
         for task in repaired["bounded_tasks"]:
             task.pop("final_deliverable_binding", None)
+
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertIn(
+            "typed_final_deliverable_contract_unbound",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_typed_final_deliverable_contract_rejects_empty_binding(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        for task in repaired["bounded_tasks"]:
+            task.pop("final_deliverable_binding", None)
+        repaired["bounded_tasks"][0]["final_deliverable_binding"] = {}
 
         validation = validate_semantic_candidate_plan(
             original_question=candidate["original_question"],

@@ -13644,6 +13644,11 @@ def _candidate_typed_contract_validation_failures(
         for task in tasks
         if str(task.get("task_id") or "").strip()
     }
+    tasks_by_id = {
+        str(task.get("task_id") or ""): task
+        for task in tasks
+        if str(task.get("task_id") or "").strip()
+    }
     if typed_contract_expected or selected_entities or required_dimensions or coverage_matrix:
         if not selected_entities:
             failures.append({"code": "typed_selected_entities_missing"})
@@ -13689,6 +13694,7 @@ def _candidate_typed_contract_validation_failures(
             )
         unknown_cells = []
         missing_task_link_cells = []
+        mismatched_task_link_cells = []
         missing_cells = [
             dict(cell)
             for cell in coverage_matrix
@@ -13728,6 +13734,25 @@ def _candidate_typed_contract_validation_failures(
                 )
             if str(cell.get("status") or "") == "covered" and not covered_by:
                 missing_task_link_cells.append(dict(cell))
+            if str(cell.get("status") or "") == "covered" and covered_by:
+                matching_task_ids = []
+                for task_id in covered_by:
+                    task = tasks_by_id.get(task_id)
+                    if not isinstance(task, Mapping):
+                        continue
+                    if entity_id not in _string_list(task.get("semantic_entity_refs")):
+                        continue
+                    if dimension_id not in _string_list(task.get("semantic_dimension_refs")):
+                        continue
+                    matching_task_ids.append(task_id)
+                if not matching_task_ids:
+                    mismatched_task_link_cells.append(
+                        {
+                            "entity_id": entity_id,
+                            "dimension_id": dimension_id,
+                            "covered_by_task_ids": covered_by,
+                        }
+                    )
         if unknown_cells:
             failures.append(
                 {
@@ -13742,6 +13767,19 @@ def _candidate_typed_contract_validation_failures(
                     "code": "typed_coverage_matrix_missing_task_links",
                     "cell_count": len(missing_task_link_cells),
                     "cells": missing_task_link_cells[:20],
+                }
+            )
+        if mismatched_task_link_cells:
+            failures.append(
+                {
+                    "code": "typed_coverage_matrix_task_ref_mismatch",
+                    "cell_count": len(mismatched_task_link_cells),
+                    "cells": mismatched_task_link_cells[:20],
+                    "message": (
+                        "Covered matrix cells must be backed by at least one referenced "
+                        "task with matching semantic_entity_refs and semantic_dimension_refs."
+                    ),
+                    "retryable": True,
                 }
             )
         if missing_cells:
@@ -13860,11 +13898,43 @@ def _candidate_typed_contract_validation_failures(
                 }
             )
         elif not any(
-            isinstance(task, Mapping) and isinstance(task.get("final_deliverable_binding"), Mapping)
+            _candidate_task_has_valid_final_deliverable_binding(
+                task,
+                final_deliverable_contract=final_deliverable_contract,
+            )
             for task in tasks
+            if isinstance(task, Mapping)
         ):
             failures.append({"code": "typed_final_deliverable_contract_unbound"})
     return failures
+
+
+def _candidate_task_has_valid_final_deliverable_binding(
+    task: Mapping[str, Any],
+    *,
+    final_deliverable_contract: Mapping[str, Any],
+) -> bool:
+    binding = task.get("final_deliverable_binding")
+    if not isinstance(binding, Mapping) or not binding:
+        return False
+    required_sections = _string_list(binding.get("required_sections"))
+    contract_required_sections = _string_list(
+        final_deliverable_contract.get("required_sections")
+    )
+    if not required_sections:
+        return False
+    if contract_required_sections and not set(contract_required_sections).issubset(
+        set(required_sections)
+    ):
+        return False
+    contract_type = str(binding.get("contract_type") or "").strip()
+    expected_contract_type = str(
+        final_deliverable_contract.get("contract_type") or ""
+    ).strip()
+    if expected_contract_type and contract_type != expected_contract_type:
+        return False
+    marker = str(binding.get("binding") or binding.get("binding_marker") or "").strip()
+    return bool(marker)
 
 
 def _candidate_plan_requires_typed_contract(
