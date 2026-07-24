@@ -18,6 +18,12 @@ sys.path.insert(0, str(PLUGIN_SRC))
 
 from deepresearch import ingest_run, prepare_run as prepare_search_handoff_run, validate_artifacts
 from deepresearch.search_handoff import _create_unique_run_dir, _search_task_from_bounded_task
+from deepresearch.semantic_planner import (
+    PLANNER_MODE_CODEX_SEMANTIC,
+    SEMANTIC_PLANNER_SCHEMA_VERSION,
+    SemanticAngle,
+    SemanticPlan,
+)
 
 
 TEST_MANUAL_ANGLES = ("primary source discovery",)
@@ -148,6 +154,173 @@ class SearchHandoffTests(unittest.TestCase):
 
         validation = validate_artifacts(evidence_path=run_dir / "evidence.json")
         self.assertTrue(validation.valid, [error.to_dict() for error in validation.errors])
+
+    def test_prepare_propagates_runner_source_budget_to_evidence(self) -> None:
+        question = "Compare official permit records within a strict source budget."
+        angle = SemanticAngle(
+            angle_id="angle_001",
+            title="Permit Record Baseline",
+            research_question="Which official permit records establish the baseline?",
+            question_context=question,
+            route="text_only",
+            evidence_need="primary_source",
+            expected_artifacts=["official record notes"],
+            success_criteria=["Claims must cite official source metadata."],
+            report_section="Permit Records",
+            expected_source_types=["official records"],
+        )
+        bounded_task = {
+            "task_id": "task_semantic_001",
+            "angle_id": "angle_001",
+            "query": "official permit records strict source budget",
+            "route": "text_only",
+            "freshness_requirement": "any",
+            "source_policy": {"decision": "allowed", "flags": []},
+            "expected_source_types": ["official records"],
+            "expected_visual_targets": [],
+            "expected_artifacts": ["official record notes"],
+            "success_criteria": ["Claims must cite official source metadata."],
+            "max_results": 3,
+            "max_sources": 3,
+            "max_images": 0,
+            "done_condition": "Stop when official source-backed notes are ready.",
+        }
+        runner_source_budget = {
+            "budget_type": "runner_level_unique_source_reuse",
+            "max_unique_sources": 12,
+            "declared_source_budget": 12,
+            "task_max_sources_sum": 3,
+            "bounded_task_count": 1,
+            "reuse_required": False,
+            "allocation_strategy": "shared_source_pool",
+            "enforcement_scope": "run",
+        }
+        semantic_plan = SemanticPlan(
+            schema_version=SEMANTIC_PLANNER_SCHEMA_VERSION,
+            question_class="product_market",
+            broad_question=False,
+            source="codex_semantic",
+            expected_evidence_needs=["primary_source"],
+            angles=[angle],
+            intent_summary="Plan official permit record research.",
+            constraints=[
+                "Runner-level source budget is preserved as a unique-source reuse "
+                "budget: max_unique_sources=12."
+            ],
+            runner_source_budget=runner_source_budget,
+            selected_entities=[
+                {
+                    "entity_id": "entity_001",
+                    "name": "County Portal",
+                    "type": "source_artifact",
+                    "required": True,
+                }
+            ],
+            required_dimensions=[
+                {
+                    "dimension_id": "dimension_001",
+                    "name": "official source basis",
+                    "required": True,
+                }
+            ],
+            coverage_matrix=[
+                {
+                    "entity_id": "entity_001",
+                    "entity_name": "County Portal",
+                    "dimension_id": "dimension_001",
+                    "dimension": "official source basis",
+                    "status": "covered",
+                    "covered_by_task_ids": ["task_semantic_001"],
+                }
+            ],
+            task_partition_contract={
+                "contract_type": "named_entity_comparison_partition",
+                "partition_key": "selected_entities",
+                "max_entities_per_task": 1,
+                "enforcement": "strict",
+            },
+            source_budget_contract={
+                "contract_type": "source_budget",
+                "runner_max_unique_sources": 12,
+                "max_task_sources": 3,
+                "per_task_cap_field": "bounded_tasks.max_sources",
+            },
+            final_deliverable_contract={
+                "contract_type": "comparison_report",
+                "required_sections": ["entity-by-dimension comparison"],
+                "required_tables": ["entity_dimension_matrix"],
+                "required_judgments": ["supported", "unknown_or_unverifiable"],
+            },
+            question_scope="narrow",
+            decomposition_strategy="Use one bounded official-record task.",
+            requirement_coverage_map=[
+                {
+                    "requirement_id": "req_001",
+                    "requirement_type": "subject",
+                    "requirement_text": question,
+                    "prompt_text": question,
+                    "prompt_span": {"start": 0, "end": len(question)},
+                    "explicit": True,
+                    "non_negotiable": True,
+                    "inferred_reason": None,
+                    "covered_by_angle_ids": ["angle_001"],
+                    "covered_by_task_ids": ["task_semantic_001"],
+                    "coverage_status": "covered",
+                }
+            ],
+            negative_scope=[],
+            bounded_tasks=[bounded_task],
+            planner_mode=PLANNER_MODE_CODEX_SEMANTIC,
+            semantic_release_eligible=False,
+            status="semantic_review_passed",
+        )
+
+        with mock.patch(
+            "deepresearch.search_handoff.plan_semantic_angles",
+            return_value=semantic_plan,
+        ):
+            result = prepare_run(
+                question=question,
+                runs_dir=self.temp_runs_dir(),
+                angles=None,
+            )
+        run_dir = Path(result["run_dir"])
+        evidence = self.load_json(run_dir / "evidence.json")
+
+        self.assertEqual(
+            evidence["semantic_planner"]["runner_source_budget"],
+            runner_source_budget,
+        )
+        self.assertEqual(
+            evidence["semantic_planner"]["selected_entities"][0]["name"],
+            "County Portal",
+        )
+        self.assertEqual(
+            evidence["semantic_planner"]["required_dimensions"][0]["name"],
+            "official source basis",
+        )
+        self.assertEqual(
+            evidence["semantic_planner"]["coverage_matrix"][0]["status"],
+            "covered",
+        )
+        self.assertEqual(
+            evidence["semantic_planner"]["task_partition_contract"][
+                "max_entities_per_task"
+            ],
+            1,
+        )
+        self.assertEqual(
+            evidence["semantic_planner"]["source_budget_contract"][
+                "runner_max_unique_sources"
+            ],
+            12,
+        )
+        self.assertIn(
+            "entity-by-dimension comparison",
+            evidence["semantic_planner"]["final_deliverable_contract"][
+                "required_sections"
+            ],
+        )
 
     def test_prepare_records_release_validation_identity_before_child_work(self) -> None:
         question = "  Example release validation   prompt. "

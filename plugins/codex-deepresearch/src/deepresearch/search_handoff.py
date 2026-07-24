@@ -455,6 +455,23 @@ def prepare_run(
             "intent_summary": semantic_plan.intent_summary,
             "domain_entities": list(semantic_plan.domain_entities),
             "constraints": list(semantic_plan.constraints),
+            "runner_source_budget": _semantic_plan_runner_source_budget(semantic_plan),
+            "selected_entities": list(
+                getattr(semantic_plan, "selected_entities", [])
+            ),
+            "required_dimensions": list(
+                getattr(semantic_plan, "required_dimensions", [])
+            ),
+            "coverage_matrix": list(getattr(semantic_plan, "coverage_matrix", [])),
+            "task_partition_contract": dict(
+                getattr(semantic_plan, "task_partition_contract", {}) or {}
+            ),
+            "source_budget_contract": dict(
+                getattr(semantic_plan, "source_budget_contract", {}) or {}
+            ),
+            "final_deliverable_contract": dict(
+                getattr(semantic_plan, "final_deliverable_contract", {}) or {}
+            ),
             "question_scope": semantic_plan.question_scope,
             "scope_downgrade": (
                 dict(semantic_plan.scope_downgrade)
@@ -1071,6 +1088,7 @@ def _prepare_blocked_semantic_planner_run(
             "source": semantic_plan.source,
             "expected_evidence_needs": list(semantic_plan.expected_evidence_needs),
             "question_scope": getattr(semantic_plan, "question_scope", ""),
+            "runner_source_budget": _semantic_plan_runner_source_budget(semantic_plan),
             "scope_downgrade": (
                 dict(semantic_plan.scope_downgrade)
                 if getattr(semantic_plan, "scope_downgrade", None)
@@ -1220,6 +1238,7 @@ def _finalize_blocked_semantic_run(
             "intent_summary": getattr(semantic_plan, "intent_summary", ""),
             "domain_entities": list(getattr(semantic_plan, "domain_entities", [])),
             "constraints": list(getattr(semantic_plan, "constraints", [])),
+            "runner_source_budget": _semantic_plan_runner_source_budget(semantic_plan),
             "question_scope": getattr(semantic_plan, "question_scope", ""),
             "scope_downgrade": (
                 dict(semantic_plan.scope_downgrade)
@@ -1379,6 +1398,17 @@ def _prepare_semantic_planning_summary(
         "fallback_kind": diagnostics.get("fallback_kind"),
         "user_visible_diagnostic": diagnostics.get("user_visible_diagnostic"),
     }
+
+
+def _semantic_plan_runner_source_budget(semantic_plan: Any) -> dict[str, Any]:
+    if hasattr(semantic_plan, "to_dict"):
+        plan_dict = semantic_plan.to_dict()
+        if isinstance(plan_dict, Mapping):
+            runner_source_budget = plan_dict.get("runner_source_budget")
+            if isinstance(runner_source_budget, Mapping):
+                return dict(runner_source_budget)
+    runner_source_budget = getattr(semantic_plan, "runner_source_budget", None)
+    return dict(runner_source_budget) if isinstance(runner_source_budget, Mapping) else {}
 
 
 def _record_semantic_artifact_trace(
@@ -2256,6 +2286,13 @@ def _search_task_from_bounded_task(
         "visual_tasks": list(bounded_task.get("expected_visual_targets") or []),
         "max_images": max_images,
         "source_policy": dict(bounded_task.get("source_policy") or {"decision": "allowed", "flags": []}),
+        "semantic_entity_refs": list(bounded_task.get("semantic_entity_refs") or []),
+        "semantic_dimension_refs": list(
+            bounded_task.get("semantic_dimension_refs") or []
+        ),
+        "final_deliverable_binding": dict(
+            bounded_task.get("final_deliverable_binding") or {}
+        ),
     }
 
 
@@ -2281,6 +2318,11 @@ def _visual_task_from_search_task(search_task: Mapping[str, Any], index: int) ->
         "max_results": int(search_task.get("max_results") or 0),
         "max_sources": int(search_task.get("max_sources") or search_task.get("max_results") or 0),
         "max_images": search_task["max_images"],
+        "semantic_entity_refs": list(search_task.get("semantic_entity_refs") or []),
+        "semantic_dimension_refs": list(search_task.get("semantic_dimension_refs") or []),
+        "final_deliverable_binding": dict(
+            search_task.get("final_deliverable_binding") or {}
+        ),
         "status": "planned",
     }
 
