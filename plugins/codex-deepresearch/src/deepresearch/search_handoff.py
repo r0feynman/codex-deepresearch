@@ -51,12 +51,17 @@ from .semantic_planner import (
     semantic_convergence_attempt_record,
     plan_semantic_angles,
     semantic_materialization_plan_hash_for_file,
+    semantic_plan_adapter_candidate_attempts,
     semantic_plan_candidate_hash,
     semantic_plan_candidate_validation,
     semantic_plan_with_review_result,
     semantic_review_failure_retryable,
     semantic_review_release_eligible,
     _codex_semantic_planner_validation_max_attempts,
+    _apply_semantic_planner_retry_strategy,
+    _candidate_retry_attempt,
+    _candidate_validation_retryable,
+    _lock_semantic_planner_retry_identity,
     write_semantic_integrity_artifacts,
     write_semantic_expectation_oracle,
     write_semantic_materialization_diff,
@@ -788,6 +793,7 @@ def _prepare_semantic_plan_with_convergence(
         deterministic_validation = _semantic_candidate_validation_from_plan(
             semantic_plan
         )
+        planner_attempt_used = _semantic_plan_latest_planner_attempt(semantic_plan)
         if semantic_plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE:
             retryable_invalid_response = (
                 _blocked_semantic_candidate_validation_retryable(
@@ -795,17 +801,18 @@ def _prepare_semantic_plan_with_convergence(
                     deterministic_validation=deterministic_validation,
                 )
             )
-            last_attempt = attempt >= max_attempts
+            last_attempt = attempt >= max_attempts or planner_attempt_used >= max_attempts
             if (
                 retryable_invalid_response
                 and not last_attempt
                 and not allow_release_ineligible_materialization_for_tests
                 and explicit_angles is None
             ):
+                next_planner_attempt = max(planner_attempt_used, attempt) + 1
                 candidate_hash = semantic_plan_candidate_hash(semantic_plan)
                 retry_request = codex_semantic_candidate_validation_retry_raw_request(
                     raw_request=semantic_plan.raw_request_payload or next_raw_request,
-                    attempt=attempt + 1,
+                    attempt=next_planner_attempt,
                     deterministic_validation=deterministic_validation,
                     candidate_hash=candidate_hash,
                     max_attempts=max_attempts,
@@ -813,7 +820,7 @@ def _prepare_semantic_plan_with_convergence(
                 repair_inputs = dict(
                     retry_request.get("semantic_convergence_repair_inputs") or {}
                 )
-                repair_inputs["next_attempt"] = attempt + 1
+                repair_inputs["next_attempt"] = next_planner_attempt
                 repair_inputs["retry_request_hash"] = retry_request.get(
                     "adapter_request_hash"
                 )
@@ -902,7 +909,8 @@ def _prepare_semantic_plan_with_convergence(
         reviewed_plan_candidate_hash = semantic_plan_candidate_hash(reviewed_plan)
         review_passed = semantic_review_release_eligible(semantic_review)
         retryable_review_failure = semantic_review_failure_retryable(semantic_review)
-        last_attempt = attempt >= max_attempts
+        planner_attempt_used = _semantic_plan_latest_planner_attempt(semantic_plan)
+        last_attempt = attempt >= max_attempts or planner_attempt_used >= max_attempts
         if (
             review_passed
             or not retryable_review_failure
@@ -970,9 +978,10 @@ def _prepare_semantic_plan_with_convergence(
             )
             return reviewed_plan, semantic_review, semantic_integrity_artifacts
 
+        next_planner_attempt = max(planner_attempt_used, attempt) + 1
         retry_request = codex_semantic_review_retry_raw_request(
             raw_request=semantic_plan.raw_request_payload or next_raw_request,
-            attempt=attempt + 1,
+            attempt=next_planner_attempt,
             deterministic_validation=deterministic_validation,
             semantic_review=semantic_review,
             candidate_hash=pre_review_candidate_hash,
@@ -981,7 +990,7 @@ def _prepare_semantic_plan_with_convergence(
         repair_inputs = dict(
             retry_request.get("semantic_convergence_repair_inputs") or {}
         )
-        repair_inputs["next_attempt"] = attempt + 1
+        repair_inputs["next_attempt"] = next_planner_attempt
         repair_inputs["retry_request_hash"] = retry_request.get("adapter_request_hash")
         attempts.append(
             semantic_convergence_attempt_record(
@@ -1016,6 +1025,20 @@ def _semantic_candidate_validation_from_plan(semantic_plan: Any) -> Mapping[str,
     return semantic_plan_candidate_validation(semantic_plan)
 
 
+def _semantic_plan_latest_planner_attempt(semantic_plan: Any) -> int:
+    latest = 0
+    for attempt in semantic_plan_adapter_candidate_attempts(semantic_plan):
+        try:
+            attempt_number = int(attempt.get("attempt"))
+        except (TypeError, ValueError):
+            continue
+        latest = max(latest, attempt_number)
+    if latest:
+        return latest
+    raw_request = getattr(semantic_plan, "raw_request_payload", None)
+    return _candidate_retry_attempt(raw_request)
+
+
 def _blocked_semantic_candidate_validation_retryable(
     *,
     semantic_plan: Any,
@@ -1026,13 +1049,7 @@ def _blocked_semantic_candidate_validation_retryable(
         return False
     if diagnostics.get("failure_category") != "adapter_invalid_response":
         return False
-    if deterministic_validation.get("ok") is True:
-        return False
-    failures = deterministic_validation.get("failures")
-    return isinstance(failures, list) and any(
-        isinstance(failure, Mapping) and failure.get("code")
-        for failure in failures
-    )
+    return _candidate_validation_retryable(deterministic_validation)
 
 
 def _write_semantic_convergence_artifact(
@@ -1536,8 +1553,12 @@ def _attach_locked_oracle_context_to_planner_request(
             "all planning and retries. Do not add topics, workstreams, or task "
             "suffixes outside that oracle merely to satisfy task-count thresholds."
         )
-    request.pop("adapter_request_hash", None)
-    request["adapter_request_hash"] = _sha256_payload(request)
+    _lock_semantic_planner_retry_identity(request)
+    _apply_semantic_planner_retry_strategy(
+        request,
+        attempt=1,
+        max_attempts=_codex_semantic_planner_validation_max_attempts(),
+    )
 
 
 def _sha256_file(path: Path) -> str:

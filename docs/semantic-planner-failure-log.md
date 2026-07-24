@@ -669,3 +669,43 @@ Resolution:
 
 - No validator threshold was lowered.
 - The failures were preserved as release-gate failures and left for the remaining #133 signoff work.
+
+## 2026-07-24 - Issue #149 / Bounded Planner Retry Exhaustion Handling
+
+Prompt or issue:
+
+- Issue #149 semantic planner fallback/retry orchestration.
+
+Command or suite:
+
+```bash
+python3 -m unittest tests.test_semantic_planner
+plugins/codex-deepresearch/scripts/codex-deepresearch public-beta-validation --runs-dir /tmp/codex-deepresearch-public-beta-validation --suite-id public-beta-validation --clean --allow-blocked
+plugins/codex-deepresearch/scripts/codex-deepresearch semantic-release-validation --runs-dir /tmp/codex-deepresearch-semantic-release-validation --suite-id semantic-release-validation --clean --allow-blocked
+```
+
+Directly observed failure:
+
+- A forced unit scenario exhausted bounded planner attempts and returned `blocked_semantic_planner_unavailable` with `terminal_reason=max_attempts_exhausted`.
+- The public-beta and semantic-release validation commands did not exercise a real retry-exhausted semantic run; they remained blocked or failed because release-counted run bundles were not supplied.
+
+Facts:
+
+- Failed retry candidates are now recorded as `discarded` with `candidate_disposition=discarded` and `materialization_allowed=false`.
+- Retry attempts record distinct strategy inputs: `default_semantic_planner`, `entity_first`, and `dimension_report_contract_first`.
+- Retry attempts preserve a locked retry identity covering the original question, prompt identity, oracle hashes, manifest oracle identity, release identity, non-negotiable requirements, and original planner input hash.
+- A retry request that changes the locked original question is rejected before planner execution.
+
+Inferences:
+
+- The implementation provides the failure-recording path needed for future regression or E2E retry exhaustion, but #133 release signoff still needs real release-counted run bundles before product readiness can be claimed.
+
+Unknowns:
+
+- Whether any of the remaining 62 #133 semantic release runs will exhaust all retry strategies under live Codex execution.
+
+Resolution:
+
+- Keep validator and reviewer thresholds unchanged.
+- Treat retry exhaustion as a blocked semantic planner outcome, not as a pass.
+- If a future regression or E2E run exhausts all retry attempts, append the prompt id, run directory, failure codes, and convergence artifact path to this log before claiming the related gate is understood.
