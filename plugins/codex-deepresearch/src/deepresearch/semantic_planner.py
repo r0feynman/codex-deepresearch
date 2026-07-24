@@ -76,6 +76,47 @@ CODEX_SEMANTIC_REVIEWER_SCHEMA_FILENAME = "reviewer.json"
 CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV = (
     "CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS"
 )
+SEMANTIC_PLANNER_RETRY_STRATEGIES: tuple[tuple[str, str], ...] = (
+    (
+        "default_semantic_planner",
+        "Use the normal semantic planner strategy: preserve the locked oracle, "
+        "decompose the user question semantically, and produce executable bounded tasks.",
+    ),
+    (
+        "entity_first",
+        "Use an entity-first strategy: identify the required providers, agencies, "
+        "documents, jurisdictions, products, or artifacts first, then assign each "
+        "bounded task to explicit entity coverage before synthesis.",
+    ),
+    (
+        "dimension_report_contract_first",
+        "Use a dimension/report-contract-first strategy: identify comparison axes, "
+        "coverage_matrix obligations, task partition limits, source budgets, and the "
+        "final deliverable contract before assigning executable bounded tasks.",
+    ),
+)
+SEMANTIC_PLANNER_RETRY_MUTABLE_FIELDS = {
+    "adapter_request_hash",
+    "raw_request_hash",
+    "raw_request_content_hash",
+    "retry_attempt",
+    "previous_candidate_validation_failure_codes",
+    "previous_candidate_validation_failures",
+    "previous_semantic_review_failure_codes",
+    "previous_semantic_review_blockers",
+    "previous_semantic_review_score",
+    "previous_semantic_review_verdict",
+    "planner_retry_instructions",
+    "semantic_convergence_attempt",
+    "semantic_convergence_max_attempts",
+    "semantic_convergence_repair_inputs",
+    "semantic_planner_retry_strategy",
+    "planner_strategy_name",
+    "planner_strategy_instructions",
+    "planner_strategy_request_hash",
+    "planner_strategy_provenance",
+    "semantic_retry_lock",
+}
 SEMANTIC_FIT_SCORE_THRESHOLD = 9.0
 SEMANTIC_DELTA_DISALLOWED_REPAIR_CATEGORIES = (
     "failed_semantic_fit",
@@ -790,8 +831,19 @@ def codex_semantic_candidate_plan(
     parsed_raw_response: dict[str, Any] | None = None
     previous_attempts: list[dict[str, Any]] = []
     max_attempts = _codex_semantic_planner_validation_max_attempts()
-    for attempt in range(1, max_attempts + 1):
+    start_attempt = _candidate_retry_attempt(raw_request) or 1
+    start_attempt = max(1, min(start_attempt, max_attempts))
+    if not isinstance(raw_request.get("semantic_retry_lock"), Mapping):
+        _lock_semantic_planner_retry_identity(raw_request)
+    if not isinstance(raw_request.get("semantic_planner_retry_strategy"), Mapping):
+        _apply_semantic_planner_retry_strategy(
+            raw_request,
+            attempt=start_attempt,
+            max_attempts=max_attempts,
+        )
+    for attempt in range(start_attempt, max_attempts + 1):
         try:
+            _validate_semantic_planner_retry_identity(raw_request)
             adapter_response = invoke_codex_semantic_planner_adapter(raw_request)
         except SemanticPlannerAdapterUnavailable as exc:
             return _blocked_codex_semantic_adapter_plan(
@@ -996,11 +1048,16 @@ def codex_semantic_candidate_plan(
                         validation=candidate_validation,
                         raw_response=raw_response,
                         candidate=candidate,
+                        raw_request=raw_request,
                         final_selection=True,
+                        discarded=False,
                     )
                 ]
                 break
-            if attempt < max_attempts:
+            retryable_validation_failure = _candidate_validation_retryable(
+                candidate_validation
+            )
+            if retryable_validation_failure and attempt < max_attempts:
                 retry_request = _codex_semantic_retry_raw_request(
                     raw_request=raw_request,
                     attempt=attempt + 1,
@@ -1013,22 +1070,30 @@ def codex_semantic_candidate_plan(
                         raw_response=raw_response,
                         candidate=candidate,
                         retry_request=retry_request,
+                        raw_request=raw_request,
                     )
                 )
                 raw_response["adapter_candidate_attempts"] = list(previous_attempts)
                 raw_request = retry_request
                 continue
+            terminal_reason = (
+                "max_attempts_exhausted"
+                if retryable_validation_failure
+                else "non_retryable_candidate_validation_failure"
+            )
             raw_response["adapter_candidate_attempts"] = list(previous_attempts) + [
                 _candidate_validation_attempt_record(
                     attempt=attempt,
                     validation=candidate_validation,
                     raw_response=raw_response,
                     candidate=candidate,
+                    raw_request=raw_request,
                     repair_inputs={
-                        "terminal_reason": "max_attempts_exhausted",
+                        "terminal_reason": terminal_reason,
                         "retry_source": "adapter_candidate_validation",
                     },
                     terminal_failure=True,
+                    discarded=True,
                 )
             ]
             raise SemanticPlannerAdapterUnavailable(
@@ -1268,6 +1333,12 @@ def build_codex_semantic_raw_request(
         raw_request["run_id"] = run_id
     if created_at:
         raw_request["created_at"] = created_at
+    _lock_semantic_planner_retry_identity(raw_request)
+    _apply_semantic_planner_retry_strategy(
+        raw_request,
+        attempt=1,
+        max_attempts=_codex_semantic_planner_validation_max_attempts(),
+    )
     raw_request["adapter_request_hash"] = _sha256_payload(raw_request)
     return raw_request
 
@@ -1413,6 +1484,13 @@ def _blocked_codex_adapter_diagnostics(
         diagnostics["candidate_validation_failure_count"] = int(
             candidate_validation.get("failure_count") or len(failure_codes)
         )
+    attempts = raw_response.get("adapter_candidate_attempts")
+    if isinstance(attempts, list):
+        diagnostics["adapter_candidate_attempts"] = [
+            _normalize_adapter_candidate_attempt_record(attempt)
+            for attempt in attempts
+            if isinstance(attempt, Mapping)
+        ]
     diagnostics["adapter_response_preview"] = _preview_text(
         json.dumps(dict(raw_response), ensure_ascii=False, sort_keys=True)
     )
@@ -1593,9 +1671,18 @@ def _candidate_typed_contract_shape_failures(candidate: Mapping[str, Any]) -> li
 def _semantic_repair_materialization_allowed(raw_request: Mapping[str, Any]) -> bool:
     """Allow heavier plan repair only after convergence has reviewer/validator input."""
 
-    return _semantic_task_source_cap_int(
+    if _semantic_task_source_cap_int(
         raw_request.get("semantic_convergence_attempt")
-    ) is not None
+    ) is not None:
+        return True
+    if _candidate_retry_attempt(raw_request) <= 1:
+        return False
+    previous_codes = {
+        str(code)
+        for code in _list(raw_request.get("previous_candidate_validation_failure_codes"))
+        if str(code).strip()
+    }
+    return "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE" in previous_codes
 
 
 def _materialize_candidate_source_cap_splits(
@@ -7571,6 +7658,170 @@ def _codex_semantic_planner_validation_max_attempts() -> int:
     return max(1, min(value, 3))
 
 
+def _semantic_planner_retry_strategy(attempt: int) -> dict[str, Any]:
+    index = max(1, min(int(attempt), len(SEMANTIC_PLANNER_RETRY_STRATEGIES))) - 1
+    strategy_name, instructions = SEMANTIC_PLANNER_RETRY_STRATEGIES[index]
+    return {
+        "attempt": int(attempt),
+        "strategy_name": strategy_name,
+        "strategy_instructions": instructions,
+    }
+
+
+def _semantic_retry_invariant_payload(request: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: copy.deepcopy(value)
+        for key, value in sorted(dict(request).items())
+        if key not in SEMANTIC_PLANNER_RETRY_MUTABLE_FIELDS
+    }
+
+
+def _semantic_retry_invariant_hash(request: Mapping[str, Any]) -> str:
+    return _sha256_payload(_semantic_retry_invariant_payload(request))
+
+
+def _semantic_retry_identity_lock(request: Mapping[str, Any]) -> dict[str, Any]:
+    invariant = _semantic_retry_invariant_payload(request)
+    locked_oracle = invariant.get("locked_semantic_expectation_oracle")
+    release_identity = {
+        field: invariant.get(field)
+        for field in (
+            "prompt_id",
+            "suite_id",
+            "prompt_hash",
+            "manifest_oracle_hash",
+            "manifest_oracle_path",
+            "manifest_oracle_fragment_id",
+            "execution_mode",
+            "runner_mode",
+        )
+        if invariant.get(field) not in (None, "")
+    }
+    return {
+        "lock_version": 1,
+        "original_question": invariant.get("original_question"),
+        "original_question_hash": _sha256_text(str(invariant.get("original_question") or "")),
+        "prompt_version": invariant.get("prompt_version"),
+        "prompt_hash": invariant.get("prompt_hash"),
+        "prompt_id": invariant.get("prompt_id"),
+        "semantic_expectation_oracle_hash": invariant.get(
+            "semantic_expectation_oracle_hash"
+        ),
+        "locked_oracle_content_hash": (
+            locked_oracle.get("oracle_content_hash")
+            if isinstance(locked_oracle, Mapping)
+            else None
+        ),
+        "manifest_oracle_hash": invariant.get("manifest_oracle_hash"),
+        "manifest_oracle_path": invariant.get("manifest_oracle_path"),
+        "manifest_oracle_fragment_id": invariant.get("manifest_oracle_fragment_id"),
+        "release_identity": release_identity,
+        "non_negotiable_requirement_ids": [
+            str(record.get("requirement_id") or "")
+            for record in _list(
+                locked_oracle.get("oracle_requirement_map")
+                if isinstance(locked_oracle, Mapping)
+                else []
+            )
+            if isinstance(record, Mapping) and record.get("non_negotiable") is True
+        ],
+        "original_planner_input_hash": _semantic_retry_invariant_hash(request),
+    }
+
+
+def _lock_semantic_planner_retry_identity(request: dict[str, Any]) -> dict[str, Any]:
+    request.pop("semantic_retry_lock", None)
+    request["semantic_retry_lock"] = _semantic_retry_identity_lock(request)
+    return request
+
+
+def _validate_semantic_planner_retry_identity(request: Mapping[str, Any]) -> None:
+    lock = request.get("semantic_retry_lock")
+    if not isinstance(lock, Mapping):
+        raise SemanticPlannerAdapterUnavailable(
+            "Semantic planner retry identity is missing; refusing to run retry without a locked oracle/input bundle."
+        )
+    current = _semantic_retry_identity_lock(request)
+    mismatches = [
+        key
+        for key in (
+            "original_question",
+            "original_question_hash",
+            "prompt_version",
+            "prompt_hash",
+            "prompt_id",
+            "semantic_expectation_oracle_hash",
+            "locked_oracle_content_hash",
+            "manifest_oracle_hash",
+            "manifest_oracle_path",
+            "manifest_oracle_fragment_id",
+            "release_identity",
+            "non_negotiable_requirement_ids",
+            "original_planner_input_hash",
+        )
+        if lock.get(key) != current.get(key)
+    ]
+    if mismatches:
+        raise SemanticPlannerAdapterUnavailable(
+            "Semantic planner retry identity changed after lock: "
+            + ", ".join(mismatches)
+        )
+
+
+def _apply_semantic_planner_retry_strategy(
+    request: dict[str, Any],
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> dict[str, Any]:
+    strategy = _semantic_planner_retry_strategy(attempt)
+    request["semantic_planner_retry_strategy"] = {
+        **strategy,
+        "max_attempts": int(max_attempts),
+        "strategy_source": "bounded_semantic_planner_fallback_retry_orchestration",
+    }
+    request["planner_strategy_name"] = strategy["strategy_name"]
+    request["planner_strategy_instructions"] = strategy["strategy_instructions"]
+    request.pop("adapter_request_hash", None)
+    request.pop("planner_strategy_request_hash", None)
+    strategy_request_hash = _sha256_payload(
+        {
+            key: copy.deepcopy(value)
+            for key, value in sorted(dict(request).items())
+            if key not in {"adapter_request_hash", "planner_strategy_request_hash"}
+        }
+    )
+    request["planner_strategy_request_hash"] = strategy_request_hash
+    request["planner_strategy_provenance"] = {
+        "strategy_name": strategy["strategy_name"],
+        "strategy_attempt": int(attempt),
+        "strategy_request_hash": strategy_request_hash,
+        "strategy_instructions_hash": _sha256_text(strategy["strategy_instructions"]),
+        "strategy_source": "bounded_semantic_planner_fallback_retry_orchestration",
+        "actual_planner_request_field": "semantic_planner_retry_strategy",
+    }
+    request["adapter_request_hash"] = _sha256_payload(request)
+    return request
+
+
+def _candidate_validation_retryable(validation: Mapping[str, Any]) -> bool:
+    if validation.get("ok") is True:
+        return False
+    codes = set(_candidate_validation_failure_codes(validation))
+    if not codes:
+        return False
+    non_retryable = {
+        "candidate_validation_exception",
+        "requirement_coverage_map_not_list",
+        "candidate_angles_not_list",
+        "candidate_bounded_tasks_not_list",
+        "semantic_angle_not_object",
+        "bounded_task_not_object",
+        "question_scope_unknown",
+    }
+    return not bool(codes & non_retryable)
+
+
 def _candidate_validation_failure_codes(validation: Mapping[str, Any]) -> list[str]:
     failures = validation.get("failures")
     if not isinstance(failures, list):
@@ -7588,14 +7839,27 @@ def _candidate_validation_attempt_record(
     validation: Mapping[str, Any],
     raw_response: Mapping[str, Any],
     candidate: Mapping[str, Any],
+    raw_request: Mapping[str, Any] | None = None,
     repair_inputs: Mapping[str, Any] | None = None,
     final_selection: bool = False,
     terminal_failure: bool = False,
+    discarded: bool | None = None,
 ) -> dict[str, Any]:
     failure_codes = _candidate_validation_failure_codes(validation)
     candidate_hash = _sha256_payload(candidate)
+    request = dict(raw_request or {})
+    strategy = request.get("semantic_planner_retry_strategy")
+    if not isinstance(strategy, Mapping):
+        strategy = {}
+    materialization_allowed = bool(final_selection and not terminal_failure)
+    candidate_disposition = "accepted" if materialization_allowed else "discarded"
     return {
         "attempt": attempt,
+        "strategy_name": strategy.get("strategy_name") or request.get("planner_strategy_name"),
+        "strategy_instructions": strategy.get("strategy_instructions")
+        or request.get("planner_strategy_instructions"),
+        "strategy_request_hash": request.get("planner_strategy_request_hash"),
+        "adapter_request_hash": request.get("adapter_request_hash"),
         "candidate_id": candidate_hash[:16],
         "candidate_hash": candidate_hash,
         "raw_response_hash": _sha256_payload(raw_response),
@@ -7609,6 +7873,22 @@ def _candidate_validation_attempt_record(
         "repair_inputs": dict(repair_inputs or {}),
         "final_selection": final_selection,
         "terminal_failure": terminal_failure,
+        "candidate_disposition": candidate_disposition,
+        "materialization_allowed": materialization_allowed,
+        "discarded": bool(
+            discarded
+            if discarded is not None
+            else (not final_selection and bool(failure_codes or terminal_failure))
+        ),
+        "discard_reason": (
+            "candidate_failed_retryable_validation"
+            if not final_selection and failure_codes and not terminal_failure
+            else (
+                "terminal_candidate_validation_failure"
+                if terminal_failure
+                else None
+            )
+        ),
         "candidate_validation_failure_codes": failure_codes,
         "candidate_validation_failure_count": int(
             validation.get("failure_count")
@@ -7625,6 +7905,7 @@ def _candidate_validation_retry_record(
     raw_response: Mapping[str, Any],
     candidate: Mapping[str, Any],
     retry_request: Mapping[str, Any],
+    raw_request: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     repair_inputs = {
         "retry_source": "adapter_candidate_validation",
@@ -7642,7 +7923,9 @@ def _candidate_validation_retry_record(
         validation=validation,
         raw_response=raw_response,
         candidate=candidate,
+        raw_request=raw_request,
         repair_inputs=repair_inputs,
+        discarded=True,
     )
 
 
@@ -7654,6 +7937,7 @@ def _codex_semantic_retry_raw_request(
 ) -> dict[str, Any]:
     retry_request = dict(raw_request)
     retry_request.pop("adapter_request_hash", None)
+    _validate_semantic_planner_retry_identity(retry_request)
     failure_codes = _candidate_validation_failure_codes(validation)
     retry_request["retry_attempt"] = attempt
     retry_request["previous_candidate_validation_failure_codes"] = failure_codes
@@ -7729,7 +8013,12 @@ def _codex_semantic_retry_raw_request(
         f"{semantic_angle_duplicate_guidance}"
         f"{repair_guidance}"
     )
-    retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
+    _apply_semantic_planner_retry_strategy(
+        retry_request,
+        attempt=attempt,
+        max_attempts=_codex_semantic_planner_validation_max_attempts(),
+    )
+    _validate_semantic_planner_retry_identity(retry_request)
     return retry_request
 
 
@@ -8524,6 +8813,10 @@ def _normalize_adapter_candidate_attempt_record(
         failure_codes = attempt.get("candidate_validation_failure_codes", [])
     return {
         "attempt": attempt.get("attempt"),
+        "strategy_name": attempt.get("strategy_name"),
+        "strategy_instructions": attempt.get("strategy_instructions"),
+        "strategy_request_hash": attempt.get("strategy_request_hash"),
+        "adapter_request_hash": attempt.get("adapter_request_hash"),
         "candidate_id": candidate_id,
         "candidate_hash": candidate_hash,
         "raw_response_hash": attempt.get("raw_response_hash"),
@@ -8541,6 +8834,10 @@ def _normalize_adapter_candidate_attempt_record(
         ),
         "final_selection": bool(attempt.get("final_selection")),
         "terminal_failure": bool(attempt.get("terminal_failure")),
+        "candidate_disposition": attempt.get("candidate_disposition"),
+        "materialization_allowed": bool(attempt.get("materialization_allowed")),
+        "discarded": bool(attempt.get("discarded")),
+        "discard_reason": attempt.get("discard_reason"),
     }
 
 
@@ -8613,8 +8910,75 @@ def semantic_convergence_attempt_record(
     deterministic = dict(deterministic_validation or {})
     review = dict(semantic_review or {})
     adapter_candidate_attempts = semantic_plan_adapter_candidate_attempts(plan)
+    raw_request_payload = (
+        dict(plan.raw_request_payload)
+        if isinstance(plan.raw_request_payload, Mapping)
+        else {}
+    )
+    strategy = raw_request_payload.get("semantic_planner_retry_strategy")
+    if not isinstance(strategy, Mapping):
+        strategy = {}
+    first_adapter_attempt = (
+        adapter_candidate_attempts[0]
+        if adapter_candidate_attempts
+        else {}
+    )
+    accepted_adapter_attempt = next(
+        (
+            adapter_attempt
+            for adapter_attempt in adapter_candidate_attempts
+            if adapter_attempt.get("final_selection")
+        ),
+        None,
+    )
+    terminal_adapter_attempt = (
+        adapter_candidate_attempts[-1]
+        if adapter_candidate_attempts
+        else {}
+    )
+    deterministic_failure_codes = _candidate_validation_failure_codes(deterministic)
+    reviewer_blocker_codes = semantic_review_failure_codes(review) if review else []
+    discarded = bool(
+        not final_selection
+        and (
+            terminal_failure
+            or deterministic_failure_codes
+            or reviewer_blocker_codes
+            or plan.status == BLOCKED_SEMANTIC_PLANNER_UNAVAILABLE
+        )
+    )
+    materialization_allowed = bool(final_selection and not terminal_failure)
+    candidate_disposition = "accepted" if materialization_allowed else "discarded"
     record = {
         "attempt": attempt,
+        "strategy_name": first_adapter_attempt.get("strategy_name")
+        or strategy.get("strategy_name")
+        or raw_request_payload.get("planner_strategy_name"),
+        "strategy_instructions": first_adapter_attempt.get("strategy_instructions")
+        or strategy.get("strategy_instructions")
+        or raw_request_payload.get("planner_strategy_instructions"),
+        "strategy_request_hash": first_adapter_attempt.get("strategy_request_hash")
+        or raw_request_payload.get("planner_strategy_request_hash"),
+        "adapter_request_hash": first_adapter_attempt.get("adapter_request_hash")
+        or raw_request_payload.get("adapter_request_hash"),
+        "strategy_sequence": [
+            str(adapter_attempt.get("strategy_name") or "")
+            for adapter_attempt in adapter_candidate_attempts
+            if str(adapter_attempt.get("strategy_name") or "").strip()
+        ],
+        "last_planner_attempt": terminal_adapter_attempt.get("attempt")
+        or _candidate_retry_attempt(raw_request_payload)
+        or attempt,
+        "accepted_planner_attempt": (
+            accepted_adapter_attempt.get("attempt")
+            if isinstance(accepted_adapter_attempt, Mapping)
+            else None
+        ),
+        "accepted_strategy_name": (
+            accepted_adapter_attempt.get("strategy_name")
+            if isinstance(accepted_adapter_attempt, Mapping)
+            else None
+        ),
         "candidate_id": evaluated_candidate_hash[:16],
         "candidate_hash": evaluated_candidate_hash,
         "planner_status": plan.status,
@@ -8623,9 +8987,7 @@ def semantic_convergence_attempt_record(
         or plan.planner_provenance.get("adapter_request_hash"),
         "raw_response_hash": plan.planner_provenance.get("raw_response_hash"),
         "deterministic_ok": deterministic.get("ok"),
-        "deterministic_failure_codes": _candidate_validation_failure_codes(
-            deterministic
-        ),
+        "deterministic_failure_codes": deterministic_failure_codes,
         "deterministic_failures": [
             dict(failure)
             for failure in _list(deterministic.get("failures"))
@@ -8636,9 +8998,7 @@ def semantic_convergence_attempt_record(
         "reviewer_release_eligible": semantic_review_release_eligible(review)
         if review
         else False,
-        "reviewer_blocker_codes": semantic_review_failure_codes(review)
-        if review
-        else [],
+        "reviewer_blocker_codes": reviewer_blocker_codes,
         "reviewer_blockers": [
             dict(blocker)
             for blocker in _list(review.get("blockers"))
@@ -8649,6 +9009,22 @@ def semantic_convergence_attempt_record(
         "repair_inputs": dict(repair_inputs or {}),
         "final_selection": final_selection,
         "terminal_failure": terminal_failure,
+        "candidate_disposition": candidate_disposition,
+        "materialization_allowed": materialization_allowed,
+        "discarded": discarded,
+        "discard_reason": (
+            "final_selection"
+            if final_selection
+            else (
+                "terminal_failure"
+                if terminal_failure
+                else (
+                    "retryable_reviewer_or_candidate_failure"
+                    if discarded
+                    else None
+                )
+            )
+        ),
     }
     if reviewed_candidate_hash and reviewed_candidate_hash != evaluated_candidate_hash:
         record["reviewed_plan_candidate_id"] = reviewed_candidate_hash[:16]
@@ -8667,6 +9043,7 @@ def semantic_convergence_artifact(
 ) -> dict[str, Any]:
     final_candidate_hash = semantic_plan_candidate_hash(final_plan)
     review = dict(final_review or {})
+    selected_attempt = _semantic_convergence_final_selection_attempt(attempts)
     terminal_codes = []
     if status != "converged":
         terminal_codes = (
@@ -8694,7 +9071,10 @@ def semantic_convergence_artifact(
         "attempts": [dict(attempt) for attempt in attempts],
         "final_selection": (
             {
-                "attempt": len(attempts),
+                "attempt": selected_attempt.get("planner_attempt") or len(attempts),
+                "planner_attempt": selected_attempt.get("planner_attempt"),
+                "outer_attempt": selected_attempt.get("outer_attempt"),
+                "strategy_name": selected_attempt.get("strategy_name"),
                 "candidate_id": final_candidate_hash[:16],
                 "candidate_hash": final_candidate_hash,
                 "semantic_fit_score": review.get("semantic_fit_score"),
@@ -8715,6 +9095,24 @@ def semantic_convergence_artifact(
             else None
         ),
     }
+
+
+def _semantic_convergence_final_selection_attempt(
+    attempts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    for attempt in attempts:
+        if attempt.get("final_selection") is not True:
+            continue
+        planner_attempt = attempt.get("accepted_planner_attempt")
+        if planner_attempt in (None, ""):
+            planner_attempt = attempt.get("last_planner_attempt") or attempt.get("attempt")
+        return {
+            "planner_attempt": planner_attempt,
+            "outer_attempt": attempt.get("attempt"),
+            "strategy_name": attempt.get("accepted_strategy_name")
+            or attempt.get("strategy_name"),
+        }
+    return {"planner_attempt": None, "outer_attempt": None, "strategy_name": None}
 
 
 def codex_semantic_review_retry_raw_request(
@@ -8786,7 +9184,12 @@ def codex_semantic_review_retry_raw_request(
             provided_images=_list(retry_request.get("provided_images")),
         )
     )
-    retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
+    _apply_semantic_planner_retry_strategy(
+        retry_request,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+    _validate_semantic_planner_retry_identity(retry_request)
     return retry_request
 
 
@@ -8827,7 +9230,12 @@ def codex_semantic_candidate_validation_retry_raw_request(
         "task infeasible, and only raise max_sources/max_images within schema and "
         "runner budget limits."
     )
-    retry_request["adapter_request_hash"] = _sha256_payload(retry_request)
+    _apply_semantic_planner_retry_strategy(
+        retry_request,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+    _validate_semantic_planner_retry_identity(retry_request)
     return retry_request
 
 

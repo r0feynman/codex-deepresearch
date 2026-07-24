@@ -52,6 +52,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     build_codex_semantic_raw_request,
     build_semantic_materialization_diff,
     classify_question,
+    codex_semantic_candidate_plan,
     heuristic_template_planner,
     question_mentions_visual_evidence,
     semantic_materialization_plan_hash_for_tasks,
@@ -62,6 +63,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     write_semantic_planner_validation,
     _codex_semantic_candidate_validation,
     _codex_semantic_planner_validation_max_attempts,
+    _codex_semantic_retry_raw_request,
     _candidate_has_comparison_deliverable_task,
     _candidate_plan_from_adapter_response,
     _candidate_req003_comparison_row_terms,
@@ -5672,7 +5674,7 @@ class SemanticPlannerTests(unittest.TestCase):
             retry_request["planner_retry_instructions"],
         )
 
-    def test_korean_cross_modal_req003_reviewer_retry_materializes_schema(self) -> None:
+    def test_korean_cross_modal_req003_retry_materializes_schema(self) -> None:
         question = "학교 급식 알레르기 표시 사진과 교육청 공식 안내 기준을 대조해줘."
 
         def planner_mutator(response: dict, _request: dict) -> dict:
@@ -5782,7 +5784,11 @@ class SemanticPlannerTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "awaiting_search_results", result)
         self.assertEqual(convergence["status"], "converged", convergence)
-        self.assertEqual(convergence["attempt_count"], 2)
+        self.assertEqual(convergence["attempt_count"], 1)
+        self.assertEqual(convergence["final_selection"]["attempt"], 2)
+        self.assertEqual(convergence["final_selection"]["outer_attempt"], 1)
+        self.assertEqual(convergence["attempts"][0]["accepted_planner_attempt"], 2)
+        self.assertEqual(convergence["attempts"][0]["accepted_strategy_name"], "entity_first")
         self.assertIn(
             "candidate_plan_req003_comparison_deliverable_materializations",
             raw_response,
@@ -5901,10 +5907,10 @@ class SemanticPlannerTests(unittest.TestCase):
             convergence["terminal_failure"]["reason_codes"],
         )
 
-    def test_adapter_invalid_candidate_validation_retries_in_outer_convergence(self) -> None:
-        def over_cap_until_convergence_retry(response: dict, request: dict) -> dict:
+    def test_adapter_invalid_candidate_validation_uses_inner_budget_without_outer_overrun(self) -> None:
+        def over_cap_until_entity_first_retry(response: dict, request: dict) -> dict:
             response = json.loads(json.dumps(response))
-            if request.get("semantic_convergence_attempt"):
+            if request.get("planner_strategy_name") == "entity_first":
                 return response
             task = response["candidate_plan"]["bounded_tasks"][0]
             task["query"] = "Compare eight vendors using official source records."
@@ -5926,42 +5932,48 @@ class SemanticPlannerTests(unittest.TestCase):
                 "Compare official public poster image guidance across agencies.",
                 requirement_types=("subject", "source_quality", "visual_modality"),
                 visual_angle_indexes=(2, 3),
-                planner_response_mutator=over_cap_until_convergence_retry,
+                planner_response_mutator=over_cap_until_entity_first_retry,
             )
         run_dir = Path(result["run_dir"])
         convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
 
         self.assertEqual(result["status"], "awaiting_search_results")
         self.assertEqual(convergence["status"], "converged")
-        self.assertEqual(convergence["attempt_count"], 2)
-        self.assertEqual(len(adapter_request["_planner_requests"]), 3)
+        self.assertEqual(convergence["attempt_count"], 1)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 2)
         first_attempt = convergence["attempts"][0]
-        self.assertEqual(
-            first_attempt["planner_status"],
-            "blocked_semantic_planner_unavailable",
-        )
+        self.assertEqual(first_attempt["planner_status"], "semantic_review_passed")
+        self.assertTrue(first_attempt["final_selection"])
+        self.assertEqual(first_attempt["accepted_planner_attempt"], 2)
+        self.assertEqual(first_attempt["accepted_strategy_name"], "entity_first")
+        self.assertEqual(convergence["final_selection"]["attempt"], 2)
+        self.assertEqual(convergence["final_selection"]["outer_attempt"], 1)
         self.assertFalse(first_attempt["terminal_failure"])
         self.assertIn(
             "bounded_task_requirement_exceeds_max_sources",
-            first_attempt["deterministic_failure_codes"],
-        )
-        self.assertIn(
-            "bounded_task_requirement_exceeds_max_images",
-            first_attempt["deterministic_failure_codes"],
-        )
-        self.assertEqual(
-            first_attempt["repair_inputs"]["retry_source"],
-            "adapter_invalid_response_candidate_validation",
-        )
-        retry_request = adapter_request["_planner_requests"][-1]
-        self.assertEqual(retry_request["semantic_convergence_attempt"], 2)
-        self.assertIn(
-            "bounded_task_requirement_exceeds_max_sources",
-            retry_request["semantic_convergence_repair_inputs"][
+            first_attempt["adapter_candidate_attempts"][0][
                 "deterministic_failure_codes"
             ],
         )
-        self.assertTrue(convergence["attempts"][1]["final_selection"])
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_images",
+            first_attempt["adapter_candidate_attempts"][0][
+                "deterministic_failure_codes"
+            ],
+        )
+        self.assertEqual(
+            first_attempt["adapter_candidate_attempts"][0]["repair_inputs"][
+                "retry_source"
+            ],
+            "adapter_candidate_validation",
+        )
+        retry_request = adapter_request["_planner_requests"][-1]
+        self.assertEqual(retry_request["retry_attempt"], 2)
+        self.assertNotIn("semantic_convergence_attempt", retry_request)
+        self.assertIn(
+            "bounded_task_requirement_exceeds_max_sources",
+            retry_request["previous_candidate_validation_failure_codes"],
+        )
 
     def test_adapter_invalid_candidate_validation_blocks_after_outer_max_attempts(self) -> None:
         def always_over_cap(response: dict, _request: dict) -> dict:
@@ -5996,8 +6008,12 @@ class SemanticPlannerTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
         self.assertEqual(convergence["status"], "blocked_semantic_planner_unavailable")
-        self.assertEqual(convergence["attempt_count"], 2)
-        self.assertEqual(len(adapter_request["_planner_requests"]), 4)
+        self.assertEqual(convergence["attempt_count"], 1)
+        self.assertEqual(len(adapter_request["_planner_requests"]), 2)
+        self.assertEqual(
+            [request["planner_strategy_name"] for request in adapter_request["_planner_requests"]],
+            ["default_semantic_planner", "entity_first"],
+        )
         self.assertTrue(convergence["attempts"][-1]["terminal_failure"])
         self.assertEqual(
             convergence["attempts"][-1]["repair_inputs"]["terminal_reason"],
@@ -6012,6 +6028,183 @@ class SemanticPlannerTests(unittest.TestCase):
             convergence["terminal_failure"]["reason_codes"],
         )
         self.assertEqual(raw_response["failure_category"], "adapter_invalid_response")
+
+    def test_semantic_retry_strategies_are_actual_planner_request_inputs(self) -> None:
+        repair_marker = "entity-first retry repaired reviewer blocker"
+
+        def planner_mutator(response: dict, request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            if request.get("planner_strategy_name") == "entity_first":
+                response["candidate_plan"]["constraints"].append(repair_marker)
+            return response
+
+        def reviewer_mutator(response: dict, request: dict) -> dict:
+            plan_text = json.dumps(request["semantic_plan"], ensure_ascii=False)
+            if repair_marker not in plan_text:
+                review = response["semantic_plan_review"]
+                review["semantic_fit_score"] = 8.4
+                review["blockers"] = [{"code": "NON_EXECUTABLE_TASK_SCOPE_CAP"}]
+                review["verdict"] = "release_ineligible"
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            "Compare official museum visitor map images with accessibility guidance.",
+            requirement_types=("subject", "visual_modality", "source_quality"),
+            visual_angle_indexes=(2, 3),
+            planner_response_mutator=planner_mutator,
+            reviewer_response_mutator=reviewer_mutator,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        planner_requests = adapter_request["_planner_requests"]
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(
+            [request["planner_strategy_name"] for request in planner_requests[:2]],
+            ["default_semantic_planner", "entity_first"],
+        )
+        self.assertIn(
+            "entity-first strategy",
+            planner_requests[1]["planner_strategy_instructions"],
+        )
+        self.assertNotEqual(
+            planner_requests[0]["planner_strategy_request_hash"],
+            planner_requests[1]["planner_strategy_request_hash"],
+        )
+        self.assertEqual(convergence["attempts"][0]["strategy_name"], "default_semantic_planner")
+        self.assertTrue(convergence["attempts"][0]["discarded"], convergence)
+        self.assertEqual(
+            convergence["attempts"][0]["candidate_disposition"],
+            "discarded",
+        )
+        self.assertFalse(convergence["attempts"][0]["materialization_allowed"])
+        self.assertEqual(convergence["attempts"][1]["strategy_name"], "entity_first")
+        self.assertTrue(convergence["attempts"][1]["final_selection"], convergence)
+        self.assertEqual(
+            convergence["attempts"][1]["candidate_disposition"],
+            "accepted",
+        )
+        self.assertTrue(convergence["attempts"][1]["materialization_allowed"])
+
+    def test_candidate_validation_retry_reaches_dimension_report_contract_strategy(self) -> None:
+        failure_marker = "discarded failure marker should not reach handoff"
+
+        def invalid_until_third_strategy(response: dict, request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            if request.get("planner_strategy_name") == "dimension_report_contract_first":
+                return response
+            task = response["candidate_plan"]["bounded_tasks"][0]
+            task["query"] = failure_marker
+            task["max_sources"] = 1
+            task["max_images"] = 1
+            task["route"] = "visual_required"
+            task["expected_visual_targets"] = ["official poster images"]
+            task["done_condition"] = (
+                "Done when at least four images and eight vendors have official "
+                "source records with caveats."
+            )
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            "Compare official public poster image guidance across agencies.",
+            requirement_types=("subject", "source_quality", "visual_modality"),
+            visual_angle_indexes=(2, 3),
+            planner_response_mutator=invalid_until_third_strategy,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")["semantic_plan"]
+        search_tasks = self.load_json(run_dir / "search_tasks.json")
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        self.assertEqual(
+            [request["planner_strategy_name"] for request in adapter_request["_planner_requests"][:3]],
+            [
+                "default_semantic_planner",
+                "entity_first",
+                "dimension_report_contract_first",
+            ],
+        )
+        inner_attempts = convergence["attempts"][0]["adapter_candidate_attempts"]
+        self.assertEqual(len(inner_attempts), 3)
+        self.assertTrue(inner_attempts[0]["discarded"], inner_attempts)
+        self.assertEqual(inner_attempts[0]["candidate_disposition"], "discarded")
+        self.assertFalse(inner_attempts[0]["materialization_allowed"])
+        self.assertTrue(inner_attempts[1]["discarded"], inner_attempts)
+        self.assertEqual(inner_attempts[1]["candidate_disposition"], "discarded")
+        self.assertFalse(inner_attempts[1]["materialization_allowed"])
+        self.assertTrue(inner_attempts[2]["final_selection"], inner_attempts)
+        self.assertEqual(inner_attempts[2]["candidate_disposition"], "accepted")
+        self.assertTrue(inner_attempts[2]["materialization_allowed"])
+        self.assertEqual(
+            inner_attempts[2]["strategy_name"],
+            "dimension_report_contract_first",
+        )
+        self.assertNotIn(failure_marker, json.dumps(semantic_plan, ensure_ascii=False))
+        self.assertNotIn(failure_marker, json.dumps(search_tasks, ensure_ascii=False))
+
+    def test_non_retryable_candidate_validation_failure_stops_without_retry(self) -> None:
+        def invalid_scope(response: dict, _request: dict) -> dict:
+            response = json.loads(json.dumps(response))
+            response["candidate_plan"]["question_scope"] = "unbounded"
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            "Research a narrow source-backed implementation question.",
+            planner_response_mutator=invalid_scope,
+        )
+        run_dir = Path(result["run_dir"])
+        convergence = self.load_json(run_dir / SEMANTIC_PLANNER_CONVERGENCE_FILENAME)
+
+        self.assertEqual(result["status"], "blocked_semantic_planner_unavailable")
+        self.assertEqual(len(adapter_request["_planner_requests"]), 1)
+        self.assertEqual(convergence["attempt_count"], 1)
+        self.assertTrue(convergence["attempts"][0]["terminal_failure"])
+        self.assertIn(
+            "question_scope_unknown",
+            convergence["terminal_failure"]["reason_codes"],
+        )
+
+    def test_retry_refuses_locked_oracle_input_identity_mutation(self) -> None:
+        question = "Compare official public poster image guidance across agencies."
+        mutations = {
+            "original_question": (
+                "Changed question",
+                "original_question",
+            ),
+            "prompt_id": ("pb-sem-mutated", "prompt_id"),
+            "prompt_hash": ("a" * 64, "prompt_hash"),
+            "semantic_expectation_oracle_hash": ("b" * 64, "semantic_expectation_oracle_hash"),
+            "manifest_oracle_hash": ("c" * 64, "manifest_oracle_hash"),
+            "locked_semantic_expectation_oracle": (
+                {"oracle_content_hash": "d" * 64, "oracle_requirement_map": []},
+                "locked_oracle_content_hash",
+            ),
+        }
+
+        for field, (mutated_value, expected_mismatch) in mutations.items():
+            with self.subTest(field=field):
+                raw_request = build_codex_semantic_raw_request(question=question)
+                retry_request = _codex_semantic_retry_raw_request(
+                    raw_request=raw_request,
+                    attempt=2,
+                    validation={
+                        "ok": False,
+                        "failures": [{"code": "typed_coverage_matrix_incomplete"}],
+                        "failure_count": 1,
+                    },
+                )
+                retry_request[field] = mutated_value
+
+                plan = codex_semantic_candidate_plan(
+                    question=question,
+                    raw_request_payload=retry_request,
+                )
+
+                reason = plan.diagnostics["adapter_invalid_response_reason"]
+                self.assertEqual(plan.status, "blocked_semantic_planner_unavailable")
+                self.assertIn("Semantic planner retry identity changed after lock", reason)
+                self.assertIn(expected_mismatch, reason)
 
     def test_visual_cap_repair_raises_image_budget_within_schema_limit(self) -> None:
         def planner_mutator(response: dict, _request: dict) -> dict:
