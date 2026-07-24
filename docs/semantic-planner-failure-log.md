@@ -998,3 +998,55 @@ Next diagnostic or fix direction:
 
 - Run focused compact-request tests and the full semantic planner unit test module.
 - Re-run isolated `sem-reg-004` from the coordinator before resuming 30 semantic regression validation.
+
+## 2026-07-24 - Issue #133 / Medium Compact Request Fixture Validation Failure
+
+Prompt or issue:
+
+- Issue #133 compact semantic planner oracle request activation.
+- Unit test prompt: `Compare Korean public architectural model output against tender documents and design criteria in a structured table.`
+
+Command or suite:
+
+```bash
+python3 -m unittest tests.test_semantic_planner.SemanticPlannerTests.test_medium_visual_optional_structured_artifact_uses_compact_oracle_request tests.test_semantic_planner.SemanticPlannerTests.test_broad_visual_optional_structured_artifact_uses_compact_oracle_request tests.test_semantic_planner.SemanticPlannerTests.test_visual_optional_non_structured_prompt_keeps_full_oracle_request tests.test_semantic_planner.SemanticPlannerTests.test_non_visual_optional_structured_artifact_routes_keep_full_oracle_request
+```
+
+Run directory:
+
+- Temporary unittest run directory reported in the assertion output: `/tmp/tmp1r4m6pkm/dr_20260724T053656`
+- The unittest fixture removed the temporary directory before artifact inspection.
+
+Status:
+
+- Focused test run failed.
+
+Reviewer/validator failure codes:
+
+- Result summary for the new medium request-mode test reported `release_ineligible_planner_mode` and `semantic_release_ineligible`.
+
+Directly observed cause:
+
+- The new medium compact-request test asserted `awaiting_search_results`, but `prepare_run` returned `blocked_semantic_planner_unavailable`.
+- The returned diagnostics said true semantic decomposition did not run and the path was a release-ineligible fallback.
+- The assertion output showed the raw request/response/review artifact paths, but the temporary directory was already removed by the time artifact reads were attempted.
+
+Facts:
+
+- The failure occurred in a newly added request-mode unit test after changing the compact oracle scope guard to include `medium`.
+- The other three focused request-mode tests in the same command passed.
+- No production validator or reviewer threshold was changed before this failure.
+
+Inferences:
+
+- The medium test fixture likely produced a planner candidate that did not satisfy an existing medium locked-oracle validation contract, so the test was broader than needed for proving request activation.
+- The compact request mode itself was available to inspect from the captured fake adapter request before the final run status assertion.
+
+Unknowns:
+
+- The exact deterministic validation code that blocked the medium fixture, because the temporary artifacts were removed before inspection.
+
+Next diagnostic or fix direction:
+
+- Narrow the medium compact activation test to assert the captured planner request mode and audit-reference metadata instead of requiring the entire fake medium plan to pass downstream search-handoff validation.
+- Keep the test focused on request activation and avoid changing semantic validator/reviewer thresholds.

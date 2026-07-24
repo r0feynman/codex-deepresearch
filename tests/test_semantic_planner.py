@@ -7930,6 +7930,43 @@ class SemanticPlannerTests(unittest.TestCase):
                         )
                     )
 
+    def test_medium_visual_optional_structured_artifact_uses_compact_oracle_request(self) -> None:
+        question = (
+            "Compare Korean public architectural model output against tender "
+            "documents and design criteria in a structured table."
+        )
+
+        _result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            route="visual_optional",
+            oracle_question_scope="medium",
+            question_scope="medium",
+            angle_count=4,
+            tasks_per_angle=3,
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+            visual_angle_indexes=(2,),
+        )
+
+        self.assertTrue(adapter_request["_planner_requests"], adapter_request)
+        request = adapter_request["_planner_requests"][0]
+        self.assertEqual(
+            request["semantic_planner_request_mode"],
+            "compact_locked_oracle",
+        )
+        compact_oracle = request["locked_semantic_expectation_oracle"]
+        self.assertTrue(compact_oracle["compact_mode"], compact_oracle)
+        self.assertEqual(compact_oracle["question_scope"], "medium")
+        self.assertEqual(compact_oracle["bounded_task_range"]["min"], 10)
+        self.assertEqual(
+            request["locked_semantic_expectation_oracle_full_reference"]["path"],
+            "semantic_expectation_oracle.json",
+        )
+        self.assertTrue(
+            request["locked_semantic_expectation_oracle_full_reference"][
+                "release_validator_oracle_artifact_preserved"
+            ]
+        )
+
     def test_broad_visual_optional_structured_artifact_uses_compact_oracle_request(self) -> None:
         question = (
             "Compare architectural model output deliverables against public design "
@@ -8032,6 +8069,38 @@ class SemanticPlannerTests(unittest.TestCase):
         requirement = full_oracle["oracle_requirement_map"][0]
         self.assertIn("prompt_span", requirement)
         self.assertIn("inferred_reason", requirement)
+
+    def test_non_visual_optional_structured_artifact_routes_keep_full_oracle_request(self) -> None:
+        question = (
+            "Compare architectural model output deliverables against public design "
+            "criteria and tender documents in a structured comparison table."
+        )
+
+        cases = (
+            ("text_only", ()),
+            ("visual_required", (1, 2, 3, 4, 5)),
+        )
+        for route, visual_angle_indexes in cases:
+            with self.subTest(route=route):
+                _result, adapter_request = self.prepare_with_codex_adapter(
+                    question,
+                    route=route,
+                    oracle_question_scope="broad",
+                    question_scope="broad",
+                    requirement_types=("subject", "source_quality", "deliverable_shape"),
+                    visual_angle_indexes=visual_angle_indexes,
+                )
+
+                request = adapter_request["_planner_requests"][0]
+                self.assertEqual(
+                    request["semantic_planner_request_mode"],
+                    "full_locked_oracle",
+                )
+                self.assertNotIn("semantic_planner_request_compaction", request)
+                self.assertNotIn(
+                    "locked_semantic_expectation_oracle_full_reference",
+                    request,
+                )
 
     def test_broad_cardinality_shortfall_requests_replan_without_generic_padding(self) -> None:
         question = "Compare official city planning implementation indicators across local plans"

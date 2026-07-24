@@ -15566,7 +15566,7 @@ def compact_semantic_planner_locked_oracle_for_request(
     budget_cap: Mapping[str, Any],
     locked_oracle: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Return a compact planner-facing oracle view for broad structured artifacts.
+    """Return a compact planner-facing oracle view for structured artifacts.
 
     The full oracle remains persisted as ``semantic_expectation_oracle.json``.
     This helper only reduces the JSON payload sent to the planner adapter while
@@ -15623,7 +15623,7 @@ def compact_semantic_planner_locked_oracle_for_request(
         "compact_mode": True,
         "compact_mode_schema_version": "codex-deepresearch.semantic-planner.compact-oracle.v1",
         "compact_mode_reason": (
-            "broad_visual_optional_structured_artifact_prompt"
+            "medium_or_broad_visual_optional_structured_artifact_prompt"
         ),
         "question_scope": locked_oracle.get("question_scope"),
         "bounded_task_range": copy.deepcopy(locked_oracle.get("bounded_task_range")),
@@ -15700,7 +15700,7 @@ def _semantic_planner_compact_oracle_mode_enabled(
 ) -> bool:
     if _normalized_visual_preference(visual_preference) != "visual_optional":
         return False
-    if str(locked_oracle.get("question_scope") or "") != "broad":
+    if str(locked_oracle.get("question_scope") or "") not in {"medium", "broad"}:
         return False
     searchable = json.dumps(
         [
