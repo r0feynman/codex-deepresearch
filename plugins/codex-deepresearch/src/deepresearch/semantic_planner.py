@@ -1682,7 +1682,16 @@ def _semantic_repair_materialization_allowed(raw_request: Mapping[str, Any]) -> 
         for code in _list(raw_request.get("previous_candidate_validation_failure_codes"))
         if str(code).strip()
     }
-    return "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE" in previous_codes
+    retryable_materialization_codes = {
+        "REQ_003_COMPARISON_DELIVERABLE_INCOMPLETE",
+        "typed_coverage_matrix_incomplete",
+        "typed_coverage_matrix_missing_cells",
+        "typed_coverage_matrix_task_ref_mismatch",
+        "typed_final_deliverable_contract_unbound",
+        "typed_source_budget_contract_missing",
+        "typed_task_partition_contract_violation",
+    }
+    return bool(previous_codes & retryable_materialization_codes)
 
 
 def _materialize_candidate_source_cap_splits(
@@ -5970,18 +5979,34 @@ def _materialize_candidate_typed_semantic_contracts(
         if dimension_ids != previous_dimension_ids:
             task_dict["semantic_dimension_refs"] = dimension_ids
         previous_deliverable_binding = task_dict.get("final_deliverable_binding")
-        if _candidate_task_is_final_deliverable(task_dict) and not isinstance(
-            previous_deliverable_binding,
-            Mapping,
+        deliverable_binding_changed = False
+        if _candidate_task_is_final_deliverable(task_dict):
+            binding = (
+                dict(previous_deliverable_binding)
+                if isinstance(previous_deliverable_binding, Mapping)
+                else {}
+            )
+            binding["contract_type"] = str(
+                deliverable_contract.get("contract_type") or ""
+            )
+            binding["required_sections"] = list(
+                deliverable_contract.get("required_sections") or []
+            )
+            binding["required_tables"] = list(
+                deliverable_contract.get("required_tables") or []
+            )
+            binding["required_judgments"] = list(
+                deliverable_contract.get("required_judgments") or []
+            )
+            binding.setdefault("binding", "final_synthesis_deliverable")
+            binding.setdefault("binding_marker", "final_synthesis_deliverable")
+            task_dict["final_deliverable_binding"] = binding
+            deliverable_binding_changed = binding != previous_deliverable_binding
+        if (
+            entity_ids != previous_entity_ids
+            or dimension_ids != previous_dimension_ids
+            or deliverable_binding_changed
         ):
-            task_dict["final_deliverable_binding"] = {
-                "contract_type": deliverable_contract.get("contract_type"),
-                "required_sections": list(
-                    deliverable_contract.get("required_sections") or []
-                ),
-                "binding": "final_synthesis_deliverable",
-            }
-        if entity_ids != previous_entity_ids or dimension_ids != previous_dimension_ids:
             task_annotations.append(
                 {
                     "task_id": task_dict.get("task_id"),
@@ -6069,7 +6094,7 @@ def _candidate_requires_typed_comparison_contract(
     lowered = text.lower()
     if len(entities) < 2 or not dimensions:
         return False
-    return _contains_any(
+    comparison_requested = _contains_any(
         lowered,
         (
             "compare",
@@ -6083,7 +6108,10 @@ def _candidate_requires_typed_comparison_contract(
             "표",
             "비교",
         ),
-    ) and _contains_any(
+    )
+    if not comparison_requested:
+        return False
+    domain_or_source_context = _contains_any(
         lowered,
         (
             "provider",
@@ -6095,8 +6123,21 @@ def _candidate_requires_typed_comparison_contract(
             "model",
             "documentation",
             "official",
+            "공식",
+            "기관",
+            "기준",
+            "자료",
+            "문서",
+            "리콜",
+            "제품",
+            "모델",
+            "브라우저",
+            "벤더",
+            "공급자",
+            "관할",
         ),
     )
+    return domain_or_source_context or bool(entities and dimensions)
 
 
 _TYPED_CONTRACT_ENTITY_STOPWORDS = {

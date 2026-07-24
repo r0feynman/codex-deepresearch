@@ -709,3 +709,44 @@ Resolution:
 - Keep validator and reviewer thresholds unchanged.
 - Treat retry exhaustion as a blocked semantic planner outcome, not as a pass.
 - If a future regression or E2E run exhausts all retry attempts, append the prompt id, run directory, failure codes, and convergence artifact path to this log before claiming the related gate is understood.
+
+## 2026-07-24 - Issue #133 / Planner Output Schema Required-Fields Probe
+
+Prompt or issue:
+
+- Issue #133 schema compatibility blocker for `planner.json`.
+
+Command or suite:
+
+```bash
+timeout 120 codex exec --json --output-schema plugins/codex-deepresearch/validation/semantic_adapter_schemas/planner.json 'Return a minimal JSON object that satisfies the provided output schema. Use one angle, one bounded task, and typed semantic contract fields.'
+```
+
+Run directory:
+
+- None. This was a direct Codex CLI output-schema probe, not a prepared DeepResearch run.
+
+Status:
+
+- Failed immediately with `invalid_json_schema`.
+
+Reviewer/validator failure codes:
+
+- `invalid_json_schema`
+
+Directly observed cause:
+
+- Codex rejected the nested object schema at `candidate_plan.bounded_tasks.items.properties.final_deliverable_binding` because the object declared properties but did not provide a `required` array containing every property key.
+
+Inferences:
+
+- Codex output-schema compatibility requires both `additionalProperties:false` on every object schema and `required` arrays that include all declared object properties.
+
+Unknowns:
+
+- Whether the schema will complete a full live model response inside the bounded probe timeout.
+
+Next diagnostic or fix direction:
+
+- `planner.json` was tightened so every object schema's `required` array contains exactly its explicit properties.
+- A follow-up live probe moved past immediate schema rejection and timed out after 120 seconds without a final JSON response.

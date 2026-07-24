@@ -82,6 +82,7 @@ from deepresearch.semantic_planner import (  # noqa: E402
     _repair_candidate_requirement_coverage,
     _semantic_adapter_command,
     _semantic_adapter_prompt,
+    _semantic_repair_materialization_allowed,
     _semantic_substitute_implementation_check,
 )
 
@@ -219,13 +220,15 @@ class SemanticPlannerTests(unittest.TestCase):
                 {
                     "entity_id": "entity_001",
                     "name": "GitHub",
-                    "entity_type": "provider",
+                    "type": "provider",
+                    "evidence": "official provider named in the request",
                     "required": True,
                 },
                 {
                     "entity_id": "entity_002",
                     "name": "Google",
-                    "entity_type": "provider",
+                    "type": "provider",
+                    "evidence": "official provider named in the request",
                     "required": True,
                 },
             ],
@@ -233,40 +236,62 @@ class SemanticPlannerTests(unittest.TestCase):
                 {
                     "dimension_id": "dimension_001",
                     "name": "initiation_endpoint",
+                    "evidence": "implementation guidance comparison dimension",
                     "required": True,
                 },
                 {
                     "dimension_id": "dimension_002",
                     "name": "device_code_polling",
+                    "evidence": "implementation guidance comparison dimension",
                     "required": True,
                 },
             ],
             "coverage_matrix": [
                 {
                     "entity_id": "entity_001",
+                    "entity_name": "GitHub",
                     "dimension_id": "dimension_001",
+                    "dimension": "initiation_endpoint",
                     "status": "covered",
                     "covered_by_task_ids": ["task_001"],
+                    "required": True,
                 },
                 {
                     "entity_id": "entity_002",
+                    "entity_name": "Google",
                     "dimension_id": "dimension_002",
+                    "dimension": "device_code_polling",
                     "status": "covered",
                     "covered_by_task_ids": ["task_002"],
+                    "required": True,
                 },
             ],
             "task_partition_contract": {
+                "contract_type": "named_entity_comparison_partition",
                 "max_entities_per_task": 2,
-                "partition_mode": "entity_dimension_pairs",
+                "partition_key": "selected_entities",
+                "entity_count": 2,
+                "grouping_rule": "At most two selected entities per bounded evidence task.",
+                "enforcement": "strict",
+                "materialized_from": "typed_semantic_contract",
+                "entity_kind": "provider",
             },
             "source_budget_contract": {
-                "max_unique_sources": 20,
-                "per_task_max_sources": 5,
-                "budget_scope": "global",
+                "contract_type": "source_budget",
+                "runner_max_unique_sources": 20,
+                "task_max_sources_sum": 10,
+                "max_task_sources": 5,
+                "per_task_cap_field": "bounded_tasks.max_sources",
+                "runner_cap_field": "runner_source_budget.max_unique_sources",
+                "cap_semantics": "runner_max_unique_sources is global; bounded task max_sources is per task.",
+                "reuse_required": False,
             },
             "final_deliverable_contract": {
+                "contract_type": "comparison_report",
                 "required_sections": ["Provider Coverage", "Comparison Matrix"],
                 "required_tables": ["entity_dimension_coverage"],
+                "required_judgments": ["supported", "unknown_or_unverifiable"],
+                "materialized_from": "typed_semantic_contract",
             },
         }
 
@@ -10027,6 +10052,41 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertEqual(schema_path.name, "planner.json")
         self.assertIn("semantically, not by keyword or fixed template", command[-1])
 
+    def test_planner_adapter_schema_is_codex_output_schema_compatible(self) -> None:
+        schema_path = (
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_adapter_schemas"
+            / "planner.json"
+        )
+        schema = self.load_json(schema_path)
+        violations: list[str] = []
+
+        def walk(value: object, path: str) -> None:
+            if isinstance(value, dict):
+                if value.get("type") == "object":
+                    if value.get("additionalProperties") is not False:
+                        violations.append(f"{path}: additionalProperties is not false")
+                    property_keys = set((value.get("properties") or {}).keys())
+                    required_keys = set(value.get("required") or [])
+                    if property_keys != required_keys:
+                        violations.append(
+                            f"{path}: required keys differ from properties "
+                            f"missing={sorted(property_keys - required_keys)} "
+                            f"extra={sorted(required_keys - property_keys)}"
+                        )
+                for key, child in value.items():
+                    walk(child, f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, f"{path}[{index}]")
+
+        walk(schema, "$")
+
+        self.assertEqual([], violations)
+
     def test_planner_adapter_schema_requires_typed_contract_fields(self) -> None:
         import jsonschema
 
@@ -10104,6 +10164,16 @@ class SemanticPlannerTests(unittest.TestCase):
                     "max_sources": 5,
                     "max_images": 0,
                     "done_condition": "Stop when official docs for selected providers are captured.",
+                    "semantic_entity_refs": ["entity_001", "entity_002"],
+                    "semantic_dimension_refs": ["dimension_001", "dimension_002"],
+                    "final_deliverable_binding": {
+                        "contract_type": "comparison_report",
+                        "required_sections": ["Provider Coverage", "Comparison Matrix"],
+                        "required_tables": ["entity_dimension_coverage"],
+                        "required_judgments": ["supported", "unknown_or_unverifiable"],
+                        "binding": "final_synthesis_deliverable",
+                        "binding_marker": "final_synthesis_deliverable",
+                    },
                 }
             ],
             "language": "en",
@@ -11966,6 +12036,261 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn(
             "typed_final_deliverable_contract_unbound",
             {failure["code"] for failure in validation["failures"]},
+        )
+
+    def test_korean_comparison_typed_contract_repair_rebuilds_lineage(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate["original_question"] = (
+            "한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료를 비교해줘."
+        )
+        candidate["constraints"] = [
+            "공식 기준과 공식 리콜 자료를 항목별 비교표로 대조한다."
+        ]
+        entities = [
+            {"entity_id": "entity_001", "name": "국토교통부 안전 기준", "type": "agency"},
+            {
+                "entity_id": "entity_002",
+                "name": "한국교통안전공단 자동차리콜센터 자료",
+                "type": "agency",
+            },
+            {"entity_id": "entity_003", "name": "제조사 리콜 공지", "type": "document"},
+            {"entity_id": "entity_004", "name": "소방청 전기차 화재 통계", "type": "agency"},
+        ]
+        dimensions = [
+            {"dimension_id": "dimension_001", "name": "배터리 화재 안전 기준"},
+            {"dimension_id": "dimension_002", "name": "리콜 판단 근거와 조치"},
+        ]
+        candidate["language"] = "ko"
+        candidate["intent_summary"] = (
+            "한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료를 비교한다."
+        )
+        candidate["domain_entities"] = entities
+        candidate["selected_entities"] = entities
+        candidate["required_dimensions"] = dimensions
+        candidate["requirement_coverage_map"] = [
+            {
+                "requirement_id": "req_001",
+                "requirement_type": "subject",
+                "requirement_text": candidate["original_question"],
+                "prompt_text": candidate["original_question"],
+                "prompt_span": {"start": 0, "end": len(candidate["original_question"])},
+                "explicit": True,
+                "non_negotiable": True,
+                "inferred_reason": None,
+                "covered_by_angle_ids": ["angle_001", "angle_002"],
+                "covered_by_task_ids": [
+                    task["task_id"] for task in candidate["bounded_tasks"]
+                ],
+                "coverage_status": "covered",
+            },
+            {
+                "requirement_id": "req_002",
+                "requirement_type": "source_quality",
+                "requirement_text": "공식 기관 기준과 공식 리콜 원문 자료가 필요하다.",
+                "prompt_text": "공식 리콜 자료",
+                "prompt_span": {"start": 0, "end": len(candidate["original_question"])},
+                "explicit": True,
+                "non_negotiable": True,
+                "inferred_reason": None,
+                "covered_by_angle_ids": ["angle_001", "angle_002"],
+                "covered_by_task_ids": [
+                    task["task_id"] for task in candidate["bounded_tasks"]
+                ],
+                "coverage_status": "covered",
+            },
+        ]
+        candidate["angles"] = [
+            {
+                "angle_id": "angle_001",
+                "title": "전기차 배터리 화재 안전 기준 비교",
+                "research_question": (
+                    "공식 기관 자료는 한국 전기차 배터리 화재 안전 기준을 "
+                    "어떻게 정의하고 설명하는가?"
+                ),
+                "why_this_angle_matters": (
+                    "안전 기준 축이 리콜 자료와 비교될 기준선을 제공한다."
+                ),
+                "included_scope": ["한국 전기차 배터리 화재 안전 기준"],
+                "excluded_scope": [],
+                "route": "text_only",
+                "evidence_need": "official_source",
+                "expected_source_types": ["공식 기관 문서", "규제 기준 원문"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["안전 기준 비교 근거"],
+                "search_queries": ["한국 전기차 배터리 화재 안전 기준 공식"],
+                "success_criteria": ["공식 기관 기준 원문을 근거로 기록한다."],
+                "report_section": "전기차 배터리 화재 안전 기준",
+                "risk_or_contradiction_checks": ["기준 적용 범위의 차이를 확인한다."],
+            },
+            {
+                "angle_id": "angle_002",
+                "title": "전기차 배터리 리콜 자료 근거 비교",
+                "research_question": (
+                    "공식 리콜 자료는 배터리 화재 위험과 리콜 조치 근거를 "
+                    "어떻게 설명하는가?"
+                ),
+                "why_this_angle_matters": (
+                    "리콜 자료 축이 실제 조치와 안전 기준의 차이를 드러낸다."
+                ),
+                "included_scope": ["한국 전기차 배터리 공식 리콜 자료"],
+                "excluded_scope": [],
+                "route": "text_only",
+                "evidence_need": "comparative_analysis",
+                "expected_source_types": ["공식 리콜 자료", "제조사 리콜 공지"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["리콜 판단 근거 비교"],
+                "search_queries": ["한국 전기차 배터리 리콜 자료 공식"],
+                "success_criteria": ["공식 리콜 자료와 조치 근거를 비교한다."],
+                "report_section": "전기차 배터리 리콜 자료",
+                "risk_or_contradiction_checks": ["리콜 사유와 안전 기준 불일치를 확인한다."],
+            },
+        ]
+        for task in candidate["bounded_tasks"]:
+            task_index = int(str(task["task_id"]).split("_")[-1]) - 1
+            entity = entities[task_index // len(dimensions)]
+            dimension = dimensions[task_index % len(dimensions)]
+            task["angle_id"] = (
+                "angle_001"
+                if dimension["dimension_id"] == "dimension_001"
+                else "angle_002"
+            )
+            task["query"] = (
+                f"{entity['name']} 전기차 배터리 화재 {dimension['name']} "
+                "공식 자료 비교"
+            )
+            task["source_policy"] = {
+                "decision": "allowed",
+                "required_source_quality": ["공식 기관 문서", "공식 리콜 원문"],
+            }
+            task["expected_source_types"] = ["공식 기관 문서", "공식 리콜 원문"]
+            task["expected_artifacts"] = [
+                f"{entity['name']} {dimension['name']} 비교 근거"
+            ]
+            task["success_criteria"] = [
+                f"{entity['name']}의 {dimension['name']} 내용을 공식 근거로 기록한다."
+            ]
+            task["done_condition"] = (
+                f"{entity['name']}의 {dimension['name']} 근거와 한계를 기록하면 중단한다."
+            )
+            task["semantic_entity_refs"] = []
+            task["semantic_dimension_refs"] = []
+        candidate["coverage_matrix"] = [
+            {
+                "entity_id": "entity_001",
+                "entity_name": "국토교통부 안전 기준",
+                "dimension_id": "dimension_001",
+                "dimension": "배터리 화재 안전 기준",
+                "status": "covered",
+                "covered_by_task_ids": ["task_002"],
+                "required": True,
+            }
+        ]
+        candidate["task_partition_contract"] = {
+            "contract_type": "named_entity_comparison_partition",
+            "partition_key": "selected_entities",
+            "max_entities_per_task": 2,
+            "entity_count": 4,
+            "grouping_rule": "At most two selected entities per bounded evidence task.",
+            "enforcement": "strict",
+            "materialized_from": "typed_semantic_contract",
+            "entity_kind": "provider",
+        }
+        candidate["source_budget_contract"] = {
+            "contract_type": "source_budget",
+            "runner_max_unique_sources": 20,
+            "task_max_sources_sum": 16,
+            "max_task_sources": 2,
+            "per_task_cap_field": "bounded_tasks.max_sources",
+            "runner_cap_field": "runner_source_budget.max_unique_sources",
+            "cap_semantics": "runner cap is global; bounded task cap is per task.",
+            "reuse_required": False,
+        }
+        candidate["final_deliverable_contract"] = {
+            "contract_type": "typed_comparative_research_report",
+            "required_sections": [
+                "전기차 배터리 화재 안전 기준",
+                "전기차 배터리 리콜 자료",
+            ],
+            "required_tables": ["entity_dimension_matrix"],
+            "required_judgments": ["supported", "unknown_or_unverifiable"],
+            "materialized_from": "typed_semantic_contract",
+        }
+        candidate["bounded_tasks"].append(
+            {
+                "task_id": "task_999",
+                "angle_id": "angle_002",
+                "query": "한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료 최종 비교 종합",
+                "route": "text_only",
+                "freshness_requirement": "any",
+                "source_policy": {
+                    "decision": "allowed",
+                    "required_source_quality": ["공식 기관 문서", "공식 리콜 원문"],
+                },
+                "expected_source_types": ["공식 기관 문서", "공식 리콜 원문"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["전기차 배터리 화재 안전 기준과 리콜 자료 최종 비교표"],
+                "success_criteria": ["모든 기관 자료와 비교 축을 최종 비교표로 종합한다."],
+                "max_sources": 2,
+                "max_images": 0,
+                "done_condition": "최종 비교표와 판단을 완성하면 중단한다.",
+                "semantic_entity_refs": [
+                    "entity_001",
+                    "entity_002",
+                    "entity_003",
+                    "entity_004",
+                ],
+                "semantic_dimension_refs": [
+                    "dimension_001",
+                    "dimension_002",
+                ],
+                "final_deliverable_binding": {
+                    "contract_type": "typed_report_binding",
+                    "required_sections": ["전기차 배터리 화재 안전 기준"],
+                    "required_tables": [],
+                    "required_judgments": ["supported"],
+                    "binding": "existing final synthesis marker",
+                    "binding_marker": "existing final synthesis marker",
+                },
+            }
+        )
+
+        repaired, materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(len(repaired["coverage_matrix"]), 8)
+        final_binding = repaired["bounded_tasks"][-1]["final_deliverable_binding"]
+        self.assertEqual(
+            final_binding["contract_type"],
+            "typed_comparative_research_report",
+        )
+        self.assertEqual(
+            final_binding["required_sections"],
+            ["전기차 배터리 화재 안전 기준", "전기차 배터리 리콜 자료"],
+        )
+        self.assertIn(
+            "coverage_matrix",
+            {materialization["field"] for materialization in materializations},
+        )
+
+    def test_typed_contract_failure_codes_enable_retry_materialization(self) -> None:
+        self.assertTrue(
+            _semantic_repair_materialization_allowed(
+                {
+                    "retry_attempt": 2,
+                    "previous_candidate_validation_failure_codes": [
+                        "typed_coverage_matrix_task_ref_mismatch",
+                        "typed_final_deliverable_contract_unbound",
+                    ],
+                }
+            )
         )
 
     def test_adapter_command_alone_is_not_valid_codex_semantic_provenance(self) -> None:
