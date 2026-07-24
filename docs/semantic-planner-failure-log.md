@@ -907,3 +907,52 @@ Next diagnostic or fix direction:
 - Run `sem-reg-004` as an isolated single prompt to separate prompt complexity from concurrency pressure.
 - If isolated `sem-reg-004` passes, re-run the 30 regression suite at lower concurrency before changing timeout policy.
 - If isolated `sem-reg-004` also times out, reduce planner prompt/output complexity or add progress/failure metadata before considering retry behavior.
+
+## 2026-07-24 - Issue #133 / sem-reg-004 Isolated Planner Timeout
+
+Prompt or issue:
+
+- Prompt id: `sem-reg-004`
+- Question: `건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘.`
+- Issue #133 semantic regression signoff.
+
+Command or suite:
+
+- Isolated single `prepare` run under `/tmp/codex-dr-sem-reg-004-isolated-20260724T045821Z`.
+- The run used `CODEX_DEEPRESEARCH_SEMANTIC_ORACLE_TIMEOUT_SECONDS=900`, `CODEX_DEEPRESEARCH_SEMANTIC_PLANNER_TIMEOUT_SECONDS=900`, and `CODEX_DEEPRESEARCH_SEMANTIC_REVIEWER_TIMEOUT_SECONDS=900`.
+
+Run directory:
+
+- `/tmp/codex-dr-sem-reg-004-isolated-20260724T045821Z/dr_20260724T045821`
+
+Status:
+
+- `blocked_semantic_planner_unavailable`
+
+Reviewer/validator failure codes:
+
+- `release_ineligible_planner_mode`
+- `semantic_release_ineligible`
+
+Directly observed cause:
+
+- `semantic_planner_raw/planner_response.json` records `blocked_reason="Codex semantic planner adapter failed: TimeoutExpired"`.
+- `semantic_planner_convergence.json` records `attempt_count=1`, `adapter_candidate_attempt_count=0`, and terminal reason `Codex semantic planner adapter failed: TimeoutExpired`.
+- `run_trace.jsonl` records oracle creation, oracle lock, and planner request creation before planner blocked.
+- `semantic_planner_raw/planner_request.json` shows the locked oracle classified the question as `question_scope="broad"`, `visual_preference="visual_optional"`, with 7 required angles and budget caps of 20 sources, 12 images, and 8 max results.
+
+Inferences:
+
+- `sem-reg-004` timeout is not caused only by regression-suite concurrency. It also occurs in an isolated run.
+- The likely next fix is to reduce planner request/output complexity for broad visual-optional structured-artifact questions, or split planning into smaller bounded stages, rather than adding a blind retry after a 900-second timeout.
+
+Unknowns:
+
+- Whether a compact planner request for the same locked oracle would complete within the same timeout.
+- Whether the current broad-scope oracle for this prompt is too expansive for a single Codex JSON-schema planner call.
+
+Next diagnostic or fix direction:
+
+- Add a compact planner request mode for broad visual-optional structured-artifact prompts that preserves the same validator thresholds and locked oracle but removes redundant prompt/schema burden.
+- Add a focused test proving the compact request preserves route, source, visual, typed-contract, and final-deliverable obligations.
+- Re-run isolated `sem-reg-004` before resuming the 30-prompt suite.
