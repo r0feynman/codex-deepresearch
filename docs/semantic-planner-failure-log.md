@@ -629,3 +629,43 @@ Resolution:
 - Materialize `source_budget_contract` from `runner_source_budget` in budget-cap and source-cap repair paths.
 - Keep empty `source_budget_contract` invalid when the field is explicitly present on a typed contract plan.
 - Re-ran the focused typed-contract/source-budget tests and `python3 -m unittest tests.test_semantic_planner tests.test_search_handoff`; both passed.
+
+## 2026-07-24 - PR #148 / Release Gates Still Missing Real Run Bundles
+
+Prompt or issue:
+
+- Issue #133 / PR #148 validation after typed semantic contract hardening.
+
+Command or suite:
+
+```bash
+plugins/codex-deepresearch/scripts/codex-deepresearch public-beta-validation --runs-dir /tmp/codex-deepresearch-public-beta-validation-pr148 --suite-id public-beta-validation --clean --allow-blocked
+plugins/codex-deepresearch/scripts/codex-deepresearch semantic-release-validation --runs-dir /tmp/codex-deepresearch-semantic-release-validation-pr148 --suite-id semantic-release-validation --clean --allow-blocked
+```
+
+Directly observed failure:
+
+- Public Beta validation status was `blocked`, with `release_gate_ready=false`.
+- Semantic release validation status was `failed`, with `valid=false` and `release_gate_ready=false`.
+
+Facts:
+
+- Public Beta validation counted 20 blocked runs: 10 `artifact_handoff_failure` and 10 `provider_failure`.
+- Public Beta validation reported `passed=0`, `failed=0`, `blocked=20`.
+- Semantic release validation reported missing run entries for all 30 semantic regression prompts, all 20 Public Beta semantic prompts, and all 12 blind holdout prompts.
+- Semantic release validation also reported `manual_trace_audit_manifest_missing`.
+- These failures came from missing release-counted run bundles, not from a Python exception in the typed contract changes.
+
+Inferences:
+
+- The typed contract implementation can be merged as a hardening slice only if the PR explicitly does not claim #133 release signoff.
+- Full #133 closure still requires generating and supplying the release-counted run directories plus manual trace audit manifest.
+
+Unknowns:
+
+- Whether all 62 release-counted semantic runs will pass once generated on the latest code.
+
+Resolution:
+
+- No validator threshold was lowered.
+- The failures were preserved as release-gate failures and left for the remaining #133 signoff work.
