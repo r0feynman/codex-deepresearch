@@ -12038,10 +12038,165 @@ class SemanticPlannerTests(unittest.TestCase):
             {failure["code"] for failure in validation["failures"]},
         )
 
+    def test_typed_final_task_binds_all_entities_and_dimensions(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate["bounded_tasks"].append(
+            {
+                "task_id": "task_999",
+                "angle_id": "angle_002",
+                "query": "Write the final comparison report for every provider and dimension.",
+                "route": "text_only",
+                "freshness_requirement": "any",
+                "source_policy": {"decision": "allowed"},
+                "expected_source_types": ["official provider documentation"],
+                "expected_visual_targets": [],
+                "expected_artifacts": ["final comparison report"],
+                "success_criteria": ["Every entity and dimension is represented."],
+                "max_sources": 2,
+                "max_images": 0,
+                "done_condition": "Stop when the final report is complete.",
+                "semantic_entity_refs": ["entity_001"],
+                "semantic_dimension_refs": ["dimension_001"],
+                "final_deliverable_binding": {
+                    "contract_type": "final_comparison_report",
+                    "required_sections": ["Provider Coverage"],
+                    "required_tables": [],
+                    "required_judgments": ["supported"],
+                    "binding": "FINAL-COMPARISON",
+                    "binding_marker": "FINAL-COMPARISON",
+                },
+            }
+        )
+
+        repaired, materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        final_task = next(
+            task
+            for task in repaired["bounded_tasks"]
+            if task["task_id"] == "task_999"
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(
+            final_task["semantic_entity_refs"],
+            ["entity_001", "entity_002", "entity_003", "entity_004"],
+        )
+        self.assertEqual(
+            final_task["semantic_dimension_refs"],
+            ["dimension_001", "dimension_002"],
+        )
+        self.assertEqual(
+            final_task["final_deliverable_binding"]["contract_type"],
+            repaired["final_deliverable_contract"]["contract_type"],
+        )
+        self.assertIn(
+            "bounded_tasks.semantic_contract_refs",
+            {materialization["field"] for materialization in materializations},
+        )
+
+    def test_report_bound_plan_materializes_final_task_and_refreshes_budget(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        for task in candidate["bounded_tasks"]:
+            task["final_deliverable_binding"] = {
+                "contract_type": "comparison_report_binding",
+                "required_sections": ["Provider Coverage"],
+                "required_tables": ["entity_dimension_coverage"],
+                "required_judgments": ["supported"],
+                "binding": "row evidence for final report",
+                "binding_marker": "row evidence for final report",
+            }
+
+        candidate, _budget_materializations = _materialize_candidate_budget_caps(
+            candidate,
+            budget_cap={"max_sources": 20},
+        )
+        repaired, materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertTrue(validation["ok"], validation)
+        final_tasks = [
+            task
+            for task in repaired["bounded_tasks"]
+            if task.get("task_partition_role") == "final_synthesis"
+        ]
+        self.assertEqual(len(final_tasks), 1)
+        self.assertEqual(len(final_tasks[0]["semantic_entity_refs"]), 4)
+        self.assertEqual(len(final_tasks[0]["semantic_dimension_refs"]), 2)
+        self.assertEqual(
+            repaired["runner_source_budget"]["bounded_task_count"],
+            len(repaired["bounded_tasks"]),
+        )
+        self.assertEqual(
+            repaired["runner_source_budget"]["task_max_sources_sum"],
+            sum(task["max_sources"] for task in repaired["bounded_tasks"]),
+        )
+        self.assertIn(
+            "bounded_tasks.final_deliverable_task",
+            {materialization["field"] for materialization in materializations},
+        )
+        self.assertIn(
+            "runner_source_budget",
+            {materialization["field"] for materialization in materializations},
+        )
+
+    def test_pairwise_partition_cap_does_not_hide_unbound_broad_evidence_task(self) -> None:
+        candidate = self.comparison_contract_candidate()
+        candidate["task_partition_contract"] = {
+            "contract_type": "named_entity_comparison_partition",
+            "partition_key": "selected_entities",
+            "max_entities_per_task": 1,
+            "entity_count": 4,
+            "grouping_rule": "Each evidence task covers one selected entity.",
+            "enforcement": "strict",
+            "materialized_from": "test",
+        }
+        candidate["bounded_tasks"][0]["query"] = (
+            "Collect Microsoft and Google OAuth device-flow official documentation."
+        )
+        candidate["bounded_tasks"][0]["semantic_entity_refs"] = [
+            "entity_001",
+            "entity_002",
+        ]
+        candidate["bounded_tasks"][0]["semantic_dimension_refs"] = ["dimension_001"]
+
+        repaired, _materializations = _materialize_candidate_typed_semantic_contracts(
+            candidate,
+            raw_request={"budget_cap": {"max_sources": 20}},
+            original_question=candidate["original_question"],
+        )
+        validation = validate_semantic_candidate_plan(
+            original_question=candidate["original_question"],
+            plan=repaired,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertEqual(
+            repaired["task_partition_contract"]["max_entities_per_task"],
+            1,
+        )
+        self.assertIn(
+            "typed_task_partition_contract_violation",
+            {failure["code"] for failure in validation["failures"]},
+        )
+
     def test_korean_comparison_typed_contract_repair_rebuilds_lineage(self) -> None:
         candidate = self.comparison_contract_candidate()
         candidate["original_question"] = (
-            "한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료를 비교해줘."
+            "국내 전기차 구동축전지 화재 안전 기준과 공식 결함시정 자료를 대조해줘."
         )
         candidate["constraints"] = [
             "공식 기준과 공식 리콜 자료를 항목별 비교표로 대조한다."
@@ -12062,7 +12217,7 @@ class SemanticPlannerTests(unittest.TestCase):
         ]
         candidate["language"] = "ko"
         candidate["intent_summary"] = (
-            "한국 전기차 배터리 화재 안전 기준과 공식 리콜 자료를 비교한다."
+            "국내 전기차 구동축전지 화재 안전 기준과 공식 결함시정 자료를 대조한다."
         )
         candidate["domain_entities"] = entities
         candidate["selected_entities"] = entities

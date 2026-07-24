@@ -799,3 +799,61 @@ Next diagnostic or fix direction:
 
 - Add timeout-specific adapter retry/backoff metadata for Codex semantic oracle/planner/reviewer calls without lowering semantic validator thresholds.
 - Re-run the failed prompt under a bounded timeout-retry probe before resuming the full 30 semantic regression suite.
+
+## 2026-07-24 - Issue #133 / Typed Contract Materialization Instability
+
+Prompt or issue:
+
+- Issue #133 semantic regression signoff.
+- Observed prompts: `sem-reg-001`, `sem-reg-002`, and `sem-reg-003`.
+
+Command or suite:
+
+- 30 semantic regression `prepare` rerun under `/tmp/codex-dr-sem-reg-30-rerun-20260724T031657Z`.
+- Focused raw-candidate revalidation of:
+  - `/tmp/codex-dr-sem-reg-30-rerun-20260724T031657Z/dr_20260724T031657_2`
+  - `/tmp/codex-dr-sem-reg-30-rerun-20260724T031657Z/dr_20260724T031657_3`
+  - `/tmp/codex-dr-sem-reg-30-rerun-20260724T031657Z/dr_20260724T031657_4`
+
+Run directory:
+
+- `/tmp/codex-dr-sem-reg-30-rerun-20260724T031657Z`
+
+Status:
+
+- Original run artifacts were `blocked_semantic_planner_unavailable`.
+- Focused current-code revalidation initially reproduced typed-contract instability before the materializer hardening.
+
+Reviewer/validator failure codes:
+
+- `typed_coverage_matrix_incomplete`
+- `typed_task_partition_contract_violation`
+- `typed_final_deliverable_contract_unbound`
+- `visual_example_expected_evidence_missing`
+- `visual_observation_expected_evidence_missing`
+- During intermediate local repair validation only: `bounded_task_requirement_exceeds_max_sources`
+- During intermediate local repair validation only: `global_source_budget_missing_executable_runner_budget`
+
+Directly observed cause:
+
+- The planner emitted useful `selected_entities`, `required_dimensions`, `coverage_matrix`, `task_partition_contract`, and `final_deliverable_contract` fields, but some fields were internally inconsistent.
+- Existing final/report tasks did not reliably bind every selected entity by every required dimension, so coverage cells stayed `missing`.
+- Some comparison or synthesis tasks referenced multiple entities and were validated as ordinary entity-specific evidence collection tasks.
+- A visual-required report-bound plan had visual tasks, but no dedicated final synthesis task binding the final deliverable contract.
+- An intermediate repair created a final synthesis task with `max_sources=1`, but validator required at least two source-backed records for the final report task and the runner source budget metadata was not refreshed after adding the task.
+
+Inferences:
+
+- The failure pattern is structural: useful Codex semantic planner output can still fail release validation when typed contract lineage is not deterministically normalized before validation.
+- The correct fix is deterministic materialization of task lineage, final deliverable binding, partition role metadata, and runner budget metadata, not lowering reviewer or validator thresholds.
+
+Unknowns:
+
+- Whether the full 30-prompt semantic regression suite will pass live Codex execution after this materializer hardening.
+- Whether additional non-timeout prompt-specific failures will appear after the first four prompts progress further.
+
+Next diagnostic or fix direction:
+
+- Re-run focused unit tests for typed final binding, report-bound final-task creation, visual obligation preservation, and broad evidence partition rejection.
+- Re-run `python3 -m unittest tests.test_semantic_planner`.
+- Re-run the 30 semantic regression prepare suite after focused tests pass.

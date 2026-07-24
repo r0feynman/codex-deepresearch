@@ -5959,19 +5959,37 @@ def _materialize_candidate_typed_semantic_contracts(
             }
         )
 
+    all_entity_ids = [
+        str(entity.get("entity_id") or "")
+        for entity in entities
+        if str(entity.get("entity_id") or "").strip()
+        and entity.get("required") is not False
+    ]
+    all_dimension_ids = [
+        str(dimension.get("dimension_id") or "")
+        for dimension in dimensions
+        if str(dimension.get("dimension_id") or "").strip()
+        and dimension.get("required") is not False
+    ]
+
     previous_tasks = normalized.get("bounded_tasks")
     normalized_tasks = []
     task_annotations: list[dict[str, Any]] = []
     for task in tasks:
         task_dict = dict(task)
-        entity_ids = _candidate_record_selected_entity_ids(
-            task_dict,
-            entities=entities,
-        )
-        dimension_ids = _candidate_record_required_dimension_ids(
-            task_dict,
-            dimensions=dimensions,
-        )
+        is_final_deliverable = _candidate_task_is_final_deliverable(task_dict)
+        if is_final_deliverable:
+            entity_ids = list(all_entity_ids)
+            dimension_ids = list(all_dimension_ids)
+        else:
+            entity_ids = _candidate_record_selected_entity_ids(
+                task_dict,
+                entities=entities,
+            )
+            dimension_ids = _candidate_record_required_dimension_ids(
+                task_dict,
+                dimensions=dimensions,
+            )
         previous_entity_ids = _string_list(task_dict.get("semantic_entity_refs"))
         previous_dimension_ids = _string_list(task_dict.get("semantic_dimension_refs"))
         if entity_ids != previous_entity_ids:
@@ -5980,7 +5998,7 @@ def _materialize_candidate_typed_semantic_contracts(
             task_dict["semantic_dimension_refs"] = dimension_ids
         previous_deliverable_binding = task_dict.get("final_deliverable_binding")
         deliverable_binding_changed = False
-        if _candidate_task_is_final_deliverable(task_dict):
+        if is_final_deliverable:
             binding = (
                 dict(previous_deliverable_binding)
                 if isinstance(previous_deliverable_binding, Mapping)
@@ -6003,6 +6021,26 @@ def _materialize_candidate_typed_semantic_contracts(
             task_dict["final_deliverable_binding"] = binding
             deliverable_binding_changed = binding != previous_deliverable_binding
         if (
+            not is_final_deliverable
+            and _candidate_task_is_partition_exempt_synthesis(task_dict)
+        ):
+            previous_role = task_dict.get("task_partition_role")
+            previous_exemption = task_dict.get("task_partition_exemption")
+            task_dict["task_partition_role"] = "comparison_synthesis"
+            task_dict["task_partition_exemption"] = {
+                "exemption_type": "comparison_synthesis_task",
+                "partition_contract": partition_contract.get("contract_type"),
+                "reason": (
+                    "Task combines already scoped entity evidence for comparison, "
+                    "normalization, mapping, or report synthesis."
+                ),
+            }
+            if (
+                previous_role != task_dict.get("task_partition_role")
+                or previous_exemption != task_dict.get("task_partition_exemption")
+            ):
+                deliverable_binding_changed = True
+        if (
             entity_ids != previous_entity_ids
             or dimension_ids != previous_dimension_ids
             or deliverable_binding_changed
@@ -6018,7 +6056,40 @@ def _materialize_candidate_typed_semantic_contracts(
                 }
             )
         normalized_tasks.append(task_dict)
+    (
+        normalized_tasks,
+        final_task_materialization,
+    ) = _candidate_ensure_final_deliverable_task(
+        normalized_tasks,
+        entities=entities,
+        dimensions=dimensions,
+        final_deliverable_contract=deliverable_contract,
+        original_question=original_question,
+    )
+    if final_task_materialization:
+        materializations.append(final_task_materialization)
+    (
+        partition_contract,
+        partition_cap_materialization,
+    ) = _candidate_normalize_partition_contract_for_plan(
+        partition_contract,
+        tasks=normalized_tasks,
+        entities=entities,
+    )
+    if partition_cap_materialization:
+        previous_partition_contract = normalized.get("task_partition_contract")
+        normalized["task_partition_contract"] = partition_contract
+        materializations.append(partition_cap_materialization)
     normalized["bounded_tasks"] = normalized_tasks
+    normalized, source_budget_task_materialization = (
+        _candidate_refresh_runner_source_budget_for_tasks(
+            normalized,
+            tasks=normalized_tasks,
+            raw_request=raw_request,
+        )
+    )
+    if source_budget_task_materialization:
+        materializations.append(source_budget_task_materialization)
     if previous_tasks != normalized_tasks:
         materializations.append(
             {
@@ -6517,6 +6588,304 @@ def _candidate_build_coverage_matrix(
                 }
             )
     return matrix
+
+
+def _candidate_ensure_final_deliverable_task(
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    entities: Sequence[Mapping[str, Any]],
+    dimensions: Sequence[Mapping[str, Any]],
+    final_deliverable_contract: Mapping[str, Any],
+    original_question: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    normalized_tasks = [dict(task) for task in tasks if isinstance(task, Mapping)]
+    if not normalized_tasks:
+        return normalized_tasks, None
+    if not _string_list(final_deliverable_contract.get("required_sections")):
+        return normalized_tasks, None
+
+    all_entity_ids = [
+        str(entity.get("entity_id") or "")
+        for entity in entities
+        if str(entity.get("entity_id") or "").strip()
+        and entity.get("required") is not False
+    ]
+    all_dimension_ids = [
+        str(dimension.get("dimension_id") or "")
+        for dimension in dimensions
+        if str(dimension.get("dimension_id") or "").strip()
+        and dimension.get("required") is not False
+    ]
+    if not all_entity_ids or not all_dimension_ids:
+        return normalized_tasks, None
+
+    final_indexes = [
+        index
+        for index, task in enumerate(normalized_tasks)
+        if _candidate_task_is_final_deliverable(task)
+    ]
+    if final_indexes:
+        return normalized_tasks, None
+
+    report_bound_tasks = [
+        task
+        for task in normalized_tasks
+        if _candidate_task_has_report_deliverable_binding(task)
+    ]
+    if not report_bound_tasks:
+        return normalized_tasks, None
+
+    existing_task_ids = {
+        str(task.get("task_id") or "")
+        for task in normalized_tasks
+        if str(task.get("task_id") or "").strip()
+    }
+    final_task_id = _candidate_next_task_id(existing_task_ids)
+    angle_id = str(normalized_tasks[-1].get("angle_id") or "")
+    required_sections = _string_list(
+        final_deliverable_contract.get("required_sections")
+    )
+    required_tables = _string_list(final_deliverable_contract.get("required_tables"))
+    required_judgments = _string_list(
+        final_deliverable_contract.get("required_judgments")
+    )
+    final_task = {
+        "task_id": final_task_id,
+        "angle_id": angle_id,
+        "query": (
+            f"Finalize the evidence-bound semantic research report for: "
+            f"{original_question}"
+        ),
+        "route": "text_only",
+        "freshness_requirement": "any",
+        "source_policy": {
+            "decision": "allowed",
+            "required_source_quality": ["reuse prior task evidence"],
+        },
+        "expected_source_types": ["previously collected evidence"],
+        "expected_visual_targets": [],
+        "expected_artifacts": [
+            "final evidence-bound report",
+            *required_sections,
+            *required_tables,
+        ],
+        "success_criteria": [
+            (
+                "Bind every selected entity by required dimension cell to the "
+                "final deliverable contract."
+            ),
+            (
+                "Preserve evidence, caveat, unknown, and visual-observation fields "
+                "from upstream bounded tasks without inventing unsupported claims."
+            ),
+        ],
+        "max_sources": 2,
+        "max_images": 0,
+        "done_condition": (
+            "Stop when the final report sections, tables, judgments, caveats, "
+            "unknowns, and source bindings required by final_deliverable_contract "
+            "are complete."
+        ),
+        "semantic_entity_refs": list(all_entity_ids),
+        "semantic_dimension_refs": list(all_dimension_ids),
+        "task_partition_role": "final_synthesis",
+        "task_partition_exemption": {
+            "exemption_type": "final_synthesis_task",
+            "partition_contract": "final_deliverable_contract",
+            "reason": (
+                "Final synthesis binds already scoped entity and dimension evidence; "
+                "it is not a broad evidence-collection task."
+            ),
+        },
+        "final_deliverable_binding": _candidate_final_deliverable_binding(
+            final_deliverable_contract
+        ),
+    }
+    normalized_tasks.append(final_task)
+    return normalized_tasks, {
+        "field": "bounded_tasks.final_deliverable_task",
+        "materialization": "created_final_synthesis_task_from_report_contract",
+        "task_id": final_task_id,
+        "entity_count": len(all_entity_ids),
+        "dimension_count": len(all_dimension_ids),
+        "required_section_count": len(required_sections),
+    }
+
+
+def _candidate_next_task_id(existing_task_ids: set[str]) -> str:
+    highest = 0
+    for task_id in existing_task_ids:
+        match = re.search(r"(\d+)$", task_id)
+        if not match:
+            continue
+        highest = max(highest, int(match.group(1)))
+    width = 3 if highest >= 100 or any("_" in task_id for task_id in existing_task_ids) else 2
+    return f"task_{highest + 1:0{width}d}"
+
+
+def _candidate_final_deliverable_binding(
+    final_deliverable_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "contract_type": str(final_deliverable_contract.get("contract_type") or ""),
+        "required_sections": _string_list(
+            final_deliverable_contract.get("required_sections")
+        ),
+        "required_tables": _string_list(final_deliverable_contract.get("required_tables")),
+        "required_judgments": _string_list(
+            final_deliverable_contract.get("required_judgments")
+        ),
+        "binding": "final_synthesis_deliverable",
+        "binding_marker": "final_synthesis_deliverable",
+    }
+
+
+def _candidate_task_has_report_deliverable_binding(task: Mapping[str, Any]) -> bool:
+    binding = task.get("final_deliverable_binding")
+    if not isinstance(binding, Mapping) or not binding:
+        return False
+    text = json.dumps(binding, ensure_ascii=False, sort_keys=True).lower()
+    return _contains_any(
+        text,
+        (
+            "report",
+            "deliverable",
+            "comparison",
+            "matrix",
+            "table",
+            "judgment",
+            "보고서",
+            "산출물",
+            "비교",
+            "비교표",
+            "판정",
+        ),
+    )
+
+
+def _candidate_normalize_partition_contract_for_plan(
+    contract: Mapping[str, Any],
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+    entities: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    normalized = dict(contract)
+    max_entities = _semantic_task_source_cap_int(
+        normalized.get("max_entities_per_task")
+    )
+    if max_entities is None or max_entities != 1 or len(entities) < 3:
+        return normalized, None
+
+    non_exempt_counts = [
+        len(_string_list(task.get("semantic_entity_refs")))
+        for task in tasks
+        if isinstance(task, Mapping)
+        and not _candidate_task_is_final_deliverable(task)
+        and not _candidate_task_is_partition_exempt_synthesis(task)
+    ]
+    if not non_exempt_counts:
+        return normalized, None
+    if max(non_exempt_counts) > 2:
+        return normalized, None
+
+    pair_tasks = [
+        task
+        for task in tasks
+        if isinstance(task, Mapping)
+        and not _candidate_task_is_final_deliverable(task)
+        and not _candidate_task_is_partition_exempt_synthesis(task)
+        and len(_string_list(task.get("semantic_entity_refs"))) == 2
+    ]
+    if not pair_tasks:
+        return normalized, None
+    if not all(_candidate_task_has_report_deliverable_binding(task) for task in pair_tasks):
+        return normalized, None
+
+    normalized["max_entities_per_task"] = 2
+    normalized["materialized_from"] = "typed_partition_contract_pairwise_report_binding"
+    normalized["grouping_rule"] = (
+        "Evidence tasks may bind at most two selected entities only when the "
+        "task carries report/deliverable bindings that keep the pair scoped; "
+        "comparison and final synthesis tasks are partition-exempt, while broad "
+        "multi-entity evidence collection remains invalid."
+    )
+    return normalized, {
+        "field": "task_partition_contract.max_entities_per_task",
+        "materialization": "raised_pairwise_bound_for_report_bound_tasks",
+        "previous_max_entities_per_task": max_entities,
+        "materialized_max_entities_per_task": 2,
+        "pair_task_ids": [task.get("task_id") for task in pair_tasks[:20]],
+    }
+
+
+def _candidate_refresh_runner_source_budget_for_tasks(
+    candidate: Mapping[str, Any],
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+    raw_request: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    normalized = copy.deepcopy(dict(candidate))
+    existing_runner_budget = normalized.get("runner_source_budget")
+    if not isinstance(existing_runner_budget, Mapping) or not existing_runner_budget:
+        return normalized, None
+
+    caps = [
+        cap
+        for cap in (
+            _semantic_task_source_cap_int(task.get("max_sources"))
+            for task in tasks
+            if isinstance(task, Mapping)
+        )
+        if cap is not None
+    ]
+    if not caps:
+        return normalized, None
+
+    total_cap = sum(caps)
+    bounded_task_count = len(caps)
+    runner_budget = dict(existing_runner_budget)
+    previous_sum = _semantic_task_source_cap_int(
+        runner_budget.get("task_max_sources_sum")
+    )
+    previous_count = _semantic_task_source_cap_int(
+        runner_budget.get("bounded_task_count")
+    )
+    declared_budget = _candidate_runner_source_budget_cap(runner_budget)
+    changed = False
+    if previous_sum != total_cap:
+        runner_budget["task_max_sources_sum"] = total_cap
+        changed = True
+    if previous_count != bounded_task_count:
+        runner_budget["bounded_task_count"] = bounded_task_count
+        changed = True
+    if declared_budget is not None:
+        reuse_required = total_cap > declared_budget
+        if runner_budget.get("reuse_required") is not reuse_required:
+            runner_budget["reuse_required"] = reuse_required
+            changed = True
+    if not changed:
+        return normalized, None
+
+    normalized["runner_source_budget"] = runner_budget
+    normalized, source_budget_contract_materialization = (
+        _materialize_candidate_source_budget_contract_from_runner(
+            normalized,
+            tasks=[task for task in tasks if isinstance(task, Mapping)],
+            raw_request=raw_request,
+        )
+    )
+    materialization = {
+        "field": "runner_source_budget",
+        "materialization": "refreshed_runner_source_budget_after_task_materialization",
+        "previous_task_max_sources_sum": previous_sum,
+        "task_max_sources_sum": total_cap,
+        "previous_bounded_task_count": previous_count,
+        "bounded_task_count": bounded_task_count,
+        "reuse_required": runner_budget.get("reuse_required"),
+    }
+    if source_budget_contract_materialization:
+        materialization["source_budget_contract"] = source_budget_contract_materialization
+    return normalized, materialization
 
 
 def _semantic_count_word_to_int(value: str) -> int | None:
@@ -14259,7 +14628,9 @@ def _candidate_typed_contract_validation_failures(
             violations = []
             unknown_ref_tasks = []
             for task in tasks:
-                if _candidate_task_is_final_deliverable(task):
+                if _candidate_task_is_final_deliverable(
+                    task
+                ) or _candidate_task_is_partition_exempt_synthesis(task):
                     continue
                 entity_refs = _string_list(task.get("semantic_entity_refs"))
                 unknown_entity_refs = [
@@ -14411,6 +14782,30 @@ def _candidate_plan_requires_typed_contract(
 
 
 def _candidate_task_is_final_deliverable(task: Mapping[str, Any]) -> bool:
+    binding = task.get("final_deliverable_binding")
+    if isinstance(binding, Mapping) and binding:
+        binding_markers = json.dumps(
+            [
+                binding.get("contract_type"),
+                binding.get("binding_marker"),
+                binding.get("binding"),
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+        ).lower()
+        if _contains_any(
+            binding_markers,
+            (
+                "final_comparison_report",
+                "final_report",
+                "final_synthesis",
+                "final-synthesis",
+                "final:",
+                "final-",
+                "final_",
+            ),
+        ):
+            return True
     text = json.dumps(
         [
             task.get("query"),
@@ -14430,10 +14825,50 @@ def _candidate_task_is_final_deliverable(task: Mapping[str, Any]) -> bool:
             "side by side",
             "comparison deliverable",
             "final report",
+            "final_comparison_report",
+            "final_synthesis",
             "\ucd5c\uc885",
             "\uc885\ud569",
+            "\ubcf4\uace0\uc11c\ub97c \uc791\uc131",
         ),
     )
+
+
+def _candidate_task_is_partition_exempt_synthesis(task: Mapping[str, Any]) -> bool:
+    role = str(task.get("task_partition_role") or "").strip().lower()
+    if role == "final_synthesis" and _candidate_task_is_final_deliverable(task):
+        return True
+    if _candidate_task_is_final_deliverable(task):
+        return True
+    entity_refs = _string_list(task.get("semantic_entity_refs"))
+    if len(entity_refs) <= 1:
+        return False
+    binding = task.get("final_deliverable_binding")
+    if not isinstance(binding, Mapping) or not binding:
+        return False
+    task_text = str(task.get("query") or "").lower()
+    has_synthesis_action = _contains_any(
+        task_text,
+        (
+            "compare",
+            "comparison",
+            "synthesis",
+            "normalize",
+            "mapping",
+            "matrix",
+            "contrast",
+            "\ube44\uad50",
+            "\ub300\uc870",
+            "\uc885\ud569",
+            "\uc815\uaddc\ud654",
+            "\ub9e4\ud551",
+            "\uc2dc\uc0ac\uc810",
+            "\uc0c1\ucda9",
+            "\uc5b4\ub5bb\uac8c \ub2e4\ub974",
+        ),
+    )
+    has_report_binding = _candidate_task_has_report_deliverable_binding(task)
+    return bool(has_synthesis_action and has_report_binding)
 
 
 def _semantic_release_angle_content_tokens(angle: Mapping[str, Any]) -> set[str]:
