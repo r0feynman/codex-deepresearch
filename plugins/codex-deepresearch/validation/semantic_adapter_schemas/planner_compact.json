@@ -1,0 +1,167 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "compact_candidate_plan",
+    "provenance"
+  ],
+  "properties": {
+    "compact_candidate_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "planner_mode",
+        "semantic_release_eligible",
+        "source",
+        "intent_summary",
+        "question_scope",
+        "decomposition_strategy",
+        "language",
+        "angle_specs",
+        "task_blueprints"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string"
+        },
+        "planner_mode": {
+          "type": "string",
+          "const": "codex_semantic"
+        },
+        "semantic_release_eligible": {
+          "type": "boolean",
+          "const": false
+        },
+        "source": {
+          "type": "string",
+          "const": "codex_semantic"
+        },
+        "intent_summary": {
+          "type": "string"
+        },
+        "question_scope": {
+          "type": "string",
+          "enum": [
+            "broad",
+            "medium",
+            "narrow"
+          ]
+        },
+        "decomposition_strategy": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "angle_specs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/angle_spec"
+          }
+        },
+        "task_blueprints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/task_blueprint"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_request_hash",
+        "adapter_invocation_kind",
+        "model_or_surface"
+      ],
+      "properties": {
+        "raw_request_hash": {
+          "type": "string"
+        },
+        "adapter_invocation_kind": {
+          "type": "string",
+          "const": "codex_exec_json"
+        },
+        "model_or_surface": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "angle_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "angle_id",
+        "title",
+        "research_question",
+        "route",
+        "evidence_need",
+        "requirement_refs"
+      ],
+      "properties": {
+        "angle_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "research_question": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string",
+          "enum": [
+            "text_only",
+            "visual_optional",
+            "visual_required"
+          ]
+        },
+        "evidence_need": {
+          "type": "string"
+        },
+        "requirement_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "task_blueprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "angle_id",
+        "query_intent",
+        "route",
+        "requirement_refs"
+      ],
+      "properties": {
+        "angle_id": {
+          "type": "string"
+        },
+        "query_intent": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string",
+          "enum": [
+            "text_only",
+            "visual_optional",
+            "visual_required"
+          ]
+        },
+        "requirement_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

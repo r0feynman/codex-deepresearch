@@ -1100,3 +1100,72 @@ Next diagnostic or fix direction:
 - Keep report-shape obligations by reference to the top-level `expected_report_shape` instead of duplicating the full list.
 - Keep source, visual, route, bounded-task, report, and oracle-hash contracts present without lowering validator or reviewer thresholds.
 - Re-run isolated `sem-reg-004` after the compact payload is measurably smaller.
+
+## 2026-07-24 - Issue #133 / Compact Planner Schema Timed Out In Live sem-reg-004
+
+Prompt or issue:
+
+- Issue #133 semantic release signoff.
+- Prompt id: `sem-reg-004`
+- Prompt: `건축 architecture 모델 산출물을 공공 설계 기준과 입찰 문서 기준으로 비교해줘.`
+
+Command or suite:
+
+- Isolated coordinator run after reducing duplicated compact oracle payload and adding the compact planner adapter schema.
+
+Run directory:
+
+- `/tmp/codex-dr-sem-reg-004-compact-schema-isolated-20260724T062609Z/dr_20260724T062609`
+
+Status:
+
+- Final status: `blocked_semantic_planner_unavailable`
+- Planner mode: `blocked`
+- Semantic release eligible: `false`
+- The leftover orphaned `codex exec` child process was killed after the parent `prepare` process had already written blocked artifacts.
+
+Reviewer/validator failure codes:
+
+- `release_ineligible_planner_mode`
+- `semantic_release_ineligible`
+
+Directly observed failure:
+
+- `semantic_planner_raw/planner_response.json` recorded `blocked_reason="Codex semantic planner adapter failed: TimeoutExpired"`.
+- `semantic_planner_raw/planner_response.json` recorded `adapter_response_received=false`.
+- `semantic_plan.json` contained zero angles and zero bounded tasks because the system correctly refused to materialize a release-eligible semantic plan without a real adapter response.
+- The run stopped before search handoff or fan-out.
+
+Measured payload facts:
+
+- `semantic_planner_raw/planner_request.json`: 20,757 bytes.
+- `plugins/codex-deepresearch/validation/semantic_adapter_schemas/planner_compact.json`: 14,526 bytes.
+- Existing full `planner.json`: 17,154 bytes.
+- The compact planner schema still had 104 nested properties.
+- The planner-facing locked oracle inside the request was 7,658 bytes.
+- The largest planner request fields were `locked_semantic_expectation_oracle`, `planner_instructions`, `response_schema_shape`, `semantic_planner_request_compaction`, and `semantic_retry_lock`.
+
+Facts:
+
+- This was not a semantic reviewer rejection of a bad plan. No candidate plan was returned.
+- This was not a validator threshold issue. The validator correctly rejected the blocked planner fallback as release-ineligible.
+- The request did use `semantic_planner_request_mode=compact_locked_oracle` and `planner_compact.json`.
+- Local deterministic tests passing did not prove that the live Codex adapter could return within the timeout.
+
+Inferences:
+
+- The compact oracle reduction was insufficient by itself.
+- The current compact adapter still asks Codex to produce too much structured JSON in one response.
+- The likely next fix is to shrink the adapter output contract further: Codex should emit only semantic intent, angle specs, and lightweight task blueprints, while deterministic code materializes selected entities, dimensions, coverage matrix, source/task/report contracts, detailed artifacts, and success criteria from the locked oracle.
+
+Unknowns:
+
+- Whether the schema size, request size, model-side structured-output generation, or a Codex CLI/runtime issue is the dominant timeout contributor.
+- Whether a much smaller compact schema alone is enough to make this live prompt complete reliably.
+
+Next diagnostic or fix direction:
+
+- Reduce `planner_compact.json` to a minimal planner-facing contract.
+- Preserve all full oracle artifacts and release validator criteria.
+- Add tests that prove required typed contracts are materialized by code rather than required from the compact Codex adapter output.
+- Re-run isolated `sem-reg-004` and record whether a real `planner_response.json` is produced before running the full 30-regression suite.

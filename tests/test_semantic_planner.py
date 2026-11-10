@@ -8080,6 +8080,306 @@ class SemanticPlannerTests(unittest.TestCase):
             "locked_semantic_expectation_oracle.expected_report_shape",
         )
 
+    def test_compact_locked_oracle_uses_compact_planner_schema_and_materializes_full_candidate(self) -> None:
+        question = (
+            "Compare architectural model output deliverables against public design "
+            "criteria and tender documents in a structured comparison table."
+        )
+
+        def compact_response(response: dict, request: dict) -> dict:
+            full_candidate = response.pop("candidate_plan")
+            angle_specs = []
+            task_blueprints = []
+            requirement_ids = [
+                str(item["requirement_id"])
+                for item in request["locked_semantic_expectation_oracle"][
+                    "oracle_requirement_map"
+                ]
+            ]
+            for angle in full_candidate["angles"]:
+                angle_index = len(angle_specs)
+                angle_ref = requirement_ids[angle_index % len(requirement_ids)]
+                angle_spec = {
+                    key: angle[key]
+                    for key in (
+                        "angle_id",
+                        "title",
+                        "research_question",
+                        "route",
+                        "evidence_need",
+                    )
+                }
+                angle_spec["requirement_refs"] = [angle_ref]
+                angle_specs.append(angle_spec)
+                for local_index in range(1, 5):
+                    requirement_ref = requirement_ids[
+                        len(task_blueprints) % len(requirement_ids)
+                    ]
+                    task_blueprints.append(
+                        {
+                            "angle_id": angle["angle_id"],
+                            "query_intent": (
+                                f"{angle['title']} evidence slice {local_index} "
+                                f"for {requirement_ref}: {angle['research_question']}"
+                            ),
+                            "route": angle["route"],
+                            "requirement_refs": [requirement_ref],
+                        }
+                    )
+            response["compact_candidate_plan"] = {
+                "schema_version": full_candidate["schema_version"],
+                "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+                "semantic_release_eligible": False,
+                "source": "codex_semantic",
+                "intent_summary": full_candidate["intent_summary"],
+                "question_scope": request["locked_semantic_expectation_oracle"][
+                    "question_scope"
+                ],
+                "decomposition_strategy": (
+                    "Compact angle specs and task blueprints materialize to the full candidate."
+                ),
+                "language": "en",
+                "angle_specs": angle_specs,
+                "task_blueprints": task_blueprints,
+            }
+            return response
+
+        result, adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            route="visual_optional",
+            command_env_configured=False,
+            default_codex_available=True,
+            oracle_question_scope="broad",
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+            visual_angle_indexes=(2,),
+            planner_response_mutator=compact_response,
+        )
+
+        self.assertEqual(result["status"], "awaiting_search_results", result)
+        run_dir = Path(result["run_dir"])
+        planner_command = next(
+            command
+            for command in adapter_request["_commands"]
+            if "--output-schema" in command
+            and Path(command[command.index("--output-schema") + 1]).name
+            == "planner_compact.json"
+        )
+        self.assertIn("--output-schema", planner_command)
+        planner_schema = Path(
+            planner_command[planner_command.index("--output-schema") + 1]
+        )
+        self.assertEqual(planner_schema.name, "planner_compact.json")
+        raw_response = self.load_json(
+            run_dir / "semantic_planner_raw" / "planner_response.json"
+        )
+        self.assertIn("compact_candidate_plan", raw_response)
+        compact_plan = raw_response["compact_candidate_plan"]
+        for model_generated_field in (
+            "selected_entities",
+            "required_dimensions",
+            "coverage_matrix_skeleton",
+            "task_partition_contract",
+            "source_budget_contract",
+            "final_deliverable_contract",
+            "constraints",
+            "negative_scope",
+        ):
+            self.assertNotIn(model_generated_field, compact_plan)
+        self.assertIn("candidate_plan", raw_response)
+        self.assertIn("compact_candidate_plan_materialization", raw_response)
+        self.assertTrue(raw_response["candidate_validation"]["ok"], raw_response)
+        candidate = raw_response["candidate_plan"]
+        self.assertNotIn("angle_specs", candidate)
+        self.assertGreaterEqual(len(candidate["bounded_tasks"]), 20)
+        self.assertTrue(candidate["selected_entities"], candidate)
+        self.assertTrue(candidate["required_dimensions"], candidate)
+        self.assertTrue(candidate["coverage_matrix"], candidate)
+        self.assertTrue(candidate["task_partition_contract"], candidate)
+        self.assertTrue(candidate["source_budget_contract"], candidate)
+        self.assertTrue(candidate["final_deliverable_contract"], candidate)
+        self.assertEqual(
+            raw_response["provenance"]["adapter_command"][
+                raw_response["provenance"]["adapter_command"].index("--output-schema") + 1
+            ].split("/")[-1],
+            "planner_compact.json",
+        )
+        semantic_plan = self.load_json(run_dir / "semantic_plan.json")[
+            "semantic_plan"
+        ]
+        validation = self.load_json(run_dir / "semantic_planner_validation.json")
+        self.assertTrue(validation["ok"], validation)
+        self.assertGreaterEqual(len(semantic_plan["bounded_tasks"]), 20)
+        self.assertTrue(
+            (run_dir / "semantic_reviewer_raw" / "reviewer_request.json").exists()
+        )
+        reviewer_request = adapter_request["_reviewer_requests"][-1]
+        self.assertEqual(
+            len(reviewer_request["semantic_plan"]["bounded_tasks"]),
+            len(semantic_plan["bounded_tasks"]),
+        )
+
+    def test_compact_planner_duplicate_blueprint_intents_are_blocked(self) -> None:
+        question = (
+            "Compare architectural model output deliverables against public design "
+            "criteria and tender documents in a structured comparison table."
+        )
+
+        def compact_response(response: dict, request: dict) -> dict:
+            full_candidate = response.pop("candidate_plan")
+            requirement_ids = [
+                str(item["requirement_id"])
+                for item in request["locked_semantic_expectation_oracle"][
+                    "oracle_requirement_map"
+                ]
+            ]
+            response["compact_candidate_plan"] = {
+                "schema_version": full_candidate["schema_version"],
+                "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+                "semantic_release_eligible": False,
+                "source": "codex_semantic",
+                "intent_summary": full_candidate["intent_summary"],
+                "question_scope": request["locked_semantic_expectation_oracle"][
+                    "question_scope"
+                ],
+                "decomposition_strategy": "Duplicate compact blueprint regression.",
+                "language": "en",
+                "angle_specs": [
+                    {
+                        "angle_id": full_candidate["angles"][0]["angle_id"],
+                        "title": full_candidate["angles"][0]["title"],
+                        "research_question": full_candidate["angles"][0][
+                            "research_question"
+                        ],
+                        "route": "text_only",
+                        "evidence_need": "primary_source",
+                        "requirement_refs": [requirement_ids[0]],
+                    }
+                ],
+                "task_blueprints": [
+                    {
+                        "angle_id": full_candidate["angles"][0]["angle_id"],
+                        "query_intent": "repeat the same compact evidence intent",
+                        "route": "text_only",
+                        "requirement_refs": [requirement_ids[0]],
+                    },
+                    {
+                        "angle_id": full_candidate["angles"][0]["angle_id"],
+                        "query_intent": "repeat the same compact evidence intent",
+                        "route": "text_only",
+                        "requirement_refs": [requirement_ids[0]],
+                    },
+                ],
+            }
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            route="visual_optional",
+            command_env_configured=False,
+            default_codex_available=True,
+            oracle_question_scope="broad",
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+            visual_angle_indexes=(2,),
+            planner_response_mutator=compact_response,
+        )
+
+        self.assertEqual(
+            result["status"],
+            "blocked_semantic_planner_unavailable",
+            result,
+        )
+        raw_response = self.load_json(
+            Path(result["run_dir"])
+            / "semantic_planner_raw"
+            / "planner_response.json"
+        )
+        self.assertIn(
+            "task_blueprints must be distinct",
+            raw_response["blocked_reason"],
+        )
+
+    def test_compact_planner_missing_requirement_refs_cannot_auto_cover_oracle(self) -> None:
+        question = (
+            "Compare architectural model output deliverables against public design "
+            "criteria and tender documents in a structured comparison table."
+        )
+
+        def compact_response(response: dict, request: dict) -> dict:
+            full_candidate = response.pop("candidate_plan")
+            angle_specs = []
+            task_blueprints = []
+            for angle in full_candidate["angles"]:
+                angle_specs.append(
+                    {
+                        "angle_id": angle["angle_id"],
+                        "title": angle["title"],
+                        "research_question": angle["research_question"],
+                        "route": angle["route"],
+                        "evidence_need": angle["evidence_need"],
+                        "requirement_refs": [],
+                    }
+                )
+                for local_index in range(1, 5):
+                    task_blueprints.append(
+                        {
+                            "angle_id": angle["angle_id"],
+                            "query_intent": (
+                                f"{angle['title']} distinct evidence slice {local_index}"
+                            ),
+                            "route": angle["route"],
+                            "requirement_refs": [],
+                        }
+                    )
+            response["compact_candidate_plan"] = {
+                "schema_version": full_candidate["schema_version"],
+                "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+                "semantic_release_eligible": False,
+                "source": "codex_semantic",
+                "intent_summary": full_candidate["intent_summary"],
+                "question_scope": request["locked_semantic_expectation_oracle"][
+                    "question_scope"
+                ],
+                "decomposition_strategy": "Missing refs must not auto-cover oracle requirements.",
+                "language": "en",
+                "angle_specs": angle_specs,
+                "task_blueprints": task_blueprints,
+            }
+            return response
+
+        result, _adapter_request = self.prepare_with_codex_adapter(
+            question,
+            stdout_format="jsonl_item_text",
+            route="visual_optional",
+            command_env_configured=False,
+            default_codex_available=True,
+            oracle_question_scope="broad",
+            requirement_types=("subject", "source_quality", "deliverable_shape"),
+            visual_angle_indexes=(2,),
+            planner_response_mutator=compact_response,
+        )
+
+        self.assertEqual(
+            result["status"],
+            "blocked_semantic_planner_unavailable",
+            result,
+        )
+        raw_response = self.load_json(
+            Path(result["run_dir"])
+            / "semantic_planner_raw"
+            / "planner_response.json"
+        )
+        attempts = raw_response["diagnostics"]["adapter_candidate_attempts"]
+        failure_codes = {
+            code
+            for attempt in attempts
+            for code in attempt["deterministic_failure_codes"]
+        }
+        self.assertIn("requirement_not_covered", failure_codes)
+        self.assertIn("non_negotiable_missing_angle_coverage", failure_codes)
+        self.assertIn("non_negotiable_missing_task_coverage", failure_codes)
+
     def test_visual_optional_non_structured_prompt_keeps_full_oracle_request(self) -> None:
         question = (
             "Compare public campaign poster images and textual guidance for "
@@ -10262,16 +10562,13 @@ class SemanticPlannerTests(unittest.TestCase):
         self.assertIn("semantically, not by keyword or fixed template", command[-1])
 
     def test_planner_adapter_schema_is_codex_output_schema_compatible(self) -> None:
-        schema_path = (
+        schema_dir = (
             ROOT
             / "plugins"
             / "codex-deepresearch"
             / "validation"
             / "semantic_adapter_schemas"
-            / "planner.json"
         )
-        schema = self.load_json(schema_path)
-        violations: list[str] = []
 
         def walk(value: object, path: str) -> None:
             if isinstance(value, dict):
@@ -10292,9 +10589,53 @@ class SemanticPlannerTests(unittest.TestCase):
                 for index, child in enumerate(value):
                     walk(child, f"{path}[{index}]")
 
-        walk(schema, "$")
+        for schema_name in ("planner.json", "planner_compact.json"):
+            with self.subTest(schema_name=schema_name):
+                schema = self.load_json(schema_dir / schema_name)
+                violations: list[str] = []
+                walk(schema, "$")
+                self.assertEqual([], violations)
 
-        self.assertEqual([], violations)
+    def test_compact_planner_schema_keeps_typed_contracts_materialized_by_code(self) -> None:
+        schema = self.load_json(
+            ROOT
+            / "plugins"
+            / "codex-deepresearch"
+            / "validation"
+            / "semantic_adapter_schemas"
+            / "planner_compact.json"
+        )
+        compact_properties = schema["properties"]["compact_candidate_plan"][
+            "properties"
+        ]
+        for field_name in (
+            "selected_entities",
+            "required_dimensions",
+            "coverage_matrix",
+            "coverage_matrix_skeleton",
+            "task_partition_contract",
+            "source_budget_contract",
+            "final_deliverable_contract",
+            "constraints",
+            "negative_scope",
+            "bounded_tasks",
+        ):
+            self.assertNotIn(field_name, compact_properties)
+        self.assertEqual(
+            {
+                "schema_version",
+                "planner_mode",
+                "semantic_release_eligible",
+                "source",
+                "intent_summary",
+                "question_scope",
+                "decomposition_strategy",
+                "language",
+                "angle_specs",
+                "task_blueprints",
+            },
+            set(compact_properties),
+        )
 
     def test_planner_adapter_schema_requires_typed_contract_fields(self) -> None:
         import jsonschema

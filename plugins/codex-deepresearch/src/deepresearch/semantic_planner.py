@@ -71,6 +71,7 @@ CODEX_SEMANTIC_ADAPTER_CAPACITY_RETRY_BACKOFF_SECONDS_ENV = (
 )
 CODEX_SEMANTIC_ADAPTER_SCHEMA_DIRNAME = "semantic_adapter_schemas"
 CODEX_SEMANTIC_PLANNER_SCHEMA_FILENAME = "planner.json"
+CODEX_SEMANTIC_COMPACT_PLANNER_SCHEMA_FILENAME = "planner_compact.json"
 CODEX_SEMANTIC_ORACLE_SCHEMA_FILENAME = "oracle.json"
 CODEX_SEMANTIC_REVIEWER_SCHEMA_FILENAME = "reviewer.json"
 CODEX_SEMANTIC_PLANNER_VALIDATION_MAX_ATTEMPTS_ENV = (
@@ -879,7 +880,10 @@ def codex_semantic_candidate_plan(
             if previous_attempts:
                 raw_response["previous_adapter_attempts"] = list(previous_attempts)
             parsed_raw_response = raw_response
-            candidate = _candidate_plan_from_adapter_response(raw_response)
+            candidate = _candidate_plan_from_adapter_response(
+                raw_response,
+                raw_request=raw_request,
+            )
             candidate, source_cap_normalizations = (
                 _normalize_candidate_executable_source_caps(candidate)
             )
@@ -1357,6 +1361,7 @@ def invoke_codex_semantic_planner_adapter(
     command = _semantic_adapter_command(
         command_env=CODEX_SEMANTIC_PLANNER_COMMAND_ENV,
         role_label="semantic planner",
+        raw_request=request,
     )
     if command is None:
         return None
@@ -1533,8 +1538,29 @@ def _structured_codex_adapter_response(
     return raw_response
 
 
-def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> dict[str, Any]:
+def _candidate_plan_from_adapter_response(
+    raw_response: Mapping[str, Any],
+    *,
+    raw_request: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     candidate = raw_response.get("candidate_plan")
+    if not isinstance(candidate, Mapping):
+        compact_candidate = _candidate_plan_from_compact_adapter_response(
+            raw_response,
+            raw_request=raw_request,
+        )
+        if compact_candidate is not None:
+            if isinstance(raw_response, dict):
+                raw_response["candidate_plan"] = compact_candidate
+                raw_response.setdefault(
+                    "adapter_response_materialization",
+                    {
+                        "materialization": "compact_planner_candidate_plan",
+                        "source_field": "compact_candidate_plan",
+                        "validator_input": "candidate_plan",
+                    },
+                )
+            candidate = compact_candidate
     if not isinstance(candidate, Mapping):
         raise SemanticPlannerAdapterUnavailable(
             "Codex semantic planner adapter response is missing candidate_plan"
@@ -1591,6 +1617,1112 @@ def _candidate_plan_from_adapter_response(raw_response: Mapping[str, Any]) -> di
             + ", ".join(malformed_contracts)
         )
     return candidate_plan
+
+
+def _candidate_plan_from_compact_adapter_response(
+    raw_response: Mapping[str, Any],
+    *,
+    raw_request: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not _semantic_planner_request_uses_compact_output(raw_request):
+        return None
+    compact = raw_response.get("compact_candidate_plan")
+    if not isinstance(compact, Mapping):
+        return None
+    original_question = str(
+        (raw_request or {}).get("original_question")
+        or compact.get("original_question")
+        or ""
+    )
+    locked_oracle = (
+        raw_request.get("locked_semantic_expectation_oracle")
+        if isinstance(raw_request, Mapping)
+        and isinstance(raw_request.get("locked_semantic_expectation_oracle"), Mapping)
+        else {}
+    )
+    scope = str(
+        compact.get("question_scope")
+        or locked_oracle.get("question_scope")
+        or "broad"
+    )
+    if scope not in SEMANTIC_SCOPE_TIERS:
+        scope = "broad"
+    selected_entities = _materialize_compact_adapter_selected_entities(
+        compact=compact,
+        locked_oracle=locked_oracle,
+        original_question=original_question,
+    )
+    required_dimensions = _materialize_compact_adapter_required_dimensions(
+        compact=compact,
+        locked_oracle=locked_oracle,
+        original_question=original_question,
+    )
+    final_deliverable_contract = _compact_adapter_default_final_deliverable_contract(
+        compact=compact,
+        locked_oracle=locked_oracle,
+    )
+    angles = _materialize_compact_adapter_angles(
+        compact=compact,
+        raw_request=raw_request,
+        original_question=original_question,
+    )
+    bounded_tasks = _materialize_compact_adapter_tasks(
+        compact=compact,
+        raw_request=raw_request,
+        original_question=original_question,
+        scope=scope,
+        angles=angles,
+        selected_entities=selected_entities,
+        required_dimensions=required_dimensions,
+        final_deliverable_contract=final_deliverable_contract,
+    )
+    requirement_coverage_map = _materialize_compact_adapter_requirement_coverage(
+        compact=compact,
+        locked_oracle=locked_oracle,
+        angles=angles,
+        tasks=bounded_tasks,
+        original_question=original_question,
+    )
+    candidate: dict[str, Any] = {
+        "schema_version": str(
+            compact.get("schema_version") or SEMANTIC_PLANNER_SCHEMA_VERSION
+        ),
+        "planner_mode": PLANNER_MODE_CODEX_SEMANTIC,
+        "semantic_release_eligible": False,
+        "source": "codex_semantic",
+        "model_or_surface": raw_response.get("model_or_surface"),
+        "original_question": original_question,
+        "language": str(
+            compact.get("language") or _compact_adapter_candidate_language(original_question)
+        ),
+        "depth_preset": (
+            raw_request.get("depth_preset")
+            if isinstance(raw_request, Mapping)
+            else compact.get("depth_preset")
+        )
+        or "standard",
+        "intent_summary": str(
+            compact.get("intent_summary")
+            or f"Compact Codex semantic plan for {original_question}."
+        ),
+        "domain_entities": _materialize_compact_adapter_domain_entities(
+            compact=compact,
+            locked_oracle=locked_oracle,
+            original_question=original_question,
+        ),
+        "constraints": _materialize_compact_adapter_constraints(
+            compact=compact,
+            locked_oracle=locked_oracle,
+            original_question=original_question,
+        ),
+        "question_scope": scope,
+        "decomposition_strategy": str(
+            compact.get("decomposition_strategy")
+            or "Compact Codex decomposition expanded deterministically into executable tasks."
+        ),
+        "requirement_coverage_map": requirement_coverage_map,
+        "negative_scope": _string_list(compact.get("negative_scope"))
+        or _string_list(locked_oracle.get("forbidden_angles"))
+        or ["Do not drift away from the locked semantic expectation oracle."],
+        "angles": angles,
+        "bounded_tasks": bounded_tasks,
+        "selected_entities": selected_entities,
+        "required_dimensions": required_dimensions,
+        "task_partition_contract": _compact_adapter_default_task_partition_contract(
+            {"selected_entities": selected_entities}
+        ),
+        "source_budget_contract": _candidate_source_budget_contract(
+            compact.get("source_budget_contract"),
+            runner_source_budget=None,
+            tasks=bounded_tasks,
+            raw_request=raw_request,
+        ),
+        "final_deliverable_contract": final_deliverable_contract,
+    }
+    for field_name in ("selected_entities", "required_dimensions", "coverage_matrix"):
+        if isinstance(compact.get(field_name), list):
+            candidate[field_name] = [
+                dict(item)
+                for item in compact.get(field_name) or []
+                if isinstance(item, Mapping)
+            ]
+    if "coverage_matrix" not in candidate and isinstance(
+        compact.get("coverage_matrix_skeleton"), list
+    ):
+        candidate["coverage_matrix"] = [
+            dict(item)
+            for item in compact.get("coverage_matrix_skeleton") or []
+            if isinstance(item, Mapping)
+        ]
+    for field_name in (
+        "task_partition_contract",
+        "source_budget_contract",
+        "final_deliverable_contract",
+    ):
+        if isinstance(compact.get(field_name), Mapping):
+            candidate[field_name] = dict(compact[field_name])
+    candidate, typed_materializations = _materialize_candidate_typed_semantic_contracts(
+        candidate,
+        raw_request=raw_request,
+        original_question=original_question,
+    )
+    candidate.setdefault("selected_entities", [])
+    candidate.setdefault("required_dimensions", [])
+    candidate.setdefault("coverage_matrix", [])
+    candidate.setdefault(
+        "task_partition_contract",
+        _compact_adapter_default_task_partition_contract(candidate),
+    )
+    candidate.setdefault(
+        "source_budget_contract",
+        _candidate_source_budget_contract(
+            candidate.get("source_budget_contract"),
+            runner_source_budget=candidate.get("runner_source_budget"),
+            tasks=[
+                task for task in _list(candidate.get("bounded_tasks")) if isinstance(task, Mapping)
+            ],
+            raw_request=raw_request,
+        ),
+    )
+    candidate.setdefault(
+        "final_deliverable_contract",
+        _compact_adapter_default_final_deliverable_contract(
+            compact=compact,
+            locked_oracle=locked_oracle,
+        ),
+    )
+    materialization = {
+        "materialization": "compact_planner_candidate_plan",
+        "source_field": "compact_candidate_plan",
+        "angle_count": len(angles),
+        "task_count": len(bounded_tasks),
+        "requirement_count": len(requirement_coverage_map),
+        "typed_contract_materializations": typed_materializations,
+    }
+    if isinstance(raw_response, dict):
+        raw_response["compact_candidate_plan_materialization"] = materialization
+    return candidate
+
+
+def _materialize_compact_adapter_domain_entities(
+    *,
+    compact: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+    original_question: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in _list(compact.get("domain_entities")):
+        record = _compact_adapter_domain_entity_record(
+            item,
+            index=len(records) + 1,
+            default_type="domain_entity",
+            evidence="compact_candidate_plan.domain_entities",
+        )
+        if record:
+            records.append(record)
+    if not records:
+        for item in _list(locked_oracle.get("expected_entities")):
+            record = _compact_adapter_domain_entity_record(
+                item,
+                index=len(records) + 1,
+                default_type=_compact_adapter_entity_type_for_text(str(item or "")),
+                evidence="locked_semantic_expectation_oracle.expected_entities",
+            )
+            if record:
+                records.append(record)
+    if not records:
+        records.append(
+            {
+                "name": original_question,
+                "type": "question_subject",
+                "evidence": original_question,
+                "required": True,
+            }
+        )
+    return records[:20]
+
+
+def _materialize_compact_adapter_selected_entities(
+    *,
+    compact: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+    original_question: str,
+) -> list[dict[str, Any]]:
+    explicit = [
+        dict(item)
+        for item in _list(compact.get("selected_entities"))
+        if isinstance(item, Mapping)
+    ]
+    if explicit:
+        return _candidate_normalize_selected_entities(explicit)
+
+    entities: list[dict[str, Any]] = []
+    for item in _materialize_compact_adapter_domain_entities(
+        compact=compact,
+        locked_oracle=locked_oracle,
+        original_question=original_question,
+    ):
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        if _compact_adapter_entity_mentions_original_question(
+            name,
+            original_question,
+        ) or len(entities) < 3:
+            entities.append(
+                {
+                    "entity_id": f"entity_{len(entities) + 1:03d}",
+                    "name": name,
+                    "type": str(item.get("type") or "named_entity"),
+                    "evidence": str(item.get("evidence") or "compact materialization"),
+                    "required": item.get("required", True) is not False,
+                }
+            )
+    if len(entities) < 2:
+        for parsed_name in _compact_adapter_entities_from_comparison_question(
+            original_question
+        ):
+            if any(
+                str(entity.get("name") or "").lower() == parsed_name.lower()
+                for entity in entities
+            ):
+                continue
+            entities.append(
+                {
+                    "entity_id": f"entity_{len(entities) + 1:03d}",
+                    "name": parsed_name,
+                    "type": _compact_adapter_entity_type_for_text(parsed_name),
+                    "evidence": "original_question.comparison_phrase",
+                    "required": True,
+                }
+            )
+    if not entities:
+        entities.append(
+            {
+                "entity_id": "entity_001",
+                "name": original_question,
+                "type": "question_subject",
+                "evidence": original_question,
+                "required": True,
+            }
+        )
+    return _candidate_normalize_selected_entities(entities[:8])
+
+
+def _compact_adapter_entities_from_comparison_question(question: str) -> list[str]:
+    text = " ".join(str(question or "").strip().split())
+    if not text:
+        return []
+    candidates: list[str] = []
+    english = re.search(
+        r"(?i)^\s*(?:compare|contrast|evaluate|assess)\s+(.+?)\s+"
+        r"(?:against|with|to|versus|vs\.?|across)\s+(.+)$",
+        text,
+    )
+    if english:
+        candidates.extend([english.group(1), *_compact_adapter_split_entity_tail(english.group(2))])
+    korean = re.search(
+        r"(.+?)(?:을|를)\s+(.+?)(?:기준으로\s*)?비교",
+        text,
+    )
+    if korean:
+        candidates.extend([korean.group(1), *_compact_adapter_split_entity_tail(korean.group(2))])
+    cleaned: list[str] = []
+    for candidate in candidates:
+        value = re.split(
+            r"(?i)\s+(?:in|using|based\s+on|according\s+to|for)\s+",
+            str(candidate or "").strip(),
+            maxsplit=1,
+        )[0]
+        value = re.sub(r"\b(?:a|an|the)\b", " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip(" .,:;")
+        value = re.sub(r"(?:기준으로|으로|로)$", "", value).strip(" .,:;")
+        if len(value) >= 3 and value.lower() not in {item.lower() for item in cleaned}:
+            cleaned.append(value)
+    return cleaned[:8]
+
+
+def _compact_adapter_split_entity_tail(text: str) -> list[str]:
+    value = re.split(
+        r"(?i)\s+(?:in|using|based\s+on|according\s+to|for)\s+",
+        str(text or "").strip(),
+        maxsplit=1,
+    )[0]
+    value = re.sub(r"(?:기준으로|으로|로)$", "", value).strip()
+    parts = re.split(r"\s*(?:,|/|;|\band\b|\bor\b|와|과|및)\s*", value)
+    return [part.strip(" .,:;") for part in parts if part.strip(" .,:;")]
+
+
+def _materialize_compact_adapter_required_dimensions(
+    *,
+    compact: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+    original_question: str,
+) -> list[dict[str, Any]]:
+    explicit = [
+        dict(item)
+        for item in _list(compact.get("required_dimensions"))
+        if isinstance(item, Mapping)
+    ]
+    if explicit:
+        return _candidate_normalize_required_dimensions(explicit)
+
+    dimensions: list[dict[str, Any]] = []
+
+    def add(name: str, evidence: str) -> None:
+        normalized = " ".join(str(name or "").strip().split())
+        if not normalized:
+            return
+        if any(item["name"].lower() == normalized.lower() for item in dimensions):
+            return
+        dimensions.append(
+            {
+                "dimension_id": f"dimension_{len(dimensions) + 1:03d}",
+                "name": normalized,
+                "evidence": evidence,
+                "required": True,
+            }
+        )
+
+    for record in _list(locked_oracle.get("oracle_requirement_map")):
+        if not isinstance(record, Mapping):
+            continue
+        requirement_type = str(record.get("requirement_type") or "")
+        requirement_text = str(record.get("requirement_text") or "")
+        if "source_quality" in requirement_type:
+            add("official or primary source basis", requirement_text)
+        elif "comparison" in requirement_type or "output_shape" in requirement_type:
+            add("comparison status, gap, and remediation", requirement_text)
+        elif "modality" in requirement_type or "scope" in requirement_type:
+            add("modality, scope, and applicability limits", requirement_text)
+        elif "caveat" in requirement_type or "contradiction" in requirement_type:
+            add("caveats, contradictions, and unknowns", requirement_text)
+    report_shape = _string_list(locked_oracle.get("expected_report_shape"))
+    if len(dimensions) < 2:
+        for item in report_shape:
+            lowered = item.lower()
+            if _contains_any(
+                lowered,
+                (
+                    "table",
+                    "matrix",
+                    "comparison",
+                    "requirement",
+                    "gap",
+                    "risk",
+                    "표",
+                    "비교",
+                    "요구",
+                    "격차",
+                    "위험",
+                ),
+            ):
+                add(item, "locked_semantic_expectation_oracle.expected_report_shape")
+            if len(dimensions) >= 4:
+                break
+    if not dimensions:
+        add(
+            "comparison evidence",
+            original_question or "compact planner comparison materialization",
+        )
+    return _candidate_normalize_required_dimensions(dimensions[:6])
+
+
+def _compact_adapter_domain_entity_record(
+    value: Any,
+    *,
+    index: int,
+    default_type: str,
+    evidence: str,
+) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        name = str(value.get("name") or value.get("entity") or "").strip()
+        if not name:
+            return None
+        return {
+            "name": " ".join(name.split()),
+            "type": str(value.get("type") or default_type),
+            "evidence": str(value.get("evidence") or evidence),
+            "required": value.get("required", True) is not False,
+        }
+    name = " ".join(str(value or "").strip().split())
+    if not name:
+        return None
+    return {
+        "name": name,
+        "type": default_type or "named_entity",
+        "evidence": evidence,
+        "required": True,
+    }
+
+
+def _compact_adapter_entity_type_for_text(text: str) -> str:
+    lowered = text.lower()
+    if _contains_any(lowered, ("document", "criteria", "tender", "bid", "문서", "기준", "입찰")):
+        return "document"
+    if _contains_any(lowered, ("model", "artifact", "산출물", "모델")):
+        return "artifact"
+    if _contains_any(lowered, ("agency", "기관")):
+        return "agency"
+    return "named_entity"
+
+
+def _compact_adapter_entity_mentions_original_question(
+    name: str,
+    original_question: str,
+) -> bool:
+    normalized_name = re.sub(r"\s+", "", str(name or "").lower())
+    normalized_question = re.sub(r"\s+", "", str(original_question or "").lower())
+    return bool(normalized_name and normalized_name in normalized_question)
+
+
+def _compact_adapter_ref_window(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    task_number: int,
+    id_field: str,
+    max_refs: int,
+) -> list[str]:
+    ids = [
+        str(record.get(id_field) or "")
+        for record in records
+        if str(record.get(id_field) or "").strip()
+        and record.get("required") is not False
+    ]
+    if not ids:
+        return []
+    if len(ids) <= max_refs:
+        return ids
+    start = (max(1, task_number) - 1) % len(ids)
+    return [ids[(start + offset) % len(ids)] for offset in range(max_refs)]
+
+
+def _compact_adapter_list_of_objects_or_strings(value: Any) -> list[Any]:
+    records: list[Any] = []
+    for item in _list(value):
+        if isinstance(item, Mapping):
+            records.append(dict(item))
+        elif str(item or "").strip():
+            records.append(str(item))
+    return records
+
+
+def _compact_adapter_candidate_language(text: str) -> str:
+    return "ko" if re.search(r"[\uac00-\ud7a3]", text) else "en"
+
+
+def _materialize_compact_adapter_angles(
+    *,
+    compact: Mapping[str, Any],
+    raw_request: Mapping[str, Any] | None,
+    original_question: str,
+) -> list[dict[str, Any]]:
+    specs = [
+        spec for spec in _list(compact.get("angle_specs")) if isinstance(spec, Mapping)
+    ]
+    if not specs:
+        raise SemanticPlannerAdapterUnavailable(
+            "Compact Codex semantic planner response is missing angle_specs"
+        )
+    request_visual_preference = _normalized_visual_preference(
+        raw_request.get("visual_preference") if isinstance(raw_request, Mapping) else None
+    )
+    angles: list[dict[str, Any]] = []
+    for index, spec in enumerate(specs, start=1):
+        angle_id = str(spec.get("angle_id") or f"angle_{index:03d}")
+        route = str(spec.get("route") or request_visual_preference or "text_only")
+        if route not in {"text_only", "visual_optional", "visual_required"}:
+            route = "text_only"
+        if request_visual_preference == "visual_optional" and route == "visual_required":
+            route = "visual_optional"
+        visual_targets = _string_list(spec.get("expected_visual_targets"))
+        if route != "text_only" and not visual_targets:
+            visual_targets = [f"{original_question} visual support evidence"]
+        if route == "text_only":
+            visual_targets = []
+        evidence_need = str(spec.get("evidence_need") or "primary_source")
+        if evidence_need not in ALLOWED_EVIDENCE_NEEDS:
+            evidence_need = "primary_source"
+        title = str(spec.get("title") or f"{original_question} Evidence Angle {index}")
+        research_question = str(
+            spec.get("research_question")
+            or f"What source-backed evidence resolves {title} for {original_question}?"
+        )
+        angles.append(
+            {
+                "angle_id": angle_id,
+                "title": title,
+                "research_question": research_question,
+                "why_this_angle_matters": str(
+                    spec.get("why_this_angle_matters")
+                    or f"This angle covers a distinct requirement for {original_question}."
+                ),
+                "included_scope": _string_list(spec.get("included_scope"))
+                or [original_question],
+                "excluded_scope": _string_list(spec.get("excluded_scope"))
+                or ["Do not substitute unrelated implementation details."],
+                "route": route,
+                "evidence_need": evidence_need,
+                "requirement_refs": _compact_adapter_requirement_refs(
+                    spec.get("requirement_refs")
+                ),
+                "expected_source_types": _string_list(spec.get("expected_source_types"))
+                or ["primary sources"],
+                "expected_visual_targets": visual_targets,
+                "expected_artifacts": _string_list(spec.get("expected_artifacts"))
+                or _compact_adapter_default_angle_artifacts(
+                    title=title,
+                    evidence_need=evidence_need,
+                    route=route,
+                    original_question=original_question,
+                ),
+                "search_queries": _string_list(spec.get("search_queries"))
+                or [f"{original_question} {title} primary evidence"],
+                "success_criteria": _string_list(spec.get("success_criteria"))
+                or [f"Findings directly address {original_question}."],
+                "report_section": str(spec.get("report_section") or title),
+                "risk_or_contradiction_checks": _string_list(
+                    spec.get("risk_or_contradiction_checks")
+                )
+                or ["Record contradictions, caveats, and unknowns."],
+            }
+        )
+    return angles
+
+
+def _compact_adapter_default_angle_artifacts(
+    *,
+    title: str,
+    evidence_need: str,
+    route: str,
+    original_question: str,
+) -> list[str]:
+    label = " ".join(str(title or original_question or "semantic angle").split())
+    lowered_need = str(evidence_need or "").lower()
+    if route != "text_only":
+        return [f"{label} visual support observations"]
+    if "official" in lowered_need:
+        return [f"{label} official source extract"]
+    if "recent" in lowered_need or "fresh" in lowered_need:
+        return [f"{label} freshness and change notes"]
+    if "comparison" in lowered_need or "compare" in lowered_need:
+        return [f"{label} comparison evidence notes"]
+    return [f"{label} source-backed notes"]
+
+
+def _compact_adapter_requirement_refs(value: Any) -> list[str]:
+    refs = []
+    for item in _string_list(value):
+        ref = item.strip()
+        if re.fullmatch(r"req_[0-9]{3}", ref):
+            refs.append(ref)
+    return _ordered_unique(refs)
+
+
+def _materialize_compact_adapter_tasks(
+    *,
+    compact: Mapping[str, Any],
+    raw_request: Mapping[str, Any] | None,
+    original_question: str,
+    scope: str,
+    angles: Sequence[Mapping[str, Any]],
+    selected_entities: Sequence[Mapping[str, Any]],
+    required_dimensions: Sequence[Mapping[str, Any]],
+    final_deliverable_contract: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    blueprints = [
+        dict(item)
+        for item in _list(compact.get("task_blueprints"))
+        if isinstance(item, Mapping)
+    ]
+    blueprints_by_angle: dict[str, list[dict[str, Any]]] = {}
+    for blueprint in blueprints:
+        blueprints_by_angle.setdefault(str(blueprint.get("angle_id") or ""), []).append(
+            blueprint
+        )
+    duplicate_intents = _compact_adapter_duplicate_blueprint_intents(blueprints)
+    if duplicate_intents:
+        raise SemanticPlannerAdapterUnavailable(
+            "Compact Codex semantic planner task_blueprints must be distinct; "
+            + ", ".join(duplicate_intents[:5])
+        )
+    tier = SEMANTIC_SCOPE_TIERS[scope]
+    locked_scope = _candidate_locked_oracle_scope_contract(raw_request)
+    bounded_range = (
+        locked_scope.get("bounded_task_range")
+        if isinstance(locked_scope, Mapping)
+        and isinstance(locked_scope.get("bounded_task_range"), Mapping)
+        else {}
+    )
+    target_task_count = _semantic_task_source_cap_int(bounded_range.get("min"))
+    if target_task_count is None:
+        target_task_count = tier["min_tasks"]
+    target_task_count = max(target_task_count, len(angles) * tier["min_tasks_per_angle"])
+    max_task_count = _semantic_task_source_cap_int(bounded_range.get("max"))
+    if max_task_count is None:
+        max_task_count = tier["max_tasks"]
+    target_task_count = min(max_task_count, target_task_count)
+    tasks: list[dict[str, Any]] = []
+    request_budget = (
+        raw_request.get("budget_cap")
+        if isinstance(raw_request, Mapping) and isinstance(raw_request.get("budget_cap"), Mapping)
+        else {}
+    )
+    request_max_results = _semantic_task_source_cap_int(request_budget.get("max_results"))
+    locked_oracle = (
+        raw_request.get("locked_semantic_expectation_oracle")
+        if isinstance(raw_request, Mapping)
+        and isinstance(raw_request.get("locked_semantic_expectation_oracle"), Mapping)
+        else {}
+    )
+    deliverable_output_required = _compact_adapter_requires_deliverable_output(
+        compact,
+        locked_oracle=locked_oracle,
+    )
+    for angle_index, angle in enumerate(angles, start=1):
+        angle_id = str(angle.get("angle_id") or f"angle_{angle_index:03d}")
+        angle_blueprints = blueprints_by_angle.get(angle_id) or []
+        for local_index, blueprint in enumerate(angle_blueprints, start=1):
+            if len(tasks) >= max_task_count:
+                break
+            task_number = len(tasks) + 1
+            route = str(blueprint.get("route") or angle.get("route") or "text_only")
+            if route not in {"text_only", "visual_optional", "visual_required"}:
+                route = "text_only"
+            if (
+                isinstance(raw_request, Mapping)
+                and raw_request.get("visual_preference") == "visual_optional"
+                and route == "visual_required"
+            ):
+                route = "visual_optional"
+            if route == "visual_optional" and local_index > 1:
+                route = "text_only"
+            expected_visual_targets = _string_list(
+                blueprint.get("expected_visual_targets")
+            ) or _string_list(angle.get("expected_visual_targets"))
+            if route == "text_only":
+                expected_visual_targets = []
+            elif not expected_visual_targets:
+                expected_visual_targets = [f"{original_question} visual support evidence"]
+            max_sources = _semantic_task_source_cap_int(blueprint.get("max_sources"))
+            if max_sources is None:
+                max_sources = 3
+            max_sources = max(SEMANTIC_TASK_MIN_SOURCES, min(SEMANTIC_TASK_MAX_SOURCES, max_sources))
+            max_images = _semantic_task_source_cap_int(blueprint.get("max_images"))
+            if route == "text_only":
+                max_images = 0
+            elif max_images is None:
+                max_images = 1
+            query_intent = str(
+                blueprint.get("query_intent")
+                or blueprint.get("query")
+                or angle.get("research_question")
+                or angle.get("title")
+                or original_question
+            )
+            expected_source_types = _string_list(
+                blueprint.get("expected_source_types")
+            ) or _string_list(angle.get("expected_source_types")) or ["primary sources"]
+            expected_artifacts = _string_list(blueprint.get("expected_artifacts")) or _string_list(
+                angle.get("expected_artifacts")
+            ) or ["source-backed notes"]
+            if route == "text_only":
+                expected_artifacts = _compact_adapter_text_only_artifacts(
+                    expected_artifacts
+                )
+            success_criteria = _string_list(blueprint.get("success_criteria")) or _string_list(
+                angle.get("success_criteria")
+            ) or [f"Task output directly supports {original_question}."]
+            if _compact_adapter_requires_official_source(
+                expected_source_types=expected_source_types,
+                source_policy=blueprint.get("source_policy"),
+            ) and not _compact_adapter_text_has_any(
+                success_criteria,
+                ("official", "primary", "regulatory"),
+            ):
+                success_criteria.append("Use official or primary source evidence.")
+            if deliverable_output_required and not _compact_adapter_text_has_any(
+                expected_artifacts,
+                ("comparison report deliverable",),
+            ):
+                expected_artifacts.append("comparison report deliverable")
+            if deliverable_output_required and not (
+                _compact_adapter_text_has_any(
+                    expected_artifacts,
+                    ("table", "matrix", "deliverable", "structured", "report"),
+                )
+                or _compact_adapter_text_has_any(
+                    success_criteria,
+                    ("table", "matrix", "deliverable", "structured", "report"),
+                )
+            ):
+                expected_artifacts.append(
+                    "comparison table report with criterion, status, gap, unknown, evidence, and source columns"
+                )
+                success_criteria.append(
+                    "Produce comparison table or matrix rows that compare requirements and criteria, record match, partial, mismatch, gap, unknown, and unverifiable status, and cite evidence sources."
+                )
+            elif deliverable_output_required:
+                if not _compact_adapter_text_has_any(
+                    expected_artifacts + success_criteria,
+                    ("criterion", "criteria", "standard", "requirement"),
+                ):
+                    success_criteria.append(
+                        "Include requirement, criterion, criteria, or standard fields in the comparison table output."
+                    )
+                if not _compact_adapter_text_has_any(
+                    expected_artifacts + success_criteria,
+                    ("status", "match", "partial", "mismatch", "gap", "unknown", "unverifiable"),
+                ):
+                    success_criteria.append(
+                        "Include status fields for match, partial, mismatch, gap, unknown, and unverifiable outcomes."
+                    )
+                if not _compact_adapter_text_has_any(
+                    expected_artifacts + success_criteria,
+                    ("evidence", "citation", "source"),
+                ):
+                    success_criteria.append(
+                        "Include evidence, citation, and source fields for each comparison row."
+                    )
+            task: dict[str, Any] = {
+                "task_id": f"task_semantic_{task_number:03d}",
+                "angle_id": angle_id,
+                "query": (
+                    f"{original_question} compact planner task {task_number}: "
+                    f"{query_intent}"
+                ),
+                "route": route,
+                "freshness_requirement": str(
+                    blueprint.get("freshness_requirement") or "current if applicable"
+                ),
+                "source_policy": (
+                    dict(blueprint.get("source_policy"))
+                    if isinstance(blueprint.get("source_policy"), Mapping)
+                    else {
+                        "decision": "allowed",
+                        "requires_official_or_primary": True,
+                        "quality_requirements": _string_list(
+                            angle.get("expected_source_types")
+                        )
+                        or ["primary"],
+                        "flags": [],
+                    }
+                ),
+                "expected_source_types": expected_source_types,
+                "expected_visual_targets": expected_visual_targets,
+                "expected_artifacts": expected_artifacts,
+                "success_criteria": success_criteria,
+                "max_sources": max_sources,
+                "max_images": max_images,
+                "done_condition": str(
+                    blueprint.get("done_condition")
+                    or "Stop when source-backed findings, caveats, and unknowns are captured."
+                ),
+                "requirement_refs": _compact_adapter_requirement_refs(
+                    blueprint.get("requirement_refs")
+                )
+                or _compact_adapter_requirement_refs(angle.get("requirement_refs")),
+            }
+            if request_max_results is not None:
+                task["max_results"] = request_max_results
+            entity_refs = _compact_adapter_ref_window(
+                selected_entities,
+                task_number=task_number,
+                id_field="entity_id",
+                max_refs=2,
+            )
+            dimension_refs = _compact_adapter_ref_window(
+                required_dimensions,
+                task_number=task_number,
+                id_field="dimension_id",
+                max_refs=2,
+            )
+            if entity_refs:
+                task["semantic_entity_refs"] = entity_refs
+            if dimension_refs:
+                task["semantic_dimension_refs"] = dimension_refs
+            for field_name in (
+                "semantic_entity_refs",
+                "semantic_dimension_refs",
+                "final_deliverable_binding",
+            ):
+                value = blueprint.get(field_name)
+                if isinstance(value, Mapping):
+                    task[field_name] = dict(value)
+                elif isinstance(value, list):
+                    task[field_name] = _string_list(value)
+            tasks.append(task)
+    if deliverable_output_required and tasks and not any(
+        isinstance(task.get("final_deliverable_binding"), Mapping) for task in tasks
+    ):
+        tasks[-1]["final_deliverable_binding"] = {
+            "contract_type": str(
+                final_deliverable_contract.get("contract_type")
+                or "comparison_report"
+            ),
+            "required_sections": _string_list(
+                final_deliverable_contract.get("required_sections")
+            ),
+            "required_tables": _string_list(
+                final_deliverable_contract.get("required_tables")
+            ),
+            "required_judgments": _string_list(
+                final_deliverable_contract.get("required_judgments")
+            ),
+            "binding": "comparison_report_deliverable_input",
+            "binding_marker": "comparison_report_deliverable_input",
+        }
+    return tasks[:max_task_count]
+
+
+def _compact_adapter_duplicate_blueprint_intents(
+    blueprints: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for blueprint in blueprints:
+        normalized = " ".join(
+            str(blueprint.get("query_intent") or blueprint.get("query") or "")
+            .lower()
+            .split()
+        )
+        angle_id = str(blueprint.get("angle_id") or "")
+        key = f"{angle_id}:{normalized}"
+        if not normalized:
+            continue
+        if key in seen:
+            duplicates.append(normalized)
+        seen.add(key)
+    return _ordered_unique(duplicates)
+
+
+def _compact_adapter_text_has_any(values: Sequence[Any], needles: Sequence[str]) -> bool:
+    text = " ".join(str(value or "").lower() for value in values)
+    return any(needle in text for needle in needles)
+
+
+def _compact_adapter_text_only_artifacts(values: Sequence[Any]) -> list[str]:
+    sanitized: list[str] = []
+    visual_tokens = (
+        "visual",
+        "image",
+        "screenshot",
+        "chart",
+        "figure",
+        "diagram",
+        "photo",
+        "vlm",
+    )
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(token in lowered for token in visual_tokens):
+            if "table" in lowered or "matrix" in lowered:
+                replacement = "source-backed evidence table"
+            elif "example" in lowered:
+                replacement = "source-backed example dossier"
+            else:
+                replacement = "source-backed evidence notes"
+            sanitized.append(replacement)
+        else:
+            sanitized.append(text)
+    return _ordered_unique(sanitized) or ["source-backed notes"]
+
+
+def _compact_adapter_requires_official_source(
+    *,
+    expected_source_types: Sequence[str],
+    source_policy: Any,
+) -> bool:
+    source_policy_values: list[Any] = list(expected_source_types)
+    if isinstance(source_policy, Mapping):
+        source_policy_values.extend(
+            [
+                source_policy.get("requires_official_or_primary"),
+                source_policy.get("quality_requirements"),
+                source_policy.get("required_source_quality"),
+            ]
+        )
+    return _compact_adapter_text_has_any(
+        [json.dumps(source_policy_values, ensure_ascii=False)],
+        ("official", "primary", "regulatory"),
+    )
+
+
+def _compact_adapter_requires_deliverable_output(
+    compact: Mapping[str, Any],
+    *,
+    locked_oracle: Mapping[str, Any] | None = None,
+) -> bool:
+    final_contract = compact.get("final_deliverable_contract")
+    if isinstance(final_contract, Mapping):
+        if _string_list(final_contract.get("required_tables")):
+            return True
+        if _string_list(final_contract.get("required_sections")):
+            return True
+    values: list[Any] = [
+        final_contract,
+        compact.get("decomposition_strategy"),
+        compact.get("intent_summary"),
+    ]
+    if isinstance(locked_oracle, Mapping):
+        values.extend(
+            [
+                locked_oracle.get("expected_report_shape"),
+                [
+                    record.get("output_shape_constraints")
+                    for record in _list(locked_oracle.get("oracle_requirement_map"))
+                    if isinstance(record, Mapping)
+                ],
+            ]
+        )
+    return _compact_adapter_text_has_any(
+        [json.dumps(values, ensure_ascii=False, sort_keys=True)],
+        ("table", "matrix", "deliverable", "structured", "표", "비교", "요구사항"),
+    )
+
+
+def _materialize_compact_adapter_constraints(
+    *,
+    compact: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+    original_question: str,
+) -> list[Any]:
+    constraints = _compact_adapter_list_of_objects_or_strings(compact.get("constraints"))
+    if constraints:
+        return constraints
+    requirements = [
+        dict(item)
+        for item in _list(locked_oracle.get("oracle_requirement_map"))
+        if isinstance(item, Mapping)
+    ]
+    if requirements:
+        return requirements
+    return [
+        {
+            "requirement_id": "req_001",
+            "requirement_type": "subject",
+            "requirement_text": original_question,
+            "prompt_text": original_question,
+            "explicit": True,
+            "non_negotiable": True,
+        }
+    ]
+
+
+def _materialize_compact_adapter_requirement_coverage(
+    *,
+    compact: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+    angles: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    original_question: str,
+) -> list[dict[str, Any]]:
+    compact_coverage = [
+        dict(item)
+        for item in _list(compact.get("coverage_matrix"))
+        if isinstance(item, Mapping) and item.get("requirement_id")
+    ]
+    source_requirements = compact_coverage or [
+        dict(item)
+        for item in _list(locked_oracle.get("oracle_requirement_map"))
+        if isinstance(item, Mapping)
+    ]
+    if not source_requirements:
+        source_requirements = [
+            {
+                "requirement_id": "req_001",
+                "requirement_type": "subject",
+                "requirement_text": original_question,
+                "non_negotiable": True,
+            }
+        ]
+    angle_ids_by_requirement: dict[str, list[str]] = {}
+    for angle in angles:
+        angle_id = str(angle.get("angle_id") or "")
+        if not angle_id:
+            continue
+        for requirement_ref in _compact_adapter_requirement_refs(
+            angle.get("requirement_refs")
+        ):
+            angle_ids_by_requirement.setdefault(requirement_ref, []).append(angle_id)
+    task_ids_by_requirement: dict[str, list[str]] = {}
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        for requirement_ref in _compact_adapter_requirement_refs(
+            task.get("requirement_refs")
+        ):
+            task_ids_by_requirement.setdefault(requirement_ref, []).append(task_id)
+    coverage: list[dict[str, Any]] = []
+    for index, requirement in enumerate(source_requirements, start=1):
+        requirement_id = str(
+            requirement.get("requirement_id") or f"req_{index:03d}"
+        )
+        covered_by_angle_ids = _string_list(
+            requirement.get("covered_by_angle_ids")
+        ) or _ordered_unique(angle_ids_by_requirement.get(requirement_id, []))
+        covered_by_task_ids = _string_list(
+            requirement.get("covered_by_task_ids")
+        ) or _ordered_unique(task_ids_by_requirement.get(requirement_id, []))
+        coverage.append(
+            {
+                "requirement_id": requirement_id,
+                "requirement_type": str(
+                    requirement.get("requirement_type") or "semantic_requirement"
+                ),
+                "requirement_text": str(
+                    requirement.get("requirement_text")
+                    or requirement.get("prompt_text")
+                    or original_question
+                ),
+                "coverage_status": (
+                    "covered"
+                    if covered_by_angle_ids and covered_by_task_ids
+                    else "not_covered"
+                ),
+                "covered_by_angle_ids": covered_by_angle_ids,
+                "covered_by_task_ids": covered_by_task_ids,
+                "non_negotiable": requirement.get("non_negotiable") is not False,
+            }
+        )
+    return coverage
+
+
+def _compact_adapter_default_task_partition_contract(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    entities = _list(candidate.get("selected_entities"))
+    return {
+        "contract_type": "semantic_task_partition",
+        "partition_key": "angle_id",
+        "entity_count": len(entities),
+        "max_entities_per_task": 2 if entities else 0,
+        "grouping_rule": "Partition compact task materialization by angle and semantic refs.",
+        "enforcement": "strict",
+        "materialized_from": "compact_planner_adapter",
+    }
+
+
+def _compact_adapter_default_final_deliverable_contract(
+    *,
+    compact: Mapping[str, Any],
+    locked_oracle: Mapping[str, Any],
+) -> dict[str, Any]:
+    report_shape = _string_list(locked_oracle.get("expected_report_shape"))
+    required_tables = [item for item in report_shape if "table" in item.lower() or "matrix" in item.lower()]
+    return {
+        "contract_type": str(
+            compact.get("final_deliverable_type") or "research_report"
+        ),
+        "required_sections": report_shape or ["Evidence Summary", "Caveats"],
+        "required_tables": required_tables,
+        "required_judgments": ["supported", "unknown_or_unverifiable"],
+        "materialized_from": "compact_planner_adapter",
+    }
 
 
 def _normalize_candidate_executable_source_caps(
@@ -6549,6 +7681,8 @@ def _candidate_record_required_dimension_ids(
 
 def _candidate_entity_name_in_text(name: str, lowered_text: str) -> bool:
     lowered_name = name.lower()
+    if lowered_name and lowered_name in lowered_text:
+        return True
     if re.search(rf"\b{re.escape(lowered_name)}\b", lowered_text):
         return True
     compact_name = re.sub(r"[^a-z0-9]+", "", lowered_name)
@@ -9820,15 +10954,23 @@ def _semantic_adapter_command(
     *,
     command_env: str,
     role_label: str,
+    raw_request: Mapping[str, Any] | None = None,
 ) -> list[str] | None:
     command_text = os.environ.get(command_env, "").strip()
     if command_text:
         command = shlex.split(command_text)
         return command or None
-    return _default_codex_semantic_adapter_command(role_label=role_label)
+    return _default_codex_semantic_adapter_command(
+        role_label=role_label,
+        raw_request=raw_request,
+    )
 
 
-def _default_codex_semantic_adapter_command(*, role_label: str) -> list[str] | None:
+def _default_codex_semantic_adapter_command(
+    *,
+    role_label: str,
+    raw_request: Mapping[str, Any] | None = None,
+) -> list[str] | None:
     if _semantic_adapter_env_flag_enabled(CODEX_SEMANTIC_DISABLE_DEFAULT_ADAPTER_ENV):
         return None
     if not _semantic_adapter_env_flag_enabled(CODEX_SEMANTIC_ENABLE_DEFAULT_ADAPTER_ENV):
@@ -9836,7 +10978,7 @@ def _default_codex_semantic_adapter_command(*, role_label: str) -> list[str] | N
     codex_binary = shutil.which("codex")
     if not codex_binary:
         return None
-    schema_path = _semantic_adapter_schema_path(role_label)
+    schema_path = _semantic_adapter_schema_path(role_label, raw_request=raw_request)
     if not schema_path.exists():
         raise SemanticPlannerAdapterUnavailable(
             f"Codex {role_label} output schema is missing: {schema_path}"
@@ -9852,11 +10994,14 @@ def _default_codex_semantic_adapter_command(*, role_label: str) -> list[str] | N
         str(_semantic_adapter_workdir()),
         "--output-schema",
         str(schema_path),
-        _semantic_adapter_prompt(role_label),
+        _semantic_adapter_prompt(role_label, raw_request=raw_request),
     ]
 
 
-def _semantic_adapter_schema_path(role_label: str) -> Path:
+def _semantic_adapter_schema_path(
+    role_label: str,
+    raw_request: Mapping[str, Any] | None = None,
+) -> Path:
     filename_by_role = {
         "semantic planner": CODEX_SEMANTIC_PLANNER_SCHEMA_FILENAME,
         "semantic oracle": CODEX_SEMANTIC_ORACLE_SCHEMA_FILENAME,
@@ -9865,6 +11010,11 @@ def _semantic_adapter_schema_path(role_label: str) -> Path:
     filename = filename_by_role.get(role_label)
     if not filename:
         raise SemanticPlannerAdapterUnavailable(f"Unknown semantic adapter role: {role_label}")
+    if (
+        role_label == "semantic planner"
+        and _semantic_planner_request_uses_compact_output(raw_request)
+    ):
+        filename = CODEX_SEMANTIC_COMPACT_PLANNER_SCHEMA_FILENAME
     return (
         Path(__file__).resolve().parents[2]
         / "validation"
@@ -9883,8 +11033,37 @@ def _semantic_adapter_workdir() -> Path:
         return Path(__file__).resolve().parents[2]
 
 
-def _semantic_adapter_prompt(role_label: str) -> str:
+def _semantic_planner_request_uses_compact_output(
+    raw_request: Mapping[str, Any] | None,
+) -> bool:
+    return (
+        isinstance(raw_request, Mapping)
+        and raw_request.get("semantic_planner_request_mode") == "compact_locked_oracle"
+    )
+
+
+def _semantic_adapter_prompt(
+    role_label: str,
+    raw_request: Mapping[str, Any] | None = None,
+) -> str:
     if role_label == "semantic planner":
+        if _semantic_planner_request_uses_compact_output(raw_request):
+            return (
+                "You are the Codex DeepResearch semantic planner compact adapter. Read the JSON "
+                "request from stdin. Return only JSON matching the provided schema. Emit only a "
+                "minimal compact_candidate_plan: intent_summary, question_scope, decomposition_strategy, "
+                "language, prompt-specific angle_specs, and lightweight task_blueprints. Do not emit "
+                "candidate_plan, bounded_tasks, selected_entities, required_dimensions, coverage_matrix, "
+                "source_budget_contract, task_partition_contract, final_deliverable_contract, constraints, "
+                "or detailed success criteria; deterministic materialization will derive those from the "
+                "locked compact oracle. For broad questions provide 5 to 8 angle_specs; for medium "
+                "questions provide 3 to 6; for narrow questions provide 2 to 4. Provide one distinct "
+                "task_blueprint per intended bounded task within the locked oracle bounded_task_range; "
+                "do not rely on repeated or padded blueprint intents. Each angle_spec and task_blueprint "
+                "must include requirement_refs using req_001 through req_005. Make each angle semantic and "
+                "prompt-specific, not a keyword/template label. Preserve the user's domain, language, "
+                "geography/time limits, and visual_optional support-only contract."
+            )
         return (
             "You are the Codex DeepResearch semantic planner. Read the JSON request from stdin. "
             "Return only JSON matching the provided schema. Decompose the original user question "
@@ -11857,6 +13036,7 @@ def _semantic_adapter_payload_from_value(value: Any) -> dict[str, Any] | None:
 def _is_semantic_adapter_response_payload(value: Mapping[str, Any]) -> bool:
     return (
         "candidate_plan" in value
+        or "compact_candidate_plan" in value
         or "expectation_oracle" in value
         or "semantic_plan_review" in value
         or value.get("artifact_type") == "semantic_planner_raw_response"
